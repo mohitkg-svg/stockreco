@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+backend/.env
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+backend/logs/
+
+# SQLite WAL files (runtime state)
+*.db-shm
+*.db-wal
+*.db.bak

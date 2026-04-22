@@ -20,12 +20,21 @@ set +a
 
 cd backend
 
-# macOS Python.framework ships without root certs — point OpenSSL at certifi's bundle
-# so Alpaca's wss://stream.data.alpaca.markets handshake succeeds.
-CERT_BUNDLE=$(/usr/local/bin/python3.8 -c "import certifi; print(certifi.where())" 2>/dev/null)
+# Use virtual environment if present, otherwise fall back to system python3
+PYTHON="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python3}"
+if [ -z "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+  if [ -x "../.venv/bin/python3" ]; then
+    PYTHON="../.venv/bin/python3"
+  else
+    PYTHON="python3"
+  fi
+fi
+
+# Point OpenSSL at certifi's bundle if available (needed on some systems for Alpaca WSS)
+CERT_BUNDLE=$("$PYTHON" -c "import certifi; print(certifi.where())" 2>/dev/null)
 if [ -n "$CERT_BUNDLE" ]; then
   export SSL_CERT_FILE="$CERT_BUNDLE"
   export REQUESTS_CA_BUNDLE="$CERT_BUNDLE"
 fi
 
-exec /usr/local/bin/python3.8 -m uvicorn main:app --host 127.0.0.1 --port 8000 "$@"
+exec "$PYTHON" -m uvicorn main:app --host 0.0.0.0 --port 8000 "$@"
