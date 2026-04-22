@@ -12,74 +12,271 @@
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script>
+      // Apply saved theme BEFORE the first paint so there is no flash.
+      (function () {
+        try {
+          var t = localStorage.getItem('theme') || 'dark';
+          document.documentElement.setAttribute('data-theme', t);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
     <style>
-        :root {
+        /* ---- Theme tokens -----------------------------------------------
+           Everything in the app references these custom properties via
+           utility classes (app-bg, app-surface, app-text, etc.) defined
+           further down. Swapping the `data-theme` attr on <html> flips
+           the entire palette without touching any JS. */
+        html[data-theme="dark"] {
             --bg-0: #070a12;
             --bg-1: #0b1020;
             --bg-2: #111827;
+            --surface: rgba(17, 24, 39, 0.72);
+            --surface-soft: rgba(17, 24, 39, 0.55);
+            --surface-solid: #131a2b;
+            --surface-border: rgba(148, 163, 184, 0.10);
+            --surface-border-soft: rgba(148, 163, 184, 0.06);
+            --text-primary: #e5e7eb;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
             --accent: #3b82f6;
+            --accent-soft: rgba(59, 130, 246, 0.22);
+            --accent-strong: #60a5fa;
+            --success: #10b981;
+            --success-soft: rgba(16, 185, 129, 0.15);
+            --danger: #ef4444;
+            --danger-soft: rgba(239, 68, 68, 0.15);
+            --warn: #f59e0b;
+            --warn-soft: rgba(245, 158, 11, 0.15);
+            --chart-bg: #0f1419;
+            --chart-grid: #1f2937;
+            --chart-border: #374151;
+            --chart-text: #d1d5db;
+            --shadow-lg: 0 10px 30px -12px rgba(0, 0, 0, 0.55);
+        }
+        html[data-theme="light"] {
+            --bg-0: #f6f8fb;
+            --bg-1: #eef2f8;
+            --bg-2: #e6ecf4;
+            --surface: rgba(255, 255, 255, 0.85);
+            --surface-soft: rgba(255, 255, 255, 0.65);
+            --surface-solid: #ffffff;
+            --surface-border: rgba(15, 23, 42, 0.08);
+            --surface-border-soft: rgba(15, 23, 42, 0.04);
+            --text-primary: #0f172a;
+            --text-secondary: #475569;
+            --text-muted: #94a3b8;
+            --accent: #2563eb;
+            --accent-soft: rgba(37, 99, 235, 0.18);
+            --accent-strong: #1d4ed8;
+            --success: #059669;
+            --success-soft: rgba(5, 150, 105, 0.12);
+            --danger: #dc2626;
+            --danger-soft: rgba(220, 38, 38, 0.12);
+            --warn: #d97706;
+            --warn-soft: rgba(217, 119, 6, 0.15);
+            --chart-bg: #ffffff;
+            --chart-grid: #e5e7eb;
+            --chart-border: #cbd5e1;
+            --chart-text: #1e293b;
+            --shadow-lg: 0 10px 25px -8px rgba(15, 23, 42, 0.15);
         }
         html, body { height: 100%; }
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            color: #e5e7eb;
-            /* Layered radial + linear gradient — subtle, only noticeable in
-               empty areas. Pure dark everywhere panels sit on top. */
+            color: var(--text-primary);
+            background: var(--bg-0);
+            background-attachment: fixed;
+            font-feature-settings: 'cv11', 'ss01', 'ss03';
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            transition: background-color .3s ease, color .3s ease;
+        }
+        html[data-theme="dark"] body {
             background:
                 radial-gradient(1200px 600px at 85% -10%, rgba(59, 130, 246, 0.08), transparent 60%),
                 radial-gradient(900px 500px at -10% 110%, rgba(16, 185, 129, 0.06), transparent 60%),
                 linear-gradient(180deg, #070a12 0%, #0a0f1c 100%);
             background-attachment: fixed;
-            font-feature-settings: 'cv11', 'ss01', 'ss03';
-            -webkit-font-smoothing: antialiased;
-            -moz-osx-font-smoothing: grayscale;
         }
-        /* Tabular numerals everywhere a price/percentage shows up — keeps
-           columns from jittering as digits change. */
+        html[data-theme="light"] body {
+            background:
+                radial-gradient(1200px 600px at 85% -10%, rgba(37, 99, 235, 0.08), transparent 60%),
+                radial-gradient(900px 500px at -10% 110%, rgba(5, 150, 105, 0.06), transparent 60%),
+                linear-gradient(180deg, #f6f8fb 0%, #eef2f8 100%);
+            background-attachment: fixed;
+        }
+
         .font-mono, code, pre { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
-        /* Modern thin scrollbar */
+
+        /* Scrollbars — thin, themed */
         .scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
         .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
         .scrollbar-thin::-webkit-scrollbar-thumb {
-            background: rgba(148, 163, 184, 0.18);
+            background: var(--surface-border);
             border-radius: 999px;
             border: 2px solid transparent;
             background-clip: content-box;
         }
-        .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.32); background-clip: content-box; border: 2px solid transparent; }
-        * { scrollbar-color: rgba(148,163,184,0.25) transparent; scrollbar-width: thin; }
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+            background: var(--text-muted);
+            background-clip: content-box;
+            border: 2px solid transparent;
+        }
+        * { scrollbar-color: var(--surface-border) transparent; scrollbar-width: thin; }
         .reasoning-text { white-space: pre-line; }
 
-        /* Glass surfaces — apply via .surface utility */
+        /* Glass surfaces */
         .surface {
-            background: linear-gradient(180deg, rgba(17, 24, 39, 0.72) 0%, rgba(17, 24, 39, 0.55) 100%);
-            backdrop-filter: saturate(140%) blur(10px);
-            -webkit-backdrop-filter: saturate(140%) blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.08);
+            background: var(--surface);
+            backdrop-filter: saturate(140%) blur(12px);
+            -webkit-backdrop-filter: saturate(140%) blur(12px);
+            border: 1px solid var(--surface-border);
         }
         .surface-soft {
-            background: rgba(17, 24, 39, 0.55);
+            background: var(--surface-soft);
             backdrop-filter: saturate(140%) blur(8px);
             -webkit-backdrop-filter: saturate(140%) blur(8px);
-            border: 1px solid rgba(148, 163, 184, 0.06);
+            border: 1px solid var(--surface-border-soft);
+        }
+        .surface-solid {
+            background: var(--surface-solid);
+            border: 1px solid var(--surface-border);
         }
 
-        /* Inputs + buttons — a global upgrade without touching app.js
-           classes. Scoped to the dark palette Tailwind emits for us. */
-        input, select, textarea { transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease; }
-        input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.22); }
+        /* Theme-aware text utilities */
+        .app-text-primary { color: var(--text-primary); }
+        .app-text-secondary { color: var(--text-secondary); }
+        .app-text-muted { color: var(--text-muted); }
+        .app-border { border-color: var(--surface-border); }
+        .app-border-soft { border-color: var(--surface-border-soft); }
+        .app-accent { color: var(--accent-strong); }
+        .app-bg-surface { background: var(--surface); }
+        .app-bg-surface-solid { background: var(--surface-solid); }
+
+        /* ---- Light-theme overrides for existing Tailwind gray palette ----
+           The app uses Tailwind classes (bg-gray-900, text-gray-400, etc.)
+           extensively. In light mode we map the most common ones to light
+           equivalents so legacy markup Just Works without touching every
+           file. These are scoped under [data-theme="light"] so dark mode
+           is unaffected. */
+        html[data-theme="light"] body { color: var(--text-primary); }
+        html[data-theme="light"] .bg-gray-900, html[data-theme="light"] .bg-gray-950 { background-color: var(--surface-solid) !important; }
+        html[data-theme="light"] .bg-gray-800 { background-color: #f1f5f9 !important; }
+        html[data-theme="light"] .bg-gray-800\/60, html[data-theme="light"] .bg-gray-800\/50, html[data-theme="light"] .bg-gray-950\/50, html[data-theme="light"] .bg-gray-950\/60 { background-color: rgba(241, 245, 249, 0.7) !important; }
+        html[data-theme="light"] .bg-gray-900\/60, html[data-theme="light"] .bg-gray-900\/80 { background-color: rgba(248, 250, 252, 0.85) !important; }
+
+        html[data-theme="light"] .border-gray-800, html[data-theme="light"] .border-gray-700 { border-color: var(--surface-border) !important; }
+        html[data-theme="light"] .border-white\/5, html[data-theme="light"] .border-white\/10 { border-color: var(--surface-border) !important; }
+
+        html[data-theme="light"] .text-white { color: var(--text-primary) !important; }
+        html[data-theme="light"] .text-gray-100, html[data-theme="light"] .text-gray-200, html[data-theme="light"] .text-gray-300 { color: var(--text-primary) !important; }
+        html[data-theme="light"] .text-gray-400 { color: var(--text-secondary) !important; }
+        html[data-theme="light"] .text-gray-500, html[data-theme="light"] .text-gray-600 { color: var(--text-muted) !important; }
+
+        html[data-theme="light"] .hover\:bg-white\/5:hover { background-color: rgba(15, 23, 42, 0.05) !important; }
+        html[data-theme="light"] .hover\:bg-white\/10:hover { background-color: rgba(15, 23, 42, 0.08) !important; }
+
+        /* Light-theme emerald/red tweaks — subtler pastels on the light bg */
+        html[data-theme="light"] .bg-emerald-500\/10, html[data-theme="light"] .bg-emerald-500\/15 { background-color: rgba(16, 185, 129, 0.10) !important; }
+        html[data-theme="light"] .bg-red-500\/10, html[data-theme="light"] .bg-red-500\/15 { background-color: rgba(239, 68, 68, 0.10) !important; }
+        html[data-theme="light"] .text-emerald-300, html[data-theme="light"] .text-emerald-400 { color: #047857 !important; }
+        html[data-theme="light"] .text-red-300, html[data-theme="light"] .text-red-400 { color: #b91c1c !important; }
+
+        /* Inputs */
+        input, select, textarea {
+            transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
+            color: var(--text-primary);
+        }
+        input:focus, select:focus, textarea:focus { outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+        html[data-theme="light"] input, html[data-theme="light"] select, html[data-theme="light"] textarea {
+            background-color: #ffffff;
+            border-color: var(--surface-border);
+        }
         button { transition: background-color .15s ease, color .15s ease, transform .08s ease, box-shadow .15s ease; }
         button:active:not(:disabled) { transform: translateY(0.5px); }
 
-        /* Accent glow used by the active tab pill */
-        .glow-blue { box-shadow: 0 6px 20px -8px rgba(59, 130, 246, 0.55), inset 0 1px 0 rgba(255,255,255,0.08); }
+        /* Accent glow on active tabs */
+        .glow-blue { box-shadow: 0 6px 20px -8px var(--accent-soft), inset 0 1px 0 rgba(255,255,255,0.08); }
 
-        /* Live indicator — softer pulse than the default animate-pulse opacity flash */
+        /* Live pulse indicator */
         @keyframes live-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); } 70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); } }
         .live-dot { animation: live-pulse 2s ease-out infinite; }
 
-        /* Headings — tighter tracking for display sizes */
+        /* Headings */
         h1, h2, h3 { letter-spacing: -0.01em; }
+
+        /* Card hover lift */
+        .lift { transition: transform .15s ease, box-shadow .15s ease; }
+        .lift:hover { transform: translateY(-1px); box-shadow: var(--shadow-lg); }
+
+        /* Stat card */
+        .stat-card {
+            background: var(--surface);
+            backdrop-filter: saturate(140%) blur(10px);
+            border: 1px solid var(--surface-border);
+            border-radius: 14px;
+            padding: 14px 16px;
+            transition: transform .15s ease, box-shadow .15s ease;
+        }
+        .stat-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-lg); }
+
+        /* Pill */
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-size: 10.5px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            border: 1px solid var(--surface-border);
+            background: var(--surface-soft);
+        }
+        .pill-success { background: var(--success-soft); color: var(--success); border-color: var(--success); }
+        .pill-danger { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+        .pill-warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+
+        /* Skeleton loader */
+        @keyframes skel-shimmer { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
+        .skel {
+            background: linear-gradient(90deg, var(--surface-border) 0px, var(--surface-border-soft) 40px, var(--surface-border) 80px);
+            background-size: 400px;
+            animation: skel-shimmer 1.2s linear infinite;
+            border-radius: 8px;
+        }
+
+        /* Theme toggle button */
+        .theme-toggle {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            width: 48px;
+            height: 26px;
+            border-radius: 999px;
+            background: var(--surface-soft);
+            border: 1px solid var(--surface-border);
+            cursor: pointer;
+            padding: 2px;
+            transition: background .2s ease;
+        }
+        .theme-toggle::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border-radius: 999px;
+            background: var(--accent);
+            top: 50%;
+            left: 3px;
+            transform: translateY(-50%);
+            transition: left .2s ease, background .2s ease;
+        }
+        html[data-theme="light"] .theme-toggle::after { left: 25px; }
     </style>
 </head>
 <body>

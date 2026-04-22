@@ -117,6 +117,22 @@ _SLIPPAGE_REJECT_ATR = 1.0
 # trailing instead.
 _T1_BE_MIN_ATR = 0.5
 
+# Profit-maximization tuning (strategy upgrade).
+# Confidence-scaled risk: a signal well above threshold gets a larger
+# position. Risk multiplier ramps linearly from 1.0x at the threshold to
+# _MAX_CONFIDENCE_RISK_MULT at 100% confidence.
+_MAX_CONFIDENCE_RISK_MULT = 1.75
+# Backtest-win-rate-aware scaling: if this ticker's strategy has a >=55%
+# historical hit rate, multiply the risk budget up to _KELLY_MAX_MULT.
+_KELLY_MAX_MULT = 1.35
+_KELLY_MIN_WIN_RATE = 55.0
+# T2 partial profit-taking: after T1 trim, if price pushes through T2,
+# trim half the remaining runner so 50% of the T2 qty banks the win.
+_T2_PARTIAL_FRAC = 0.5
+# Stale-trade exit: close an open trade that hasn't hit T1 after
+# N × timeframe minutes have elapsed. Frees capital for fresher setups.
+_STALE_TRADE_TF_MULT = 8
+
 # Background thread pool for non-blocking post-mortems. Sized small — these
 # are infrequent, and we don't want to fan out a hundred analyses if many
 # trades close at once.
@@ -682,9 +698,27 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if risk_per_share <= 0:
             return None
         risk_budget = equity * cfg.max_risk_per_trade_pct
-        max_qty_by_risk = int(risk_budget / risk_per_share)
+        # Profit-max: scale risk budget with confidence headroom above threshold.
+        # Signals that clear the gate by a wide margin deserve a bigger bet.
+        conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
+        conf_mult = 1.0 + (_MAX_CONFIDENCE_RISK_MULT - 1.0) * min(1.0, conf_headroom)
+        # Kelly-lite: if backtest win-rate is strong, boost further.
+        try:
+            bt_wr = float(signal.get("backtest_win_rate") or 0)
+        except Exception:
+            bt_wr = 0.0
+        if bt_wr >= _KELLY_MIN_WIN_RATE:
+            kelly_edge = min(1.0, (bt_wr - _KELLY_MIN_WIN_RATE) / (100.0 - _KELLY_MIN_WIN_RATE))
+            kelly_mult = 1.0 + (_KELLY_MAX_MULT - 1.0) * kelly_edge
+        else:
+            kelly_mult = 1.0
+        effective_risk_budget = risk_budget * conf_mult * kelly_mult
+        max_qty_by_risk = int(effective_risk_budget / risk_per_share)
         max_qty_by_remaining = int(stock_remaining / entry)
-        max_qty_by_per_ticker = int((stock_budget * 0.25) / entry)
+        # Profit-max: per-ticker cap raised from 25% → 30% of stock budget.
+        # With a 10-position concurrent cap, this lets a strong conviction
+        # trade meaningfully out-size weaker ones without starving diversity.
+        max_qty_by_per_ticker = int((stock_budget * 0.30) / entry)
         max_qty_by_cash = int(cash / entry)
         max_qty_by_bp = int(buying_power / entry)
         qty = min(
@@ -724,11 +758,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             take_profit=far_tp,
             stop_loss=round(stop, 2),
             time_in_force="gtc",
-            # B3: Pass the local idempotency hash to Alpaca as client_order_id.
-            # If we crash between submit and DB commit and retry, Alpaca
-            # rejects the duplicate with a 422 instead of creating a second
-            # bracket on the same ticker.
-            client_order_id=f"at-{idem}",
+            # Use a UUID so Alpaca never rejects a retry as a duplicate
+            # client_order_id (cancelled/filled IDs cannot be reused). DB-level
+            # idempotency is handled by the idem hash above — the Alpaca ID
+            # just needs to be unique per submission attempt.
+            client_order_id=f"at-{__import__('uuid').uuid4().hex[:16]}",
         )
         if "error" in res:
             # Stamp the idempotency_key on error rows too — without it, every
@@ -1772,6 +1806,36 @@ def manage_open_positions() -> Dict[str, Any]:
                         except Exception as _e:
                             logger.warning(f"SL invariant check {t.ticker}: {_e}")
 
+                    # Profit-max: stale-trade guard. Trades that haven't hit T1
+                    # after N × timeframe minutes have had their chance — close
+                    # them to recycle capital into fresher setups. Only fires
+                    # for trades currently at a small loss or flat (no point
+                    # closing a winning position just because T1 hasn't hit).
+                    if t.status == "open" and t.entry_price and not t.hit_t1 and t.filled_at:
+                        try:
+                            src_tf = _trade_source_timeframe(t, db)
+                            _stale_map = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440,"1mo":1440*20}
+                            tf_minutes = _stale_map.get(src_tf, 240)
+                            age_min = (datetime.utcnow() - t.filled_at).total_seconds() / 60.0
+                            max_age_min = _STALE_TRADE_TF_MULT * tf_minutes
+                            if age_min > max_age_min:
+                                # Only close if the trade is not meaningfully
+                                # winning (price below 0.3×R above entry).
+                                px_probe = _current_price(t.ticker)
+                                entry_px = float(t.entry_price)
+                                rps = max(0.01, entry_px - float(t.stop_loss or entry_px))
+                                if px_probe is not None and (px_probe - entry_px) < 0.3 * rps:
+                                    _force_close_trade(
+                                        t, db,
+                                        f"stale trade: open {age_min/60:.1f}h without T1 "
+                                        f"(max {max_age_min/60:.1f}h for {src_tf})",
+                                        summary,
+                                        status_override="closed_stale",
+                                    )
+                                    continue
+                        except Exception as _e:
+                            logger.warning(f"stale-trade check {t.ticker}: {_e}")
+
                     # 2) Open trade: state-machine trailing stop (long)
                     if t.status == "open" and t.entry_price and t.stop_order_id:
                         px = _current_price(t.ticker)
@@ -1867,6 +1931,41 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     except Exception as _re:
                                                         logger.warning(f"F3 SL-qty resize failed for {t.ticker}: {_re}")
                                                     metrics.inc("autotrade_event", event="partial_t1")
+                                        # Profit-max: T2 partial profit — trim half the remaining
+                                        # runner at T2 to lock in another chunk of gains while still
+                                        # leaving a runner for T3 and recalc extensions.
+                                        if target_idx == 1 and t.qty >= 2:
+                                            trim_qty = max(1, int(t.qty * _T2_PARTIAL_FRAC))
+                                            if trim_qty < t.qty:
+                                                try:
+                                                    from alpaca.trading.requests import MarketOrderRequest
+                                                    from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+                                                    trim_res = c.submit_order(order_data=MarketOrderRequest(
+                                                        symbol=t.ticker, qty=trim_qty,
+                                                        side=_OS.SELL, time_in_force=_TIF.DAY,
+                                                    ))
+                                                    trim_ok = trim_res is not None
+                                                except Exception as _te:
+                                                    logger.warning(f"T2 partial-trim submit failed for {t.ticker}: {_te}")
+                                                    trim_ok = False
+                                                if trim_ok:
+                                                    realized_partial = (px - float(t.entry_price)) * trim_qty
+                                                    t.realized_pl = (t.realized_pl or 0.0) + round(realized_partial, 2)
+                                                    t.qty = t.qty - trim_qty
+                                                    t.note = (t.note or "") + (
+                                                        f" | PARTIAL: trimmed {trim_qty} shares at T2 "
+                                                        f"(px={px:.2f}, +${realized_partial:.2f}); "
+                                                        f"runner = {t.qty} shares"
+                                                    )
+                                                    try:
+                                                        from alpaca.trading.requests import ReplaceOrderRequest
+                                                        c.replace_order_by_id(
+                                                            t.stop_order_id,
+                                                            order_data=ReplaceOrderRequest(qty=int(t.qty)),
+                                                        )
+                                                    except Exception as _re:
+                                                        logger.warning(f"T2 SL-qty resize failed for {t.ticker}: {_re}")
+                                                    metrics.inc("autotrade_event", event="partial_t2")
                                         if new_stop > t.current_stop and _replace_stop(t.stop_order_id, new_stop):
                                             t.current_stop = new_stop
                                             t.level_index = li + 1

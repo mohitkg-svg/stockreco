@@ -124,19 +124,38 @@ _app_health = {
 
 
 def scheduled_scan():
-    """Scan all watchlist stocks and update signals in DB."""
+    """Scan all watchlist stocks in parallel and update signals in DB.
+
+    Performance upgrade: previously serial (~N × per-ticker-latency). Now uses
+    a small worker pool so the whole watchlist finishes in the time of the
+    slowest ticker, not the sum of all tickers. Each worker opens its own
+    short-lived DB session — SQLite WAL + Neon pool both handle this fine,
+    and the existing entry_lock in auto_trader serialises the sensitive bits.
+    """
     from datetime import datetime as _dt, timezone as _tz
+    from concurrent.futures import ThreadPoolExecutor
     db = SessionLocal()
     try:
-        stocks = db.query(WatchlistStock).all()
-        for stock in stocks:
-            logger.info(f"Auto-scanning {stock.ticker}")
-            try:
-                _run_analysis_for_ticker(stock.ticker, db)
-            except Exception as e:
-                logger.error(f"Scan error for {stock.ticker}: {e}")
+        tickers = [s.ticker for s in db.query(WatchlistStock).all()]
     finally:
         db.close()
+
+    def _scan_one(ticker: str):
+        logger.info(f"Auto-scanning {ticker}")
+        _local = SessionLocal()
+        try:
+            _run_analysis_for_ticker(ticker, _local)
+        except Exception as e:
+            logger.error(f"Scan error for {ticker}: {e}")
+        finally:
+            _local.close()
+
+    # Cap at 4 to stay inside the Yahoo token-bucket (30 req/min) — each
+    # ticker fans out to 7 timeframes + meta; 4 parallel scanners ≈ 28 rps.
+    max_workers = min(4, max(1, len(tickers)))
+    if tickers:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="scan") as pool:
+            list(pool.map(_scan_one, tickers))
     _app_health["last_scan_at"] = _dt.now(_tz.utc).isoformat()
 
 

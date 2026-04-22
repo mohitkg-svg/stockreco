@@ -1,5 +1,46 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
+// ---------- Theme ----------
+// Persist in localStorage; the index.html pre-paint script applies it before
+// the React tree mounts so there is never a flash of the wrong theme.
+function useTheme() {
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('theme') || 'dark'; } catch (_) { return 'dark'; }
+  });
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem('theme', theme); } catch (_) {}
+  }, [theme]);
+  const toggle = useCallback(() => setTheme(t => t === 'dark' ? 'light' : 'dark'), []);
+  return [theme, toggle];
+}
+
+function ThemeToggle({ theme, onToggle }) {
+  return (
+    <button
+      onClick={onToggle}
+      aria-label="Toggle theme"
+      title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+      className="theme-toggle"
+    />
+  );
+}
+
+// Theme-aware chart options — passed to lightweight-charts createChart.
+function chartThemeOptions() {
+  const css = getComputedStyle(document.documentElement);
+  const bg = css.getPropertyValue('--chart-bg').trim() || '#0f1419';
+  const grid = css.getPropertyValue('--chart-grid').trim() || '#1f2937';
+  const border = css.getPropertyValue('--chart-border').trim() || '#374151';
+  const text = css.getPropertyValue('--chart-text').trim() || '#d1d5db';
+  return {
+    layout: { background: { color: bg }, textColor: text },
+    grid: { vertLines: { color: grid }, horzLines: { color: grid } },
+    timeScale: { timeVisible: true, secondsVisible: false, borderColor: border },
+    rightPriceScale: { borderColor: border },
+  };
+}
+
 // API base resolution order:
 //  1) window.__API_BASE__ injected by index.html / server template
 //  2) <meta name="api-base" content="..."> tag
@@ -210,7 +251,7 @@ function WatchlistPanel({ overview, selected, onSelect, onAdd, onRemove, onRefre
 }
 
 // ---------- Stock Chart ----------
-function StockChart({ ticker, timeframe, liveQuote = null }) {
+function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideIndicators = false }) {
   const lastCandleRef = useRef(null);  // {time, open, high, low, close} of the bar we keep mutating
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -222,16 +263,16 @@ function StockChart({ ticker, timeframe, liveQuote = null }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [srLevels, setSrLevels] = useState([]);
+  // Cache the last-fetched chart data so toggling hideIndicators can redraw
+  // without re-hitting the backend.
+  const lastDataRef = useRef(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
     const chart = LightweightCharts.createChart(containerRef.current, {
       width: containerRef.current.clientWidth,
       height: 460,
-      layout: { background: { color: '#0f1419' }, textColor: '#d1d5db' },
-      grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#374151' },
-      rightPriceScale: { borderColor: '#374151' },
+      ...chartThemeOptions(),
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
     chartRef.current = chart;
@@ -263,7 +304,7 @@ function StockChart({ ticker, timeframe, liveQuote = null }) {
       chartRef.current = null;
       seriesRef.current = { candle: null, volume: null, indicators: {} };
     };
-  }, []);
+  }, [theme]);
 
   useEffect(() => {
     if (!ticker || !chartRef.current) return;
@@ -329,16 +370,35 @@ function StockChart({ ticker, timeframe, liveQuote = null }) {
         Object.values(indicators).forEach(s => chartRef.current.removeSeries(s));
         seriesRef.current.indicators = {};
 
-        data.indicators.forEach(ind => {
-          const lineSeries = chartRef.current.addLineSeries({
-            color: ind.color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+        // Cache raw data for the hideIndicators-toggle redraw path.
+        lastDataRef.current = data;
+
+        if (!hideIndicators) {
+          data.indicators.forEach(ind => {
+            const lineSeries = chartRef.current.addLineSeries({
+              color: ind.color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+            });
+            lineSeries.setData(ind.values.filter(v => v.value != null));
+            seriesRef.current.indicators[ind.name] = lineSeries;
           });
-          lineSeries.setData(ind.values.filter(v => v.value != null));
-          seriesRef.current.indicators[ind.name] = lineSeries;
-        });
+        }
 
         // Support/Resistance price lines on the candle series
         clearPriceLines();
+        if (hideIndicators) {
+          setSrLevels(data.support_resistance);
+          // Skip all the overlay drawing — candles + volume only.
+          const n = candleBars.length;
+          const want = DEFAULT_VISIBLE_BARS[timeframe] || 150;
+          if (n > 0) {
+            const from = Math.max(0, n - want);
+            chartRef.current.timeScale().setVisibleLogicalRange({ from, to: n + 2 });
+          } else {
+            chartRef.current.timeScale().fitContent();
+          }
+          setLoading(false);
+          return;
+        }
         data.support_resistance.forEach(lvl => {
           addPriceLine({
             price: lvl.price,
@@ -478,7 +538,7 @@ function StockChart({ ticker, timeframe, liveQuote = null }) {
       clearTimeout(_fetchTimer);
       ac.abort();
     };
-  }, [ticker, timeframe]);
+  }, [ticker, timeframe, hideIndicators]);
 
   // ----- Live tick: extend the most recent bar with the latest WS price -----
   useEffect(() => {
@@ -829,22 +889,29 @@ function BacktestPanel({ ticker }) {
   );
 }
 
-function Stat({ label, value, positive, negative }) {
-  const color = positive ? 'text-emerald-400' : negative ? 'text-red-400' : 'text-white';
+function Stat({ label, value, positive, negative, hint }) {
+  const color = positive ? 'text-emerald-400' : negative ? 'text-red-400' : 'app-text-primary';
   return (
-    <div className="bg-gray-800 rounded p-2">
-      <div className="text-gray-500 text-[10px] uppercase">{label}</div>
-      <div className={`font-semibold ${color}`}>{value}</div>
+    <div className="stat-card">
+      <div className="text-[10px] uppercase tracking-[0.14em] app-text-muted">{label}</div>
+      <div className={`font-mono font-semibold text-lg mt-0.5 ${color}`}>{value}</div>
+      {hint && <div className="text-[10px] app-text-muted mt-0.5">{hint}</div>}
     </div>
   );
 }
 
 // ---------- Analysis View ----------
-function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeChanged = null }) {
+function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeChanged = null, theme = 'dark' }) {
   const [analysis, setAnalysis] = useState(null);
   const [timeframe, setTimeframe] = useState('1d');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [hideIndicators, setHideIndicators] = useState(() => {
+    try { return localStorage.getItem('hideIndicators') === '1'; } catch (_) { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('hideIndicators', hideIndicators ? '1' : '0'); } catch (_) {}
+  }, [hideIndicators]);
 
   const loadAnalysis = useCallback(async (refresh = false) => {
     if (!ticker) return;
@@ -903,8 +970,20 @@ function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeCh
       {error && <div className="m-4 p-3 bg-red-900/30 border border-red-800 rounded text-sm text-red-300">{error}</div>}
 
       <div className="p-4 space-y-4">
-        <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-          <StockChart ticker={ticker} timeframe={timeframe} liveQuote={liveQuote} />
+        <div className="surface rounded-xl overflow-hidden">
+          <div className="px-3 py-2 flex items-center justify-between border-b app-border text-xs">
+            <div className="app-text-muted uppercase tracking-widest">{timeframe} chart</div>
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={hideIndicators}
+                onChange={e => setHideIndicators(e.target.checked)}
+                className="accent-blue-500"
+              />
+              <span className="app-text-secondary">Hide all indicators</span>
+            </label>
+          </div>
+          <StockChart ticker={ticker} timeframe={timeframe} liveQuote={liveQuote} theme={theme} hideIndicators={hideIndicators} />
         </div>
 
         {analysis?.timeframe_alignment && <TimeframeAlignment alignment={analysis.timeframe_alignment} signals={analysis.signals} />}
@@ -1703,74 +1782,162 @@ function TradingPanel({ ticker, reloadToken }) {
   const tickerPositions = positions.filter(p => p.symbol === ticker);
   const otherPositions = positions.filter(p => p.symbol !== ticker);
 
+  const totalUnrealized = positions.reduce((a, p) => a + (p.unrealized_pl || 0), 0);
+  const totalCost = positions.reduce((a, p) => a + (p.avg_entry_price * Math.abs(p.qty)), 0);
+  const totalUnrealizedPct = totalCost > 0 ? (totalUnrealized / totalCost) * 100 : 0;
+  const cashPct = account?.equity > 0 ? (account.cash / account.equity) * 100 : 0;
+  const deployedPct = 100 - cashPct;
+
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-lg font-bold">📒 Paper Trading {account?.paper && <span className="text-[10px] px-2 py-0.5 ml-2 rounded bg-amber-900/50 border border-amber-700 text-amber-300 uppercase">Paper</span>}</h3>
-        <button onClick={load} className="text-xs text-gray-400 hover:text-white">↻ Refresh</button>
-      </div>
-      <div className="grid grid-cols-4 gap-2 text-xs mb-4">
-        <Stat label="Cash" value={`$${account?.cash?.toLocaleString()}`} />
-        <Stat label="Equity" value={`$${account?.equity?.toLocaleString()}`} />
-        <Stat label="Buying Power" value={`$${account?.buying_power?.toLocaleString()}`} />
-        <Stat label="Status" value={account?.status?.replace('AccountStatus.', '')} />
+    <div className="surface rounded-2xl p-5 shadow-xl">
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div className="flex items-center gap-3 flex-wrap">
+          <h3 className="text-xl font-bold flex items-center gap-2">
+            <span>📒</span>
+            <span>Paper Trading</span>
+          </h3>
+          {account?.paper && <span className="pill pill-warn">Paper</span>}
+          {account?.status && <span className="pill">{account.status.replace('AccountStatus.', '')}</span>}
+          {positions.length > 0 && (
+            <span className={`pill ${totalUnrealized >= 0 ? 'pill-success' : 'pill-danger'}`}>
+              Unrealized {totalUnrealized >= 0 ? '+' : ''}${totalUnrealized.toFixed(2)} ({totalUnrealizedPct.toFixed(2)}%)
+            </span>
+          )}
+        </div>
+        <button onClick={load} className="text-xs app-text-secondary hover:app-text-primary flex items-center gap-1 px-2 py-1 rounded-md hover:bg-white/5">
+          <span>↻</span><span>Refresh</span>
+        </button>
       </div>
 
-      <div className="mb-3">
-        <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Positions ({positions.length})</div>
+      {/* Hero stats row */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+        <Stat
+          label="Equity"
+          value={`$${account?.equity?.toLocaleString(undefined, {maximumFractionDigits: 0})}`}
+          hint={`Portfolio $${account?.portfolio_value?.toLocaleString(undefined, {maximumFractionDigits: 0})}`}
+        />
+        <Stat
+          label="Cash"
+          value={`$${account?.cash?.toLocaleString(undefined, {maximumFractionDigits: 0})}`}
+          hint={`${cashPct.toFixed(1)}% of equity`}
+        />
+        <Stat
+          label="Buying Power"
+          value={`$${account?.buying_power?.toLocaleString(undefined, {maximumFractionDigits: 0})}`}
+          hint={`${deployedPct.toFixed(1)}% deployed`}
+        />
+        <Stat
+          label="Open Positions"
+          value={positions.length}
+          hint={`${positions.filter(p => p.unrealized_pl > 0).length} winners · ${positions.filter(p => p.unrealized_pl < 0).length} losers`}
+        />
+      </div>
+
+      {/* Equity deployment progress */}
+      <div className="mb-5">
+        <div className="flex items-center justify-between text-[11px] app-text-secondary mb-1.5">
+          <span className="uppercase tracking-wider">Capital deployment</span>
+          <span className="font-mono">{deployedPct.toFixed(1)}% of equity in positions</span>
+        </div>
+        <div className="h-2 rounded-full overflow-hidden" style={{background: 'var(--surface-border)'}}>
+          <div
+            className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 transition-all"
+            style={{width: `${Math.min(100, deployedPct)}%`}}
+          />
+        </div>
+      </div>
+
+      {/* Positions — card grid */}
+      <div className="mb-5">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-xs app-text-secondary uppercase tracking-wider font-semibold">Open Positions ({positions.length})</div>
+        </div>
         {positions.length === 0 ? (
-          <div className="text-xs text-gray-500 italic">No open positions.</div>
+          <div className="surface-soft rounded-xl p-6 text-center">
+            <div className="text-sm app-text-muted italic">No open positions.</div>
+          </div>
         ) : (
-          <table className="w-full text-xs">
-            <thead className="text-gray-500 border-b border-gray-800">
-              <tr><th className="text-left py-1">Symbol</th><th className="text-right">Qty</th><th className="text-right">Avg</th><th className="text-right">Last</th><th className="text-right">P/L</th><th className="text-right">P/L %</th><th></th></tr>
-            </thead>
-            <tbody>
-              {[...tickerPositions, ...otherPositions].map(p => (
-                <tr key={p.symbol} className={`border-b border-gray-800/50 ${p.symbol === ticker ? 'bg-blue-950/20' : ''}`}>
-                  <td className="py-1 font-semibold">{p.symbol} <span className="text-[10px] text-gray-500">{p.side}</span></td>
-                  <td className="text-right">{p.qty}</td>
-                  <td className="text-right">${p.avg_entry_price.toFixed(2)}</td>
-                  <td className="text-right">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</td>
-                  <td className={`text-right ${p.unrealized_pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{p.unrealized_pl >= 0 ? '+' : ''}${p.unrealized_pl.toFixed(2)}</td>
-                  <td className={`text-right ${p.unrealized_plpc >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{p.unrealized_plpc >= 0 ? '+' : ''}{p.unrealized_plpc.toFixed(2)}%</td>
-                  <td className="text-right">
-                    <button disabled={busy} onClick={() => closePos(p.symbol)} className="text-[10px] px-2 py-0.5 rounded bg-red-800/60 hover:bg-red-700 disabled:opacity-50">Close</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {[...tickerPositions, ...otherPositions].map(p => {
+              const isWin = p.unrealized_pl >= 0;
+              const rowHighlight = p.symbol === ticker ? 'ring-1 ring-blue-500/50' : '';
+              return (
+                <div key={p.symbol} className={`surface-soft rounded-xl p-3 lift ${rowHighlight}`}>
+                  <div className="flex items-start justify-between mb-2">
+                    <div>
+                      <div className="font-bold text-base flex items-center gap-2">
+                        <span>{p.symbol}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded app-bg-surface-solid app-text-secondary uppercase tracking-wider">{p.side}</span>
+                      </div>
+                      <div className="text-[11px] app-text-muted font-mono">Qty {p.qty} @ ${p.avg_entry_price.toFixed(2)}</div>
+                    </div>
+                    <button disabled={busy} onClick={() => closePos(p.symbol)}
+                            className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold">
+                      Close
+                    </button>
+                  </div>
+                  <div className="flex items-baseline justify-between">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider app-text-muted">Last</div>
+                      <div className="font-mono text-base font-semibold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
+                    </div>
+                    <div className="text-right">
+                      <div className={`font-mono text-lg font-bold ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {isWin ? '+' : ''}${p.unrealized_pl.toFixed(2)}
+                      </div>
+                      <div className={`text-xs font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {isWin ? '+' : ''}{p.unrealized_plpc.toFixed(2)}%
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
 
+      {/* Recent orders — compact clean table */}
       <div>
-        <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">Recent orders</div>
+        <div className="text-xs app-text-secondary uppercase tracking-wider font-semibold mb-2">Recent Orders</div>
         {orders.length === 0 ? (
-          <div className="text-xs text-gray-500 italic">No orders yet.</div>
+          <div className="text-xs app-text-muted italic">No orders yet.</div>
         ) : (
-          <table className="w-full text-xs">
-            <thead className="text-gray-500 border-b border-gray-800">
-              <tr><th className="text-left py-1">Symbol</th><th className="text-right">Side</th><th className="text-right">Qty</th><th className="text-right">Type</th><th className="text-right">Status</th><th className="text-right">Submitted</th><th></th></tr>
-            </thead>
-            <tbody>
-              {orders.slice(0, 12).map(o => (
-                <tr key={o.id} className="border-b border-gray-800/50">
-                  <td className="py-1 font-semibold">{o.symbol}</td>
-                  <td className={`text-right ${o.side.includes('BUY') ? 'text-emerald-400' : 'text-red-400'}`}>{o.side.replace('OrderSide.', '')}</td>
-                  <td className="text-right">{o.qty}</td>
-                  <td className="text-right text-gray-500">{(o.type || '').replace('OrderType.', '')}</td>
-                  <td className="text-right text-gray-400">{(o.status || '').replace('OrderStatus.', '')}</td>
-                  <td className="text-right text-gray-500">{o.submitted_at?.slice(11, 19) || '—'}</td>
-                  <td className="text-right">
-                    {(o.status || '').includes('NEW') || (o.status || '').includes('ACCEPTED') ? (
-                      <button disabled={busy} onClick={() => cancelOrd(o.id)} className="text-[10px] px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-50">Cancel</button>
-                    ) : null}
-                  </td>
+          <div className="surface-soft rounded-xl overflow-hidden">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="app-text-muted border-b app-border">
+                  <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Symbol</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
+                  <th className="py-2 px-3"></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {orders.slice(0, 12).map(o => (
+                  <tr key={o.id} className="border-b app-border-soft last:border-0 hover:bg-white/3">
+                    <td className="py-2 px-3 font-semibold font-mono">{o.symbol}</td>
+                    <td className={`text-right py-2 px-3 font-semibold ${o.side.includes('BUY') ? 'text-emerald-400' : 'text-red-400'}`}>{o.side.replace('OrderSide.', '')}</td>
+                    <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
+                    <td className="text-right py-2 px-3 app-text-muted">{(o.type || '').replace('OrderType.', '')}</td>
+                    <td className="text-right py-2 px-3 app-text-secondary">{(o.status || '').replace('OrderStatus.', '')}</td>
+                    <td className="text-right py-2 px-3 app-text-muted font-mono">{o.submitted_at?.slice(11, 19) || '—'}</td>
+                    <td className="text-right py-2 px-3">
+                      {(o.status || '').includes('NEW') || (o.status || '').includes('ACCEPTED') ? (
+                        <button disabled={busy} onClick={() => cancelOrd(o.id)}
+                                className="text-[10px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 app-text-secondary disabled:opacity-50 border app-border">
+                          Cancel
+                        </button>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </div>
@@ -1783,6 +1950,7 @@ function App() {
   const [selected, setSelected] = useState(null);
   const [reloadToken, setReloadToken] = useState(0);
   const [view, setView] = useState('charts'); // 'charts' | 'trading'
+  const [theme, toggleTheme] = useTheme();
 
   // Stabilise loadOverview by reading `selected` from a ref instead of a dep.
   // Previously [selected] in the dep array re-created loadOverview on every
@@ -1868,12 +2036,16 @@ function App() {
             ))}
           </nav>
         </div>
-        <div className="text-xs text-gray-400 flex items-center gap-4">
-          <span className="hidden sm:inline text-gray-500">Auto-scan every 15 min · Polling every 60s</span>
-          <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-soft ${liveConnected ? 'text-emerald-400' : 'text-gray-500'}`}>
-            <span className={`w-1.5 h-1.5 rounded-full ${liveConnected ? 'bg-emerald-400 live-dot' : 'bg-gray-600'}`}></span>
+        <div className="text-xs flex items-center gap-4">
+          <span className="hidden sm:inline app-text-muted">Auto-scan 15m · Polling 60s</span>
+          <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-soft ${liveConnected ? 'text-emerald-400' : 'app-text-muted'}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${liveConnected ? 'bg-emerald-400 live-dot' : 'bg-gray-500'}`}></span>
             <span className="font-semibold tracking-wide text-[11px] uppercase">{liveConnected ? 'Live' : 'Offline'}</span>
           </span>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] app-text-muted uppercase tracking-wider hidden md:inline">{theme === 'dark' ? '🌙' : '☀️'}</span>
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          </div>
         </div>
       </header>
       <div className="flex-1 flex overflow-hidden">
@@ -1892,6 +2064,7 @@ function App() {
               reloadToken={reloadToken}
               liveQuote={selected ? liveQuotes[selected] : null}
               onAutoTradeChanged={loadOverview}
+              theme={theme}
             />
           </>
         )}

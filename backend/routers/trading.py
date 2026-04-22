@@ -37,7 +37,12 @@ class AutoTraderConfigRequest(BaseModel):
     trade_options: Optional[bool] = None
     daily_loss_limit_pct: Optional[float] = Field(None, ge=0, le=0.5)
     max_concurrent_positions: Optional[int] = Field(None, ge=0, le=100)
+    max_per_sector: Optional[int] = Field(None, ge=0, le=50)
     flatten_by_eod: Optional[bool] = None
+    signal_timeframes: Optional[str] = None
+    stop_atr_mult: Optional[float] = Field(None, gt=0, le=10)
+    chandelier_atr_mult: Optional[float] = Field(None, ge=0, le=10)
+    dry_run: Optional[bool] = None
 
 
 class KillSwitchRequest(BaseModel):

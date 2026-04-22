@@ -304,6 +304,39 @@ _overview_cache: dict = {"payload": None, "expiry": 0.0, "fingerprint": None}
 _OVERVIEW_TTL = 20.0
 
 
+@router.post("/scan")
+def trigger_scan(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Manually trigger a full watchlist scan in the background (parallel)."""
+    def _do_scan():
+        from concurrent.futures import ThreadPoolExecutor
+        from database import SessionLocal as _SL
+        _bootstrap = _SL()
+        try:
+            tickers = [s.ticker for s in _bootstrap.query(WatchlistStock).all()]
+        finally:
+            _bootstrap.close()
+
+        def _one(ticker: str):
+            _local = _SL()
+            try:
+                _run_analysis_for_ticker(ticker, _local)
+            except Exception as e:
+                logger.error(f"Scan error for {ticker}: {e}")
+            finally:
+                _local.close()
+
+        if tickers:
+            with ThreadPoolExecutor(max_workers=min(4, len(tickers)), thread_name_prefix="manual-scan") as pool:
+                list(pool.map(_one, tickers))
+        from main import _app_health
+        from datetime import datetime as _dt, timezone as _tz
+        _app_health["last_scan_at"] = _dt.now(_tz.utc).isoformat()
+        logger.info("Manual scan complete.")
+
+    background_tasks.add_task(_do_scan)
+    return {"status": "scan started"}
+
+
 @router.get("/overview", response_model=List[OverviewItem])
 def get_overview(db: Session = Depends(get_db)):
     """Quick summary for all watchlist stocks with their latest strong signal.
@@ -345,9 +378,24 @@ def get_overview(db: Session = Depends(get_db)):
         if r.ticker not in best_by_ticker:
             best_by_ticker[r.ticker] = r
 
+    # Parallel price fetch — get_current_price hits an external API (or
+    # Yahoo-cached value) per ticker. Serial it dominates the endpoint; a
+    # small pool collapses it to single-ticker latency.
+    from concurrent.futures import ThreadPoolExecutor
+    def _pi(t: str):
+        try:
+            return t, get_current_price(t)
+        except Exception:
+            return t, None
+    prices: dict = {}
+    if tickers:
+        with ThreadPoolExecutor(max_workers=min(8, len(tickers)), thread_name_prefix="overview-px") as pool:
+            for t, pi in pool.map(_pi, tickers):
+                prices[t] = pi
+
     result = []
     for stock in stocks:
-        price_info = get_current_price(stock.ticker)
+        price_info = prices.get(stock.ticker)
         best = best_by_ticker.get(stock.ticker)
         item = OverviewItem(
             ticker=stock.ticker,
