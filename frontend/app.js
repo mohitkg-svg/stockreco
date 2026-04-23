@@ -75,14 +75,51 @@ const DEFAULT_VISIBLE_BARS = {
   '1mo': 120,   // 10 years
 };
 
+// ---------- API key (shared secret, stored in localStorage) ----------
+// The backend gates every /api/* endpoint with `X-API-Key`. The browser
+// can't set headers on WebSockets, so we also append `?token=` to the WS
+// URL. The login screen in <App/> populates this on first visit.
+const API_KEY_STORAGE = 'app_api_key';
+function getApiKey() {
+  try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (_) { return ''; }
+}
+function setApiKey(k) {
+  try {
+    if (k) localStorage.setItem(API_KEY_STORAGE, k);
+    else   localStorage.removeItem(API_KEY_STORAGE);
+  } catch (_) {}
+}
+function authHeaders() {
+  const k = getApiKey();
+  return k ? { 'X-API-Key': k } : {};
+}
+
+// Global 401 handler — one bad key invalidates the session and forces a
+// re-login. Dispatches a custom event the App root listens for.
+function on401() {
+  setApiKey('');
+  window.dispatchEvent(new CustomEvent('app:unauthorized'));
+}
+
 const api = {
-  get: (path) => fetch(`${API_BASE}${path}`).then(r => r.ok ? r.json() : Promise.reject(r.statusText)),
+  get: (path) => fetch(`${API_BASE}${path}`, { headers: authHeaders() })
+    .then(r => {
+      if (r.status === 401) { on401(); return Promise.reject('unauthorized'); }
+      return r.ok ? r.json() : Promise.reject(r.statusText);
+    }),
   post: (path, body) => fetch(`${API_BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: body ? JSON.stringify(body) : undefined,
-  }).then(r => r.ok ? r.json() : r.json().then(e => Promise.reject(e.detail || r.statusText))),
-  delete: (path) => fetch(`${API_BASE}${path}`, { method: 'DELETE' }).then(r => r.ok ? r.json() : Promise.reject(r.statusText)),
+  }).then(r => {
+    if (r.status === 401) { on401(); return Promise.reject('unauthorized'); }
+    return r.ok ? r.json() : r.json().then(e => Promise.reject(e.detail || r.statusText));
+  }),
+  delete: (path) => fetch(`${API_BASE}${path}`, { method: 'DELETE', headers: authHeaders() })
+    .then(r => {
+      if (r.status === 401) { on401(); return Promise.reject('unauthorized'); }
+      return r.ok ? r.json() : Promise.reject(r.statusText);
+    }),
 };
 
 // ---------- Live Quotes WebSocket ----------
@@ -98,7 +135,11 @@ function useLiveQuotes(onSignalUpdate) {
     let reconnectTimer = null;
 
     const connect = () => {
-      const wsUrl = API_BASE.replace(/^http/, 'ws') + '/ws/quotes';
+      // Browsers can't set headers on WebSockets; token auth via query param.
+      // The backend verifies it with the same constant-time compare.
+      const key = getApiKey();
+      const q = key ? `?token=${encodeURIComponent(key)}` : '';
+      const wsUrl = API_BASE.replace(/^http/, 'ws') + '/ws/quotes' + q;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -162,7 +203,7 @@ function SignalBadge({ type, confidence, isNew }) {
 }
 
 // ---------- Watchlist Panel ----------
-function WatchlistPanel({ overview, selected, onSelect, onAdd, onRemove, onRefresh }) {
+function WatchlistPanel({ overview, selected, onSelect, onAdd, onRemove, onRefresh, onCloseMobile }) {
   const [newTicker, setNewTicker] = useState('');
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState(null);
@@ -183,11 +224,16 @@ function WatchlistPanel({ overview, selected, onSelect, onAdd, onRemove, onRefre
   };
 
   return (
-    <div className="w-72 surface border-r border-white/5 flex flex-col h-full">
-      <div className="p-3.5 border-b border-white/5">
-        <div className="flex items-center justify-between mb-2.5">
-          <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-400">Watchlist</h2>
-          <button onClick={onRefresh} className="w-6 h-6 rounded-md text-gray-500 hover:text-white hover:bg-white/5 flex items-center justify-center" title="Refresh">⟳</button>
+    <div className="w-full surface border-r app-border flex flex-col h-full">
+      <div className="p-3.5 border-b app-border">
+        <div className="flex items-center justify-between mb-2.5 gap-2">
+          <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] app-text-secondary">Watchlist</h2>
+          <div className="flex items-center gap-1">
+            <button onClick={onRefresh} className="w-7 h-7 rounded-md app-text-muted hover:app-text-primary hover:bg-white/5 flex items-center justify-center" title="Refresh">⟳</button>
+            {onCloseMobile && (
+              <button onClick={onCloseMobile} className="md:hidden w-7 h-7 rounded-md app-text-muted hover:app-text-primary hover:bg-white/5 flex items-center justify-center" title="Close">✕</button>
+            )}
+          </div>
         </div>
         <form onSubmit={handleAdd} className="flex gap-1">
           <input
@@ -351,7 +397,7 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
     // without making deliberate switches feel laggy.
     const _debounceMs = 160;
     const _fetchTimer = setTimeout(() => {
-    fetch(`${API_BASE}/api/analysis/${ticker}/chart?timeframe=${timeframe}`, { signal: ac.signal })
+    fetch(`${API_BASE}/api/analysis/${ticker}/chart?timeframe=${timeframe}`, { signal: ac.signal, headers: authHeaders() })
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
       .then(data => {
         if (cancelled || !chartRef.current || !seriesRef.current.candle) return;
@@ -538,7 +584,11 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
       clearTimeout(_fetchTimer);
       ac.abort();
     };
-  }, [ticker, timeframe, hideIndicators]);
+    // `theme` is in the deps because the chart creation effect recreates the
+    // lightweight-charts instance on theme change — without re-running the
+    // data effect, the new chart instance renders empty (no candles,
+    // indicators, or price lines).
+  }, [ticker, timeframe, hideIndicators, theme]);
 
   // ----- Live tick: extend the most recent bar with the latest WS price -----
   useEffect(() => {
@@ -570,12 +620,12 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
 // ---------- Timeframe Selector ----------
 function TimeframeSelector({ value, onChange }) {
   return (
-    <div className="flex surface-soft rounded-xl p-1 text-xs">
+    <div className="flex surface-soft rounded-xl p-1 text-xs overflow-x-auto scrollbar-thin max-w-full">
       {TIMEFRAMES.map(tf => (
         <button
           key={tf}
           onClick={() => onChange(tf)}
-          className={`px-3 py-1.5 rounded-lg font-semibold tracking-wide ${value === tf ? 'bg-gradient-to-b from-blue-500 to-blue-600 text-white glow-blue' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+          className={`px-2 sm:px-3 py-1.5 rounded-lg font-semibold tracking-wide shrink-0 ${value === tf ? 'bg-gradient-to-b from-blue-500 to-blue-600 text-white glow-blue' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
         >
           {tf.toUpperCase()}
         </button>
@@ -609,7 +659,7 @@ function SignalCard({ signal, currentPrice }) {
         </div>
       </div>
       {signal.entry != null && (
-        <div className="grid grid-cols-5 gap-2 mb-3 text-sm">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3 text-sm">
           <div className="surface-soft rounded-xl p-2.5">
             <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold">Entry</div>
             <div className="font-mono font-semibold text-[15px] mt-0.5">${signal.entry.toFixed(2)}</div>
@@ -657,13 +707,100 @@ function SignalCard({ signal, currentPrice }) {
           ⚠️ No {signal.signal_type} strategy has ≥3 historical trades on this ticker — confidence reduced by 25%.
         </div>
       )}
-      <div className="mt-3">
-        <div className="text-xs text-gray-400 mb-1">Reasoning</div>
-        <div className="text-sm reasoning-text bg-gray-950/50 rounded p-3 max-h-48 overflow-y-auto scrollbar-thin">
-          {signal.reasoning}
+      <ReasoningBlock reasoning={signal.reasoning} />
+      {signal.entry != null && <LevelMethodology signal={signal} />}
+    </div>
+  );
+}
+
+// ---------- Reasoning renderer ----------
+// Parses signal.reasoning (multi-line text with ✅/❌/⚠️/📊 prefixes) into
+// styled rows with coloured icons + aligned text. Falls back to plain
+// pre-line text for unstructured content.
+function ReasoningBlock({ reasoning }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!reasoning || !reasoning.trim()) return null;
+
+  const rawLines = reasoning.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  // Classify each line by leading symbol.
+  const classify = (line) => {
+    if (/^✅/.test(line))  return { kind: 'pos',  text: line.replace(/^✅\s*/, '') };
+    if (/^❌/.test(line))  return { kind: 'neg',  text: line.replace(/^❌\s*/, '') };
+    if (/^⚠️?/.test(line)) return { kind: 'warn', text: line.replace(/^⚠️?\s*/, '') };
+    if (/^📊|^📈|^📉/.test(line)) return { kind: 'info', text: line.replace(/^[📊📈📉]\s*/, '') };
+    if (/^[•\-–]/.test(line)) return { kind: 'bullet', text: line.replace(/^[•\-–]\s*/, '') };
+    return { kind: 'prose', text: line };
+  };
+
+  const rows = rawLines.map(classify);
+  const posCount = rows.filter(r => r.kind === 'pos').length;
+  const negCount = rows.filter(r => r.kind === 'neg').length;
+  const warnCount = rows.filter(r => r.kind === 'warn').length;
+
+  // Collapsed by default when there are >6 rows; full list one click away.
+  const VISIBLE = 6;
+  const shown = expanded ? rows : rows.slice(0, VISIBLE);
+  const hiddenCount = Math.max(0, rows.length - VISIBLE);
+
+  const iconFor = (kind) => {
+    switch (kind) {
+      case 'pos':    return <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] font-bold shrink-0">✓</span>;
+      case 'neg':    return <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-red-500/20 text-red-400 text-[10px] font-bold shrink-0">×</span>;
+      case 'warn':   return <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-amber-500/20 text-amber-400 text-[10px] font-bold shrink-0">!</span>;
+      case 'info':   return <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-blue-500/20 text-blue-400 text-[10px] font-bold shrink-0">i</span>;
+      case 'bullet': return <span className="inline-flex items-center justify-center w-4 h-4 app-text-muted text-[10px] shrink-0">•</span>;
+      default:       return null;
+    }
+  };
+
+  return (
+    <div className="mt-3">
+      {/* Header with factor tally */}
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[10px] uppercase tracking-[0.14em] app-text-muted font-semibold">Reasoning</div>
+        <div className="flex items-center gap-1.5 text-[10px]">
+          {posCount > 0 && (
+            <span className="pill pill-success font-mono">{posCount}✓</span>
+          )}
+          {negCount > 0 && (
+            <span className="pill pill-danger font-mono">{negCount}×</span>
+          )}
+          {warnCount > 0 && (
+            <span className="pill pill-warn font-mono">{warnCount}!</span>
+          )}
         </div>
       </div>
-      {signal.entry != null && <LevelMethodology signal={signal} />}
+
+      {/* Body */}
+      <div className="surface-soft rounded-xl overflow-hidden">
+        <div className="divide-y" style={{ borderColor: 'var(--surface-border-soft)' }}>
+          {shown.map((r, i) => {
+            if (r.kind === 'prose' && !r.text.startsWith(' ')) {
+              // Heading-style row
+              return (
+                <div key={i} className="px-3 py-1.5 text-[11px] font-semibold app-text-secondary uppercase tracking-wider">
+                  {r.text}
+                </div>
+              );
+            }
+            return (
+              <div key={i} className="px-3 py-2 flex items-start gap-2.5 text-xs leading-snug app-text-primary">
+                {iconFor(r.kind)}
+                <span className="flex-1">{r.text}</span>
+              </div>
+            );
+          })}
+        </div>
+        {hiddenCount > 0 && (
+          <button
+            onClick={() => setExpanded(e => !e)}
+            className="w-full py-2 text-[11px] app-text-secondary hover:app-text-primary border-t app-border-soft hover:bg-white/5"
+          >
+            {expanded ? 'Show less' : `Show ${hiddenCount} more factor${hiddenCount !== 1 ? 's' : ''}`}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -747,7 +884,7 @@ function TimeframeAlignment({ alignment, signals }) {
           Strategy: {strategy}
         </span>
       </div>
-      <div className="grid grid-cols-7 gap-2">
+      <div className="grid grid-cols-4 sm:grid-cols-7 gap-2">
         {TIMEFRAMES.map(tf => {
           const sig = alignment[tf] || 'NEUTRAL';
           const s = byTf[tf];
@@ -800,10 +937,8 @@ function BacktestPanel({ ticker }) {
     const chart = LightweightCharts.createChart(chartRef.current, {
       width: chartRef.current.clientWidth,
       height: 200,
-      layout: { background: { color: '#0f1419' }, textColor: '#d1d5db' },
-      grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
-      timeScale: { timeVisible: false, borderColor: '#374151' },
-      rightPriceScale: { borderColor: '#374151' },
+      ...chartThemeOptions(),
+      timeScale: { ...chartThemeOptions().timeScale, timeVisible: false },
     });
     chartInstance.current = chart;
     const line = chart.addAreaSeries({
@@ -889,6 +1024,50 @@ function BacktestPanel({ ticker }) {
   );
 }
 
+// Reusable collapsible section with a scrollable body frame. Used for
+// Auto-Trades / Positions / Orders so long lists don't push the panel
+// to a multi-screen height. Collapsed-by-default is the common case.
+function CollapsibleSection({
+  title,
+  count,
+  subtitle,
+  children,
+  defaultOpen = false,
+  maxHeight = 440,
+  actions,
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="surface-soft rounded-xl overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center justify-between px-3 py-2.5 text-left hover:bg-white/3"
+      >
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs uppercase tracking-wider app-text-secondary font-semibold">{title}</span>
+          {typeof count === 'number' && (
+            <span className="pill text-[10px] font-mono">{count}</span>
+          )}
+          {subtitle && <span className="text-[11px] app-text-muted">{subtitle}</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          {actions && <div onClick={e => e.stopPropagation()}>{actions}</div>}
+          <span className="app-text-muted text-xs">{open ? '▾' : '▸'}</span>
+        </div>
+      </button>
+      {open && (
+        <div
+          className="border-t app-border-soft overflow-y-auto scrollbar-thin"
+          style={{ maxHeight: `${maxHeight}px` }}
+        >
+          <div className="p-3">{children}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Stat({ label, value, positive, negative, hint }) {
   const color = positive ? 'text-emerald-400' : negative ? 'text-red-400' : 'app-text-primary';
   return (
@@ -896,6 +1075,249 @@ function Stat({ label, value, positive, negative, hint }) {
       <div className="text-[10px] uppercase tracking-[0.14em] app-text-muted">{label}</div>
       <div className={`font-mono font-semibold text-lg mt-0.5 ${color}`}>{value}</div>
       {hint && <div className="text-[10px] app-text-muted mt-0.5">{hint}</div>}
+    </div>
+  );
+}
+
+// ---------- News helpers ----------
+function SentimentPill({ label, score, severity }) {
+  const cls =
+    label === 'positive' ? 'pill-success' :
+    label === 'negative' ? 'pill-danger' :
+    '';
+  const fmt = (score || score === 0) ? (score >= 0 ? `+${score.toFixed(2)}` : score.toFixed(2)) : '';
+  return (
+    <span className={`pill ${cls}`} title={`Sentiment ${fmt} · severity ${severity ?? '?'}`}>
+      {label || 'neutral'} {fmt && <span className="opacity-70 font-mono">{fmt}</span>}
+    </span>
+  );
+}
+
+function relativeTime(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  const diffMs = Date.now() - d.getTime();
+  const mins = Math.max(1, Math.round(diffMs / 60000));
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${hrs}h ago`;
+  const days = Math.round(hrs / 24);
+  return `${days}d ago`;
+}
+
+// ---------- News Panel ----------
+function NewsPanel({ ticker }) {
+  const [items, setItems] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!ticker) return;
+    setLoading(true); setErr(null);
+    api.get(`/api/news/${ticker}?limit=20&hours=168`)
+      .then(d => setItems(d || []))
+      .catch(e => setErr(String(e)))
+      .finally(() => setLoading(false));
+  }, [ticker]);
+
+  const shown = expanded ? (items || []) : (items || []).slice(0, 6);
+
+  return (
+    <div className="surface rounded-2xl p-4">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 className="text-base font-bold flex items-center gap-2">
+          <span>📰</span>
+          <span>News</span>
+          <span className="text-xs app-text-muted font-normal">— VADER sentiment · Alpaca feed</span>
+        </h3>
+        {items && items.length > 0 && (
+          <div className="text-[11px] app-text-muted">{items.length} article{items.length !== 1 ? 's' : ''} · last 7d</div>
+        )}
+      </div>
+      {loading && <div className="text-xs app-text-muted italic">Loading…</div>}
+      {err && <div className="text-xs text-red-400">Error: {err}</div>}
+      {items && items.length === 0 && !loading && (
+        <div className="text-xs app-text-muted italic">
+          No news indexed for {ticker} yet. News ingestion runs every 2 minutes — check back later.
+        </div>
+      )}
+      {items && items.length > 0 && (
+        <div className="space-y-2">
+          {shown.map(it => (
+            <a
+              key={it.id}
+              href={it.url || '#'}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block surface-soft rounded-xl p-3 lift hover:bg-white/3"
+            >
+              <div className="flex items-start justify-between gap-3 mb-1">
+                <div className="flex-1 min-w-0 font-semibold text-sm leading-snug">{it.headline}</div>
+                <SentimentPill label={it.sentiment_label} score={it.sentiment_score} severity={it.severity} />
+              </div>
+              {it.summary && <div className="text-xs app-text-secondary line-clamp-2 mb-1.5">{it.summary.slice(0, 220)}{it.summary.length > 220 ? '…' : ''}</div>}
+              <div className="text-[10px] app-text-muted font-mono flex items-center gap-2 flex-wrap">
+                <span>{it.source || 'Unknown source'}</span>
+                {it.author && <><span>·</span><span>{it.author}</span></>}
+                <span>·</span>
+                <span>{relativeTime(it.published_at)}</span>
+                {it.symbols && it.symbols.length > 1 && <><span>·</span><span>+{it.symbols.length - 1} more</span></>}
+              </div>
+            </a>
+          ))}
+          {items.length > 6 && (
+            <button
+              onClick={() => setExpanded(e => !e)}
+              className="text-xs app-text-secondary hover:app-text-primary px-3 py-1 rounded-md hover:bg-white/5"
+            >
+              {expanded ? 'Show less' : `Show ${items.length - 6} more`}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Trade-vs-News Context (inline explainer on a closed auto-trade) ----------
+function TradeNewsContext({ tradeId }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    if (!tradeId) return;
+    setLoading(true); setErr(null);
+    api.get(`/api/news/trade/${tradeId}/context`)
+      .then(d => setData(d))
+      .catch(e => setErr(String(e)))
+      .finally(() => setLoading(false));
+  }, [tradeId]);
+
+  if (loading) return <div className="text-xs app-text-muted">Loading news context…</div>;
+  if (err) return <div className="text-xs text-red-400">Error: {err}</div>;
+  if (!data) return null;
+
+  const counts = data.news_counts || {};
+  const verdict = data.verdict || '';
+  const vColor = verdict === 'aligned' ? 'pill-success' : verdict === 'contrary' ? 'pill-danger' : '';
+
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="pill">Avg sentiment (during): <span className="font-mono ml-1">{data.avg_sentiment_during?.toFixed(3) ?? '—'}</span></span>
+        <span className="pill">Pre: {counts.pre || 0}</span>
+        <span className="pill">During: {counts.during || 0}</span>
+        <span className="pill">Post: {counts.post || 0}</span>
+        {verdict && <span className={`pill ${vColor}`}>{verdict}</span>}
+      </div>
+      {['pre_trade', 'during_trade', 'post_trade'].map(bucket => {
+        const list = data.articles?.[bucket] || [];
+        if (list.length === 0) return null;
+        const label = bucket === 'pre_trade' ? 'Before entry' : bucket === 'during_trade' ? 'During trade' : 'After close';
+        return (
+          <div key={bucket} className="surface-soft rounded-lg p-2">
+            <div className="text-[10px] uppercase tracking-wider app-text-muted font-semibold mb-1.5">{label} ({list.length})</div>
+            <div className="space-y-1.5">
+              {list.slice(0, 5).map(a => (
+                <a key={a.id} href={a.url || '#'} target="_blank" rel="noopener noreferrer"
+                   className="block hover:bg-white/5 rounded px-1 py-0.5">
+                  <div className="flex items-start gap-2">
+                    <SentimentPill label={a.sentiment_label} score={a.sentiment_score} severity={a.severity} />
+                    <div className="flex-1 min-w-0">
+                      <div className="app-text-primary leading-snug truncate">{a.headline}</div>
+                      <div className="text-[10px] app-text-muted font-mono">{a.source} · {relativeTime(a.published_at)}</div>
+                    </div>
+                  </div>
+                </a>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- News vs Trades Summary (week-later review) ----------
+function NewsAnalysisSummary() {
+  const [days, setDays] = useState(7);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const load = useCallback((d) => {
+    setLoading(true); setErr(null);
+    api.get(`/api/news/analysis/summary?days=${d}`)
+      .then(x => setData(x))
+      .catch(e => setErr(String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(days); }, [days, load]);
+
+  return (
+    <div className="surface rounded-2xl p-4">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 className="text-base font-bold flex items-center gap-2">
+          <span>📊</span><span>News ↔ Trade Alignment</span>
+        </h3>
+        <div className="flex items-center gap-2">
+          {[3, 7, 14, 30].map(n => (
+            <button
+              key={n}
+              onClick={() => setDays(n)}
+              className={`text-xs px-2 py-1 rounded-md ${days === n ? 'bg-blue-600 text-white' : 'surface-soft app-text-secondary'}`}
+            >
+              {n}d
+            </button>
+          ))}
+        </div>
+      </div>
+      {loading && <div className="text-xs app-text-muted italic">Loading…</div>}
+      {err && <div className="text-xs text-red-400">Error: {err}</div>}
+      {data && (
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+            <Stat label="Closed trades" value={data.total_trades} />
+            <Stat
+              label="Alignment rate"
+              value={data.alignment_rate_pct != null ? `${data.alignment_rate_pct}%` : '—'}
+              hint="news direction ↔ trade outcome"
+            />
+            <Stat label="Win w/ +news" value={(data.matrix?.positive_sent?.win ?? 0)} />
+            <Stat label="Loss w/ −news" value={(data.matrix?.negative_sent?.loss ?? 0)} />
+          </div>
+          {data.matrix && (
+            <div className="surface-soft rounded-xl overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="app-text-muted border-b app-border">
+                    <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Sentiment during trade</th>
+                    <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Wins</th>
+                    <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Losses</th>
+                    <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Flat</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {['positive_sent', 'negative_sent', 'neutral_sent', 'no_news'].map(b => (
+                    <tr key={b} className="border-b app-border-soft last:border-0">
+                      <td className="py-1.5 px-3 capitalize">{b.replace('_', ' ')}</td>
+                      <td className="text-right py-1.5 px-3 font-mono text-emerald-400">{data.matrix[b]?.win ?? 0}</td>
+                      <td className="text-right py-1.5 px-3 font-mono text-red-400">{data.matrix[b]?.loss ?? 0}</td>
+                      <td className="text-right py-1.5 px-3 font-mono app-text-muted">{data.matrix[b]?.flat ?? 0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="text-[11px] app-text-muted leading-relaxed">
+            Alignment rate = (positive-news wins + negative-news losses) / (all trades that had news). After a week of data, a meaningfully non-50% alignment rate is the signal that news sentiment is actually predictive — that's your cue to wire news into auto-trader gates in phase 2.
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -913,20 +1335,34 @@ function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeCh
     try { localStorage.setItem('hideIndicators', hideIndicators ? '1' : '0'); } catch (_) {}
   }, [hideIndicators]);
 
+  // Track the ticker owned by the most-recent fetch. Stops a slow response
+  // for ticker A from clobbering the UI after the user clicked ticker B.
+  const inFlightTickerRef = useRef(null);
+
   const loadAnalysis = useCallback(async (refresh = false) => {
     if (!ticker) return;
+    const requestedTicker = ticker;
+    inFlightTickerRef.current = requestedTicker;
     setLoading(true); setError(null);
     try {
-      const data = await api.get(`/api/analysis/${ticker}${refresh ? '?refresh=true' : ''}`);
+      const data = await api.get(`/api/analysis/${requestedTicker}${refresh ? '?refresh=true' : ''}`);
+      // Drop if the user switched away while we were waiting — prevents the
+      // "price of the previous ticker briefly appears" flash.
+      if (inFlightTickerRef.current !== requestedTicker) return;
       setAnalysis(data);
     } catch (e) {
+      if (inFlightTickerRef.current !== requestedTicker) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (inFlightTickerRef.current === requestedTicker) setLoading(false);
     }
   }, [ticker]);
 
+  // Clear stale data the INSTANT the ticker changes so the header / signal
+  // cards show a skeleton instead of the previous ticker's price.
   useEffect(() => {
+    setAnalysis(null);
+    setError(null);
     loadAnalysis(false);
   }, [ticker, loadAnalysis, reloadToken]);
 
@@ -938,38 +1374,51 @@ function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeCh
 
   return (
     <div className="flex-1 overflow-y-auto scrollbar-thin">
-      <div className="p-4 border-b border-gray-800 flex items-center justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold">{ticker}</h1>
-            {analysis?.name && <span className="text-gray-400 text-sm">{analysis.name}</span>}
-            {analysis?.current_price && (
+      <div className="p-3 sm:p-4 border-b app-border flex items-center justify-between flex-wrap gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+            <h1 className="text-xl sm:text-2xl font-bold">{ticker}</h1>
+            {analysis?.name && <span className="app-text-secondary text-sm hidden sm:inline">{analysis.name}</span>}
+            {/* Price: prefer loaded analysis, fall back to live WS quote so
+                there's always SOMETHING during the ticker-switch fetch. If
+                neither is available, show a skeleton shimmer — never a stale
+                value from the previously-selected ticker. */}
+            {analysis?.current_price ? (
               <div className="flex items-baseline gap-2">
                 <span className="text-xl font-semibold">${analysis.current_price.toFixed(2)}</span>
-                {/* Audit fix M8 (mirror): null/NaN-safe change_pct render. */}
                 {analysis.change_pct != null && Number.isFinite(analysis.change_pct) ? (
                   <span className={`text-sm ${analysis.change_pct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                     {analysis.change_pct >= 0 ? '+' : ''}{analysis.change_pct.toFixed(2)}%
                   </span>
                 ) : (
-                  <span className="text-sm text-gray-500">—</span>
+                  <span className="text-sm app-text-muted">—</span>
                 )}
               </div>
+            ) : liveQuote && (liveQuote.last || (liveQuote.bid && liveQuote.ask)) ? (
+              <div className="flex items-baseline gap-2">
+                <span className="text-xl font-semibold">
+                  ${(liveQuote.last || (liveQuote.bid + liveQuote.ask) / 2).toFixed(2)}
+                </span>
+                <span className="text-xs app-text-muted">live</span>
+              </div>
+            ) : (
+              <div className="skel h-6 w-28" />
             )}
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
           <TickerAutoTradeToggle ticker={ticker} onChanged={onAutoTradeChanged} />
           <TimeframeSelector value={timeframe} onChange={setTimeframe} />
-          <button onClick={() => loadAnalysis(true)} disabled={loading} className="bg-gray-700 hover:bg-gray-600 disabled:opacity-50 px-3 py-1 rounded text-sm">
-            {loading ? 'Refreshing…' : 'Refresh Analysis'}
+          <button onClick={() => loadAnalysis(true)} disabled={loading}
+                  className="px-2.5 sm:px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold border app-border surface-soft app-text-primary hover:bg-white/5 disabled:opacity-50">
+            {loading ? '…' : '↻'}<span className="hidden sm:inline">&nbsp;{loading ? 'Refreshing' : 'Refresh'}</span>
           </button>
         </div>
       </div>
 
-      {error && <div className="m-4 p-3 bg-red-900/30 border border-red-800 rounded text-sm text-red-300">{error}</div>}
+      {error && <div className="m-3 sm:m-4 p-3 bg-red-900/30 border border-red-800 rounded text-sm text-red-300">{error}</div>}
 
-      <div className="p-4 space-y-4">
+      <div className="p-3 sm:p-4 space-y-3 sm:space-y-4">
         <div className="surface rounded-xl overflow-hidden">
           <div className="px-3 py-2 flex items-center justify-between border-b app-border text-xs">
             <div className="app-text-muted uppercase tracking-widest">{timeframe} chart</div>
@@ -996,6 +1445,8 @@ function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeCh
             <SignalCard signal={analysis.primary_signal} currentPrice={analysis?.current_price} />
           </div>
         )}
+
+        <NewsPanel ticker={ticker} />
 
         <OptionsPanel ticker={ticker} signal={analysis?.primary_signal} />
 
@@ -1310,26 +1761,29 @@ function TradeFromSignal({ signal }) {
 function AutoTraderPanel({ reloadToken }) {
   const [status, setStatus] = useState(null);
   const [trades, setTrades] = useState([]);
-  const [putsWatch, setPutsWatch] = useState(null);
+  // putsWatch was eagerly fetched here (blocked first paint for ~1.5s); now
+  // PutsWatchSection lazily fetches on expand.
   const [busy, setBusy] = useState(false);
   const [showCfg, setShowCfg] = useState(false);
   const [expanded, setExpanded] = useState(null); // trade.id whose post-mortem is open
+  const [newsExpanded, setNewsExpanded] = useState(null); // trade.id whose news context is open
 
+  // Perf: puts-watch iterates the full watchlist, synthesises a bear thesis
+  // per ticker, and fetches option chains — it was gating the whole panel's
+  // first paint. Now: status + trades load fast (they're cheap DB queries);
+  // puts-watch is fetched lazily when the user expands that section.
   const inFlight = useRef(false);
   const load = useCallback(async () => {
-    if (inFlight.current) return;  // dogpile guard
+    if (inFlight.current) return;
     inFlight.current = true;
     try {
-      // allSettled so a single endpoint failure doesn't blank the whole panel.
       const results = await Promise.allSettled([
         api.get('/api/trading/auto/status'),
         api.get('/api/trading/auto/trades?limit=20'),
-        api.get('/api/options/puts-watch'),
       ]);
-      const [sr, tr, pwr] = results;
+      const [sr, tr] = results;
       if (sr.status === 'fulfilled') setStatus(sr.value);
       if (tr.status === 'fulfilled') setTrades(tr.value || []);
-      if (pwr.status === 'fulfilled') setPutsWatch(pwr.value);
     } finally {
       inFlight.current = false;
     }
@@ -1360,10 +1814,25 @@ function AutoTraderPanel({ reloadToken }) {
     finally { setBusy(false); }
   };
 
-  if (!status) return null;
+  if (!status) {
+    // Skeleton — paints immediately so the panel slot isn't blank.
+    return (
+      <div className="surface rounded-2xl p-5 space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="skel h-7 w-48" />
+          <div className="skel h-7 w-24" />
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {[0,1,2,3].map(i => <div key={i} className="skel h-20" />)}
+        </div>
+        <div className="skel h-2 w-full" />
+        <div className="skel h-2 w-full" />
+      </div>
+    );
+  }
   if (!status.broker_connected) {
     return (
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 text-xs text-gray-500">
+      <div className="surface rounded-2xl p-5 text-sm app-text-muted">
         Auto-trader unavailable: broker not connected.
       </div>
     );
@@ -1371,227 +1840,443 @@ function AutoTraderPanel({ reloadToken }) {
 
   const pct = (used, budget) => budget > 0 ? Math.min(100, (used / budget) * 100) : 0;
   const cfg = status.config;
+  const stockPct = pct(status.stock_used, status.stock_budget);
+  const optionPct = pct(status.option_used, status.option_budget);
+  const totalPct = status.total_cap > 0 ? (status.deployed / status.total_cap) * 100 : 0;
+  const liveCount = trades.filter(t => t.status === 'open' || t.status === 'pending').length;
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-lg font-bold flex items-center gap-2">
-          🤖 Auto-Trader
-          <span className={`text-[10px] px-2 py-0.5 rounded uppercase font-bold ${status.enabled ? 'bg-emerald-700 text-emerald-100' : 'bg-gray-800 text-gray-400 border border-gray-700'}`}>
-            {status.enabled ? 'ON' : 'OFF'}
+    <div className="surface rounded-2xl p-5 shadow-xl">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div className="flex items-center gap-3 flex-wrap">
+          <h3 className="text-xl font-bold flex items-center gap-2">
+            <span>🤖</span>
+            <span>Auto-Trader</span>
+          </h3>
+          <span className={`pill ${status.enabled ? 'pill-success' : ''}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${status.enabled ? 'bg-emerald-400 live-dot' : 'bg-gray-500'}`}></span>
+            {status.enabled ? 'Running' : 'Paused'}
           </span>
-        </h3>
+          {cfg.trade_options && <span className="pill">Puts ON</span>}
+          {cfg.trade_calls && <span className="pill">Calls ON</span>}
+          {cfg.aggressive_options_mode && <span className="pill pill-warn">🚀 Aggressive</span>}
+          {cfg.dry_run && <span className="pill pill-warn">Dry run</span>}
+          <span className="pill">Conf ≥ {cfg.confidence_threshold}%</span>
+        </div>
         <div className="flex items-center gap-2">
-          <button onClick={() => setShowCfg(s => !s)} className="text-xs text-gray-400 hover:text-white">⚙ Config</button>
+          <button
+            onClick={() => setShowCfg(s => !s)}
+            className="text-xs app-text-secondary hover:app-text-primary flex items-center gap-1 px-2.5 py-1.5 rounded-lg hover:bg-white/5 border app-border-soft"
+          >
+            <span>⚙</span><span>Config</span>
+          </button>
           <button
             onClick={toggle}
             disabled={busy}
-            className={`px-3 py-1 text-xs rounded font-semibold ${status.enabled ? 'bg-red-700 hover:bg-red-600' : 'bg-emerald-700 hover:bg-emerald-600'}`}
+            className={`px-3.5 py-1.5 text-xs rounded-lg font-semibold transition ${
+              status.enabled
+                ? 'bg-red-500/20 hover:bg-red-500/30 text-red-400 border border-red-500/40'
+                : 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/40'
+            } disabled:opacity-50`}
           >
-            {status.enabled ? 'Disable' : 'Enable'}
+            {status.enabled ? 'Pause' : 'Start'}
           </button>
         </div>
       </div>
 
-      {/* Budget bars */}
-      <div className="space-y-2 mb-3">
-        <BudgetBar label="Stocks" used={status.stock_used} budget={status.stock_budget} pct={pct(status.stock_used, status.stock_budget)} color="bg-blue-600" />
-        <BudgetBar label="Options" used={status.option_used} budget={status.option_budget} pct={pct(status.option_used, status.option_budget)} color="bg-purple-600" />
-        <div className="text-[11px] text-gray-500">
-          Total deployed: ${status.deployed.toLocaleString(undefined, {maximumFractionDigits: 0})} / ${status.total_cap.toLocaleString(undefined, {maximumFractionDigits: 0})} cap
-          ({(status.total_cap > 0 ? (status.deployed / status.total_cap * 100) : 0).toFixed(1)}% of {(cfg.max_pct_of_equity * 100).toFixed(0)}%-of-equity ceiling)
-        </div>
+      {/* Hero stats */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+        <Stat
+          label="Equity"
+          value={`$${Number(status.equity).toLocaleString(undefined, {maximumFractionDigits: 0})}`}
+          hint={`Cap $${Number(status.total_cap).toLocaleString(undefined, {maximumFractionDigits: 0})}`}
+        />
+        <Stat
+          label="Deployed"
+          value={`$${Number(status.deployed).toLocaleString(undefined, {maximumFractionDigits: 0})}`}
+          hint={`${totalPct.toFixed(1)}% of cap`}
+        />
+        <Stat
+          label="Open Trades"
+          value={liveCount}
+          hint={`${trades.length} total`}
+        />
+        <Stat
+          label="Today P/L"
+          value={(() => {
+            const pl = trades
+              .filter(t => t.closed_at && new Date(t.closed_at).toDateString() === new Date().toDateString())
+              .reduce((a, t) => a + (t.realized_pl || 0), 0);
+            return `${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`;
+          })()}
+          positive={trades.filter(t => t.closed_at && new Date(t.closed_at).toDateString() === new Date().toDateString()).reduce((a, t) => a + (t.realized_pl || 0), 0) > 0}
+          negative={trades.filter(t => t.closed_at && new Date(t.closed_at).toDateString() === new Date().toDateString()).reduce((a, t) => a + (t.realized_pl || 0), 0) < 0}
+          hint="UTC today, closed"
+        />
       </div>
 
-      {/* Config panel */}
+      {/* Budget gauges */}
+      <div className="space-y-3 mb-4">
+        <BudgetBar
+          label="Stock allocation"
+          used={status.stock_used} budget={status.stock_budget} pct={stockPct}
+          color="bg-gradient-to-r from-blue-500 to-indigo-500"
+        />
+        <BudgetBar
+          label="Option allocation"
+          used={status.option_used} budget={status.option_budget} pct={optionPct}
+          color="bg-gradient-to-r from-purple-500 to-fuchsia-500"
+        />
+      </div>
+
+      {/* Config drawer */}
       {showCfg && (
-        <div className="bg-gray-950/50 border border-gray-800 rounded p-3 mb-3 grid grid-cols-2 gap-3 text-xs">
-          <CfgField label="Confidence ≥" value={cfg.confidence_threshold} suffix="%"
-                    onCommit={v => updateCfg({ confidence_threshold: Number(v) })} />
-          <CfgField label="Risk per trade" value={cfg.max_risk_per_trade_pct * 100} suffix="% of equity"
-                    onCommit={v => updateCfg({ max_risk_per_trade_pct: Number(v) / 100 })} />
-          <CfgField label="Stock budget" value={cfg.stock_pct_of_equity * 100} suffix="% of equity"
-                    onCommit={v => updateCfg({ stock_pct_of_equity: Number(v) / 100 })} />
-          <CfgField label="Option budget" value={cfg.option_pct_of_equity * 100} suffix="% of equity"
-                    onCommit={v => updateCfg({ option_pct_of_equity: Number(v) / 100 })} />
-          <div className="col-span-2 flex items-center gap-2 pt-1">
-            <label className="flex items-center gap-2 text-gray-300 cursor-pointer">
-              <input type="checkbox" checked={!!cfg.trade_options}
-                     onChange={e => updateCfg({ trade_options: e.target.checked })} />
-              <span>Auto-buy PUT options on bearish non-BUY tickers (uses 10% bucket)</span>
-            </label>
+        <div className="surface-soft rounded-xl p-4 mb-4">
+          <div className="text-xs app-text-muted uppercase tracking-[0.14em] font-semibold mb-3">Configuration</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+            <CfgField label="Confidence threshold" value={cfg.confidence_threshold} suffix="%"
+                      onCommit={v => updateCfg({ confidence_threshold: Number(v) })} />
+            <CfgField label="Risk per trade" value={cfg.max_risk_per_trade_pct * 100} suffix="% equity"
+                      onCommit={v => updateCfg({ max_risk_per_trade_pct: Number(v) / 100 })} />
+            <CfgField label="Stock bucket" value={cfg.stock_pct_of_equity * 100} suffix="% equity"
+                      onCommit={v => updateCfg({ stock_pct_of_equity: Number(v) / 100 })} />
+            <CfgField label="Option bucket" value={cfg.option_pct_of_equity * 100} suffix="% equity"
+                      onCommit={v => updateCfg({ option_pct_of_equity: Number(v) / 100 })} />
           </div>
-          <div className="col-span-2 text-[11px] text-gray-500 leading-relaxed">
-            Strategy: long stocks on BUY signals at or above the threshold (bracket: stop = signal stop, TP = T2; stop trails to break-even at T1). For watchlist tickers without a strong BUY, a bear thesis is synthesized and the best PUT contract is bought (if options trading is enabled). PUT exits: underlying hits T1/T2, premium decays ≥ 50%, or underlying breaches the bear stop. Max 1 open auto-trade per ticker.
+          <div className="mt-3 pt-3 border-t app-border-soft space-y-2">
+            <label className="flex items-center gap-2 cursor-pointer text-sm">
+              <input type="checkbox" checked={!!cfg.trade_options}
+                     onChange={e => updateCfg({ trade_options: e.target.checked })}
+                     className="accent-blue-500" />
+              <span>Auto-buy <strong>PUTs</strong> on bearish setups</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer text-sm">
+              <input type="checkbox" checked={!!cfg.trade_calls}
+                     disabled={!cfg.trade_options}
+                     onChange={e => updateCfg({ trade_calls: e.target.checked })}
+                     className="accent-blue-500" />
+              <span className={!cfg.trade_options ? 'opacity-50' : ''}>
+                Auto-buy <strong>CALLs</strong> on bullish setups
+                {!cfg.trade_options && <span className="app-text-muted"> (requires PUTs enabled)</span>}
+              </span>
+            </label>
+            <div className="pt-2 border-t app-border-soft">
+              <label className="flex items-start gap-2 cursor-pointer text-sm">
+                <input type="checkbox" checked={!!cfg.aggressive_options_mode}
+                       disabled={!cfg.trade_options || !cfg.trade_calls}
+                       onChange={e => updateCfg({ aggressive_options_mode: e.target.checked })}
+                       className="accent-orange-500 mt-0.5" />
+                <div className={(!cfg.trade_options || !cfg.trade_calls) ? 'opacity-50' : ''}>
+                  <div className="font-semibold">🚀 Aggressive options mode</div>
+                  <div className="text-[11px] app-text-muted leading-relaxed">
+                    Treat options as the <em>primary</em> growth vehicle. Liberalizes call/put
+                    triggers (45% thesis floor), drops contract score gate to 55,
+                    raises per-ticker option cap to 50%, and removes the concentration
+                    guard so a call can stack on an existing stock long. Pair with a
+                    30/70 stock/option budget split.
+                    {!(cfg.trade_options && cfg.trade_calls) && <span className="block mt-1 text-amber-400">Requires both PUTs and CALLs enabled.</span>}
+                  </div>
+                </div>
+              </label>
+              {cfg.aggressive_options_mode && (
+                <div className="mt-2 flex items-center gap-2 flex-wrap">
+                  <span className="pill pill-warn">⚠ Higher risk — premium decay + leverage</span>
+                  {(Math.abs(cfg.stock_pct_of_equity - 0.30) > 0.05 || Math.abs(cfg.option_pct_of_equity - 0.70) > 0.05) && (
+                    <button
+                      onClick={() => updateCfg({ stock_pct_of_equity: 0.30, option_pct_of_equity: 0.70 })}
+                      className="text-[11px] px-2 py-1 rounded-md bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 border border-orange-500/40 font-semibold"
+                    >
+                      Apply 30/70 stock/option split
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="mt-3 text-[11px] app-text-muted leading-relaxed">
+            Strategy: long stock on BUY ≥ threshold with bracket stop. Soft-BE at T1 · BE at T2 · recompute + chandelier past T3. Puts use a synthesized bear thesis; exits on T1/T2 hit, 50% premium decay, or underlying broke stop.
           </div>
         </div>
       )}
 
-      {/* Open auto-trades */}
-      <div>
-        <div className="text-xs text-gray-400 uppercase tracking-wider mb-1">
-          Auto-trades ({trades.filter(t => t.status === 'open' || t.status === 'pending').length} live · {trades.length} total)
-        </div>
+      {/* Auto-trade list — collapsible with scrolling body */}
+      <div className="mb-4">
+        <CollapsibleSection
+          title="Auto-Trades"
+          count={trades.length}
+          subtitle={`${liveCount} live · ${trades.length} total`}
+          defaultOpen={false}
+          maxHeight={460}
+        >
         {trades.length === 0 ? (
-          <div className="text-xs text-gray-500 italic">
-            {status.enabled ? 'No auto-trades yet — waiting for the next strong BUY signal.' : 'Enable auto-trading to let signals open positions automatically.'}
-          </div>
-        ) : (
-          <table className="w-full text-xs">
-            <thead className="text-gray-500 border-b border-gray-800">
-              <tr>
-                <th className="text-left py-1">Ticker</th>
-                <th className="text-right">Qty</th>
-                <th className="text-right">Entry</th>
-                <th className="text-right">Stop</th>
-                <th className="text-right">T1 / T2 / T3</th>
-                <th className="text-right">Status</th>
-                <th className="text-right">P/L</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trades.map(t => {
-                const losingStop = t.status === 'closed_stop' && (t.realized_pl ?? 0) < 0;
-                const isOpen = expanded === t.id;
-                return (
-                  <React.Fragment key={t.id}>
-                    <tr className="border-b border-gray-800/50">
-                      <td className="py-1 font-semibold">
-                        {t.ticker}
-                        {(t.level_index ?? 0) > 0 && (
-                          <span
-                            title={`trail level ${t.level_index}${t.targets_history?.length ? ` · ${t.targets_history.length} recalc` : ''}`}
-                            className="ml-1 text-[9px] px-1 py-0.5 rounded bg-amber-800/50 border border-amber-700 text-amber-300"
-                          >
-                            L{t.level_index}{t.targets_history?.length ? `·R${t.targets_history.length}` : ''}
-                          </span>
-                        )}
-                        {losingStop && (
-                          <button
-                            onClick={() => setExpanded(isOpen ? null : t.id)}
-                            title="View loss post-mortem"
-                            className="ml-1 text-[9px] px-1 py-0.5 rounded bg-red-900/50 border border-red-700 text-red-200 hover:bg-red-800"
-                          >
-                            🔍 {isOpen ? 'hide' : 'why?'}
-                          </button>
-                        )}
-                      </td>
-                      <td className="text-right">{t.qty}</td>
-                      <td className="text-right">{t.entry_price ? `$${t.entry_price.toFixed(2)}` : `~$${t.requested_entry?.toFixed(2)}`}</td>
-                      <td className="text-right text-red-300">${t.current_stop?.toFixed(2)}</td>
-                      <td className="text-right text-emerald-300">
-                        ${t.target1?.toFixed(2)} / ${t.target2?.toFixed(2)}{t.target3 ? ` / $${t.target3.toFixed(2)}` : ''}
-                      </td>
-                      <td className="text-right">
-                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${
-                          t.status === 'open' ? 'bg-emerald-900/50 text-emerald-300 border border-emerald-800' :
-                          t.status === 'pending' ? 'bg-amber-900/50 text-amber-300 border border-amber-800' :
-                          t.status === 'closed_target' ? 'bg-emerald-800 text-white' :
-                          t.status === 'closed_stop' ? 'bg-red-800 text-white' :
-                          'bg-gray-800 text-gray-400'
-                        }`}>{t.status.replace('closed_', '')}</span>
-                      </td>
-                      <td className={`text-right ${t.realized_pl == null ? 'text-gray-500' : t.realized_pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {t.realized_pl == null ? '—' : (t.realized_pl >= 0 ? '+' : '') + '$' + t.realized_pl.toFixed(2)}
-                      </td>
-                    </tr>
-                    {isOpen && (
-                      <tr className="bg-red-950/20 border-b border-red-900/30">
-                        <td colSpan={7} className="p-3">
-                          <PostMortem trade={t} onRegen={async () => {
-                            try {
-                              const fresh = await api.post(`/api/trading/auto/postmortem/${t.id}`);
-                              setTrades(ts => ts.map(x => x.id === t.id ? { ...x, post_mortem: fresh, has_post_mortem: true } : x));
-                            } catch (e) { alert('Regen failed: ' + (e.detail || e)); }
-                          }} />
-                        </td>
-                      </tr>
-                    )}
-                  </React.Fragment>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
-
-      {/* Put-play watch — non-BUY tickers with viable bear theses */}
-      <PutsWatchSection data={putsWatch} canTrade={cfg.trade_options} />
-    </div>
-  );
-}
-
-function PutsWatchSection({ data, canTrade }) {
-  const [open, setOpen] = useState(false);
-  if (!data) return null;
-  const sugg = data.suggestions || [];
-  return (
-    <div className="mt-4 pt-3 border-t border-gray-800">
-      <div className="flex items-center justify-between mb-2">
-        <button onClick={() => setOpen(o => !o)} className="text-xs text-gray-400 hover:text-white flex items-center gap-1">
-          <span>{open ? '▼' : '▶'}</span>
-          <span className="uppercase tracking-wider">📉 Put-Play Watch ({sugg.length})</span>
-          {!canTrade && <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-900/50 border border-amber-700 text-amber-300">manual only — enable options auto-buy in Config</span>}
-        </button>
-      </div>
-      {open && (
-        sugg.length === 0 ? (
-          <div className="text-xs text-gray-500 italic">
-            No bearish put-plays found in the watchlist right now. (Tickers with strong BUY signals are excluded; tickers with weak bear conviction or illiquid put chains are skipped.)
+          <div className="text-center text-sm app-text-muted italic py-4">
+            {status.enabled ? 'Waiting for the next strong BUY signal…' : 'Enable auto-trading to let signals open positions automatically.'}
           </div>
         ) : (
           <div className="space-y-2">
-            {sugg.map(s => {
-              const top = s.top_contracts[0];
+            {trades.map(t => {
+              const losingStop = t.status === 'closed_stop' && (t.realized_pl ?? 0) < 0;
+              const isPmOpen = expanded === t.id;
+              const isClosed = !!t.closed_at;
+              const isNewsOpen = newsExpanded === t.id;
+              const statusPill =
+                t.status === 'open' ? { cls: 'pill-success', label: 'live' } :
+                t.status === 'pending' ? { cls: 'pill-warn', label: 'pending' } :
+                t.status === 'closed_target' ? { cls: 'pill-success', label: 'target' } :
+                t.status === 'closed_stop' ? { cls: 'pill-danger', label: 'stopped' } :
+                t.status?.startsWith('closed_') ? { cls: '', label: t.status.replace('closed_', '') } :
+                { cls: '', label: t.status };
+              const plColor = t.realized_pl == null ? 'app-text-muted'
+                            : t.realized_pl >= 0 ? 'text-emerald-400'
+                            : 'text-red-400';
               return (
-                <div key={s.ticker} className="border border-purple-900/50 rounded p-2 bg-purple-950/20 text-xs">
-                  <div className="flex items-center justify-between mb-1">
+                <div key={t.id} className="surface-soft rounded-xl p-3 lift">
+                  {/* Top row: ticker + pills + P/L */}
+                  <div className="flex items-start justify-between gap-3 mb-2 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-base font-mono">{t.ticker}</span>
+                      <span className="text-[10px] app-text-muted uppercase">{t.asset_type}</span>
+                      <span className={`pill ${statusPill.cls}`}>{statusPill.label}</span>
+                      {(t.level_index ?? 0) > 0 && (
+                        <span
+                          title={`Trail level ${t.level_index}${t.targets_history?.length ? ` · ${t.targets_history.length} recalc` : ''}`}
+                          className="pill pill-warn"
+                        >
+                          L{t.level_index}{t.targets_history?.length ? `·R${t.targets_history.length}` : ''}
+                        </span>
+                      )}
+                    </div>
+                    <div className={`font-mono text-sm font-bold ${plColor}`}>
+                      {t.realized_pl == null
+                        ? <span className="app-text-muted">—</span>
+                        : `${t.realized_pl >= 0 ? '+' : ''}$${t.realized_pl.toFixed(2)}`}
+                    </div>
+                  </div>
+
+                  {/* Middle row: qty, entry, stop, targets */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                     <div>
-                      <span className="font-bold text-white">{s.ticker}</span>
-                      <span className="text-gray-400 ml-2">{s.name}</span>
-                      <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-red-900/60 text-red-200 border border-red-800">
-                        BEAR {s.thesis.confidence}%
-                      </span>
+                      <div className="text-[10px] uppercase tracking-wider app-text-muted">Qty</div>
+                      <div className="font-mono">{t.qty}</div>
                     </div>
-                    <div className="text-right text-gray-400">
-                      Entry ${s.thesis.entry?.toFixed(2)} · Stop ${s.thesis.stop_loss?.toFixed(2)} · T1 ${s.thesis.target1?.toFixed(2)} · T2 ${s.thesis.target2?.toFixed(2)}
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-1">
-                    {s.top_contracts.slice(0, 3).map((c, i) => (
-                      <div key={i} className="bg-gray-950/60 border border-gray-800 rounded p-1.5 text-[11px]">
-                        <div className="font-semibold text-purple-300">
-                          ${c.strike} PUT · {c.expiration} ({c.dte}d) {c.is_weekly && <span className="text-amber-400">WKLY</span>}
-                        </div>
-                        <div className="text-gray-400">
-                          ${c.premium} · BE ${c.breakeven} · R:R {c.rr_t1}/{c.rr_t2}/{c.rr_t3} · score <span className="text-emerald-300 font-semibold">{c.score}</span>
-                        </div>
-                        <div className="text-gray-500 text-[10px]">vol {c.volume} · OI {c.open_interest} · IV {c.iv}% · Δ {c.delta_estimate}</div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider app-text-muted">Entry</div>
+                      <div className="font-mono">
+                        {t.entry_price ? `$${t.entry_price.toFixed(2)}` : <span className="app-text-muted">~${t.requested_entry?.toFixed(2)}</span>}
                       </div>
-                    ))}
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider app-text-muted">Stop</div>
+                      <div className="font-mono text-red-400">{t.current_stop != null ? `$${t.current_stop.toFixed(2)}` : '—'}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-wider app-text-muted">Targets</div>
+                      <div className="font-mono text-emerald-400 text-[11px]">
+                        {[t.target1, t.target2, t.target3].filter(x => x != null).map(x => `$${x.toFixed(2)}`).join(' / ')}
+                      </div>
+                    </div>
                   </div>
-                  <div className="text-[10px] text-gray-500 mt-1 reasoning-text">
-                    {s.thesis.reasoning}
-                  </div>
+
+                  {/* Actions row (only when relevant) */}
+                  {(losingStop || isClosed) && (
+                    <div className="mt-2 pt-2 border-t app-border-soft flex gap-2">
+                      {losingStop && (
+                        <button
+                          onClick={() => setExpanded(isPmOpen ? null : t.id)}
+                          className="text-[10px] px-2 py-1 rounded-md bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/30 font-semibold"
+                        >
+                          🔍 {isPmOpen ? 'Hide post-mortem' : 'Why did this lose?'}
+                        </button>
+                      )}
+                      {isClosed && (
+                        <button
+                          onClick={() => setNewsExpanded(isNewsOpen ? null : t.id)}
+                          className="text-[10px] px-2 py-1 rounded-md bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border border-blue-500/30 font-semibold"
+                        >
+                          📰 {isNewsOpen ? 'Hide news' : 'News during trade'}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Expanded sections */}
+                  {isPmOpen && (
+                    <div className="mt-2 p-2 rounded-lg bg-red-500/5 border border-red-500/20">
+                      <PostMortem trade={t} onRegen={async () => {
+                        try {
+                          const fresh = await api.post(`/api/trading/auto/postmortem/${t.id}`);
+                          setTrades(ts => ts.map(x => x.id === t.id ? { ...x, post_mortem: fresh, has_post_mortem: true } : x));
+                        } catch (e) { alert('Regen failed: ' + (e.detail || e)); }
+                      }} />
+                    </div>
+                  )}
+                  {isNewsOpen && (
+                    <div className="mt-2 p-2 rounded-lg bg-blue-500/5 border border-blue-500/20">
+                      <TradeNewsContext tradeId={t.id} />
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
-        )
+        )}
+        </CollapsibleSection>
+      </div>
+
+      {/* Options watch — both sides, lazy-loaded on expand */}
+      <CallsWatchSection canTrade={!!cfg.trade_calls} />
+      <PutsWatchSection canTrade={!!cfg.trade_options} />
+    </div>
+  );
+}
+
+// Generic lazy options-watch section — rendered once for calls + once for puts.
+// Cached for the session so re-opening doesn't refetch.
+function OptionsWatchSection({ kind, endpoint, label, icon, cardBorder, canTrade }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const fetchData = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const d = await api.get(endpoint);
+      setData(d);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [endpoint]);
+
+  const toggleOpen = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !data && !loading) fetchData();
+  };
+
+  const sugg = data?.suggestions || [];
+  const pillCls = kind === 'call' ? 'pill-success' : 'pill-danger';
+  const confPill = kind === 'call' ? 'pill-success' : 'pill-danger';
+  const confLabel = kind === 'call' ? 'BULL' : 'BEAR';
+  const strikeColor = kind === 'call' ? 'text-emerald-400' : 'text-red-400';
+
+  return (
+    <div className="mt-2 pt-3 border-t app-border-soft">
+      <button
+        onClick={toggleOpen}
+        className="w-full flex items-center justify-between app-text-secondary hover:app-text-primary py-1 rounded"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-xs">{open ? '▼' : '▸'}</span>
+          <span className="text-xs uppercase tracking-wider font-semibold">{icon} {label}</span>
+          {data && <span className="pill">{sugg.length}</span>}
+          {!canTrade && <span className="pill pill-warn">manual only</span>}
+        </div>
+        {open && (
+          <span
+            className="text-[11px] app-text-muted hover:app-text-primary cursor-pointer px-2 py-0.5 rounded hover:bg-white/5"
+            onClick={e => { e.stopPropagation(); fetchData(); }}
+          >
+            ↻ Rescan
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="mt-3">
+          {loading && <div className="text-xs app-text-muted italic">Scanning chain across watchlist…</div>}
+          {err && <div className="text-xs text-red-400">Error: {err}</div>}
+          {!loading && !err && sugg.length === 0 && (
+            <div className="text-xs app-text-muted italic">
+              No {kind === 'call' ? 'bullish call' : 'bearish put'}-plays found. (Weak conviction or illiquid chains are skipped.)
+            </div>
+          )}
+          {sugg.length > 0 && (
+            <div className="space-y-2">
+              {sugg.map(s => (
+                <div key={s.ticker} className={`surface-soft rounded-xl p-3 border ${cardBorder}`}>
+                  <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-base font-mono">{s.ticker}</span>
+                      <span className="text-xs app-text-muted">{s.name}</span>
+                      <span className={`pill ${confPill}`}>{confLabel} {s.thesis.confidence}%</span>
+                    </div>
+                    <div className="text-[11px] app-text-muted font-mono">
+                      Entry ${s.thesis.entry?.toFixed(2)} · Stop ${s.thesis.stop_loss?.toFixed(2)} · T1 ${s.thesis.target1?.toFixed(2)} · T2 ${s.thesis.target2?.toFixed(2)}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                    {s.top_contracts.slice(0, 3).map((c, i) => (
+                      <div key={i} className="app-bg-surface-solid rounded-lg p-2 border app-border-soft">
+                        <div className={`font-semibold ${strikeColor} text-xs`}>
+                          ${c.strike} {kind === 'call' ? 'CALL' : 'PUT'} · {c.expiration} ({c.dte}d)
+                          {c.is_weekly && <span className="ml-1 pill pill-warn text-[9px]">WKLY</span>}
+                        </div>
+                        <div className="text-[11px] app-text-secondary font-mono mt-0.5">
+                          ${c.premium} · BE ${c.breakeven} · R:R {c.rr_t1}/{c.rr_t2}/{c.rr_t3} · <span className="text-emerald-400 font-bold">{c.score}</span>
+                        </div>
+                        <div className="text-[10px] app-text-muted font-mono">vol {c.volume} · OI {c.open_interest} · IV {c.iv}% · Δ {c.delta_estimate}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {s.thesis.reasoning && (
+                    <div className="text-[11px] app-text-muted mt-2 reasoning-text line-clamp-3">
+                      {s.thesis.reasoning}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
     </div>
+  );
+}
+
+function CallsWatchSection({ canTrade }) {
+  return (
+    <OptionsWatchSection
+      kind="call"
+      endpoint="/api/options/calls-watch"
+      label="Call-Play Watch"
+      icon="📈"
+      cardBorder="border-emerald-500/20"
+      canTrade={canTrade}
+    />
+  );
+}
+
+// Lazy puts-watch — only hits the expensive endpoint when the user expands
+// this section. Cached for the session so re-opening doesn't refetch.
+function PutsWatchSection({ canTrade }) {
+  return (
+    <OptionsWatchSection
+      kind="put"
+      endpoint="/api/options/puts-watch"
+      label="Put-Play Watch"
+      icon="📉"
+      cardBorder="border-purple-500/20"
+      canTrade={canTrade}
+    />
   );
 }
 
 function BudgetBar({ label, used, budget, pct, color }) {
   return (
     <div>
-      <div className="flex justify-between text-[11px] text-gray-400 mb-0.5">
-        <span>{label}</span>
-        <span>${used.toLocaleString(undefined, {maximumFractionDigits: 0})} / ${budget.toLocaleString(undefined, {maximumFractionDigits: 0})} ({pct.toFixed(0)}%)</span>
+      <div className="flex justify-between text-xs mb-1.5">
+        <span className="app-text-secondary font-semibold">{label}</span>
+        <span className="font-mono app-text-primary">
+          ${Number(used).toLocaleString(undefined, {maximumFractionDigits: 0})}
+          <span className="app-text-muted"> / ${Number(budget).toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
+          <span className="ml-1.5 app-text-muted">({pct.toFixed(1)}%)</span>
+        </span>
       </div>
-      <div className="h-1.5 bg-gray-800 rounded overflow-hidden">
-        <div className={`h-full ${color}`} style={{ width: `${pct}%` }} />
+      <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--surface-border)' }}>
+        <div className={`h-full ${color} transition-all`} style={{ width: `${pct}%` }} />
       </div>
     </div>
   );
@@ -1698,7 +2383,7 @@ function TickerAutoTradeToggle({ ticker, onChanged }) {
       const next = !enabled;
       await fetch(`${API_BASE}/api/watchlist/${ticker}/auto-trade`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ enabled: next }),
       });
       setEnabled(next);
@@ -1764,7 +2449,7 @@ function TradingPanel({ ticker, reloadToken }) {
   };
   const cancelOrd = async (id) => {
     setBusy(true);
-    try { await fetch(`${API_BASE}/api/trading/orders/${id}`, { method: 'DELETE' }); await load(); }
+    try { await fetch(`${API_BASE}/api/trading/orders/${id}`, { method: 'DELETE', headers: authHeaders() }); await load(); }
     catch (e) {} finally { setBusy(false); }
   };
 
@@ -1847,110 +2532,187 @@ function TradingPanel({ ticker, reloadToken }) {
         </div>
       </div>
 
-      {/* Positions — card grid */}
-      <div className="mb-5">
-        <div className="flex items-center justify-between mb-2">
-          <div className="text-xs app-text-secondary uppercase tracking-wider font-semibold">Open Positions ({positions.length})</div>
-        </div>
-        {positions.length === 0 ? (
-          <div className="surface-soft rounded-xl p-6 text-center">
-            <div className="text-sm app-text-muted italic">No open positions.</div>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-            {[...tickerPositions, ...otherPositions].map(p => {
-              const isWin = p.unrealized_pl >= 0;
-              const rowHighlight = p.symbol === ticker ? 'ring-1 ring-blue-500/50' : '';
-              return (
-                <div key={p.symbol} className={`surface-soft rounded-xl p-3 lift ${rowHighlight}`}>
-                  <div className="flex items-start justify-between mb-2">
-                    <div>
-                      <div className="font-bold text-base flex items-center gap-2">
-                        <span>{p.symbol}</span>
-                        <span className="text-[10px] px-1.5 py-0.5 rounded app-bg-surface-solid app-text-secondary uppercase tracking-wider">{p.side}</span>
+      {/* Positions — collapsible with scrolling body */}
+      <div className="mb-4">
+        <CollapsibleSection
+          title="Open Positions"
+          count={positions.length}
+          defaultOpen={false}
+          maxHeight={460}
+        >
+          {positions.length === 0 ? (
+            <div className="text-center text-sm app-text-muted italic py-4">No open positions.</div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {[...tickerPositions, ...otherPositions].map(p => {
+                const isWin = p.unrealized_pl >= 0;
+                const rowHighlight = p.symbol === ticker ? 'ring-1 ring-blue-500/50' : '';
+                return (
+                  <div key={p.symbol} className={`app-bg-surface-solid rounded-xl p-3 lift border app-border-soft ${rowHighlight}`}>
+                    <div className="flex items-start justify-between mb-2">
+                      <div>
+                        <div className="font-bold text-base flex items-center gap-2">
+                          <span>{p.symbol}</span>
+                          <span className="text-[10px] px-1.5 py-0.5 rounded app-bg-surface-solid app-text-secondary uppercase tracking-wider">{p.side}</span>
+                        </div>
+                        <div className="text-[11px] app-text-muted font-mono">Qty {p.qty} @ ${p.avg_entry_price.toFixed(2)}</div>
                       </div>
-                      <div className="text-[11px] app-text-muted font-mono">Qty {p.qty} @ ${p.avg_entry_price.toFixed(2)}</div>
+                      <button disabled={busy} onClick={() => closePos(p.symbol)}
+                              className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold">
+                        Close
+                      </button>
                     </div>
-                    <button disabled={busy} onClick={() => closePos(p.symbol)}
-                            className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold">
-                      Close
-                    </button>
+                    <div className="flex items-baseline justify-between">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-wider app-text-muted">Last</div>
+                        <div className="font-mono text-base font-semibold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
+                      </div>
+                      <div className="text-right">
+                        <div className={`font-mono text-lg font-bold ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {isWin ? '+' : ''}${p.unrealized_pl.toFixed(2)}
+                        </div>
+                        <div className={`text-xs font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {isWin ? '+' : ''}{p.unrealized_plpc.toFixed(2)}%
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                  <div className="flex items-baseline justify-between">
-                    <div>
-                      <div className="text-[10px] uppercase tracking-wider app-text-muted">Last</div>
-                      <div className="font-mono text-base font-semibold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
-                    </div>
-                    <div className="text-right">
-                      <div className={`font-mono text-lg font-bold ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {isWin ? '+' : ''}${p.unrealized_pl.toFixed(2)}
-                      </div>
-                      <div className={`text-xs font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
-                        {isWin ? '+' : ''}{p.unrealized_plpc.toFixed(2)}%
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+                );
+              })}
+            </div>
+          )}
+        </CollapsibleSection>
       </div>
 
-      {/* Recent orders — compact clean table */}
-      <div>
-        <div className="text-xs app-text-secondary uppercase tracking-wider font-semibold mb-2">Recent Orders</div>
+      {/* Recent orders — collapsible with scrolling body */}
+      <CollapsibleSection
+        title="Recent Orders"
+        count={orders.length}
+        defaultOpen={false}
+        maxHeight={420}
+      >
         {orders.length === 0 ? (
-          <div className="text-xs app-text-muted italic">No orders yet.</div>
+          <div className="text-center text-sm app-text-muted italic py-4">No orders yet.</div>
         ) : (
-          <div className="surface-soft rounded-xl overflow-hidden">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="app-text-muted border-b app-border">
-                  <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Symbol</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
-                  <th className="py-2 px-3"></th>
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 app-bg-surface-solid z-10">
+              <tr className="app-text-muted border-b app-border">
+                <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Symbol</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
+                <th className="py-2 px-3"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {orders.map(o => (
+                <tr key={o.id} className="border-b app-border-soft last:border-0 hover:bg-white/3">
+                  <td className="py-2 px-3 font-semibold font-mono">{o.symbol}</td>
+                  <td className={`text-right py-2 px-3 font-semibold ${o.side.includes('BUY') ? 'text-emerald-400' : 'text-red-400'}`}>{o.side.replace('OrderSide.', '')}</td>
+                  <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
+                  <td className="text-right py-2 px-3 app-text-muted">{(o.type || '').replace('OrderType.', '')}</td>
+                  <td className="text-right py-2 px-3 app-text-secondary">{(o.status || '').replace('OrderStatus.', '')}</td>
+                  <td className="text-right py-2 px-3 app-text-muted font-mono">{o.submitted_at?.slice(11, 19) || '—'}</td>
+                  <td className="text-right py-2 px-3">
+                    {(o.status || '').includes('NEW') || (o.status || '').includes('ACCEPTED') ? (
+                      <button disabled={busy} onClick={() => cancelOrd(o.id)}
+                              className="text-[10px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 app-text-secondary disabled:opacity-50 border app-border">
+                        Cancel
+                      </button>
+                    ) : null}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {orders.slice(0, 12).map(o => (
-                  <tr key={o.id} className="border-b app-border-soft last:border-0 hover:bg-white/3">
-                    <td className="py-2 px-3 font-semibold font-mono">{o.symbol}</td>
-                    <td className={`text-right py-2 px-3 font-semibold ${o.side.includes('BUY') ? 'text-emerald-400' : 'text-red-400'}`}>{o.side.replace('OrderSide.', '')}</td>
-                    <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
-                    <td className="text-right py-2 px-3 app-text-muted">{(o.type || '').replace('OrderType.', '')}</td>
-                    <td className="text-right py-2 px-3 app-text-secondary">{(o.status || '').replace('OrderStatus.', '')}</td>
-                    <td className="text-right py-2 px-3 app-text-muted font-mono">{o.submitted_at?.slice(11, 19) || '—'}</td>
-                    <td className="text-right py-2 px-3">
-                      {(o.status || '').includes('NEW') || (o.status || '').includes('ACCEPTED') ? (
-                        <button disabled={busy} onClick={() => cancelOrd(o.id)}
-                                className="text-[10px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 app-text-secondary disabled:opacity-50 border app-border">
-                          Cancel
-                        </button>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </table>
         )}
-      </div>
+      </CollapsibleSection>
+    </div>
+  );
+}
+
+// ---------- Login screen ----------
+// Shown when the backend requires APP_API_KEY and localStorage doesn't have
+// one. On submit, we probe /api/health with the key — it always requires
+// auth when auth is configured, so a 200 means the key is valid.
+function LoginScreen({ onSuccess }) {
+  const [key, setKey] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const submit = async (e) => {
+    e?.preventDefault();
+    if (!key.trim()) return;
+    setBusy(true); setErr(null);
+    try {
+      // /api/analysis/overview is gated and lightweight — perfect probe.
+      const r = await fetch(`${API_BASE}/api/analysis/overview`, {
+        headers: { 'X-API-Key': key.trim() },
+      });
+      if (r.status === 401) { setErr('Invalid key'); setBusy(false); return; }
+      if (!r.ok && r.status !== 200) { setErr(`Server ${r.status}`); setBusy(false); return; }
+      setApiKey(key.trim());
+      onSuccess();
+    } catch (e) {
+      setErr('Network error');
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="h-screen flex items-center justify-center p-6">
+      <form onSubmit={submit} className="surface rounded-2xl p-7 w-full max-w-sm shadow-2xl">
+        <div className="flex items-center gap-2 mb-4">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/20">📈</div>
+          <div className="text-base font-bold">StockTA</div>
+        </div>
+        <div className="text-xs app-text-secondary uppercase tracking-[0.14em] font-semibold mb-1.5">Access key</div>
+        <input
+          type="password"
+          value={key}
+          onChange={e => setKey(e.target.value)}
+          placeholder="Paste your API key"
+          autoFocus
+          className="w-full bg-gray-900/60 border border-white/10 rounded-lg px-3 py-2.5 text-sm placeholder-gray-500 focus:border-blue-500/70 font-mono"
+        />
+        {err && <div className="mt-2 text-xs text-red-400">{err}</div>}
+        <button
+          type="submit"
+          disabled={busy || !key.trim()}
+          className="mt-4 w-full py-2.5 rounded-lg bg-gradient-to-b from-blue-500 to-blue-600 hover:from-blue-400 hover:to-blue-500 disabled:opacity-50 text-sm font-semibold shadow-lg shadow-blue-500/20"
+        >
+          {busy ? 'Verifying…' : 'Unlock'}
+        </button>
+        <div className="mt-4 text-[10px] app-text-muted leading-relaxed">
+          Your key is stored only in this browser's localStorage. It's never sent anywhere other than the API. Log out from the header pill to clear it.
+        </div>
+      </form>
     </div>
   );
 }
 
 // ---------- Main App ----------
+// Thin dispatcher: gate on auth and only mount the real UI once authenticated.
+// Keeping hooks in two components avoids the "rendered more hooks than
+// previous render" crash when the auth guard is in the same component.
 function App() {
+  const [authed, setAuthed] = useState(!!getApiKey());
+  useEffect(() => {
+    const onUnauth = () => setAuthed(false);
+    window.addEventListener('app:unauthorized', onUnauth);
+    return () => window.removeEventListener('app:unauthorized', onUnauth);
+  }, []);
+  if (!authed) return <LoginScreen onSuccess={() => setAuthed(true)} />;
+  return <AuthedApp onLogout={() => { setApiKey(''); setAuthed(false); }} />;
+}
+
+function AuthedApp({ onLogout }) {
   const [overview, setOverview] = useState([]);
   const [selected, setSelected] = useState(null);
   const [reloadToken, setReloadToken] = useState(0);
   const [view, setView] = useState('charts'); // 'charts' | 'trading'
   const [theme, toggleTheme] = useTheme();
+  const [mobileWatchOpen, setMobileWatchOpen] = useState(false);
 
   // Stabilise loadOverview by reading `selected` from a ref instead of a dep.
   // Previously [selected] in the dep array re-created loadOverview on every
@@ -2015,50 +2777,84 @@ function App() {
 
   return (
     <div className="h-screen flex flex-col">
-      <header className="surface sticky top-0 z-20 px-5 py-2.5 flex items-center justify-between">
-        <div className="flex items-center gap-5">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-sm shadow-lg shadow-blue-500/20">📈</div>
-            <div className="text-[15px] font-bold tracking-tight bg-gradient-to-r from-white to-blue-200 bg-clip-text text-transparent">StockTA</div>
+      <header className="surface sticky top-0 z-20 px-3 sm:px-5 py-2 sm:py-2.5 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 sm:gap-5 min-w-0">
+          {/* Mobile watchlist toggle — visible only on small screens, only in charts view */}
+          {view === 'charts' && (
+            <button
+              onClick={() => setMobileWatchOpen(o => !o)}
+              className="md:hidden w-9 h-9 rounded-lg surface-soft border app-border flex items-center justify-center app-text-primary"
+              aria-label="Open watchlist"
+            >
+              ☰
+            </button>
+          )}
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-sm shadow-lg shadow-blue-500/20 shrink-0">📈</div>
+            <div className="text-[15px] font-bold tracking-tight app-brand hidden sm:block">StockTA</div>
           </div>
-          <nav className="flex surface-soft rounded-xl p-1 text-xs">
+          <nav className="flex surface-soft rounded-xl p-1 text-xs shrink-0">
             {[
-              { id: 'charts', label: 'Charts & Analysis' },
-              { id: 'trading', label: '📒 Trading' },
+              { id: 'charts', label: 'Charts', full: 'Charts & Analysis' },
+              { id: 'trading', label: '📒', full: '📒 Trading' },
             ].map(t => (
               <button
                 key={t.id}
                 onClick={() => setView(t.id)}
-                className={`px-3.5 py-1.5 rounded-lg font-medium ${view === t.id ? 'bg-gradient-to-b from-blue-500 to-blue-600 text-white glow-blue' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+                className={`px-2.5 sm:px-3.5 py-1.5 rounded-lg font-medium ${view === t.id ? 'bg-gradient-to-b from-blue-500 to-blue-600 text-white glow-blue' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
               >
-                {t.label}
+                <span className="sm:hidden">{t.label}</span>
+                <span className="hidden sm:inline">{t.full}</span>
               </button>
             ))}
           </nav>
         </div>
-        <div className="text-xs flex items-center gap-4">
-          <span className="hidden sm:inline app-text-muted">Auto-scan 15m · Polling 60s</span>
-          <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-soft ${liveConnected ? 'text-emerald-400' : 'app-text-muted'}`}>
+        <div className="text-xs flex items-center gap-2 sm:gap-4 shrink-0">
+          <span className="hidden lg:inline app-text-muted">Auto-scan 15m · Polling 60s</span>
+          <span className={`inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-full surface-soft ${liveConnected ? 'text-emerald-400' : 'app-text-muted'}`}>
             <span className={`w-1.5 h-1.5 rounded-full ${liveConnected ? 'bg-emerald-400 live-dot' : 'bg-gray-500'}`}></span>
-            <span className="font-semibold tracking-wide text-[11px] uppercase">{liveConnected ? 'Live' : 'Offline'}</span>
+            <span className="font-semibold tracking-wide text-[10px] sm:text-[11px] uppercase">{liveConnected ? 'Live' : 'Offline'}</span>
           </span>
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] app-text-muted uppercase tracking-wider hidden md:inline">{theme === 'dark' ? '🌙' : '☀️'}</span>
-            <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          </div>
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          <button
+            onClick={onLogout}
+            title="Clear saved API key and log out"
+            className="text-[10px] sm:text-[11px] px-2 sm:px-2.5 py-1 rounded-full surface-soft app-text-secondary hover:app-text-primary font-semibold uppercase tracking-wider"
+          >
+            <span className="hidden sm:inline">Log out</span>
+            <span className="sm:hidden">⏻</span>
+          </button>
         </div>
       </header>
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden relative">
         {view === 'charts' && (
           <>
-            <WatchlistPanel
-              overview={overviewWithLive}
-              selected={selected}
-              onSelect={setSelected}
-              onAdd={handleAdd}
-              onRemove={handleRemove}
-              onRefresh={loadOverview}
-            />
+            {/* Mobile scrim backdrop — tap to close watchlist drawer */}
+            {mobileWatchOpen && (
+              <div
+                className="md:hidden fixed inset-0 z-30 bg-black/50"
+                onClick={() => setMobileWatchOpen(false)}
+              />
+            )}
+            {/* Watchlist: sidebar on desktop, slide-in drawer on mobile */}
+            <div className={`
+              ${mobileWatchOpen ? 'translate-x-0' : '-translate-x-full'}
+              md:translate-x-0
+              fixed md:static inset-y-0 left-0 z-40 md:z-auto
+              w-[80vw] max-w-xs md:w-72
+              transition-transform duration-200 ease-in-out
+              flex
+            `}>
+              <WatchlistPanel
+                overview={overviewWithLive}
+                selected={selected}
+                onSelect={(t) => { setSelected(t); setMobileWatchOpen(false); }}
+                onAdd={handleAdd}
+                onRemove={handleRemove}
+                onRefresh={loadOverview}
+                onCloseMobile={() => setMobileWatchOpen(false)}
+              />
+            </div>
             <AnalysisView
               ticker={selected}
               reloadToken={reloadToken}
@@ -2069,8 +2865,9 @@ function App() {
           </>
         )}
         {view === 'trading' && (
-          <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-4">
+          <div className="flex-1 overflow-y-auto scrollbar-thin p-2 sm:p-4 space-y-3 sm:space-y-4">
             <AutoTraderPanel reloadToken={reloadToken} />
+            <NewsAnalysisSummary />
             <TradingPanel reloadToken={reloadToken} />
           </div>
         )}

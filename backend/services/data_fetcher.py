@@ -248,7 +248,14 @@ def _get_alpaca_bars_client():
 
 
 def _fetch_alpaca_bars(ticker: str, timeframe: str) -> pd.DataFrame:
-    """Fetch historical OHLCV from Alpaca. Returns empty DF on failure."""
+    """Fetch historical OHLCV from Alpaca. Returns empty DF on failure.
+
+    Feed selection mirrors the live quote stream via ALPACA_DATA_FEED env:
+      • SIP (Algo Trader Plus): full consolidated tape, INCLUDES pre/post
+        market bars. Preferred when available.
+      • IEX (free tier): single-exchange, regular hours only (near-empty
+        during extended hours).
+    """
     cfg = _ALPACA_TF.get(timeframe)
     if not cfg:
         return pd.DataFrame()
@@ -259,6 +266,7 @@ def _fetch_alpaca_bars(ticker: str, timeframe: str) -> pd.DataFrame:
         from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         from datetime import timedelta, datetime as _dt
+        import os as _os
 
         atf_str, days = cfg
         # Map string → TimeFrame enum
@@ -273,8 +281,11 @@ def _fetch_alpaca_bars(ticker: str, timeframe: str) -> pd.DataFrame:
         atf = tf_map[atf_str]
         end = _dt.utcnow()
         start = end - timedelta(days=days)
+        feed = (_os.getenv("ALPACA_DATA_FEED", "iex") or "iex").lower()
+        if feed not in ("iex", "sip"):
+            feed = "iex"
         req = StockBarsRequest(symbol_or_symbols=ticker.upper(), timeframe=atf,
-                               start=start, end=end, feed="iex")
+                               start=start, end=end, feed=feed)
         bars = client.get_stock_bars(req)
         df_raw = bars.df
         if df_raw is None or df_raw.empty:
@@ -324,7 +335,17 @@ def fetch_ohlcv(ticker: str, timeframe: str) -> pd.DataFrame:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
 
     intraday = timeframe in _INTRADAY_TFS
-    sources = ["yahoo", "alpaca"] if intraday else ["alpaca", "yahoo"]
+    # With SIP feed (Algo Trader Plus), Alpaca has extended-hours bars AND
+    # better latency + no Yahoo rate limit. Use it as primary for all
+    # timeframes. Fall back to Yahoo on API errors.
+    # With IEX (free tier), Alpaca intraday bars are RTH-only — Yahoo's
+    # consolidated feed is richer, so fall back to old priority.
+    import os as _os_dp
+    _sip_on = (_os_dp.getenv("ALPACA_DATA_FEED", "iex") or "iex").lower() == "sip"
+    if _sip_on:
+        sources = ["alpaca", "yahoo"]
+    else:
+        sources = ["yahoo", "alpaca"] if intraday else ["alpaca", "yahoo"]
 
     from services import metrics as _metrics
     _TRANSIENT_NET_HINTS = (
@@ -419,27 +440,82 @@ def get_ticker_info(ticker: str) -> dict:
         return {"name": ticker.upper()}
 
 
+def _alpaca_latest_trade(ticker: str) -> Optional[float]:
+    """REST fallback for a real-time last trade price via Alpaca's snapshot
+    endpoint. Used when the WS quote cache is empty / stale (e.g. right
+    after container boot, extended-hours with sparse prints, or during WS
+    reconnect). 10s result cache so we don't hit Alpaca for every
+    watchlist row during an overview build."""
+    import os as _os_lt, time as _t_lt, httpx as _httpx_lt
+    now = _t_lt.time()
+    cached = _latest_trade_cache.get(ticker.upper())
+    if cached and now < cached[1]:
+        return cached[0]
+    key = _os_lt.getenv("APCA_API_KEY_ID")
+    secret = _os_lt.getenv("APCA_API_SECRET_KEY")
+    if not key or not secret:
+        return None
+    feed = (_os_lt.getenv("ALPACA_DATA_FEED", "iex") or "iex").lower()
+    if feed not in ("iex", "sip"):
+        feed = "iex"
+    try:
+        with _httpx_lt.Client(timeout=5.0) as client:
+            r = client.get(
+                f"https://data.alpaca.markets/v2/stocks/{ticker.upper()}/snapshot",
+                headers={
+                    "APCA-API-KEY-ID": key,
+                    "APCA-API-SECRET-KEY": secret,
+                },
+                params={"feed": feed},
+            )
+        if r.status_code != 200:
+            return None
+        d = r.json() or {}
+        lt = (d.get("latestTrade") or {}).get("p")
+        if lt:
+            px = float(lt)
+            _latest_trade_cache[ticker.upper()] = (px, now + 10)
+            return px
+    except Exception:
+        return None
+    return None
+
+
+_latest_trade_cache: Dict[str, tuple] = {}
+
+
 def get_current_price(ticker: str) -> Optional[Tuple[float, float]]:
     """Return (current_price, change_pct).
 
-    Prefers live Alpaca tick (if streaming) and computes change_pct versus the
-    previous daily close. Falls back to Yahoo's latest daily bar otherwise.
+    Price priority:
+      1. WebSocket live quote (sub-second, populated by StockDataStream)
+      2. Alpaca REST snapshot latestTrade (fresh, covers ext-hours)
+      3. Last daily bar close (fallback; regular-session close)
+    change_pct is computed vs the previous daily close from OHLCV data so
+    it stays consistent across the 3 price sources.
     """
     try:
         df = fetch_ohlcv(ticker, "1d")
         if df.empty or len(df) < 2:
             return None
         prev = float(df.iloc[-2]["Close"])
-        latest = float(df.iloc[-1]["Close"])
+        latest = float(df.iloc[-1]["Close"])  # daily-bar fallback
 
-        # Overlay live quote if available
+        # 1) Prefer live WS quote — populated as SIP ticks arrive.
+        live = None
         try:
-            from services.live_quotes import get_live_price  # local import to avoid cycles
+            from services.live_quotes import get_live_price  # local import avoids cycle
             live = get_live_price(ticker)
-            if live and live > 0:
-                latest = live
         except Exception:
-            pass
+            live = None
+        if live and live > 0:
+            latest = live
+        else:
+            # 2) WS cache empty or stale — hit Alpaca snapshot REST for the
+            #    most recent trade. Keeps watchlist consistent with chart.
+            lt = _alpaca_latest_trade(ticker)
+            if lt and lt > 0:
+                latest = lt
 
         change_pct = ((latest - prev) / prev) * 100
         return round(latest, 2), round(change_pct, 2)

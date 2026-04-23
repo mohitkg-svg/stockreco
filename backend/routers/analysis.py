@@ -15,10 +15,11 @@ from services.gap_detector import detect_all_gaps
 from services.signal_generator import generate_signal, get_timeframe_alignment
 from services.backtester import run_multi_strategy
 from services import auto_trader
+from routers._auth import require_api_key
 import logging
 import time
 
-router = APIRouter(prefix="/api/analysis", tags=["analysis"])
+router = APIRouter(prefix="/api/analysis", tags=["analysis"], dependencies=[Depends(require_api_key)])
 logger = logging.getLogger(__name__)
 
 ANALYSIS_TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d", "1mo"]
@@ -287,6 +288,14 @@ def _run_analysis_for_ticker(ticker: str, db: Session) -> List[dict]:
             auto_trader.consider_put_play(ticker)
     except Exception as e:
         logger.warning(f"put-play hook error on {ticker}: {e}")
+    # Call-play hunt: fires for tickers where the stock auto-trader DID NOT
+    # open a new position (either sub-threshold BUY, or stock already at its
+    # per-ticker cap). consider_call_play enforces its own concentration
+    # guard — it won't stack a call on a stock trade that still has headroom.
+    try:
+        auto_trader.consider_call_play(ticker)
+    except Exception as e:
+        logger.warning(f"call-play hook error on {ticker}: {e}")
     # Reverse-thesis check: if a high-conviction OPPOSITE signal landed for an
     # open auto-trade on this ticker, close it now (don't wait for 60s tick).
     try:

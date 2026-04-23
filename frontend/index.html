@@ -60,23 +60,23 @@
             --bg-0: #f6f8fb;
             --bg-1: #eef2f8;
             --bg-2: #e6ecf4;
-            --surface: rgba(255, 255, 255, 0.85);
-            --surface-soft: rgba(255, 255, 255, 0.65);
+            --surface: rgba(255, 255, 255, 0.92);
+            --surface-soft: rgba(255, 255, 255, 0.75);
             --surface-solid: #ffffff;
-            --surface-border: rgba(15, 23, 42, 0.08);
-            --surface-border-soft: rgba(15, 23, 42, 0.04);
-            --text-primary: #0f172a;
-            --text-secondary: #475569;
-            --text-muted: #94a3b8;
+            --surface-border: rgba(15, 23, 42, 0.12);
+            --surface-border-soft: rgba(15, 23, 42, 0.06);
+            --text-primary: #0f172a;     /* slate-900 */
+            --text-secondary: #334155;   /* slate-700 (was 600 — bumped for readability) */
+            --text-muted: #64748b;       /* slate-500 (was 400 — way too light on white) */
             --accent: #2563eb;
-            --accent-soft: rgba(37, 99, 235, 0.18);
+            --accent-soft: rgba(37, 99, 235, 0.15);
             --accent-strong: #1d4ed8;
-            --success: #059669;
-            --success-soft: rgba(5, 150, 105, 0.12);
-            --danger: #dc2626;
-            --danger-soft: rgba(220, 38, 38, 0.12);
-            --warn: #d97706;
-            --warn-soft: rgba(217, 119, 6, 0.15);
+            --success: #047857;          /* emerald-700 */
+            --success-soft: rgba(16, 185, 129, 0.12);
+            --danger: #b91c1c;           /* red-700 */
+            --danger-soft: rgba(239, 68, 68, 0.10);
+            --warn: #b45309;             /* amber-700 */
+            --warn-soft: rgba(245, 158, 11, 0.12);
             --chart-bg: #ffffff;
             --chart-grid: #e5e7eb;
             --chart-border: #cbd5e1;
@@ -163,27 +163,181 @@
            file. These are scoped under [data-theme="light"] so dark mode
            is unaffected. */
         html[data-theme="light"] body { color: var(--text-primary); }
+
+        /* Surface backgrounds */
         html[data-theme="light"] .bg-gray-900, html[data-theme="light"] .bg-gray-950 { background-color: var(--surface-solid) !important; }
         html[data-theme="light"] .bg-gray-800 { background-color: #f1f5f9 !important; }
-        html[data-theme="light"] .bg-gray-800\/60, html[data-theme="light"] .bg-gray-800\/50, html[data-theme="light"] .bg-gray-950\/50, html[data-theme="light"] .bg-gray-950\/60 { background-color: rgba(241, 245, 249, 0.7) !important; }
-        html[data-theme="light"] .bg-gray-900\/60, html[data-theme="light"] .bg-gray-900\/80 { background-color: rgba(248, 250, 252, 0.85) !important; }
+        html[data-theme="light"] .bg-gray-800\/60, html[data-theme="light"] .bg-gray-800\/50, html[data-theme="light"] .bg-gray-950\/50, html[data-theme="light"] .bg-gray-950\/60 { background-color: #f8fafc !important; }
+        html[data-theme="light"] .bg-gray-900\/60, html[data-theme="light"] .bg-gray-900\/80 { background-color: #ffffff !important; }
+        html[data-theme="light"] .bg-gray-950\/30 { background-color: #f8fafc !important; }
 
-        html[data-theme="light"] .border-gray-800, html[data-theme="light"] .border-gray-700 { border-color: var(--surface-border) !important; }
+        /* Borders — darker for light theme contrast */
+        html[data-theme="light"] .border-gray-800, html[data-theme="light"] .border-gray-700,
+        html[data-theme="light"] .border-gray-800\/50, html[data-theme="light"] .border-gray-800\/30,
+        html[data-theme="light"] .border-gray-800\/60, html[data-theme="light"] .border-gray-900\/30 {
+            border-color: var(--surface-border) !important;
+        }
         html[data-theme="light"] .border-white\/5, html[data-theme="light"] .border-white\/10 { border-color: var(--surface-border) !important; }
 
+        /* Text */
         html[data-theme="light"] .text-white { color: var(--text-primary) !important; }
         html[data-theme="light"] .text-gray-100, html[data-theme="light"] .text-gray-200, html[data-theme="light"] .text-gray-300 { color: var(--text-primary) !important; }
         html[data-theme="light"] .text-gray-400 { color: var(--text-secondary) !important; }
         html[data-theme="light"] .text-gray-500, html[data-theme="light"] .text-gray-600 { color: var(--text-muted) !important; }
 
-        html[data-theme="light"] .hover\:bg-white\/5:hover { background-color: rgba(15, 23, 42, 0.05) !important; }
-        html[data-theme="light"] .hover\:bg-white\/10:hover { background-color: rgba(15, 23, 42, 0.08) !important; }
+        /* Hover tints */
+        html[data-theme="light"] .hover\:bg-white\/5:hover { background-color: rgba(15, 23, 42, 0.04) !important; }
+        html[data-theme="light"] .hover\:bg-white\/10:hover { background-color: rgba(15, 23, 42, 0.07) !important; }
+        html[data-theme="light"] .hover\:bg-gray-800\/50:hover, html[data-theme="light"] .hover\:bg-gray-800\/30:hover { background-color: #f1f5f9 !important; }
+        html[data-theme="light"] .hover\:bg-gray-800:hover, html[data-theme="light"] .hover\:bg-gray-700:hover { background-color: #e2e8f0 !important; }
 
-        /* Light-theme emerald/red tweaks — subtler pastels on the light bg */
-        html[data-theme="light"] .bg-emerald-500\/10, html[data-theme="light"] .bg-emerald-500\/15 { background-color: rgba(16, 185, 129, 0.10) !important; }
-        html[data-theme="light"] .bg-red-500\/10, html[data-theme="light"] .bg-red-500\/15 { background-color: rgba(239, 68, 68, 0.10) !important; }
-        html[data-theme="light"] .text-emerald-300, html[data-theme="light"] .text-emerald-400 { color: #047857 !important; }
-        html[data-theme="light"] .text-red-300, html[data-theme="light"] .text-red-400 { color: #b91c1c !important; }
+        /* ---- Semantic color panels (signal cards, alerts, badges) ----
+           Dark mode uses deeply saturated translucent fills on a black
+           background. Those same fills are near-invisible on white, so
+           we remap them to pastel tints with meaningful borders. */
+
+        /* Emerald / success */
+        html[data-theme="light"] .bg-emerald-500\/10, html[data-theme="light"] .bg-emerald-500\/15,
+        html[data-theme="light"] .bg-emerald-900\/30, html[data-theme="light"] .bg-emerald-900\/50,
+        html[data-theme="light"] .bg-emerald-600\/30, html[data-theme="light"] .bg-emerald-700\/40 {
+            background-color: #dcfce7 !important;    /* emerald-100 */
+        }
+        html[data-theme="light"] .bg-emerald-800 { background-color: #86efac !important; color: #064e3b !important; }
+        html[data-theme="light"] .border-emerald-500\/20, html[data-theme="light"] .border-emerald-500\/30,
+        html[data-theme="light"] .border-emerald-500\/40, html[data-theme="light"] .border-emerald-600\/50,
+        html[data-theme="light"] .border-emerald-700, html[data-theme="light"] .border-emerald-800 {
+            border-color: #6ee7b7 !important;        /* emerald-300 */
+        }
+        html[data-theme="light"] .text-emerald-200, html[data-theme="light"] .text-emerald-300,
+        html[data-theme="light"] .text-emerald-400 {
+            color: #047857 !important;               /* emerald-700 */
+        }
+
+        /* Red / danger */
+        html[data-theme="light"] .bg-red-500\/10, html[data-theme="light"] .bg-red-500\/15,
+        html[data-theme="light"] .bg-red-500\/20, html[data-theme="light"] .bg-red-500\/30,
+        html[data-theme="light"] .bg-red-900\/30, html[data-theme="light"] .bg-red-900\/40,
+        html[data-theme="light"] .bg-red-900\/50, html[data-theme="light"] .bg-red-900\/60,
+        html[data-theme="light"] .bg-red-950\/20, html[data-theme="light"] .bg-red-950\/40,
+        html[data-theme="light"] .bg-red-700\/40, html[data-theme="light"] .bg-red-800\/60 {
+            background-color: #fee2e2 !important;    /* red-100 */
+        }
+        html[data-theme="light"] .bg-red-800 { background-color: #fca5a5 !important; color: #7f1d1d !important; }
+        html[data-theme="light"] .border-red-500\/20, html[data-theme="light"] .border-red-500\/30,
+        html[data-theme="light"] .border-red-500\/40, html[data-theme="light"] .border-red-600\/50,
+        html[data-theme="light"] .border-red-700, html[data-theme="light"] .border-red-800,
+        html[data-theme="light"] .border-red-900\/30 {
+            border-color: #fca5a5 !important;        /* red-300 */
+        }
+        html[data-theme="light"] .text-red-200, html[data-theme="light"] .text-red-300,
+        html[data-theme="light"] .text-red-400 {
+            color: #b91c1c !important;               /* red-700 */
+        }
+
+        /* Amber / warning */
+        html[data-theme="light"] .bg-amber-800\/50, html[data-theme="light"] .bg-amber-900\/40,
+        html[data-theme="light"] .bg-amber-900\/50, html[data-theme="light"] .bg-amber-950\/20,
+        html[data-theme="light"] .bg-amber-950\/40 {
+            background-color: #fef3c7 !important;    /* amber-100 */
+        }
+        html[data-theme="light"] .border-amber-700, html[data-theme="light"] .border-amber-800 {
+            border-color: #fcd34d !important;        /* amber-300 */
+        }
+        html[data-theme="light"] .text-amber-300, html[data-theme="light"] .text-amber-400,
+        html[data-theme="light"] .text-yellow-300, html[data-theme="light"] .text-yellow-400 {
+            color: #b45309 !important;               /* amber-700 */
+        }
+        html[data-theme="light"] .bg-yellow-950\/20 { background-color: #fef3c7 !important; }
+        html[data-theme="light"] .border-yellow-800\/50 { border-color: #fcd34d !important; }
+
+        /* Blue / accent */
+        html[data-theme="light"] .bg-blue-500\/15, html[data-theme="light"] .bg-blue-500\/20,
+        html[data-theme="light"] .bg-blue-700, html[data-theme="light"] .bg-blue-700\/40,
+        html[data-theme="light"] .bg-blue-950\/20, html[data-theme="light"] .bg-blue-950\/30,
+        html[data-theme="light"] .bg-blue-900\/50 {
+            background-color: #dbeafe !important;    /* blue-100 */
+        }
+        html[data-theme="light"] .text-blue-200, html[data-theme="light"] .text-blue-300,
+        html[data-theme="light"] .text-blue-400, html[data-theme="light"] .text-blue-100 {
+            color: #1d4ed8 !important;               /* blue-700 */
+        }
+        html[data-theme="light"] .border-blue-500\/30, html[data-theme="light"] .border-blue-500\/50,
+        html[data-theme="light"] .border-blue-700, html[data-theme="light"] .border-blue-800,
+        html[data-theme="light"] .border-blue-900\/30 {
+            border-color: #93c5fd !important;
+        }
+
+        /* Indigo (used for strategy/analysis badges) */
+        html[data-theme="light"] .bg-indigo-700, html[data-theme="light"] .bg-indigo-900\/40,
+        html[data-theme="light"] .bg-indigo-950\/30 {
+            background-color: #e0e7ff !important;
+        }
+        html[data-theme="light"] .text-indigo-300, html[data-theme="light"] .text-indigo-400 {
+            color: #4338ca !important;
+        }
+        html[data-theme="light"] .border-indigo-700, html[data-theme="light"] .border-indigo-800\/50 {
+            border-color: #a5b4fc !important;
+        }
+
+        /* Purple / fuchsia (options panels) */
+        html[data-theme="light"] .bg-purple-500\/20, html[data-theme="light"] .bg-purple-900\/50,
+        html[data-theme="light"] .bg-purple-950\/20, html[data-theme="light"] .bg-purple-950\/40 {
+            background-color: #f5d0fe !important;    /* fuchsia-100 */
+        }
+        html[data-theme="light"] .text-purple-300, html[data-theme="light"] .text-purple-400 {
+            color: #7e22ce !important;
+        }
+        html[data-theme="light"] .border-purple-500\/20, html[data-theme="light"] .border-purple-900\/50 {
+            border-color: #d8b4fe !important;
+        }
+
+        /* Pills - ensure pill variants stay readable on white */
+        html[data-theme="light"] .pill {
+            background: #f1f5f9;
+            border-color: #cbd5e1;
+            color: #334155;
+        }
+        html[data-theme="light"] .pill-success {
+            background: #dcfce7;
+            color: #047857;
+            border-color: #6ee7b7;
+        }
+        html[data-theme="light"] .pill-danger {
+            background: #fee2e2;
+            color: #b91c1c;
+            border-color: #fca5a5;
+        }
+        html[data-theme="light"] .pill-warn {
+            background: #fef3c7;
+            color: #b45309;
+            border-color: #fcd34d;
+        }
+
+        /* stat-card in light theme gets a subtle shadow instead of relying on surface glow */
+        html[data-theme="light"] .stat-card {
+            background: #ffffff;
+            border-color: var(--surface-border);
+            box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.04), 0 1px 2px -1px rgba(15, 23, 42, 0.04);
+        }
+
+        /* Chart reasoning panel uses bg-gray-950/50 natively — override */
+        html[data-theme="light"] .reasoning-text {
+            color: var(--text-primary);
+        }
+
+        /* Brand word-mark — gradient text that reads in both themes.
+           Dark: white→light blue (on dark surface).
+           Light: slate-900→blue-600 (on white surface). */
+        .app-brand {
+            background-image: linear-gradient(90deg, #ffffff 0%, #bfdbfe 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            -webkit-text-fill-color: transparent;
+        }
+        html[data-theme="light"] .app-brand {
+            background-image: linear-gradient(90deg, #0f172a 0%, #2563eb 100%);
+        }
 
         /* Inputs */
         input, select, textarea {

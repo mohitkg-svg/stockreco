@@ -42,6 +42,9 @@ echo "→ Deploying $SERVICE to Cloud Run in $REGION (project: $PROJECT)"
 
 # Build env-var string. Comma-separate, escape commas in values (none expected
 # for our keys) — anything hairy should move to Secret Manager.
+# We use `--update-env-vars` below (not --set-env-vars) so existing Cloud
+# Run env vars set via `gcloud run services update` (e.g. ALPACA_DATA_FEED)
+# are preserved across deploys. --set-env-vars previously wiped them.
 ENV_VARS="APCA_API_KEY_ID=${APCA_API_KEY_ID},APCA_API_SECRET_KEY=${APCA_API_SECRET_KEY},DATABASE_URL=${DATABASE_URL}"
 if [ -n "${APP_API_KEY:-}" ]; then
   ENV_VARS="${ENV_VARS},APP_API_KEY=${APP_API_KEY}"
@@ -50,6 +53,20 @@ fi
 # (the X-API-Key gate is the real access control). Tighten after first deploy
 # by setting CORS_ALLOW_ORIGINS to the exact Cloud Run URL.
 ENV_VARS="${ENV_VARS},CORS_ALLOW_ORIGINS=*"
+# Algo Trader Plus feature flags — sticky so deploys don't wipe them:
+#   ALPACA_DATA_FEED=sip         SIP consolidated tape (bars + live stream)
+#   ALPACA_OPTIONS_FEED=indicative  Options snapshots (AT+ tier supports this)
+#   ALPACA_NEWS_STREAM=1         Enable NewsDataStream when alpaca-py adds it
+#   ALPACA_OPTIONS_STREAM=0      Leave OFF unless OPRA real-time is in plan
+ENV_VARS="${ENV_VARS},ALPACA_DATA_FEED=${ALPACA_DATA_FEED:-sip}"
+ENV_VARS="${ENV_VARS},ALPACA_OPTIONS_FEED=${ALPACA_OPTIONS_FEED:-indicative}"
+ENV_VARS="${ENV_VARS},ALPACA_NEWS_STREAM=${ALPACA_NEWS_STREAM:-1}"
+ENV_VARS="${ENV_VARS},ALPACA_OPTIONS_STREAM=${ALPACA_OPTIONS_STREAM:-0}"
+
+# Cloud SQL Unix-socket mount — required for DATABASE_URL to resolve to
+# the managed Postgres instance. Hardcoded here so deploys never drop the
+# mount; if you move to a different instance, edit CSQL_INSTANCE below.
+CSQL_INSTANCE="${CSQL_INSTANCE:-$PROJECT:us-central1:stockrecs-db}"
 
 gcloud run deploy "$SERVICE" \
   --source . \
@@ -62,7 +79,8 @@ gcloud run deploy "$SERVICE" \
   --min-instances 1 \
   --max-instances 3 \
   --timeout 300s \
-  --set-env-vars "$ENV_VARS"
+  --add-cloudsql-instances "$CSQL_INSTANCE" \
+  --update-env-vars "$ENV_VARS"
 
 URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
 echo ""

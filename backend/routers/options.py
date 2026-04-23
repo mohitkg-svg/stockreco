@@ -7,13 +7,15 @@ import logging
 from database import get_db, WatchlistStock, Signal
 from services.options_analyzer import suggest_options_for_signal
 from services.bear_thesis import build_bear_thesis
+from services.bull_thesis import build_bull_thesis
+from routers._auth import require_api_key
 
 # Timeframes Put-Play Watch will try, in preference order for "best thesis".
 # Short TFs are included so intraday SELL signals on otherwise-bullish names
 # (e.g. MU: 1d BUY but 5m/15m/30m/1h SELL) still surface weekly put plays.
 _PUTS_WATCH_TFS = ["1h", "4h", "30m", "15m", "5m", "1d"]
 
-router = APIRouter(prefix="/api/options", tags=["options"])
+router = APIRouter(prefix="/api/options", tags=["options"], dependencies=[Depends(require_api_key)])
 logger = logging.getLogger(__name__)
 
 
@@ -114,6 +116,83 @@ def puts_watch(min_bear_confidence: float = Query(45), db: Session = Depends(get
         if best is None:
             skipped.append({"ticker": stock.ticker,
                             "reason": fallback_reason or "no viable put play"})
+            continue
+        out.append({
+            "ticker": stock.ticker,
+            "name": stock.name,
+            "thesis": best["thesis"],
+            "top_contracts": best["contracts"],
+        })
+    out.sort(key=lambda r: r["top_contracts"][0]["score"] if r["top_contracts"] else 0, reverse=True)
+    return {"suggestions": out, "skipped": skipped}
+
+
+# Mirror of puts-watch for bullish CALL plays. Closes the long-side gap
+# where sub-threshold BUYs + capacity-capped tickers were previously
+# ignored. Runs off the same build_bull_thesis / suggest_options_for_signal
+# pipeline, and skips tickers where a stock auto-trade still has headroom
+# (per the same concentration guard consider_call_play uses).
+_CALLS_WATCH_TFS = ["1d", "4h", "1h", "30m", "15m", "5m"]
+
+
+@router.get("/calls-watch")
+def calls_watch(min_bull_confidence: float = Query(45), db: Session = Depends(get_db)):
+    """
+    Scan the watchlist for bullish call-play setups. For each ticker we try
+    multiple timeframes (preferring those with a recent BUY signal) and keep
+    whichever produces the highest-scoring qualifying call chain.
+    """
+    stocks = db.query(WatchlistStock).all()
+    out = []
+    skipped: List[Dict] = []
+    for stock in stocks:
+        recent_buys = (db.query(Signal)
+                       .filter(Signal.ticker == stock.ticker,
+                               Signal.signal_type == "BUY",
+                               Signal.confidence >= 50)
+                       .order_by(desc(Signal.generated_at)).all())
+        tfs_ordered: List[str] = []
+        seen = set()
+        for s in recent_buys:
+            if s.timeframe in _CALLS_WATCH_TFS and s.timeframe not in seen:
+                tfs_ordered.append(s.timeframe); seen.add(s.timeframe)
+        for tf in _CALLS_WATCH_TFS:
+            if tf not in seen:
+                tfs_ordered.append(tf); seen.add(tf)
+
+        best = None
+        fallback_reason: Optional[str] = None
+        for tf in tfs_ordered:
+            try:
+                thesis = build_bull_thesis(stock.ticker, tf)
+            except Exception as e:
+                logger.warning(f"bull_thesis {stock.ticker} {tf} failed: {e}")
+                continue
+            if not thesis:
+                fallback_reason = fallback_reason or "not bullish enough on any timeframe"
+                continue
+            if thesis["confidence"] < min_bull_confidence:
+                fallback_reason = (fallback_reason or
+                                   f"bull conviction {thesis['confidence']} < threshold")
+                continue
+            try:
+                sugg = suggest_options_for_signal(stock.ticker, thesis)
+            except Exception as e:
+                logger.warning(f"calls suggest failed for {stock.ticker} {tf}: {e}")
+                continue
+            if not sugg["contracts"]:
+                fallback_reason = fallback_reason or "no CALL met R:R + liquidity filters"
+                continue
+            top_score = sugg["contracts"][0]["score"]
+            if best is None or top_score > best["score"]:
+                best = {
+                    "score": top_score,
+                    "thesis": thesis,
+                    "contracts": sugg["contracts"][:5],
+                }
+        if best is None:
+            skipped.append({"ticker": stock.ticker,
+                            "reason": fallback_reason or "no viable call play"})
             continue
         out.append({
             "ticker": stock.ticker,

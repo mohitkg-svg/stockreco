@@ -50,3 +50,15 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
 def auth_configured() -> bool:
     """True if APP_API_KEY is set — used by /api/health to surface config."""
     return _expected_key() is not None
+
+
+def verify_ws_token(token: Optional[str]) -> bool:
+    """Browser WebSockets can't set custom headers, so auth uses a ?token=
+    query param instead. Same constant-time comparison as the header path.
+    Returns True when auth passes (or is disabled in dev mode)."""
+    expected = _expected_key()
+    if expected is None:
+        return True
+    if not token:
+        return False
+    return hmac.compare_digest(token.strip(), expected)

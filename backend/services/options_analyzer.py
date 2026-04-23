@@ -2,9 +2,67 @@
 Option-play selector: given a stock signal (direction + targets + stop),
 filter the option chain to contracts with >= 3:1 reward-to-risk and score them.
 """
+import logging
+import math
+import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from services.options_fetcher import fetch_option_chain, fetch_expirations
+
+logger = logging.getLogger(__name__)
+
+# IV-vs-RV gate: reject contracts whose implied volatility is meaningfully
+# above the underlying's realized volatility. Paying up for IV before vol
+# mean-reverts is a losing trade even when direction is right (options
+# analyzer post-mortem on CRWV-class weeklies showed IV rank 75+ eaten by
+# post-entry vol crush).
+_IV_RV_RATIO_MAX = 1.75        # skip contracts when IV > 1.75× 20d realized vol
+_IV_RV_WINDOW = 20             # trading days of daily returns for the RV calc
+
+# 20d realized-vol cache: ticker -> (rv_annualized, expiry_ts).
+_rv_cache: Dict[str, tuple] = {}
+_RV_TTL_SEC = 6 * 3600   # recompute twice/day — daily bars don't change intraday
+
+
+def _realized_vol_20d(ticker: str) -> Optional[float]:
+    """Annualised 20-day realized volatility using daily log-returns.
+    Cached 6h. Returns None on failure — callers should treat that as
+    "unknown, don't block" rather than reject-by-default."""
+    now = time.time()
+    cached = _rv_cache.get(ticker)
+    if cached and now < cached[1]:
+        return cached[0]
+    try:
+        from services.data_fetcher import fetch_ohlcv
+        df = fetch_ohlcv(ticker, "1d")
+        if df is None or len(df) < _IV_RV_WINDOW + 1:
+            return None
+        closes = df["Close"].astype(float).iloc[-(_IV_RV_WINDOW + 1):]
+        # log returns
+        import numpy as np
+        r = np.log(closes / closes.shift(1)).dropna()
+        if r.empty:
+            return None
+        std_daily = float(r.std())
+        rv_ann = std_daily * math.sqrt(252)
+        _rv_cache[ticker] = (rv_ann, now + _RV_TTL_SEC)
+        return rv_ann
+    except Exception as e:
+        logger.debug(f"realized-vol compute failed for {ticker}: {e}")
+        return None
+
+
+def _iv_is_expensive(ticker: str, iv: float) -> bool:
+    """True when the contract's IV is > _IV_RV_RATIO_MAX × underlying's RV.
+    False (= allow) when either value is unavailable."""
+    if not iv or iv <= 0:
+        return False
+    rv = _realized_vol_20d(ticker)
+    if rv is None or rv <= 0:
+        return False
+    # Both IV and RV are annualized decimal (e.g. 0.35 = 35%). yfinance
+    # returns IV as a decimal already.
+    return iv > _IV_RV_RATIO_MAX * rv
 
 
 MIN_RR = 2.0  # Lowered from 3.0 — intraday SELL signals (5m/15m/30m) have
@@ -12,7 +70,10 @@ MIN_RR = 2.0  # Lowered from 3.0 — intraday SELL signals (5m/15m/30m) have
               # realistic put premiums, so PUTS tabs stayed empty even when
               # the signal was actionable. 2:1 still gates out junk but lets
               # short-timeframe scalps through.
-MIN_DTE = 2         # include weeklies (expirations ≥ 2 days out)
+MIN_DTE = 10        # Post-mortem fix (CRWV -$2,561): weeklies ≤ 3 DTE get
+                    # shredded by theta even when the underlying moves in
+                    # your favor. 10 DTE minimum keeps us in contracts
+                    # where a 2-3 day thesis has time to play out.
 MAX_DTE = 90
 MIN_VOLUME = 5
 MIN_OI = 25
@@ -134,6 +195,13 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             if vol < MIN_VOLUME or oi < MIN_OI:
                 continue
             iv = float(o.get("impliedVolatility") or 0)
+
+            # IV-vs-RV gate — skip over-priced premium. Contracts where IV
+            # is more than 1.75× the underlying's 20d realized vol get
+            # punished by mean-reversion (IV crush) even when direction is
+            # right. No-op when RV is unavailable (caches None for 6h).
+            if _iv_is_expensive(ticker, iv):
+                continue
 
             # Keep strikes reasonably close to money (within 25% either side for runner plays)
             if abs(strike - spot) / spot > 0.25:

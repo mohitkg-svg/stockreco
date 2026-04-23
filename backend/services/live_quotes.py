@@ -46,6 +46,11 @@ _subscribed_symbols: Set[str] = set()
 # Background worker task + lock
 _stream_task: Optional[asyncio.Task] = None
 _recompute_task: Optional[asyncio.Task] = None
+# News + option streaming (Algo Trader Plus)
+_news_stream_task: Optional[asyncio.Task] = None
+_option_stream_task: Optional[asyncio.Task] = None
+_option_stream_client: Any = None
+_option_subscribed: Set[str] = set()
 # Initialized lazily in start() — must be created on the running loop, not at import time.
 _recompute_queue: Optional["asyncio.Queue[str]"] = None
 _last_recompute: Dict[str, float] = {}
@@ -233,9 +238,22 @@ async def _alpaca_worker():
 
     try:
         from alpaca.data.live import StockDataStream
+        from alpaca.data.enums import DataFeed
     except ImportError:
         logger.error("alpaca-py not installed. Run: pip install alpaca-py")
         return
+
+    # Feed selection:
+    #   - IEX  (default, free tier): single-exchange tape, ~2% of US volume.
+    #     Extended-hours sessions are near-empty on IEX, which manifests as
+    #     "frozen pre-market prices" in the UI.
+    #   - SIP (Algo Trader Plus): full consolidated tape across all US
+    #     exchanges, including pre/post-market. This is the fix for the
+    #     missing extended-hours data reported by the user.
+    # Controlled via ALPACA_DATA_FEED env var so we don't hard-code paid
+    # tier dependency; default stays IEX for safety if the env is missing.
+    _feed_name = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+    _feed = DataFeed.SIP if _feed_name == "sip" else DataFeed.IEX
 
     # Exponential backoff on reconnect. Fixed 10s retries hammered Alpaca
     # during DNS flakes / 429s, piling up thousands of "connection limit
@@ -245,8 +263,9 @@ async def _alpaca_worker():
     backoff = 10
     while True:
         try:
-            client = StockDataStream(key, secret)
+            client = StockDataStream(key, secret, feed=_feed)
             _alpaca_client = client
+            logger.info(f"Alpaca stream using feed={_feed.value}")
 
             # We subscribe lazily as watchlist changes via ensure_symbols()
             while True:
@@ -325,8 +344,151 @@ async def _recompute_worker():
 # ------------------------------------------------------------------
 # Lifecycle hooks
 # ------------------------------------------------------------------
+async def _news_worker():
+    """Subscribe to Alpaca news WebSocket and ingest ticks into NewsEvent.
+
+    Replaces the 2-min REST poll with push-based ingestion. Events are
+    scored with VADER + the finance lexicon (same code path as the poller),
+    persisted to news_events, and broadcast to UI subscribers via the same
+    fan-out as stock quotes so the frontend news panel updates live.
+    """
+    key = os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("APCA_API_SECRET_KEY")
+    if not key or not secret:
+        logger.info("news-stream: APCA creds missing — skipping")
+        return
+    try:
+        from alpaca.data.live import NewsDataStream  # type: ignore[attr-defined]
+    except Exception:
+        # alpaca-py 0.21.1 doesn't export NewsDataStream yet. REST poll path
+        # (services.news.poll_watchlist, running every 2min via APScheduler)
+        # keeps news ingestion working until the SDK adds the class.
+        logger.info("news-stream: NewsDataStream not in this alpaca-py version — using REST poll instead")
+        return
+
+    async def _handle_news(n):
+        # Alpaca's news-stream event → same shape as the REST article (id,
+        # headline, summary, source, author, created_at, symbols, url).
+        try:
+            from services import news as news_svc
+            item = {
+                "id": getattr(n, "id", None),
+                "headline": getattr(n, "headline", "") or "",
+                "summary": getattr(n, "summary", "") or "",
+                "source": getattr(n, "source", "") or "",
+                "author": getattr(n, "author", "") or "",
+                "url": getattr(n, "url", "") or "",
+                "created_at": (getattr(n, "created_at", None).isoformat() + "Z") if getattr(n, "created_at", None) else None,
+                "symbols": getattr(n, "symbols", []) or [],
+            }
+            if not item["id"] or not item["headline"]:
+                return
+            result = news_svc.ingest([item])
+            if result.get("inserted"):
+                logger.info(f"news-stream: {item['symbols'][0] if item['symbols'] else '?'}: {item['headline'][:80]}")
+                # Broadcast to /ws/quotes subscribers so the UI can push a toast / refresh the panel.
+                await _broadcast({
+                    "type": "news",
+                    "symbol": (item["symbols"][0] if item["symbols"] else None),
+                    "headline": item["headline"],
+                    "created_at": item["created_at"],
+                })
+        except Exception as e:
+            logger.debug(f"news-stream handler error: {e}")
+
+    backoff = 5
+    while True:
+        try:
+            client = NewsDataStream(key, secret)
+            # Subscribe to all-symbols ('*') so any watchlist change auto-covers.
+            # Alpaca's news feed supports '*' as a wildcard.
+            client.subscribe_news(_handle_news, "*")
+            logger.info("news-stream: connected, subscribed to '*'")
+            await asyncio.get_running_loop().run_in_executor(None, client.run)
+            backoff = 5
+        except Exception as e:
+            logger.warning(f"news-stream error, reconnecting in {backoff}s: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(300, backoff * 2)
+
+
+async def _option_stream_worker():
+    """Subscribe to option quotes for currently-held contracts via OptionDataStream.
+
+    Requires Algo Trader Plus (OPRA feed). Gated by ALPACA_OPTIONS_STREAM env.
+    Updates _option_quotes dict as ticks arrive — currently used for UI
+    overlay; future enhancement is event-driven stop-loss evaluation.
+    """
+    global _option_stream_client
+    if (os.getenv("ALPACA_OPTIONS_STREAM", "0") or "0").lower() not in ("1", "true", "on"):
+        return
+    key = os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("APCA_API_SECRET_KEY")
+    if not key or not secret:
+        return
+    try:
+        from alpaca.data.live import OptionDataStream
+    except Exception as e:
+        logger.warning(f"option-stream: OptionDataStream unavailable ({e})")
+        return
+
+    async def _handle_opt_quote(q):
+        sym = getattr(q, "symbol", None)
+        if not sym:
+            return
+        data = {
+            "symbol": sym,
+            "bid": float(q.bid_price) if getattr(q, "bid_price", None) is not None else None,
+            "ask": float(q.ask_price) if getattr(q, "ask_price", None) is not None else None,
+            "ts": time.time(),
+        }
+        _option_quotes[sym] = data
+        await _broadcast({"type": "option_quote", **data})
+
+    backoff = 5
+    while True:
+        try:
+            client = OptionDataStream(key, secret)
+            _option_stream_client = client
+            # Wait for a subscription before connecting; the manage loop
+            # calls ensure_option_symbols() when option auto-trades open.
+            # Audit fix #4: we re-subscribe to the FULL _option_subscribed set
+            # on every (re)connect so reconnect events don't silently drop
+            # coverage of still-open option positions.
+            while not _option_subscribed:
+                await asyncio.sleep(5)
+            snapshot = list(_option_subscribed)
+            client.subscribe_quotes(_handle_opt_quote, *snapshot)
+            logger.info(f"option-stream: connected (feed=OPRA), subscribed to {len(snapshot)} OCC symbols: {snapshot[:5]}{'…' if len(snapshot) > 5 else ''}")
+            await asyncio.get_running_loop().run_in_executor(None, client.run)
+            backoff = 5
+        except Exception as e:
+            logger.warning(f"option-stream error, reconnecting in {backoff}s: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(300, backoff * 2)
+
+
+def ensure_option_symbols(occ_symbols: List[str]) -> None:
+    """Dynamically add OCC option symbols to the option stream subscription.
+    Called by auto_trader when an option trade opens."""
+    global _option_stream_client
+    upper = {s.upper() for s in occ_symbols if s}
+    new = upper - _option_subscribed
+    if not new:
+        return
+    _option_subscribed.update(new)
+    if _option_stream_client:
+        try:
+            async def _noop(_q): pass
+            _option_stream_client.subscribe_quotes(_noop, *new)
+            logger.info(f"option-stream: subscribed {sorted(new)}")
+        except Exception as e:
+            logger.warning(f"option-stream dynamic subscribe {new} failed: {e}")
+
+
 async def start(initial_tickers: List[str]) -> None:
     global _stream_task, _recompute_task, _loop, _recompute_queue
+    global _news_stream_task, _option_stream_task
     _loop = asyncio.get_running_loop()
     if _recompute_queue is None:
         _recompute_queue = asyncio.Queue(maxsize=128)
@@ -335,6 +497,11 @@ async def start(initial_tickers: List[str]) -> None:
         _stream_task = asyncio.create_task(_alpaca_worker(), name="alpaca_stream")
     if _recompute_task is None:
         _recompute_task = asyncio.create_task(_recompute_worker(), name="live_recompute")
+    # Algo Trader Plus streams — default News on (free), Options off (needs OPRA).
+    if _news_stream_task is None and (os.getenv("ALPACA_NEWS_STREAM", "1") or "1").lower() in ("1", "true", "on"):
+        _news_stream_task = asyncio.create_task(_news_worker(), name="alpaca_news_stream")
+    if _option_stream_task is None:
+        _option_stream_task = asyncio.create_task(_option_stream_worker(), name="alpaca_option_stream")
     logger.info(f"Live quotes started with {len(initial_tickers)} initial tickers")
 
 
@@ -344,18 +511,23 @@ async def stop() -> None:
     Bare cancel() without await leaks the executor thread, which keeps trying
     to reconnect in the background after the FastAPI app has shut down."""
     global _stream_task, _recompute_task, _alpaca_client
+    global _news_stream_task, _option_stream_task, _option_stream_client
     if _alpaca_client:
         try:
             await asyncio.get_running_loop().run_in_executor(None, _alpaca_client.stop)
         except Exception:
             pass
         _alpaca_client = None
-    pending = [t for t in (_stream_task, _recompute_task) if t]
+    if _option_stream_client:
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _option_stream_client.stop)
+        except Exception:
+            pass
+        _option_stream_client = None
+    pending = [t for t in (_stream_task, _recompute_task, _news_stream_task, _option_stream_task) if t]
     for task in pending:
         task.cancel()
     if pending:
-        # Bounded wait — if the executor thread is genuinely stuck, we'd
-        # rather log loudly and proceed than hang shutdown forever.
         try:
             await asyncio.wait_for(
                 asyncio.gather(*pending, return_exceptions=True),
@@ -365,3 +537,5 @@ async def stop() -> None:
             logger.warning("live_quotes.stop: tasks did not finish within 5s; forcing shutdown")
     _stream_task = None
     _recompute_task = None
+    _news_stream_task = None
+    _option_stream_task = None

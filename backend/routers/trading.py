@@ -35,6 +35,8 @@ class AutoTraderConfigRequest(BaseModel):
     option_pct_of_equity: Optional[float] = Field(None, ge=0, le=1)
     max_risk_per_trade_pct: Optional[float] = Field(None, gt=0, le=0.1)
     trade_options: Optional[bool] = None
+    trade_calls: Optional[bool] = None
+    aggressive_options_mode: Optional[bool] = None
     daily_loss_limit_pct: Optional[float] = Field(None, ge=0, le=0.5)
     max_concurrent_positions: Optional[int] = Field(None, ge=0, le=100)
     max_per_sector: Optional[int] = Field(None, ge=0, le=50)
@@ -64,6 +66,11 @@ class OrderRequest(BaseModel):
     take_profit: Optional[float] = None
     stop_loss: Optional[float] = None
     time_in_force: str = Field("day", pattern="^(day|gtc|opg|ioc|DAY|GTC|OPG|IOC)$")
+    # Algo Trader Plus: allow pre-market (4-9:30 ET) + after-hours (16-20 ET)
+    # fills. Alpaca only honours this on DAY-TIF LIMIT orders — silently
+    # downgrades otherwise. Default "auto" flips true when market is closed
+    # AND it's a limit order.
+    extended_hours: Optional[str] = Field("auto", pattern="^(auto|true|false|on|off|AUTO|TRUE|FALSE|ON|OFF)$")
 
 
 @router.get("/account")
@@ -94,6 +101,21 @@ def orders(status: str = "all", limit: int = 50):
 def submit_order(req: OrderRequest):
     if not paper_trader.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
+    # Resolve extended_hours (auto = true only during pre/post-market and
+    # only on DAY-TIF limit orders — paper_trader does the final legality
+    # check too).
+    _eh_in = (req.extended_hours or "auto").lower()
+    if _eh_in in ("true", "on"):
+        extended_hours = True
+    elif _eh_in in ("false", "off"):
+        extended_hours = False
+    else:  # auto
+        extended_hours = (
+            req.entry_type.lower() == "limit"
+            and req.time_in_force.lower() == "day"
+            and not paper_trader.is_market_open()
+        )
+
     res = paper_trader.submit_bracket_order(
         symbol=req.symbol,
         qty=req.qty,
@@ -103,6 +125,7 @@ def submit_order(req: OrderRequest):
         take_profit=req.take_profit,
         stop_loss=req.stop_loss,
         time_in_force=req.time_in_force,
+        extended_hours=extended_hours,
     )
     if "error" in res:
         raise HTTPException(status_code=400, detail=res["error"])

@@ -173,6 +173,7 @@ def submit_bracket_order(
     stop_loss: Optional[float] = None,
     time_in_force: str = "day",
     client_order_id: Optional[str] = None,
+    extended_hours: bool = False,  # Algo Trader Plus: trade pre/post market
 ) -> Dict[str, Any]:
     """
     Submit a bracket order: parent entry + take-profit + stop-loss as one unit.
@@ -227,6 +228,13 @@ def submit_bracket_order(
     if use_bracket:
         common_kwargs["take_profit"] = tp
         common_kwargs["stop_loss"] = sl
+
+    # Extended-hours orders: Alpaca only accepts them on DAY-TIF LIMIT orders.
+    # Silently downgrade to regular-session if extended_hours is True but the
+    # order geometry doesn't support it — avoids rejection at submit time.
+    _extended = bool(extended_hours) and entry_type.lower() == "limit" and tif == TimeInForce.DAY
+    if _extended:
+        common_kwargs["extended_hours"] = True
 
     try:
         if entry_type.lower() == "limit":

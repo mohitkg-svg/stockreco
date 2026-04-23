@@ -18,6 +18,7 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from services import live_quotes
+from routers._auth import verify_ws_token
 
 router = APIRouter(tags=["stream"])
 logger = logging.getLogger(__name__)
@@ -34,6 +35,13 @@ _DEAD_DROP_THRESHOLD = 200
 
 @router.websocket("/ws/quotes")
 async def quotes_ws(websocket: WebSocket):
+    # Auth via ?token= query param (browsers can't set headers on WS).
+    # Skipped when APP_API_KEY is unset (dev mode).
+    token = websocket.query_params.get("token")
+    if not verify_ws_token(token):
+        # 1008 = policy violation — the standard close code for auth failure.
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
     # Per-symbol latest snapshot for coalescing fast-fire quote streams.

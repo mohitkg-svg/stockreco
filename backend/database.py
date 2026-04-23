@@ -18,11 +18,18 @@ if _IS_SQLITE:
     # default 5s, even if SQLite's pragma would have waited longer.
     _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
 else:
-    # Postgres: use a small connection pool with pre-ping so idle connections
-    # that Neon/Cloud SQL may drop are recycled transparently.
+    # Postgres: connection pool with pre-ping so idle connections that
+    # Neon/Cloud SQL may drop are recycled transparently. Sizing rationale:
+    #   scan jobs: up to 4 parallel watchlist scanners × 2 sessions each
+    #   manage loop: 1 + per-trade session in the inner loop (up to ~15)
+    #   HTTP request handlers: up to ~10 concurrent
+    #   news/calibration/misc: ~2
+    # Bumped from 5+5=10 → 15+10=25 after audit found manage-loop stalling
+    # when parallel scans exhausted the old 10-connection ceiling.
     _engine_kwargs["pool_pre_ping"] = True
-    _engine_kwargs["pool_size"] = 5
-    _engine_kwargs["max_overflow"] = 5
+    _engine_kwargs["pool_size"] = 15
+    _engine_kwargs["max_overflow"] = 10
+    _engine_kwargs["pool_recycle"] = 3600  # recycle stale connections hourly
 
 engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
@@ -90,7 +97,14 @@ class AutoTraderConfig(Base):
     stock_pct_of_equity = Column(Float, default=0.40) # of equity, not of cap
     option_pct_of_equity = Column(Float, default=0.10)
     max_risk_per_trade_pct = Column(Float, default=0.02)  # 2% of equity
-    trade_options = Column(Boolean, default=False)    # off by default — needs option-trading approval
+    trade_options = Column(Boolean, default=False)    # Master toggle — enables PUT auto-buy for bearish theses
+    trade_calls = Column(Boolean, default=False)      # Enables CALL auto-buy for sub-threshold bullish setups
+    # Aggressive-options mode: treat options as the PRIMARY growth vehicle.
+    # When true: liberalizes call/put triggers, lowers score gate, raises
+    # per-ticker option cap, and removes the concentration guard that
+    # prevented stacking calls on top of existing stock longs. Meant to be
+    # used alongside a 30/70 stock/option budget split.
+    aggressive_options_mode = Column(Boolean, default=False)
     # CSV of timeframes whose signals are eligible to open auto-trades. Anything
     # not on this list (e.g. "1mo", "5m") is ignored even if confidence > gate.
     signal_timeframes = Column(String, default="1h,4h,1d")
@@ -169,6 +183,54 @@ class AutoTrade(Base):
     low_water_mark = Column(Float, nullable=True)   # for short trades
     # Sector tag captured at entry (for correlation sizing)
     sector = Column(String, nullable=True)
+
+
+class Alert(Base):
+    """Operator-facing alerts — emitted by critical code paths (SL resubmit
+    failures, BP circuit breaker trips, broker-down events, option assignment
+    surprises, kill-switch activations). Rendered in the UI header as an
+    unread-count bell so operators notice problems before they cost money.
+
+    Severity: "critical" > "error" > "warning" > "info".
+    """
+    __tablename__ = "alerts"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    severity = Column(String, index=True, nullable=False)  # critical/error/warning/info
+    category = Column(String, index=True, nullable=False)  # e.g. "sl_invariant", "bp_breaker"
+    message = Column(Text, nullable=False)
+    ticker = Column(String, nullable=True)
+    trade_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    acked_at = Column(DateTime, nullable=True)
+
+
+class NewsEvent(Base):
+    """One row per fetched news article, de-duplicated on `external_id`.
+
+    Populated by services.news.poll_watchlist every 2 minutes. Phase 1 is
+    read-only observability — auto-trader does NOT read this table yet.
+    The `trade_id` FK is intentionally absent: we join news ↔ trades at
+    query time (by ticker + time overlap) so historical news analysis
+    works for trades that were closed before news ingestion started.
+    """
+    __tablename__ = "news_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    external_id = Column(String, unique=True, index=True, nullable=False)  # Alpaca news id
+    ticker = Column(String, index=True, nullable=False)   # primary ticker (first mentioned symbol)
+    symbols = Column(String, nullable=True)               # comma-separated list of all tickers mentioned
+    source = Column(String, nullable=True)                # Benzinga / Reuters / etc
+    author = Column(String, nullable=True)
+    headline = Column(String, nullable=False)
+    summary = Column(Text, nullable=True)
+    url = Column(String, nullable=True)
+    published_at = Column(DateTime, index=True, nullable=False)  # article timestamp
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # VADER compound score in [-1, +1]. Higher = more positive.
+    sentiment_score = Column(Float, nullable=True)
+    sentiment_label = Column(String, nullable=True)  # positive | negative | neutral
+    # severity = abs(sentiment_score) * 100, rounded — a 0-100 score for
+    # how strongly-signed the sentiment is, independent of direction.
+    severity = Column(Integer, nullable=True)
 
 
 def _ensure_column(table: str, column: str, ddl: str):
@@ -259,6 +321,8 @@ def create_tables():
     _ensure_column("auto_trader_config", "killed_reason", "VARCHAR")
     _ensure_column("auto_trader_config", "max_concurrent_positions", "INTEGER DEFAULT 10")
     _ensure_column("auto_trader_config", "flatten_by_eod", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "trade_calls", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "aggressive_options_mode", "BOOLEAN DEFAULT FALSE")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:

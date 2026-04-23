@@ -46,6 +46,40 @@ _entry_lock = threading.Lock()
 # where every 15-min scan resubmits the same doomed orders for every
 # qualifying ticker.
 _bp_exhausted_until: Optional[datetime] = None
+# Broker-down circuit breaker. Set when Alpaca returns a 5xx (broker API
+# outage). Pauses entry/exit submission so we don't DDoS a broken broker.
+_broker_down_until: Optional[datetime] = None
+
+# Counter of SL-resubmit failures in the last rolling hour — surfaced via
+# /api/health and alerts.count_unacked(). Reset every 60 minutes.
+_sl_resubmit_failures: List[float] = []   # unix-ts of each failure
+_sl_resubmit_lock = threading.Lock()
+
+
+def record_sl_resubmit_failure() -> None:
+    import time as _t
+    now = _t.time()
+    with _sl_resubmit_lock:
+        # Drop entries older than 1h
+        cutoff = now - 3600
+        _sl_resubmit_failures[:] = [t for t in _sl_resubmit_failures if t > cutoff]
+        _sl_resubmit_failures.append(now)
+
+
+def sl_resubmit_failures_1h() -> int:
+    import time as _t
+    now = _t.time()
+    with _sl_resubmit_lock:
+        cutoff = now - 3600
+        return sum(1 for t in _sl_resubmit_failures if t > cutoff)
+
+
+def bp_breaker_active() -> bool:
+    return bool(_bp_exhausted_until and datetime.utcnow() < _bp_exhausted_until)
+
+
+def broker_down() -> bool:
+    return bool(_broker_down_until and datetime.utcnow() < _broker_down_until)
 
 # Postmortem fix M1: local in-flight buying-power reservation. Alpaca's
 # reported `buying_power` lags submitted bracket orders (pending TPs reserve
@@ -126,12 +160,32 @@ _MAX_CONFIDENCE_RISK_MULT = 1.75
 # historical hit rate, multiply the risk budget up to _KELLY_MAX_MULT.
 _KELLY_MAX_MULT = 1.35
 _KELLY_MIN_WIN_RATE = 55.0
-# T2 partial profit-taking: after T1 trim, if price pushes through T2,
-# trim half the remaining runner so 50% of the T2 qty banks the win.
-_T2_PARTIAL_FRAC = 0.5
+# T2 partial profit-taking. At T1 we already trimmed 1/3 of the original
+# position (runner = 2/3). This fraction is applied to that REMAINING qty.
+# 0.33 of 2/3 original = 22% of original, leaving a 45% runner for T3+.
+# Lowered from 0.50 (old = 33% runner) — post-mortem showed winners died
+# too small because we banked 67% before T3 ever fired.
+_T2_PARTIAL_FRAC = 0.33
 # Stale-trade exit: close an open trade that hasn't hit T1 after
 # N × timeframe minutes have elapsed. Frees capital for fresher setups.
 _STALE_TRADE_TF_MULT = 8
+
+# Portfolio-heat cap: the sum of live $-at-risk across all open stock+option
+# auto-trades cannot exceed this fraction of equity at the moment a new
+# entry is evaluated. A 2%-per-trade risk budget with 15 concurrent slots
+# otherwise allowed 30% portfolio heat — one correlated drawdown could wipe
+# out a third of the account before anything stopped out.
+_PORTFOLIO_HEAT_CAP_PCT = 0.10
+# Gap-open reject: if live price has drifted more than this % from the
+# signal's original entry, the signal was computed on stale data and the
+# geometry is no longer trustworthy (targets/stop were set relative to the
+# old price; entering at the new price breaks every R-calculation).
+_STALE_GAP_PCT = 0.02
+# Opening-15-min filter: intraday TFs have wide spreads + direction
+# whipsaws in this window. Higher TFs (1d, 1mo) are unaffected.
+_OPENING_FILTER_TFS = {"5m", "15m", "30m", "1h"}
+_OPENING_FILTER_START_UTC = (13, 30)   # 9:30 ET
+_OPENING_FILTER_END_UTC = (13, 45)     # 9:45 ET
 
 # Background thread pool for non-blocking post-mortems. Sized small — these
 # are infrequent, and we don't want to fan out a hundred analyses if many
@@ -187,8 +241,11 @@ from services import paper_trader, live_quotes
 from services import post_mortem as post_mortem_svc
 from services import metrics
 from services.bear_thesis import build_bear_thesis
+from services.bull_thesis import build_bull_thesis
 from services.options_analyzer import suggest_options_for_signal
 from services.data_fetcher import get_current_price as fetch_current_price
+from services.earnings import inside_earnings_window, hours_to_next_earnings
+from services.alerts import alert as _raise_alert
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +274,8 @@ def get_config_dict() -> Dict[str, Any]:
             "option_pct_of_equity": cfg.option_pct_of_equity,
             "max_risk_per_trade_pct": cfg.max_risk_per_trade_pct,
             "trade_options": cfg.trade_options,
+            "trade_calls": bool(getattr(cfg, "trade_calls", False)),
+            "aggressive_options_mode": bool(getattr(cfg, "aggressive_options_mode", False)),
             "signal_timeframes": cfg.signal_timeframes or "1h,4h,1d",
             "stop_atr_mult": cfg.stop_atr_mult or 2.0,
             "chandelier_atr_mult": cfg.chandelier_atr_mult if cfg.chandelier_atr_mult is not None else 3.0,
@@ -229,20 +288,38 @@ def get_config_dict() -> Dict[str, Any]:
 
 # ---------- Kill switch + daily loss bookkeeping --------------------------
 
-def realized_pnl_today() -> float:
-    """Sum of realized_pl on auto-trades closed since 00:00 UTC today.
+def _session_start_utc() -> datetime:
+    """Start of the current US market session in UTC.
 
-    Used by the daily-loss gate and surfaced on /api/health for observability.
-    Kept as UTC for simplicity — the gate fires against today's paper P/L
-    rather than a calendar-session P/L, which is close enough for our purposes
-    and doesn't require market-calendar logic.
+    Audit fix #8: the daily-loss gate used 00:00 UTC, which misaligned with
+    the US market session by ~4-5 hours. If the user closed a big loser at
+    11 PM ET (04:00 UTC next day), it counted against the wrong day. We
+    now anchor to the most recent 9:30 ET boundary (13:30 UTC during EDT,
+    14:30 UTC during EST). DST is handled naively — a 1h drift twice a
+    year is acceptable for a rolling PnL window.
     """
+    from datetime import timedelta as _td
+    now = datetime.utcnow()
+    # US market opens 9:30 ET = 13:30 UTC (EDT) / 14:30 UTC (EST).
+    # EDT runs ~2nd Sun of March → 1st Sun of Nov.
+    month = now.month
+    is_edt = 3 <= month <= 10 or (month == 11 and now.day <= 7)
+    open_hour_utc = 13 if is_edt else 14
+    session_anchor = now.replace(hour=open_hour_utc, minute=30, second=0, microsecond=0)
+    if now < session_anchor:
+        session_anchor = session_anchor - _td(days=1)
+    return session_anchor
+
+
+def realized_pnl_today() -> float:
+    """Sum of realized_pl on auto-trades closed since the current market
+    session's 9:30 ET open. Used by the daily-loss gate and surfaced on
+    /api/health for observability."""
     db = SessionLocal()
     try:
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         rows = db.query(AutoTrade).filter(
             AutoTrade.closed_at != None,  # noqa: E711
-            AutoTrade.closed_at >= today_start,
+            AutoTrade.closed_at >= _session_start_utc(),
         ).all()
         return float(sum((r.realized_pl or 0.0) for r in rows))
     except Exception as e:
@@ -326,6 +403,57 @@ def unkill(reason: Optional[str] = None) -> Dict[str, Any]:
     logger.warning(f"AUTO-TRADER UNKILLED reason={reason!r} (enabled still False — re-arm via /auto/config)")
     metrics.inc("autotrade_event", event="unkilled")
     return {"killed": False, "enabled": False, "reason": reason}
+
+
+def detect_unexpected_positions() -> Dict[str, Any]:
+    """Audit fix #9: detect option-assignment surprises.
+
+    A long call assigned at expiration = we own 100 shares at strike.
+    A long put exercised = we get short 100 shares (which Alpaca paper/live
+    may convert to a flat cash position depending on config).
+
+    Either way, if Alpaca reports a stock position on a ticker we don't
+    have an open stock auto-trade for, something exogenous happened and
+    the operator needs to know immediately. Run every hour.
+    """
+    if not paper_trader.is_enabled():
+        return {"unexpected": []}
+    try:
+        alpaca_positions = paper_trader.get_positions() or []
+    except Exception as e:
+        logger.warning(f"detect_unexpected_positions: Alpaca fetch failed: {e}")
+        return {"unexpected": [], "error": str(e)}
+
+    db = SessionLocal()
+    try:
+        open_tickers = {
+            r.ticker for r in db.query(AutoTrade).filter(
+                AutoTrade.status.in_(["pending", "open"]),
+                AutoTrade.asset_type == "stock",
+            ).all()
+        }
+    finally:
+        db.close()
+
+    unexpected = []
+    for pos in alpaca_positions:
+        sym = (pos.get("symbol") or "").upper()
+        qty = float(pos.get("qty") or 0)
+        if not sym or qty == 0:
+            continue
+        # Skip multi-leg option positions (they're tracked via auto_trades).
+        if len(sym) > 6:  # OCC symbols are 15-21 chars
+            continue
+        if sym not in open_tickers:
+            unexpected.append({"symbol": sym, "qty": qty, "avg": pos.get("avg_entry_price")})
+            _raise_alert(
+                "critical", "unexpected_position",
+                f"Alpaca reports unexpected stock position {sym} qty={qty} avg=${pos.get('avg_entry_price')} — "
+                f"possible option assignment or external manual trade. Investigate.",
+                ticker=sym,
+            )
+
+    return {"unexpected": unexpected, "count": len(unexpected)}
 
 
 def compute_confidence_calibration(min_bucket_n: int = 5) -> Dict[str, Any]:
@@ -506,7 +634,8 @@ def regenerate_post_mortem(trade_id: int) -> Optional[Dict[str, Any]]:
 
 # ---------- Entry: react to a fresh signal --------------------------------
 
-MIN_OPTION_SCORE = 65   # contract score gate before we'll auto-buy a put
+MIN_OPTION_SCORE = 65             # contract score gate in default mode
+MIN_OPTION_SCORE_AGGRESSIVE = 55  # lowered gate when aggressive_options_mode is on
 
 
 def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -524,8 +653,13 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     tickers) serialize so a 3rd same-sector trade can't slip past the cap.
     """
     # Short-circuit if the buying-power breaker tripped recently.
-    global _bp_exhausted_until
+    # `global` declared here for both vars so the later error-handler can
+    # assign without Python raising SyntaxError about "used prior to global".
+    global _bp_exhausted_until, _broker_down_until  # noqa: E501
     if _bp_exhausted_until and datetime.utcnow() < _bp_exhausted_until:
+        return None
+    # Broker-down (Alpaca 5xx) breaker
+    if _broker_down_until and datetime.utcnow() < _broker_down_until:
         return None
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_signal({signal.get('ticker')}): entry lock busy >30s, skipping")
@@ -571,6 +705,51 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             )
             return None
 
+        # Portfolio-heat cap — total $-at-risk across all open auto-trades
+        # must stay under _PORTFOLIO_HEAT_CAP_PCT of equity. This complements
+        # the per-trade risk cap (which bounds any single trade) with a
+        # book-wide cap that prevents 15 simultaneous 2% trades = 30% heat.
+        try:
+            _heat_acct = paper_trader.get_account()
+            _heat_equity = float(_heat_acct["equity"]) if _heat_acct else 0.0
+        except Exception:
+            _heat_equity = 0.0
+        if _heat_equity > 0:
+            open_trades_heat = db.query(AutoTrade).filter(
+                AutoTrade.status.in_(["pending", "open"])
+            ).all()
+            current_heat = 0.0
+            for ot in open_trades_heat:
+                oe = ot.entry_price or ot.requested_entry or 0.0
+                os_ = ot.current_stop or ot.stop_loss or 0.0
+                if ot.asset_type == "stock" and oe > 0 and os_ > 0:
+                    current_heat += max(0.0, (oe - os_)) * (ot.qty or 0)
+                elif ot.asset_type == "option" and oe > 0:
+                    # For long options, max-loss = premium paid (contract × 100).
+                    current_heat += float(oe) * 100 * (ot.qty or 0)
+            heat_cap = _heat_equity * _PORTFOLIO_HEAT_CAP_PCT
+            if current_heat >= heat_cap:
+                logger.info(
+                    f"AutoTrader skip {signal.get('ticker')}: portfolio heat "
+                    f"${current_heat:.0f} ≥ cap ${heat_cap:.0f} "
+                    f"({_PORTFOLIO_HEAT_CAP_PCT*100:.0f}% × equity {_heat_equity:.0f})"
+                )
+                metrics.inc("autotrade_event", event="portfolio_heat_cap")
+                return None
+
+        # Opening-15-min whipsaw filter for intraday TFs.
+        sig_tf_str = (signal.get("timeframe") or "").strip()
+        if sig_tf_str in _OPENING_FILTER_TFS:
+            _now_utc = datetime.utcnow()
+            _hm = (_now_utc.hour, _now_utc.minute)
+            if _OPENING_FILTER_START_UTC <= _hm < _OPENING_FILTER_END_UTC:
+                logger.info(
+                    f"AutoTrader skip {signal.get('ticker')}: opening-15m filter "
+                    f"({_hm[0]:02d}:{_hm[1]:02d} UTC, TF {sig_tf_str})"
+                )
+                metrics.inc("autotrade_event", event="opening_filter")
+                return None
+
         # F7: Signal freshness — reject stale signals. Freshness window scales
         # with the timeframe (2× tf minutes, floor 15m, ceil 4h).
         _tf_min_map = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":390,"1mo":390}
@@ -607,6 +786,20 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             return None
         if stop >= entry:
             return None  # malformed signal
+        # Post-mortem fix (MU -$227): reject BUY signals whose T1 sits at or
+        # below entry — a common signal-gen flaw (pulled T1 from S1 pivot
+        # below current price) that would instantly fire the T1-trail and
+        # place the stop at entry _above_ current price, stopping out at
+        # market. Also rejects microscopically-tight T1s (AAPL: T1 was 11¢
+        # above entry; any normal retrace tripped BE and chopped us flat).
+        _MIN_T1_GAP_PCT = 0.004   # T1 must be ≥ 0.4% above entry for BUY
+        if t1 <= entry * (1.0 + _MIN_T1_GAP_PCT):
+            logger.info(
+                f"AutoTrader skip {signal.get('ticker')}: T1 {t1} ≤ entry {entry} × 1.004 "
+                f"(geometry broken or too tight)"
+            )
+            metrics.inc("autotrade_event", event="bad_t1_geometry")
+            return None
         # C10: Fat-finger guard — risk-per-share outside [0.1%, 10%] of entry
         # almost always indicates a bad level (stop on wrong side of a gap,
         # or a stop so wide the trade is a lottery ticket). Reject loudly
@@ -621,6 +814,60 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             )
             metrics.inc("autotrade_event", event="fat_finger_reject")
             return None
+
+        # Post-mortem fix: require stop distance ≥ 0.8 × daily ATR. Stops
+        # tighter than that are shaken out by normal noise before the thesis
+        # has a chance to play out.
+        try:
+            _atr_sig = _chandelier_atr(signal.get("ticker", "").upper())
+            if _atr_sig and _atr_sig > 0:
+                if (entry - stop) < 0.8 * _atr_sig:
+                    logger.info(
+                        f"AutoTrader skip {signal.get('ticker')}: stop distance "
+                        f"${entry-stop:.2f} < 0.8 × ATR(${_atr_sig:.2f}) — too tight"
+                    )
+                    metrics.inc("autotrade_event", event="stop_too_tight_atr")
+                    return None
+        except Exception:
+            pass
+
+        # Gap-open reject: if live price has drifted past _STALE_GAP_PCT from
+        # the signal's entry, the targets/stop were computed for a different
+        # price level. Entering now breaks every R-multiple and usually
+        # leaves the stop on the wrong side of the gap.
+        try:
+            _live_px = _current_price(signal.get("ticker", "").upper())
+            if _live_px and _live_px > 0:
+                _gap_pct = abs(_live_px - entry) / entry
+                if _gap_pct > _STALE_GAP_PCT:
+                    logger.info(
+                        f"AutoTrader skip {signal.get('ticker')}: live ${_live_px:.2f} "
+                        f"gapped {_gap_pct*100:.2f}% from signal entry ${entry:.2f} "
+                        f"(> {_STALE_GAP_PCT*100:.1f}% threshold)"
+                    )
+                    metrics.inc("autotrade_event", event="gap_open_reject")
+                    return None
+        except Exception:
+            pass
+
+        # Earnings-calendar gate: reject entries on tickers with a scheduled
+        # earnings release within 48h. The rule-based signal generator has no
+        # way to know an earnings print is pending; blindly holding through
+        # one is a coin-flip + implied-vol reset that historically destroys
+        # edge. Options are even more exposed (IV crush on the print) — same
+        # gate is applied in consider_put_play.
+        try:
+            _ticker_probe = signal.get("ticker", "").upper()
+            if _ticker_probe and inside_earnings_window(_ticker_probe):
+                hte = hours_to_next_earnings(_ticker_probe)
+                logger.info(
+                    f"AutoTrader skip {_ticker_probe}: earnings in {hte:.1f}h — "
+                    f"avoiding event-driven variance"
+                )
+                metrics.inc("autotrade_event", event="earnings_skip")
+                return None
+        except Exception:
+            pass
         # Trailing-only exit: park the bracket TP far away so it never fires.
         # Real exit comes from the trailing stop in manage_open_positions().
         risk_per_share = entry - stop
@@ -779,11 +1026,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             ))
             db.commit()
             logger.warning(f"AutoTrader submit failed for {ticker}: {res['error']}")
-            # Buying-power circuit breaker: if Alpaca says we're tapped out,
-            # skip ALL consider_signal calls for the next 30 min. Otherwise
-            # the next tick re-evaluates every ticker and submits N more
-            # doomed orders before anything closes.
             err_lower = str(res.get("error", "")).lower()
+            # `_bp_exhausted_until` and `_broker_down_until` are already in the
+            # function's global scope via the declaration at the top of
+            # consider_signal — no second `global` needed here.
             if "insufficient buying power" in err_lower or "insufficient_buying_power" in err_lower:
                 from datetime import timedelta as _td2
                 _bp_exhausted_until = datetime.utcnow() + _td2(minutes=30)
@@ -791,6 +1037,16 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     f"AutoTrader: buying-power exhausted, pausing new entries until {_bp_exhausted_until.isoformat()}Z"
                 )
                 metrics.inc("autotrade_event", event="bp_exhausted")
+                _raise_alert("warning", "bp_breaker", f"Buying power exhausted on {ticker}; new entries paused 30m", ticker=ticker)
+            elif any(code in err_lower for code in ("500", "502", "503", "504", "server error", "bad gateway", "service unavailable", "gateway timeout", "internal server error")):
+                # Broker 5xx — pause all entry/exit submits for 10 min so we don't
+                # DDoS Alpaca during an outage. Auto-recovers after the timer
+                # expires; manage loop still runs its reconciliation logic.
+                from datetime import timedelta as _td3
+                _broker_down_until = datetime.utcnow() + _td3(minutes=10)
+                logger.error(f"AutoTrader: Alpaca 5xx detected, broker-down circuit breaker tripped for 10m")
+                metrics.inc("autotrade_event", event="broker_down")
+                _raise_alert("error", "broker_down", f"Alpaca 5xx on {ticker} submit: {res['error'][:200]}", ticker=ticker)
             return None
 
         trade = AutoTrade(
@@ -874,11 +1130,28 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         if existing:
             return None
 
+        # Earnings-calendar gate — puts are even more exposed to post-earnings
+        # IV crush than stocks, so we reject within the same 48h window.
+        try:
+            if inside_earnings_window(ticker):
+                hte = hours_to_next_earnings(ticker)
+                logger.info(
+                    f"AutoTrader skip PUT {ticker}: earnings in {hte:.1f}h "
+                    f"(IV-crush risk)"
+                )
+                metrics.inc("autotrade_event", event="earnings_skip_put")
+                return None
+        except Exception:
+            pass
+
         thesis = build_bear_thesis(ticker, "1d")
         if not thesis:
             return None
-        if thesis["confidence"] < cfg.confidence_threshold * 0.7:
-            # Bear conviction scale runs cooler than long conviction; require ~70% of threshold
+        # Aggressive mode: drop bear-thesis floor to 45 (from ~53). Lets more
+        # bearish setups through — capital deployment is the goal.
+        aggressive = bool(getattr(cfg, "aggressive_options_mode", False))
+        min_bear_conf = 45.0 if aggressive else (cfg.confidence_threshold * 0.7)
+        if thesis["confidence"] < min_bear_conf:
             return None
 
         # Postmortem fix H4: bear-thesis is computed off cached daily data
@@ -922,7 +1195,8 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         if not contracts:
             return None
         top = contracts[0]
-        if top.get("score", 0) < MIN_OPTION_SCORE:
+        min_score = MIN_OPTION_SCORE_AGGRESSIVE if aggressive else MIN_OPTION_SCORE
+        if top.get("score", 0) < min_score:
             return None
 
         # Budget check
@@ -941,13 +1215,14 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         option_budget = equity * cfg.option_pct_of_equity
         option_remaining = option_budget - alloc["option"]
 
-        # Sizing rules:
-        #   • Risk per contract = effective_max_loss (already in $, not per-share)
-        #   • Max risk per trade ≤ max_risk_per_trade_pct of equity
-        #   • Notional (premium*100*qty) ≤ remaining option bucket
-        #   • Per-ticker option cap = 33% of option budget
-        #   • Buying-power cap — reject at-sizing if BP already eaten by other
-        #     pending submits (prevents Alpaca 40310000 at submit time).
+        # Aggressive mode raises per-ticker cap from 33% → 50% to allow more
+        # conviction-weighted sizing. Risk-per-trade remains capped.
+        # Audit fix #10: in aggressive mode we also enforce a hard cap
+        # per ticker/contract so a single cheap option can't soak 5%+
+        # of equity. Max 2% of equity per option position in aggressive
+        # mode (1% otherwise — tighter than the bucket-fraction cap).
+        per_ticker_frac = 0.50 if aggressive else 0.33
+        per_contract_dollar_cap = equity * (0.02 if aggressive else 0.01)
         risk_per_contract = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
         if risk_per_contract <= 0:
             return None
@@ -955,12 +1230,17 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         risk_budget = equity * cfg.max_risk_per_trade_pct
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
-        max_qty_by_per_ticker = int((option_budget * 0.33) / notional_per_contract) if notional_per_contract > 0 else 0
+        max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_cash = int(cash / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_bp = int(buying_power / notional_per_contract) if notional_per_contract > 0 else 0
+        # Per-contract $ cap — hard ceiling on position size independent of
+        # the bucket fractions. Catches the cheap-far-OTM case where
+        # max_qty_by_per_ticker could hit 200+ contracts on a $0.30 option.
+        max_qty_by_dollar_cap = int(per_contract_dollar_cap / notional_per_contract) if notional_per_contract > 0 else 0
         qty = min(
             max_qty_by_risk, max_qty_by_remaining,
             max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp,
+            max_qty_by_dollar_cap,
         )
         if qty < 1:
             return None
@@ -968,8 +1248,6 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         occ = top["symbol"]
 
         # Alpaca rejects option MARKET orders outside RTH (code 42210000).
-        # Skip early instead of submitting, logging, and writing an error row
-        # on every 15-min scan while the market is closed.
         if not paper_trader.is_market_open():
             logger.info(f"AutoTrader skip PUT {ticker} {occ}: market closed")
             return None
@@ -1028,9 +1306,257 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Postmortem fix M1: reserve BP for option premium too.
         _reserve_bp(qty * float(top["premium"]) * 100.0)
         metrics.inc("autotrade_event", event="opened_put")
+        try:
+            live_quotes.ensure_option_symbols([occ])
+        except Exception:
+            pass
         return _serialize(trade)
     except Exception as e:
         logger.exception(f"consider_put_play error for {ticker}: {e}")
+        return None
+    finally:
+        db.close()
+        _entry_lock.release()
+
+
+def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Mirror of consider_put_play for the long-call side.
+
+    Runs after every per-ticker analysis. Buys a call ONLY when one of:
+      • The stock-side signal was a BUY at sub-threshold confidence (the
+        stock gate rejected it, but the direction is sound enough for a
+        defined-risk premium bet).
+      • Stock auto-trade on the ticker is already at its per-ticker cap
+        (stock slot full — call adds exposure cheaply).
+      • No stock trade exists but the bull thesis is strong (60%+).
+
+    Blocked when:
+      • trade_calls config flag is off (default — user must explicitly enable).
+      • An open stock long ALREADY exists on the ticker AT OR BELOW cap
+        (avoid stacking correlated long exposure on the same underlying).
+      • Earnings within 48h (same IV-crush risk as puts).
+    """
+    if not _entry_lock.acquire(timeout=30.0):
+        logger.warning(f"consider_call_play({ticker}): entry lock busy >30s, skipping")
+        metrics.inc("autotrade_event", event="entry_lock_timeout")
+        return None
+    db = SessionLocal()
+    try:
+        cfg = get_config(db)
+        # Requires BOTH trade_options (options trading is approved) AND
+        # the call-specific flag (user has opted in to call plays).
+        if not (cfg.enabled and getattr(cfg, "trade_calls", False) and cfg.trade_options):
+            return None
+        if not paper_trader.is_enabled():
+            return None
+
+        ticker = ticker.upper()
+
+        # Per-ticker auto-trade gate
+        ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
+        if ws and getattr(ws, "auto_trade_enabled", True) is False:
+            return None
+
+        # Concentration guard: if a stock auto-trade on this ticker is open
+        # and NOT at per-ticker cap, don't stack a call on top (double-long
+        # via premium would just leverage the already-established exposure).
+        # We allow the call when the stock side is at cap (capital maxed out)
+        # or when no stock trade exists.
+        existing_stock = db.query(AutoTrade).filter(
+            AutoTrade.ticker == ticker,
+            AutoTrade.asset_type == "stock",
+            AutoTrade.status.in_(["pending", "open"]),
+        ).first()
+        existing_option = db.query(AutoTrade).filter(
+            AutoTrade.ticker == ticker,
+            AutoTrade.asset_type == "option",
+            AutoTrade.status.in_(["pending", "open"]),
+        ).first()
+        if existing_option:
+            return None  # one option play at a time per ticker
+
+        aggressive = bool(getattr(cfg, "aggressive_options_mode", False))
+        # In default mode: concentration guard — only stack a call on top of
+        # a stock long if the stock is at per-ticker cap. In aggressive mode:
+        # this guard is dropped — dual-deploy (stock + call) on every strong
+        # BUY is the whole point of the mode.
+        if existing_stock and not aggressive:
+            try:
+                acct = paper_trader.get_account()
+                eq = float(acct["equity"]) if acct else 0.0
+                stock_budget = eq * cfg.stock_pct_of_equity
+                per_ticker_cap = stock_budget * 0.30
+                stock_notional = (existing_stock.entry_price or existing_stock.requested_entry or 0.0) * (existing_stock.qty or 0)
+                if stock_notional < per_ticker_cap * 0.90:
+                    # Stock slot still has ≥10% headroom — prefer more stock.
+                    return None
+            except Exception:
+                pass
+
+        # Earnings gate
+        try:
+            if inside_earnings_window(ticker):
+                hte = hours_to_next_earnings(ticker)
+                logger.info(
+                    f"AutoTrader skip CALL {ticker}: earnings in {hte:.1f}h (IV-crush risk)"
+                )
+                metrics.inc("autotrade_event", event="earnings_skip_call")
+                return None
+        except Exception:
+            pass
+
+        thesis = build_bull_thesis(ticker, "1d")
+        if not thesis:
+            return None
+        # Aggressive mode: drop bull-thesis floor to 45 (from ~53). Lets more
+        # bullish setups trigger — capital deployment is the whole point.
+        min_bull_conf = 45.0 if aggressive else (cfg.confidence_threshold * 0.7)
+        if thesis["confidence"] < min_bull_conf:
+            return None
+
+        # Live-price gap: bull-thesis stop sits BELOW price. If live price
+        # has already cracked below it, the thesis is stale.
+        try:
+            fresh_px = _current_price(ticker)
+            stop_underlying = float(thesis.get("stop_loss") or 0)
+            if fresh_px and stop_underlying > 0 and fresh_px <= stop_underlying * 1.01:
+                logger.info(
+                    f"AutoTrader skip CALL {ticker}: live ${fresh_px:.2f} already "
+                    f"<= 101% of bull-thesis stop ${stop_underlying:.2f} (stale)"
+                )
+                return None
+        except Exception:
+            pass
+
+        # Stop-distance sanity (mirror of puts): > 12% wide = too much
+        # theta exposure for the few contracts we'd afford.
+        try:
+            entry_underlying = float(thesis.get("entry") or 0)
+            stop_underlying = float(thesis.get("stop_loss") or 0)
+            if entry_underlying > 0 and stop_underlying > 0:
+                stop_distance_pct = (entry_underlying - stop_underlying) / entry_underlying
+                if stop_distance_pct > 0.12:
+                    logger.info(
+                        f"AutoTrader skip CALL {ticker}: bull-thesis stop {stop_distance_pct*100:.1f}% "
+                        f"below entry — too wide for option theta budget"
+                    )
+                    return None
+        except Exception:
+            pass
+
+        sugg = suggest_options_for_signal(ticker, thesis)  # direction='BUY' → calls
+        contracts = sugg.get("contracts") or []
+        if not contracts:
+            return None
+        top = contracts[0]
+        min_score = MIN_OPTION_SCORE_AGGRESSIVE if aggressive else MIN_OPTION_SCORE
+        if top.get("score", 0) < min_score:
+            return None
+
+        # Budget check — shares the same option bucket as puts.
+        acct = paper_trader.get_account()
+        if not acct:
+            return None
+        equity = float(acct["equity"])
+        cash = float(acct["cash"])
+        buying_power = float(acct.get("buying_power") or cash)
+        _decay_in_flight_bp_if_stale()
+        in_flight = _get_in_flight_bp()
+        buying_power = max(0.0, buying_power - in_flight)
+        cash = max(0.0, cash - in_flight)
+        alloc = _open_allocations(db)
+        option_budget = equity * cfg.option_pct_of_equity
+        option_remaining = option_budget - alloc["option"]
+
+        # Audit fix #10: in aggressive mode we also enforce a hard cap
+        # per ticker/contract so a single cheap option can't soak 5%+
+        # of equity. Max 2% of equity per option position in aggressive
+        # mode (1% otherwise — tighter than the bucket-fraction cap).
+        per_ticker_frac = 0.50 if aggressive else 0.33
+        per_contract_dollar_cap = equity * (0.02 if aggressive else 0.01)
+        risk_per_contract = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
+        if risk_per_contract <= 0:
+            return None
+        notional_per_contract = float(top["premium"]) * 100
+        risk_budget = equity * cfg.max_risk_per_trade_pct
+        max_qty_by_risk = int(risk_budget / risk_per_contract)
+        max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
+        max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
+        max_qty_by_cash = int(cash / notional_per_contract) if notional_per_contract > 0 else 0
+        max_qty_by_bp = int(buying_power / notional_per_contract) if notional_per_contract > 0 else 0
+        qty = min(max_qty_by_risk, max_qty_by_remaining, max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp)
+        if qty < 1:
+            return None
+
+        occ = top["symbol"]
+
+        if not paper_trader.is_market_open():
+            logger.info(f"AutoTrader skip CALL {ticker} {occ}: market closed")
+            return None
+
+        logger.info(
+            f"AutoTrader CALL {ticker} {occ} qty={qty} premium={top['premium']} "
+            f"score={top['score']} bull-conf={thesis['confidence']}"
+        )
+
+        res = paper_trader.submit_simple_option_order(
+            occ_symbol=occ, qty=qty, side="buy",
+            order_type="market", time_in_force="day",
+        )
+        if "error" in res:
+            db.add(AutoTrade(
+                ticker=ticker, symbol=occ, asset_type="option", side="buy",
+                qty=qty, requested_entry=top["premium"],
+                stop_loss=top["effective_stop_premium"],
+                current_stop=top["effective_stop_premium"],
+                target1=thesis["target1"], target2=thesis["target2"],
+                target3=thesis.get("target3"), level_index=0,
+                status="error",
+                note=f"call submit failed: {res['error']}",
+            ))
+            db.commit()
+            logger.warning(f"AutoTrader call submit failed for {occ}: {res['error']}")
+            return None
+
+        trade = AutoTrade(
+            ticker=ticker,
+            symbol=occ,
+            asset_type="option",
+            side="buy",
+            qty=qty,
+            requested_entry=float(top["premium"]),
+            # For calls: underlying stop sits BELOW price. The option
+            # manage loop (`_manage_option_trade`) already supports puts;
+            # we reuse it for calls by parsing direction from the OCC
+            # symbol — the `is_put` check there also handles calls via
+            # its else branch (added in this change).
+            stop_loss=float(thesis["stop_loss"]),
+            current_stop=float(thesis["stop_loss"]),
+            target1=float(thesis["target1"]),
+            target2=float(thesis["target2"]),
+            target3=float(thesis["target3"]) if thesis.get("target3") else None,
+            level_index=0,
+            parent_order_id=res.get("id"),
+            status="pending",
+            note=(
+                f"CALL play: bull-conf {thesis['confidence']} | strike {top['strike']} "
+                f"exp {top['expiration']} ({top['dte']}d) | underlying stop "
+                f"${thesis['stop_loss']:.2f}, T1 ${thesis['target1']:.2f}, T2 ${thesis['target2']:.2f}"
+            ),
+        )
+        db.add(trade)
+        db.commit()
+        db.refresh(trade)
+        _reserve_bp(qty * float(top["premium"]) * 100.0)
+        metrics.inc("autotrade_event", event="opened_call")
+        try:
+            live_quotes.ensure_option_symbols([occ])
+        except Exception:
+            pass
+        return _serialize(trade)
+    except Exception as e:
+        logger.exception(f"consider_call_play error for {ticker}: {e}")
         return None
     finally:
         db.close()
@@ -1149,6 +1675,52 @@ def _chandelier_atr(ticker: str) -> Optional[float]:
         return atr
     except Exception:
         return None
+
+
+# Daily ADX cache for adaptive chandelier — same 5-min TTL as the ATR cache.
+_chandelier_adx_cache: Dict[str, tuple] = {}
+
+
+def _chandelier_adx(ticker: str) -> Optional[float]:
+    """Daily ADX_14 for the ticker — used to loosen/tighten the chandelier
+    trail based on trend strength. Strong trends (ADX > 30) let winners
+    run with a wider trail; chop (ADX < 20) tightens it to reduce bleed."""
+    import time as _t
+    now = _t.time()
+    cached = _chandelier_adx_cache.get(ticker.upper())
+    if cached and now < cached[1]:
+        return cached[0]
+    try:
+        from services.data_fetcher import fetch_ohlcv as _fo
+        from services.indicators import compute_indicators as _ci
+        _df = _fo(ticker, "1d")
+        if _df is None or _df.empty:
+            return None
+        _ind = _ci(_df)
+        if "ADX_14" not in _ind.columns:
+            return None
+        adx = float(_ind["ADX_14"].iloc[-1])
+        _chandelier_adx_cache[ticker.upper()] = (adx, now + _CHANDELIER_ATR_TTL)
+        return adx
+    except Exception:
+        return None
+
+
+def _adaptive_chandelier_mult(base_mult: float, ticker: str) -> float:
+    """Adjust the configured chandelier multiplier based on trend strength:
+      • ADX > 30  (strong trend)     → base × 1.33 (give winners room)
+      • ADX < 20  (chop)             → base × 0.83 (cut bleed)
+      • 20 ≤ ADX ≤ 30 (transitional) → base (config value unchanged)
+    Returns base if ADX cannot be read.
+    """
+    adx = _chandelier_adx(ticker)
+    if adx is None:
+        return base_mult
+    if adx > 30:
+        return base_mult * 1.33
+    if adx < 20:
+        return base_mult * 0.83
+    return base_mult
 
 
 def _current_price(ticker: str) -> Optional[float]:
@@ -1304,24 +1876,32 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
     exit_reason = None
     final_status = None
 
-    # 3) State-machine trailing on the UNDERLYING (mirrors stock logic, inverted for puts).
-    #    For puts: targets are BELOW current price, "current_stop" is the underlying stop ABOVE.
-    #    Crossing T1 (price drops below T1) → tighten underlying stop to entry underlying;
-    #    Crossing T2 → underlying stop moves to T1; Crossing T3 → moves to T2 + recalc.
+    # 3) State-machine trailing on the UNDERLYING.
+    #
+    #    PUT  (is_put=True):  targets are BELOW current price; stop sits ABOVE.
+    #                         Target hit when px <= next_target (dropping).
+    #                         "Tighter" = LOWER upper-stop.
+    #    CALL (is_put=False): targets are ABOVE current price; stop sits BELOW.
+    #                         Target hit when px >= next_target (rising).
+    #                         "Tighter" = HIGHER lower-stop.
+    #
     #    We don't move a real broker stop (options have no SL leg here) — we only
     #    update t.current_stop (the underlying-stop level we'll exit at).
-    if px is not None and is_put:
-        # Parse entry-underlying from note ("underlying stop $X" + thesis records),
-        # but for trailing we just need the current underlying stop in t.current_stop
-        # (initialised to the bear-thesis underlying stop when we record it below).
+    if px is not None:
         targets = [t.target1, t.target2, t.target3]
         li = t.level_index or 0
         target_idx = li % 3
         next_target = targets[target_idx]
-        if next_target and px <= next_target:
-            # Partial profit-taking for options: at T1, sell HALF the contracts
-            # to lock in profit (theta-decay risk on remaining halves is now
-            # paid for by the realized half). Only trims once.
+        hit = next_target is not None and (
+            (is_put and px <= next_target) or (not is_put and px >= next_target)
+        )
+        if hit:
+            # Partial profit-taking: at T1, sell HALF the contracts to lock in profit.
+            # Audit fix #1: verify the trim submit was actually accepted
+            # (has an id AND a non-error status) before decrementing our DB
+            # qty — otherwise the DB qty can drift from Alpaca reality on a
+            # silent rejection. Also alert on failure so operators know a
+            # runner is still fully on.
             if target_idx == 0 and t.qty >= 2 and not t.hit_t1:
                 half = int(t.qty // 2)
                 if half >= 1:
@@ -1329,8 +1909,13 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                         occ_symbol=t.symbol, qty=half, side="sell",
                         order_type="market", time_in_force="day",
                     )
-                    if "error" not in trim:
-                        # Capture partial realised P/L
+                    trim_ok = (
+                        isinstance(trim, dict)
+                        and "error" not in trim
+                        and trim.get("id")
+                        and str(trim.get("status", "")).lower() not in ("rejected", "canceled", "expired")
+                    )
+                    if trim_ok:
                         if cur_premium is not None and t.entry_price:
                             partial_pl = (cur_premium - t.entry_price) * half * 100
                             t.realized_pl = (t.realized_pl or 0) + partial_pl
@@ -1341,16 +1926,30 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                             f"runner = {int(t.qty)} contracts"
                         )
                         logger.info(
-                            f"AutoTrader PUT {t.ticker} partial-trim {half} @ underlying {px:.2f}; "
-                            f"runner {int(t.qty)} contracts"
+                            f"AutoTrader {'PUT' if is_put else 'CALL'} {t.ticker} partial-trim {half} @ "
+                            f"underlying {px:.2f}; runner {int(t.qty)} contracts"
                         )
+                    else:
+                        err = trim.get("error") if isinstance(trim, dict) else "unknown"
+                        logger.error(f"option partial-trim submit FAILED for {t.symbol}: {err}; leaving full qty open")
+                        _raise_alert(
+                            "error", "option_trim_failed",
+                            f"T1 partial-trim rejected on {t.ticker} {t.symbol} ({err}); position unchanged",
+                            ticker=t.ticker, trade_id=t.id,
+                        )
+                        # Do NOT mutate t.qty or t.hit_t1 — will retry next tick.
+            # Compute new u-stop level.
             if target_idx == 0:
-                new_stop = round(next_target * 1.02, 2)  # near break-even on underlying
+                # Near break-even on underlying. Puts: 2% above T1 ; calls: 2% below T1.
+                new_stop = round(next_target * (1.02 if is_put else 0.98), 2)
             else:
                 prev = targets[target_idx - 1]
                 new_stop = round(prev, 2) if prev else t.current_stop
-            # For a put, tighter = LOWER upper-stop. Only commit if it's tighter.
-            tightened = bool(t.current_stop and new_stop < t.current_stop)
+            # Tightness check is direction-dependent.
+            if is_put:
+                tightened = bool(t.current_stop and new_stop < t.current_stop)
+            else:
+                tightened = bool(t.current_stop and new_stop > t.current_stop)
             if tightened:
                 t.current_stop = new_stop
             t.level_index = li + 1
@@ -1361,7 +1960,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                 f" | underlying {tag} hit @ {px:.2f} (u-stop unchanged)"
             )
             if target_idx == 2:
-                new_targets = _recalculate_targets(t.ticker, "bear", px)
+                new_targets = _recalculate_targets(t.ticker, "bear" if is_put else "long", px)
                 if new_targets:
                     t.target1, t.target2, t.target3 = new_targets
                     _record_target_history(
@@ -1373,14 +1972,20 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             db.commit()
             summary["trailed"] += 1
             logger.info(
-                f"AutoTrader PUT {t.ticker} underlying {tag} hit, u-stop→{new_stop} "
-                f"(level_index={t.level_index})"
+                f"AutoTrader {'PUT' if is_put else 'CALL'} {t.ticker} underlying {tag} hit, "
+                f"u-stop→{new_stop} (level_index={t.level_index})"
             )
 
-    # 4) Underlying-stop breach (price moved AGAINST the put thesis) → close
-    if px is not None and is_put and t.current_stop and px >= t.current_stop:
-        exit_reason = f"underlying broke trailing u-stop ${t.current_stop:.2f} (now ${px:.2f})"
-        final_status = "closed_stop"
+    # 4) Underlying-stop breach (price moved AGAINST the thesis) → close.
+    #    Puts: breach = price rose past stop (stop sits above).
+    #    Calls: breach = price fell below stop (stop sits below).
+    if px is not None and t.current_stop:
+        if is_put and px >= t.current_stop:
+            exit_reason = f"underlying broke trailing u-stop ${t.current_stop:.2f} (now ${px:.2f})"
+            final_status = "closed_stop"
+        elif (not is_put) and px <= t.current_stop:
+            exit_reason = f"underlying broke trailing u-stop ${t.current_stop:.2f} (now ${px:.2f})"
+            final_status = "closed_stop"
 
     # 5) Premium decay safety — still exit if the option has lost ≥ 50% of premium
     if not exit_reason and cur_premium is not None and t.entry_price:
@@ -1639,6 +2244,27 @@ def manage_open_positions() -> Dict[str, Any]:
 
                     # ===== Option auto-trades take a separate path =====
                     if t.asset_type == "option":
+                        # Audit fix #13: earnings-triggered force-close for
+                        # options within 6h of the print. IV crush on
+                        # earnings can erase 40-80% of premium in minutes.
+                        # We exit BEFORE the print to bank whatever remains.
+                        try:
+                            hte = hours_to_next_earnings(t.ticker)
+                            if hte is not None and 0 < hte <= 6:
+                                _raise_alert(
+                                    "warning", "earnings_force_close",
+                                    f"{t.ticker} earnings in {hte:.1f}h — closing {t.symbol} to avoid IV crush",
+                                    ticker=t.ticker, trade_id=t.id,
+                                )
+                                _force_close_trade(
+                                    t, db,
+                                    f"earnings in {hte:.1f}h — pre-empting IV crush",
+                                    summary,
+                                    status_override="closed_manual",
+                                )
+                                continue
+                        except Exception as _e:
+                            logger.warning(f"earnings close check {t.ticker}: {_e}")
                         _manage_option_trade(t, c, db, summary)
                         continue
 
@@ -1786,6 +2412,11 @@ def manage_open_positions() -> Dict[str, Any]:
                                         f"AutoTrader {t.ticker} SL INVARIANT VIOLATION: "
                                         f"stop_order_id {t.stop_order_id} status={sl_status} — resubmitting"
                                     )
+                                    _raise_alert(
+                                        "critical", "sl_invariant",
+                                        f"{t.ticker}: stop leg gone ({sl_status}); resubmit in progress",
+                                        ticker=t.ticker, trade_id=t.id,
+                                    )
                                     from alpaca.trading.requests import StopOrderRequest
                                     from alpaca.trading.enums import OrderSide, TimeInForce
                                     new_stop_price = round(float(t.current_stop or t.stop_loss), 2)
@@ -1803,6 +2434,12 @@ def manage_open_positions() -> Dict[str, Any]:
                                         metrics.inc("autotrade_event", event="sl_resubmitted")
                                     except Exception as _re:
                                         logger.error(f"AutoTrader {t.ticker} SL resubmit FAILED: {_re}")
+                                        record_sl_resubmit_failure()
+                                        _raise_alert(
+                                            "critical", "sl_resubmit_failed",
+                                            f"{t.ticker} SL resubmit FAILED: {_re} — POSITION IS NAKED",
+                                            ticker=t.ticker, trade_id=t.id,
+                                        )
                         except Exception as _e:
                             logger.warning(f"SL invariant check {t.ticker}: {_e}")
 
@@ -1856,7 +2493,11 @@ def manage_open_positions() -> Dict[str, Any]:
                                 touches = _target_touch_counts.get(t.id, 0) + 1
                                 _target_touch_counts[t.id] = touches
                                 if touches < _TARGET_CONFIRM_TICKS:
-                                    logger.info(
+                                    # Audit fix #12: demoted INFO → DEBUG.
+                                    # Target touches can fire 10+ times/min in
+                                    # volatile markets and otherwise drown
+                                    # the log stream.
+                                    logger.debug(
                                         f"AutoTrader {t.ticker} {['T1','T2','T3'][target_idx]} "
                                         f"touch {touches}/{_TARGET_CONFIRM_TICKS} @ {px:.2f} — awaiting confirmation"
                                     )
@@ -1870,7 +2511,25 @@ def manage_open_positions() -> Dict[str, Any]:
                                     skip_stop_move = False
                                     if target_idx == 0:
                                         atr_be = _chandelier_atr(t.ticker)
-                                        if atr_be and (next_target - t.entry_price) < _T1_BE_MIN_ATR * atr_be:
+                                        # Post-mortem fix (AAPL): the previous
+                                        # `if atr_be and …` guard let NaN/None
+                                        # fall through silently — NaN is truthy
+                                        # but `NaN < x` is False, so the
+                                        # too-tight-T1 skip never fired for
+                                        # AAPL (T1 only 11¢ above entry).
+                                        import math as _math
+                                        atr_ok = (atr_be is not None and
+                                                  isinstance(atr_be, (int, float)) and
+                                                  not _math.isnan(atr_be) and
+                                                  atr_be > 0)
+                                        # Belt-and-braces: percentage-based
+                                        # guard kicks in even if ATR is
+                                        # unavailable. T1 within 0.4% of entry
+                                        # is always too tight for a BE trail.
+                                        pct_gap = (next_target - t.entry_price) / max(0.01, t.entry_price)
+                                        too_tight_pct = pct_gap < 0.004
+                                        too_tight_atr = atr_ok and (next_target - t.entry_price) < _T1_BE_MIN_ATR * atr_be
+                                        if too_tight_pct or too_tight_atr:
                                             skip_stop_move = True
                                             logger.info(
                                                 f"AutoTrader {t.ticker} T1 too tight "
@@ -1889,7 +2548,23 @@ def manage_open_positions() -> Dict[str, Any]:
 
                                     if not skip_stop_move:
                                         if target_idx == 0:
-                                            new_stop = round(t.entry_price, 2)
+                                            # Post-mortem fix (AAPL/MRVL/MU chop-outs):
+                                            # instead of slamming the stop to full
+                                            # break-even at T1 — which is extremely
+                                            # vulnerable to normal 1% retraces when
+                                            # T1 is close to entry — trail to
+                                            # `entry − 0.3 × initial_risk`. The
+                                            # partial trim already realised at T1
+                                            # pays for 1/3 of the residual risk,
+                                            # so expected value is still positive
+                                            # while we keep meaningful breathing
+                                            # room for the winner to develop.
+                                            initial_risk = max(0.01, float(t.entry_price) - float(t.stop_loss))
+                                            soft_be = float(t.entry_price) - 0.3 * initial_risk
+                                            new_stop = round(max(soft_be, t.current_stop), 2)
+                                        elif target_idx == 1:
+                                            # At T2: now tighten to full entry (BE).
+                                            new_stop = round(float(t.entry_price), 2)
                                         else:
                                             prev = targets[target_idx - 1]
                                             new_stop = round(prev, 2) if prev else t.current_stop
@@ -1973,7 +2648,16 @@ def manage_open_positions() -> Dict[str, Any]:
                                                 t.hit_t1 = True
                                             tag = ["T1", "T2", "T3"][target_idx]
                                             t.note = (t.note or "") + f" | {tag} hit @ {px:.2f}, stop→{new_stop}"
-                                            if target_idx == 2:
+                                            if target_idx == 2 and (t.level_index or 0) < 3:
+                                                # First T3 cycle — recompute
+                                                # the next rung for one more
+                                                # leg. After that (level_index
+                                                # ≥ 3), let chandelier alone
+                                                # trail the runner instead of
+                                                # rolling fresh targets each
+                                                # leg — the BE-like stop moves
+                                                # from recompute chopped out
+                                                # otherwise-nice extensions.
                                                 new_targets = _recalculate_targets(t.ticker, "long", px)
                                                 if new_targets:
                                                     t.target1, t.target2, t.target3 = new_targets
@@ -1983,6 +2667,13 @@ def manage_open_positions() -> Dict[str, Any]:
                                                         new_targets,
                                                     )
                                                     t.note = (t.note or "") + f" | recalc T1-3: {new_targets}"
+                                            elif target_idx == 2:
+                                                # Past the first recompute —
+                                                # just let chandelier trail.
+                                                t.note = (t.note or "") + (
+                                                    f" | level_index ≥ 3, chandelier-only trail "
+                                                    f"(no more target recompute)"
+                                                )
                                             _target_touch_counts.pop(t.id, None)
                                             db.commit()
                                             summary["trailed"] += 1
@@ -1995,8 +2686,9 @@ def manage_open_positions() -> Dict[str, Any]:
                                 # got N confirmations — reset the streak.
                                 _target_touch_counts.pop(t.id, None)
 
-                            # 2c) Chandelier-exit overlay
-                            ch_mult = cfg_snapshot["chandelier_atr_mult"]
+                            # 2c) Chandelier-exit overlay — adaptive to trend strength.
+                            base_mult = cfg_snapshot["chandelier_atr_mult"]
+                            ch_mult = _adaptive_chandelier_mult(base_mult, t.ticker) if base_mult > 0 else 0
                             if ch_mult > 0 and (t.level_index or 0) >= 1 and t.high_water_mark:
                                 _atr = _chandelier_atr(t.ticker)
                                 if _atr is not None:

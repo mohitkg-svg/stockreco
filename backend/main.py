@@ -35,11 +35,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
-from database import create_tables, SessionLocal, WatchlistStock
-from routers import watchlist, analysis, backtest, options, stream, trading
+from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
+from services import news as news_svc
 
 FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
 
@@ -181,10 +182,30 @@ async def lifespan(app: FastAPI):
         scheduled_scan, "interval", minutes=15, id="watchlist_scan",
         max_instances=1, coalesce=True, misfire_grace_time=60,
     )
-    # Trail stops to break-even at T1 and reconcile filled exits every 60s.
+    # Audit fix #2: manage loop cadence 60s → 20s. Previously any broker-
+    # side SL drop could leave a position naked for up to 60s before the
+    # next tick detected it. 20s caps the exposure window at ~1/3 of that
+    # while still respecting Alpaca's REST rate limit on status-poll calls.
     scheduler.add_job(
-        _scheduled_manage, "interval", seconds=60, id="auto_trader_manage",
-        max_instances=1, coalesce=True, misfire_grace_time=30,
+        _scheduled_manage, "interval", seconds=20, id="auto_trader_manage",
+        max_instances=1, coalesce=True, misfire_grace_time=10,
+    )
+    # Audit fix #9: hourly detection of unexpected stock positions
+    # (option-assignment surprises, manual trades outside the bot, etc.).
+    # Alerts the operator if Alpaca reports a position we don't track.
+    scheduler.add_job(
+        auto_trader.detect_unexpected_positions, "interval", minutes=60,
+        id="unexpected_positions_audit",
+        max_instances=1, coalesce=True, misfire_grace_time=120,
+    )
+    # News ingestion — alpaca-py 0.21.1 doesn't yet export NewsDataStream,
+    # so the 2-min REST poll remains our news ingestion path. The
+    # live_quotes._news_worker is already coded to auto-activate once the
+    # SDK adds the class (falls back to no-op silently on import error).
+    # Cadence stays at 2m — fast enough for event-driven reactions.
+    scheduler.add_job(
+        news_svc.poll_watchlist, "interval", minutes=2, id="news_poll",
+        max_instances=1, coalesce=True, misfire_grace_time=60,
     )
     # F1: Nightly confidence-vs-realized calibration (03:10 UTC = 23:10 ET).
     # Pure read-only aggregation — logs the win-rate per confidence bucket
@@ -218,6 +239,22 @@ async def lifespan(app: FastAPI):
         # record the error so /api/health can flag the silent-stream-failure.
         _app_health["live_quotes_error"] = str(e)
         logger.error(f"Could not start live quotes: {e}")
+
+    # Re-subscribe option stream to any OCC symbols of trades open at boot.
+    try:
+        from database import AutoTrade as _AT
+        _db2 = SessionLocal()
+        try:
+            occ_syms = [r.symbol for r in _db2.query(_AT).filter(
+                _AT.asset_type == "option",
+                _AT.status.in_(["pending", "open"]),
+            ).all() if r.symbol]
+        finally:
+            _db2.close()
+        if occ_syms:
+            live_quotes.ensure_option_symbols(occ_syms)
+    except Exception as e:
+        logger.warning(f"option-stream boot resubscribe skipped: {e}")
 
     yield
     scheduler.shutdown()
@@ -255,6 +292,28 @@ if _ALPACA_LIVE:
             "ALPACA_LIVE=1 requires APP_API_KEY to be set — "
             "refuse to expose live trading endpoints without auth"
         )
+    # Audit fix #3: verify broker connectivity at boot. A silent None
+    # return from _get_client() (e.g., creds mounted but malformed) would
+    # otherwise let the app boot healthy and silently fail every order.
+    from services import paper_trader as _pt_boot
+    _boot_client = _pt_boot._get_client()
+    if _boot_client is None:
+        raise RuntimeError(
+            "ALPACA_LIVE=1 but Alpaca TradingClient could not be initialized — "
+            "check APCA_API_KEY_ID / APCA_API_SECRET_KEY are set and valid"
+        )
+    try:
+        _boot_acct = _pt_boot.get_account()
+        if not _boot_acct:
+            raise RuntimeError("Alpaca /account probe returned empty — creds may be wrong")
+        logger.critical(
+            f"Boot: Alpaca LIVE account verified · equity=${float(_boot_acct['equity']):.0f} "
+            f"· cash=${float(_boot_acct['cash']):.0f} · pdt={_boot_acct.get('pattern_day_trader')}"
+        )
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Alpaca /account probe failed at boot: {e} — refusing to start live")
     logger.critical(
         "========================================\n"
         "  LIVE TRADING MODE ENABLED\n"
@@ -304,6 +363,8 @@ app.include_router(backtest.router)
 app.include_router(options.router)
 app.include_router(stream.router)
 app.include_router(trading.router)
+app.include_router(news.router)
+app.include_router(alerts_router.router)
 
 
 @app.get("/api/health")
@@ -354,10 +415,46 @@ def health():
     except Exception:
         pass
 
+    # Audit fix #11: surface critical operational state so the frontend
+    # bell icon / external monitors can detect silent-failure modes.
+    bp_breaker = False
+    broker_down_flag = False
+    sl_failures_1h = 0
+    killed_flag = False
+    killed_reason = None
+    alerts_unacked = 0
+    try:
+        from services import auto_trader as _at_h
+        bp_breaker = _at_h.bp_breaker_active()
+        broker_down_flag = _at_h.broker_down()
+        sl_failures_1h = _at_h.sl_resubmit_failures_1h()
+    except Exception:
+        pass
+    try:
+        _dbk = SessionLocal()
+        try:
+            _cfg = _dbk.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            if _cfg:
+                killed_flag = bool(_cfg.killed)
+                killed_reason = _cfg.killed_reason
+        finally:
+            _dbk.close()
+    except Exception:
+        pass
+    try:
+        from services import alerts as _alerts_h
+        alerts_unacked = _alerts_h.count_unacked(since_hours=24)
+    except Exception:
+        pass
+
     degraded = (
         not _app_health["scheduler_started"]
         or not _app_health["live_quotes_started"]
         or (stream_stale_secs is not None and stream_stale_secs > 120)
+        or bp_breaker
+        or broker_down_flag
+        or killed_flag
+        or sl_failures_1h > 0
     )
     return {
         "status": "ok",
@@ -372,6 +469,13 @@ def health():
         "open_positions": open_positions,
         "auth_configured": auth_configured(),
         "alpaca_live": _ALPACA_LIVE,
+        # Audit fix #11 — new critical-state fields
+        "bp_breaker_active": bp_breaker,
+        "broker_down": broker_down_flag,
+        "sl_resubmit_failures_1h": sl_failures_1h,
+        "killed": killed_flag,
+        "killed_reason": killed_reason,
+        "alerts_unacked": alerts_unacked,
     }
 
 
