@@ -1757,6 +1757,134 @@ function TradeFromSignal({ signal }) {
   );
 }
 
+// ---------- Universe Scanner / Candidate Pool Panel ----------
+// Shows the current top-N tickers identified by the universe scanner.
+// Auto-trader picks from this pool when `cfg.use_universe_scanner=true`.
+// Collapsible, scrollable; manual "Rescan" button triggers the scheduler
+// job on demand (takes 30-60s for ~500 tickers).
+function CandidatePoolPanel() {
+  const [rows, setRows] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [err, setErr] = useState(null);
+  const [open, setOpen] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const d = await api.get('/api/trading/auto/candidate-pool?limit=50');
+      setRows(d || []);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 60000);   // refresh every minute
+    return () => clearInterval(iv);
+  }, [load]);
+
+  const rescan = useCallback(async () => {
+    setScanning(true); setErr(null);
+    try {
+      const r = await api.post('/api/trading/auto/universe-scan');
+      console.info('universe scan result', r);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setScanning(false);
+    }
+  }, [load]);
+
+  const count = Array.isArray(rows) ? rows.length : 0;
+  const header = (
+    <div className="flex items-center justify-between">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-base font-bold">🎯 Candidate Pool</span>
+        <span className="pill text-[10px]">{count}</span>
+        {rows?.[0]?.generated_at && (
+          <span className="text-[11px] app-text-muted font-mono">
+            · updated {relativeTime(rows[0].generated_at)}
+          </span>
+        )}
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={(e) => { e.stopPropagation(); rescan(); }}
+          disabled={scanning}
+          className="text-[11px] px-2.5 py-1 rounded-md surface-soft border app-border hover:bg-white/5 disabled:opacity-50"
+        >
+          {scanning ? 'Scanning…' : '↻ Rescan'}
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="surface rounded-2xl p-4 shadow-xl">
+      <button onClick={() => setOpen(o => !o)} className="w-full text-left">
+        {header}
+      </button>
+      <div className="text-[11px] app-text-muted leading-relaxed mt-1">
+        Top {count} setups ranked across ~500 liquid US equities. Auto-trader picks from this pool when <code className="app-text-primary">use_universe_scanner</code> is enabled. Scans 4× per day at market-sensitive UTC slots (12:00, 14:30, 17:00, 19:30).
+      </div>
+      {open && (
+        <div className="mt-3 overflow-x-auto">
+          {loading && !rows && <div className="text-xs app-text-muted italic">Loading…</div>}
+          {err && <div className="text-xs text-red-400">Error: {err}</div>}
+          {Array.isArray(rows) && rows.length === 0 && !loading && (
+            <div className="text-sm app-text-muted italic py-4 text-center">
+              Pool is empty. Click <strong>Rescan</strong> above to seed it, or wait for the next scheduled scan.
+            </div>
+          )}
+          {Array.isArray(rows) && rows.length > 0 && (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="app-text-muted border-b app-border">
+                  <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">#</th>
+                  <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Ticker</th>
+                  <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Score</th>
+                  <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Price</th>
+                  <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">RVOL</th>
+                  <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">RS 20d</th>
+                  <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">ADX</th>
+                  <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">% 52wH</th>
+                  <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Setup</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={r.ticker} className="border-b app-border-soft last:border-0 hover:bg-white/3">
+                    <td className="py-1.5 px-2 app-text-muted font-mono">{i + 1}</td>
+                    <td className="py-1.5 px-2 font-semibold font-mono">{r.ticker}</td>
+                    <td className="text-right py-1.5 px-2 font-mono font-semibold">{r.score?.toFixed(1)}</td>
+                    <td className="text-right py-1.5 px-2 font-mono">${r.price?.toFixed(2)}</td>
+                    <td className={`text-right py-1.5 px-2 font-mono ${r.rvol >= 1.5 ? 'text-emerald-400' : r.rvol < 0.7 ? 'text-red-400' : ''}`}>
+                      {r.rvol?.toFixed(2)}
+                    </td>
+                    <td className={`text-right py-1.5 px-2 font-mono ${r.rs_20d >= 0.05 ? 'text-emerald-400' : r.rs_20d <= -0.05 ? 'text-red-400' : ''}`}>
+                      {r.rs_20d >= 0 ? '+' : ''}{((r.rs_20d || 0) * 100).toFixed(1)}%
+                    </td>
+                    <td className="text-right py-1.5 px-2 font-mono">{r.adx?.toFixed(0)}</td>
+                    <td className={`text-right py-1.5 px-2 font-mono ${(r.pct_from_52w_high || 0) >= -0.03 ? 'text-emerald-400' : ''}`}>
+                      {((r.pct_from_52w_high || 0) * 100).toFixed(1)}%
+                    </td>
+                    <td className="py-1.5 px-2 text-[11px] app-text-secondary">{r.reason}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------- Auto-Trader Panel: enable, configure, monitor automated trades ----------
 function AutoTraderPanel({ reloadToken }) {
   const [status, setStatus] = useState(null);
@@ -1861,6 +1989,7 @@ function AutoTraderPanel({ reloadToken }) {
           {cfg.trade_options && <span className="pill">Puts ON</span>}
           {cfg.trade_calls && <span className="pill">Calls ON</span>}
           {cfg.aggressive_options_mode && <span className="pill pill-warn">🚀 Aggressive</span>}
+          {cfg.use_universe_scanner && <span className="pill pill-success">🎯 Universe ON</span>}
           {cfg.dry_run && <span className="pill pill-warn">Dry run</span>}
           <span className="pill">Conf ≥ {cfg.confidence_threshold}%</span>
         </div>
@@ -1993,6 +2122,29 @@ function AutoTraderPanel({ reloadToken }) {
                 </div>
               )}
             </div>
+          </div>
+          {/* Universe scanner + entry order type */}
+          <div className="mt-3 pt-3 border-t app-border-soft space-y-2">
+            <label className="flex items-start gap-2 cursor-pointer text-sm">
+              <input type="checkbox" checked={!!cfg.use_universe_scanner}
+                     onChange={e => updateCfg({ use_universe_scanner: e.target.checked })}
+                     className="accent-blue-500 mt-0.5" />
+              <div>
+                <div className="font-semibold">🎯 Universe scanner (top-N ranked)</div>
+                <div className="text-[11px] app-text-muted leading-relaxed">
+                  Trade from the daily top-{cfg.universe_top_n ?? 30} setups across ~500 liquid US equities instead of just the watchlist. Scan runs 4× per day at UTC 12:00 / 14:30 / 17:00 / 19:30.
+                </div>
+              </div>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer text-sm">
+              <input type="checkbox" checked={cfg.entry_order_type === 'limit_at_mid'}
+                     onChange={e => updateCfg({ entry_order_type: e.target.checked ? 'limit_at_mid' : 'market' })}
+                     className="accent-blue-500" />
+              <span>
+                <strong>Limit-at-mid entries</strong>
+                <span className="text-[11px] app-text-muted ml-2">captures ~half the bid-ask spread; falls back to market on illiquid quotes</span>
+              </span>
+            </label>
           </div>
           <div className="mt-3 text-[11px] app-text-muted leading-relaxed">
             Strategy: long stock on BUY ≥ threshold with bracket stop. Soft-BE at T1 · BE at T2 · recompute + chandelier past T3. Puts use a synthesized bear thesis; exits on T1/T2 hit, 50% premium decay, or underlying broke stop.
@@ -2867,6 +3019,7 @@ function AuthedApp({ onLogout }) {
         {view === 'trading' && (
           <div className="flex-1 overflow-y-auto scrollbar-thin p-2 sm:p-4 space-y-3 sm:space-y-4">
             <AutoTraderPanel reloadToken={reloadToken} />
+            <CandidatePoolPanel />
             <NewsAnalysisSummary />
             <TradingPanel reloadToken={reloadToken} />
           </div>

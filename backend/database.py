@@ -18,18 +18,17 @@ if _IS_SQLITE:
     # default 5s, even if SQLite's pragma would have waited longer.
     _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
 else:
-    # Postgres: connection pool with pre-ping so idle connections that
-    # Neon/Cloud SQL may drop are recycled transparently. Sizing rationale:
-    #   scan jobs: up to 4 parallel watchlist scanners × 2 sessions each
-    #   manage loop: 1 + per-trade session in the inner loop (up to ~15)
-    #   HTTP request handlers: up to ~10 concurrent
-    #   news/calibration/misc: ~2
-    # Bumped from 5+5=10 → 15+10=25 after audit found manage-loop stalling
-    # when parallel scans exhausted the old 10-connection ceiling.
+    # Postgres: connection pool with pre-ping. Cloud SQL db-f1-micro only
+    # has ~25 total slots with 3-5 reserved for superusers, so keep our
+    # ceiling well under that. 8+7=15 leaves room for the background
+    # scheduler jobs (news poll, universe scanner, best_strategy) to share
+    # the same pool without tripping "remaining connection slots reserved"
+    # at boot when they all initialize simultaneously.
     _engine_kwargs["pool_pre_ping"] = True
-    _engine_kwargs["pool_size"] = 15
-    _engine_kwargs["max_overflow"] = 10
-    _engine_kwargs["pool_recycle"] = 3600  # recycle stale connections hourly
+    _engine_kwargs["pool_size"] = 8
+    _engine_kwargs["max_overflow"] = 7
+    _engine_kwargs["pool_recycle"] = 3600
+    _engine_kwargs["pool_timeout"] = 30
 
 engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
@@ -105,6 +104,20 @@ class AutoTraderConfig(Base):
     # prevented stacking calls on top of existing stock longs. Meant to be
     # used alongside a 30/70 stock/option budget split.
     aggressive_options_mode = Column(Boolean, default=False)
+    # Entry order type: "market" (default) or "limit_at_mid".
+    # limit_at_mid submits a limit at (bid+ask)/2 with a 3-min cancel timer.
+    # Saves ~half the bid-ask spread on liquid names. For illiquid or
+    # fast-moving signals, market is still safer.
+    entry_order_type = Column(String, default="market")
+    # When true, auto-trader scans the union of watchlist + candidate_pool
+    # (top-N tickers from universe scanner). When false, watchlist only.
+    use_universe_scanner = Column(Boolean, default=False)
+    # How many candidates the scanner keeps in the pool.
+    universe_top_n = Column(Integer, default=30)
+    # CSV of ticker symbols to never auto-trade (stock or options). Applied
+    # in consider_signal / consider_call_play / consider_put_play and by the
+    # universe scanner (which skips blacklisted names from the pool).
+    ticker_blacklist = Column(String, default="")
     # CSV of timeframes whose signals are eligible to open auto-trades. Anything
     # not on this list (e.g. "1mo", "5m") is ignored even if confidence > gate.
     signal_timeframes = Column(String, default="1h,4h,1d")
@@ -183,6 +196,69 @@ class AutoTrade(Base):
     low_water_mark = Column(Float, nullable=True)   # for short trades
     # Sector tag captured at entry (for correlation sizing)
     sector = Column(String, nullable=True)
+    # Critical-audit fix #11: snapshot of qty at entry so partial trims at
+    # T1/T2 reference a fixed denominator, not the shrinking current qty.
+    # Prevents exponential position decay across cascaded trims.
+    original_qty = Column(Float, nullable=True)
+
+
+class CandidatePool(Base):
+    """Universe scanner output — top-N tickers currently exhibiting a viable
+    setup. Populated by `services/universe_scanner.py` every 15 minutes.
+    Auto-trader's scan reads from the union of (watchlist, candidate_pool)
+    when `cfg.use_universe_scanner` is true.
+    """
+    __tablename__ = "candidate_pool"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=True)
+    sector = Column(String, nullable=True)
+    price = Column(Float, nullable=True)
+    score = Column(Float, nullable=False, index=True)  # composite pre-filter score
+    rvol = Column(Float, nullable=True)
+    rs_20d = Column(Float, nullable=True)
+    rs_60d = Column(Float, nullable=True)
+    adx = Column(Float, nullable=True)
+    pct_from_52w_high = Column(Float, nullable=True)
+    reason = Column(String, nullable=True)        # human-readable setup tag
+    generated_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class BestStrategyPerTicker(Base):
+    """Cached winner of the per-ticker walk-forward backtest.
+
+    Updated weekly by `compute_best_strategy_per_ticker()`. The signal
+    generator uses this to preferentially emit signals from the strategy
+    that has demonstrated edge on THIS ticker over the holdout window.
+    """
+    __tablename__ = "best_strategy_per_ticker"
+    ticker = Column(String, primary_key=True)
+    strategy = Column(String, nullable=False)
+    direction = Column(String, nullable=False)     # BUY|SELL
+    confidence = Column(Float, nullable=False)
+    oos_trades = Column(Integer, nullable=True)
+    win_rate = Column(Float, nullable=True)
+    avg_pl = Column(Float, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ConfidenceCalibration(Base):
+    """Per-bucket realized win-rate from closed auto-trades.
+
+    Populated nightly by `compute_confidence_calibration`. Used by
+    `consider_signal` to apply an empirical multiplier on the risk budget:
+    high-confidence buckets that have underperformed get shrunk, buckets
+    that beat expectation get boosted. Closes the loop that was previously
+    just being logged.
+    """
+    __tablename__ = "confidence_calibration"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bucket = Column(String, index=True, unique=True, nullable=False)  # "70-79" etc.
+    n = Column(Integer, nullable=False)
+    win_rate = Column(Float, nullable=False)      # 0..1
+    avg_pl = Column(Float, nullable=False)
+    multiplier = Column(Float, nullable=False, default=1.0)  # risk-budget multiplier
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Alert(Base):
@@ -323,6 +399,11 @@ def create_tables():
     _ensure_column("auto_trader_config", "flatten_by_eod", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "trade_calls", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "aggressive_options_mode", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "entry_order_type", "VARCHAR DEFAULT 'market'")
+    _ensure_column("auto_trader_config", "use_universe_scanner", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "universe_top_n", "INTEGER DEFAULT 30")
+    _ensure_column("auto_trader_config", "ticker_blacklist", "VARCHAR DEFAULT ''")
+    _ensure_column("auto_trades", "original_qty", "DOUBLE PRECISION")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:

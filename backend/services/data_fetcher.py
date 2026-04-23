@@ -49,6 +49,7 @@ _crumb_expiry: float = 0
 BASE_URL = "https://query2.finance.yahoo.com"
 
 TIMEFRAME_CONFIG = {
+    "1m":  {"interval": "1m",  "range": "2d",   "ttl": 60},    # entry confirmation only
     # Range tuning: the chart UI only displays 50-80 bars by default and
     # SMA200 is the deepest indicator we plot. So we keep ~5× SMA200 worth
     # of bars (≈1000 bars) for each intraday TF — enough headroom for the
@@ -216,9 +217,8 @@ def _resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
 # Alpaca historical bars (preferred when credentials are present)
 # ------------------------------------------------------------------
 _ALPACA_TF = {
-    # Mirror the trimmed Yahoo ranges so the fallback path doesn't pull
-    # 10x more data than the chart uses. ~780-1200 bars per intraday TF.
-    "5m":  ("5Min",  10),     # (alpaca-tf, lookback days)
+    "1m":  ("1Min",  2),      # Profit-audit #6: 1-min SIP bars for entry confirmation
+    "5m":  ("5Min",  10),
     "15m": ("15Min", 30),
     "30m": ("30Min", 60),
     "1h":  ("1Hour", 180),
@@ -271,6 +271,7 @@ def _fetch_alpaca_bars(ticker: str, timeframe: str) -> pd.DataFrame:
         atf_str, days = cfg
         # Map string → TimeFrame enum
         tf_map = {
+            "1Min":  TimeFrame(1, TimeFrameUnit.Minute),
             "5Min":  TimeFrame(5, TimeFrameUnit.Minute),
             "15Min": TimeFrame(15, TimeFrameUnit.Minute),
             "30Min": TimeFrame(30, TimeFrameUnit.Minute),

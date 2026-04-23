@@ -481,7 +481,83 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
 
     if bull_score > bear_score and confidence_bull >= 55:
         signal_type = "BUY"
-        confidence = min(round(confidence_bull), 95)
+        # Regime-aware confidence (profit-audit #2):
+        _regime_mult = 1.0
+        _adx_cur = float(ind.get("adx") or 0)
+        if _adx_cur and _adx_cur < 20:
+            _regime_mult *= 0.85
+        elif _adx_cur and _adx_cur > 35:
+            _regime_mult *= 1.05
+        _rsi_cur = float(ind.get("rsi") or 50)
+        if _rsi_cur > 75:
+            _regime_mult *= 0.90
+
+        # Ground-up Tier 1: RVOL boost/penalty.
+        # High RVOL breakouts work 2-3× as often as low-RVOL. Reject signals
+        # with RVOL < 0.6 (fakeout risk) and boost those with RVOL > 1.5.
+        try:
+            _vol_cur = float(ind.get("volume") or 0)
+            _vol_avg = float(ind.get("vol_sma20") or 0)
+            rvol = (_vol_cur / _vol_avg) if _vol_avg > 0 else 1.0
+        except Exception:
+            rvol = 1.0
+        if rvol >= 2.0:
+            _regime_mult *= 1.12
+        elif rvol >= 1.5:
+            _regime_mult *= 1.06
+        elif rvol < 0.6:
+            _regime_mult *= 0.85
+
+        # Ground-up Tier 1: Relative strength vs SPY (20-day).
+        # Tickers outperforming SPY have momentum tail wind; laggards are
+        # usually value traps. Compute on the fly — cheap with cached OHLCV.
+        try:
+            from services.data_fetcher import fetch_ohlcv as _fo_rs
+            spy_df = _fo_rs("SPY", "1d")
+            if spy_df is not None and not spy_df.empty and len(spy_df) >= 21:
+                spy_r20 = float(spy_df["Close"].iloc[-1] / spy_df["Close"].iloc[-21] - 1)
+                tk_r20 = float(df["Close"].iloc[-1] / df["Close"].iloc[-21] - 1) if len(df) >= 21 else 0.0
+                rs_diff = tk_r20 - spy_r20
+                if rs_diff >= 0.05:
+                    _regime_mult *= 1.10   # strong leader
+                elif rs_diff >= 0.02:
+                    _regime_mult *= 1.04
+                elif rs_diff <= -0.05:
+                    _regime_mult *= 0.88   # laggard
+                elif rs_diff <= -0.02:
+                    _regime_mult *= 0.94
+        except Exception:
+            pass
+
+        # Ground-up Tier 3: Sector momentum + market breadth.
+        try:
+            from services.market_context import (
+                sector_confidence_multiplier,
+                breadth_confidence_multiplier,
+            )
+            from services.data_fetcher import get_ticker_info as _gti
+            _sector = (_gti(ticker).get("sector") or "").strip()
+            _regime_mult *= sector_confidence_multiplier(_sector, "BUY")
+            _regime_mult *= breadth_confidence_multiplier("BUY")
+        except Exception:
+            pass
+
+        # Ground-up Tier 2: best-strategy-per-ticker boost.
+        try:
+            from services.best_strategy import confidence_boost
+            _regime_mult *= confidence_boost(ticker, "Composite (multi-factor)", "BUY")
+        except Exception:
+            pass
+
+        # Ground-up Tier 2: recent-earnings catalyst boost (PEAD).
+        try:
+            from services.earnings import recent_earnings_catalyst
+            if recent_earnings_catalyst(ticker, days_back=10):
+                _regime_mult *= 1.05   # modest boost; overdoing gets volatile
+        except Exception:
+            pass
+
+        confidence = min(round(confidence_bull * _regime_mult), 95)
         entry = round(price, 2)
 
         # Stop: prefer just below nearest demand-zone LOW (stronger than swing-low alone)
@@ -523,6 +599,15 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         # Multi-TF resistances above = institutional ceilings (strong T2/T3 candidates)
         for r in mtf_resists_above:
             above.append(float(r["price"]))
+        # Ground-up Tier 2: Volume-profile levels (POC/VAH/VAL) — high-probability
+        # magnets where large institutions previously transacted.
+        try:
+            from services.volume_profile import compute_volume_profile, levels_above
+            _vp = compute_volume_profile(df, window=60, num_bins=40)
+            for lvl in levels_above(_vp, entry):
+                above.append(float(lvl))
+        except Exception:
+            pass
         above = sorted(set(round(v, 2) for v in above))
         # Audit fix H3: enforce a minimum R:R ≥ 1.0 on T1. Without this, a
         # supply cluster that sits 0.3×risk above entry could become T1 and
@@ -544,7 +629,70 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         t3 = picked[2] if len(picked) >= 3 else max(entry + risk * 4.0, t2 + risk)
     elif bear_score > bull_score and confidence_bear >= 55:
         signal_type = "SELL"
-        confidence = min(round(confidence_bear), 95)
+        # Regime-aware confidence (profit-audit #2, SELL/put side mirror).
+        _regime_mult = 1.0
+        _adx_cur = float(ind.get("adx") or 0)
+        if _adx_cur and _adx_cur < 20:
+            _regime_mult *= 0.85
+        elif _adx_cur and _adx_cur > 35:
+            _regime_mult *= 1.05
+        _rsi_cur = float(ind.get("rsi") or 50)
+        if _rsi_cur < 25:
+            _regime_mult *= 0.90
+
+        # Ground-up Tier 1 mirror: RVOL, RS, sector, breadth (SELL direction).
+        try:
+            _vol_cur = float(ind.get("volume") or 0)
+            _vol_avg = float(ind.get("vol_sma20") or 0)
+            rvol = (_vol_cur / _vol_avg) if _vol_avg > 0 else 1.0
+        except Exception:
+            rvol = 1.0
+        if rvol >= 2.0:
+            _regime_mult *= 1.12
+        elif rvol >= 1.5:
+            _regime_mult *= 1.06
+        elif rvol < 0.6:
+            _regime_mult *= 0.85
+
+        try:
+            from services.data_fetcher import fetch_ohlcv as _fo_rs
+            spy_df = _fo_rs("SPY", "1d")
+            if spy_df is not None and not spy_df.empty and len(spy_df) >= 21:
+                spy_r20 = float(spy_df["Close"].iloc[-1] / spy_df["Close"].iloc[-21] - 1)
+                tk_r20 = float(df["Close"].iloc[-1] / df["Close"].iloc[-21] - 1) if len(df) >= 21 else 0.0
+                rs_diff = tk_r20 - spy_r20
+                # For SELL, UNDERperformance is the edge.
+                if rs_diff <= -0.05:
+                    _regime_mult *= 1.10
+                elif rs_diff <= -0.02:
+                    _regime_mult *= 1.04
+                elif rs_diff >= 0.05:
+                    _regime_mult *= 0.88
+                elif rs_diff >= 0.02:
+                    _regime_mult *= 0.94
+        except Exception:
+            pass
+
+        try:
+            from services.market_context import (
+                sector_confidence_multiplier,
+                breadth_confidence_multiplier,
+            )
+            from services.data_fetcher import get_ticker_info as _gti
+            _sector = (_gti(ticker).get("sector") or "").strip()
+            _regime_mult *= sector_confidence_multiplier(_sector, "SELL")
+            _regime_mult *= breadth_confidence_multiplier("SELL")
+        except Exception:
+            pass
+
+        # Ground-up Tier 2: best-strategy-per-ticker boost.
+        try:
+            from services.best_strategy import confidence_boost
+            _regime_mult *= confidence_boost(ticker, "Composite (multi-factor)", "SELL")
+        except Exception:
+            pass
+
+        confidence = min(round(confidence_bear * _regime_mult), 95)
         entry = round(price, 2)
 
         zone_ceilings = []
@@ -580,6 +728,14 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         # Multi-TF supports below = institutional floors (strong T2/T3 candidates)
         for s in mtf_supports_below:
             below.append(float(s["price"]))
+        # Ground-up Tier 2: Volume-profile levels (POC/VAH/VAL below price).
+        try:
+            from services.volume_profile import compute_volume_profile, levels_below
+            _vp = compute_volume_profile(df, window=60, num_bins=40)
+            for lvl in levels_below(_vp, entry):
+                below.append(float(lvl))
+        except Exception:
+            pass
         below = sorted(set(round(v, 2) for v in below), reverse=True)
         # Audit fix H3 (short mirror): drop any candidate closer than 1R to
         # entry so T1 always offers ≥ 1:1 reward-to-risk.

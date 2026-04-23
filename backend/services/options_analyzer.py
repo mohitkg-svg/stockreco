@@ -109,13 +109,31 @@ def _dte(expiration_ts: int) -> int:
     return max(0, math.ceil(seconds_remaining / 86400))
 
 
-def _score(rr_t1: float, rr_t2: float, rr_t3: float, dte: int, vol: int, oi: int, iv: float, delta_proxy: float) -> float:
-    """0-100 composite score for an option contract."""
-    # Use best R:R across targets (T1 often too close for 3:1)
+def _score(
+    rr_t1: float, rr_t2: float, rr_t3: float, dte: int, vol: int, oi: int, iv: float,
+    delta_proxy: float,
+    premium: float = 0.0,
+    # Real Greeks from Alpaca OPRA/indicative feed (AT+ tier). When None,
+    # we fall back to the delta_proxy heuristic so Yahoo fallback still scores.
+    delta: Optional[float] = None, theta: Optional[float] = None,
+    gamma: Optional[float] = None, vega: Optional[float] = None,
+) -> float:
+    """Composite score for an option contract. Max ~125 with Greeks, ~100 without.
+
+    Sections (each independent so operator can intuit why a contract ranks):
+      R:R core              → 40 pts
+      R:R T2 bonus          → 15 pts
+      DTE sweet-spot        → 15 pts
+      Liquidity (vol/OI)    → 20 pts
+      Delta fitness         → 10 pts  (real delta when available)
+      Theta efficiency      → 15 pts  (Greeks-only)
+      Vega-crush penalty    → −10 pts (Greeks-only)
+      Gamma leverage        → 10 pts  (Greeks-only)
+    """
     best_rr = max(rr_t1, rr_t2, rr_t3)
-    rr_score = min(best_rr / 5.0, 1.0) * 40                    # 5:1 on any target → 40
-    rr2_bonus = min(rr_t2 / 10.0, 1.0) * 15                    # 10:1 on T2 → 15
-    # DTE sweet spot 30-60d; weeklies get decent score when R:R is very high
+    rr_score = min(best_rr / 5.0, 1.0) * 40
+    rr2_bonus = min(rr_t2 / 10.0, 1.0) * 15
+
     if 30 <= dte <= 60:
         dte_score = 15
     elif 20 <= dte <= 75:
@@ -123,15 +141,62 @@ def _score(rr_t1: float, rr_t2: float, rr_t3: float, dte: int, vol: int, oi: int
     elif 8 <= dte <= 19:
         dte_score = 8
     elif dte <= WEEKLY_DTE:
-        # Weeklies: good only when best_rr is exceptional (theta burns fast)
         dte_score = 10 if best_rr >= 6 else 5
     else:
         dte_score = 5
-    # Liquidity
+
     liq = min((vol / 100.0), 1.0) * 10 + min((oi / 500.0), 1.0) * 10
-    # Delta ~0.4-0.6 is ideal (good gearing, enough intrinsic)
-    delta_score = 10 * max(0.0, 1.0 - abs(abs(delta_proxy) - 0.5) / 0.5)
-    return round(rr_score + rr2_bonus + dte_score + liq + delta_score, 1)
+
+    # Delta fitness: real delta wins when present (accounts for skew, vol
+    # smile, and moneyness non-linearity that the proxy ignores).
+    d_eff = delta if delta is not None else delta_proxy
+    delta_score = 10 * max(0.0, 1.0 - abs(abs(d_eff) - 0.5) / 0.5)
+
+    # ---- Greeks-aware adjustments ----
+    theta_efficiency = 0.0
+    vega_penalty = 0.0
+    gamma_reward = 0.0
+
+    if theta is not None and premium > 0:
+        # Critical-audit fix #3: don't DOUBLE-penalize weeklies. The dte_score
+        # above already penalizes <=7 DTE (5-10 pts vs 15). Applying both
+        # dte_score AND theta_efficiency on weeklies punishes good 2-3 day
+        # setups that happen to be on short calendar. Skip theta efficiency
+        # entirely for weeklies — dte_score handles calendar risk there.
+        if dte > WEEKLY_DTE:
+            theta_pct = abs(theta) / premium
+            if theta_pct <= 0.01:
+                theta_efficiency = 15
+            elif theta_pct <= 0.02:
+                theta_efficiency = 10
+            elif theta_pct <= 0.03:
+                theta_efficiency = 5
+            elif theta_pct <= 0.05:
+                theta_efficiency = 0
+            else:
+                theta_efficiency = -8
+
+    if vega is not None and iv and iv > 0 and premium > 0:
+        # Vol-crush exposure = vega × IV / premium — high when we're paying
+        # for inflated vol that may mean-revert against the thesis.
+        vc = abs(vega) * float(iv) / premium
+        if vc > 0.10:
+            vega_penalty = -10
+        elif vc > 0.05:
+            vega_penalty = -5
+
+    if gamma is not None and premium > 0:
+        # Gamma-per-dollar: how fast delta changes per underlying unit per
+        # dollar of premium. High = strong leverage on favorable moves.
+        gpd = gamma / premium
+        if gpd >= 0.05:
+            gamma_reward = 10
+        elif gpd >= 0.02:
+            gamma_reward = 5
+
+    total = (rr_score + rr2_bonus + dte_score + liq + delta_score
+             + theta_efficiency + vega_penalty + gamma_reward)
+    return round(total, 1)
 
 
 def _delta_proxy(spot: float, strike: float, is_call: bool) -> float:
@@ -231,8 +296,21 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             if best_rr < MIN_RR:
                 continue
 
-            delta = _delta_proxy(spot, strike, is_call)
-            score = _score(rr_t1, rr_t2, rr_t3, dte, vol, oi, iv, delta)
+            proxy = _delta_proxy(spot, strike, is_call)
+            # Real Greeks from Alpaca snapshot (None when falling back to Yahoo).
+            real_delta = o.get("delta")
+            real_theta = o.get("theta")
+            real_gamma = o.get("gamma")
+            real_vega  = o.get("vega")
+            score = _score(
+                rr_t1, rr_t2, rr_t3, dte, vol, oi, iv, proxy,
+                premium=premium,
+                delta=real_delta, theta=real_theta,
+                gamma=real_gamma, vega=real_vega,
+            )
+            # For downstream consumers: surface the real delta when we have it,
+            # fall back to proxy. This is what gets shown as "Δ" in the UI.
+            delta = real_delta if real_delta is not None else proxy
 
             breakeven = strike + premium if is_call else strike - premium
 

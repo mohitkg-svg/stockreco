@@ -37,6 +37,10 @@ class AutoTraderConfigRequest(BaseModel):
     trade_options: Optional[bool] = None
     trade_calls: Optional[bool] = None
     aggressive_options_mode: Optional[bool] = None
+    entry_order_type: Optional[str] = Field(None, pattern="^(market|limit_at_mid)$")
+    use_universe_scanner: Optional[bool] = None
+    universe_top_n: Optional[int] = Field(None, ge=5, le=200)
+    ticker_blacklist: Optional[str] = Field(None, max_length=500)
     daily_loss_limit_pct: Optional[float] = Field(None, ge=0, le=0.5)
     max_concurrent_positions: Optional[int] = Field(None, ge=0, le=100)
     max_per_sector: Optional[int] = Field(None, ge=0, le=50)
@@ -201,6 +205,53 @@ def auto_config(req: AutoTraderConfigRequest):
 @router.get("/auto/trades")
 def auto_trades(limit: int = 50):
     return auto_trader.list_trades(limit=limit)
+
+
+@router.get("/auto/calibration")
+def auto_calibration(min_bucket_n: int = 5):
+    """Confidence-bucket calibration — observed win-rate and the risk
+    multiplier being applied to each bucket. Closes the loop from the
+    nightly job."""
+    return auto_trader.compute_confidence_calibration(min_bucket_n=min_bucket_n)
+
+
+@router.get("/auto/strategy-scorecard")
+def auto_strategy_scorecard(days: int = 60, min_trades: int = 5):
+    """Per-strategy realized P&L from live trades (profit-audit #8).
+    Shows which strategies are carrying the book and which are dragging."""
+    return auto_trader.strategy_scorecard(days=days, min_trades=min_trades)
+
+
+@router.get("/auto/candidate-pool")
+def auto_candidate_pool(limit: int = 50):
+    """Current universe-scanner pool: top-N tickers ranked by composite score.
+    Auto-trader treats this as an extension of the watchlist when
+    use_universe_scanner=True."""
+    from database import SessionLocal, CandidatePool
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(CandidatePool)
+            .order_by(CandidatePool.score.desc())
+            .limit(limit).all()
+        )
+        return [{
+            "ticker": r.ticker, "name": r.name,
+            "score": r.score, "price": r.price,
+            "rvol": r.rvol, "rs_20d": r.rs_20d, "rs_60d": r.rs_60d,
+            "adx": r.adx, "pct_from_52w_high": r.pct_from_52w_high,
+            "reason": r.reason,
+            "generated_at": r.generated_at.isoformat() if r.generated_at else None,
+        } for r in rows]
+    finally:
+        db.close()
+
+
+@router.post("/auto/universe-scan")
+def auto_universe_scan():
+    """Manually trigger the universe scanner (for operator testing / warm-up)."""
+    from services import universe_scanner as _us
+    return _us.run_scan()
 
 
 @router.post("/auto/manage-now")

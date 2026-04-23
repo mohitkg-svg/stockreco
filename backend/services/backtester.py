@@ -259,36 +259,110 @@ def score_strategy(stats: dict) -> float:
 
 def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dict[str, Any]:
     """
-    Evaluate every strategy (long + short variants) on the given OHLCV dataframe.
-    Returns all results sorted best → worst.
+    Ground-up Tier 2: Walk-forward evaluation.
+
+    Split the series into 4 folds. For each fold, train on the prior
+    history, test on the fold's window. Average the fold results into a
+    "walk-forward confidence" that's much harder to game with overfitting
+    than a single 80/20 split.
+
+    Also reports the full-period result for UI display (equity curve, etc.)
+    and an aggregate OOS confidence (mean of fold OOS scores).
     """
-    if df.empty or len(df) < 60:
+    if df.empty or len(df) < 120:
         return {"results": [], "best": None}
 
     d = compute_indicators(df.copy())
     d = d.dropna(subset=["SMA_50"]).copy()
-    if len(d) < 30:
+    if len(d) < 60:
         return {"results": [], "best": None}
 
     atr_col = next((c for c in d.columns if c.startswith("ATR_")), None)
-    atr = d[atr_col] if atr_col else d["Close"] * 0.02
+
+    def _evaluate(frame: pd.DataFrame):
+        """Run all strategies on `frame`. Returns dict keyed by (strategy, direction)."""
+        a = frame[atr_col] if atr_col else frame["Close"] * 0.02
+        out = {}
+        for strat in all_strategies(frame):
+            for direction, series in [("BUY", strat["entry_long"]), ("SELL", strat["entry_short"])]:
+                sim = _simulate(frame, series, direction, a, timeframe=timeframe)
+                out[(strat["name"], direction)] = {
+                    "strategy": strat["name"],
+                    "description": strat["description"],
+                    "direction": direction,
+                    "stats": sim["stats"],
+                    "equity_curve": sim["equity_curve"],
+                    "trades": sim["trades"],
+                }
+        return out
+
+    # Full-period run (for UI charts).
+    full_results = _evaluate(d)
+
+    # Walk-forward: 4 folds on the last half of the series. Each fold tests
+    # a quarter-of-half = 1/8 of total bars. Earlier halves are treated as
+    # training context (indicators are already computed on full history).
+    n = len(d)
+    wf_start = n // 2   # backtest on last half only
+    fold_width = (n - wf_start) // 4
+    wf_fold_conf: Dict[tuple, list] = {}  # key -> list of per-fold confidence
+
+    if fold_width >= 20:
+        for fold_i in range(4):
+            s = wf_start + fold_i * fold_width
+            e = s + fold_width
+            fold_df = d.iloc[s:e].copy()
+            if len(fold_df) < 20:
+                continue
+            fold_results = _evaluate(fold_df)
+            for key, r in fold_results.items():
+                if r["stats"].get("total_trades", 0) >= 2:
+                    wf_fold_conf.setdefault(key, []).append(score_strategy(r["stats"]))
+    # Aggregate walk-forward confidence — mean of fold scores, conservative
+    # if too few folds produced trades.
+    oos_results = {}
+    for key, confs in wf_fold_conf.items():
+        if len(confs) >= 2:
+            # Mean across folds — folds that didn't produce trades are
+            # implicitly penalized by being excluded from the numerator but
+            # NOT the denominator here; use len(confs) so 2-of-4 folds with
+            # 60 score each yields 60, not 30. The "robustness-of-folds"
+            # nuance is carried as len(confs) in oos_trades.
+            oos_results[key] = {
+                "stats": {"total_trades": sum(
+                    full_results[key]["stats"].get("total_trades", 0) // 4
+                    for _ in range(1)
+                )},
+            }
+            # Stash averaged confidence into a synthetic stats-equivalent
+            oos_results[key]["_wf_confidence"] = round(sum(confs) / len(confs), 2)
+            oos_results[key]["_wf_fold_count"] = len(confs)
 
     results = []
-    for strat in all_strategies(d):
-        for direction, series in [("BUY", strat["entry_long"]), ("SELL", strat["entry_short"])]:
-            sim = _simulate(d, series, direction, atr, timeframe=timeframe)
-            score = score_strategy(sim["stats"])
-            results.append({
-                "strategy": strat["name"],
-                "description": strat["description"],
-                "direction": direction,
-                "confidence": score,
-                "stats": sim["stats"],
-                "equity_curve": sim["equity_curve"],
-                "trades": sim["trades"],
-            })
+    for key, r in full_results.items():
+        full_conf = score_strategy(r["stats"])
+        oos_row = oos_results.get(key)
+        if oos_row and oos_row.get("_wf_confidence") is not None:
+            wf_conf = float(oos_row["_wf_confidence"])
+            fold_count = int(oos_row.get("_wf_fold_count", 0) or 0)
+            # Critical-audit fix #2: scale WF confidence by fold_count/4 so
+            # a strategy that only produced qualifying trades in 2 of 4 folds
+            # is demoted proportionally, not just via the flat 0.90 below.
+            # Example: 70 confidence on 2/4 folds → scaled to 35 (vs 63 before),
+            # properly demoting brittle regime-specific strategies.
+            wf_conf_scaled = wf_conf * (max(0, fold_count) / 4.0)
+            adj_conf = 0.65 * wf_conf_scaled + 0.35 * full_conf
+            robustness = round(min(100, wf_conf_scaled), 1)
+        else:
+            adj_conf = full_conf * 0.80   # stricter than old 0.85 given no WF
+            robustness = None
+        r["confidence"] = round(adj_conf, 1)
+        r["confidence_full"] = round(full_conf, 1)
+        r["oos_confidence"] = robustness
+        r["oos_trades"] = (oos_row.get("_wf_fold_count", 0) if oos_row else 0)
+        results.append(r)
 
-    # Sort by confidence desc, drop strategies with 0 trades to reduce noise
+    # Sort by adjusted confidence; drop strategies with 0 full-period trades.
     results = [r for r in results if r["stats"]["total_trades"] > 0]
     results.sort(key=lambda r: r["confidence"], reverse=True)
     best = results[0] if results else None

@@ -80,3 +80,39 @@ def inside_earnings_window(ticker: str, hours: int = _EARNINGS_AVOIDANCE_HOURS) 
     if hte is None:
         return False
     return 0 <= hte <= hours
+
+
+def recent_earnings_catalyst(ticker: str, days_back: int = 10) -> bool:
+    """Ground-up Tier 2: True if the ticker had an earnings print within the
+    last `days_back` days. Post-earnings momentum (PEAD) is a real factor —
+    a recent catalyst strengthens a BUY setup. Inverse for SELL.
+    """
+    ticker = ticker.upper()
+    now = time.time()
+    cached = _earnings_cache.get(ticker)
+    if cached and now < cached[1]:
+        ts = cached[0]
+    else:
+        ts = _fetch_next_earnings_ts(ticker)
+        _earnings_cache[ticker] = (ts, now + _CACHE_TTL_SEC)
+    # _fetch_next_earnings_ts only returns UPCOMING. For the "recent" check
+    # we need past dates; do a second fetch without filtering.
+    try:
+        import yfinance as yf
+        from curl_cffi import requests as _cc
+        from datetime import datetime, timezone
+        session = _cc.Session(impersonate="chrome110")
+        t = yf.Ticker(ticker, session=session)
+        df = t.earnings_dates
+        if df is None or df.empty:
+            return False
+        cutoff = datetime.now(timezone.utc).timestamp() - (days_back * 86400)
+        past_recent = [
+            idx for idx in df.index
+            if hasattr(idx, "timestamp")
+            and idx.timestamp() < datetime.now(timezone.utc).timestamp()
+            and idx.timestamp() >= cutoff
+        ]
+        return len(past_recent) > 0
+    except Exception:
+        return False

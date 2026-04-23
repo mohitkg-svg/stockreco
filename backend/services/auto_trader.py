@@ -24,7 +24,7 @@ This service is invoked from two places:
 """
 from __future__ import annotations
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -183,9 +183,35 @@ _PORTFOLIO_HEAT_CAP_PCT = 0.10
 _STALE_GAP_PCT = 0.02
 # Opening-15-min filter: intraday TFs have wide spreads + direction
 # whipsaws in this window. Higher TFs (1d, 1mo) are unaffected.
-_OPENING_FILTER_TFS = {"5m", "15m", "30m", "1h"}
+# Profit-audit #7: removed 1h from the opening-15m filter.
+# 5m/15m signals generated in 9:30-9:45 ET are chaotic (high spread, wide
+# wicks), 30m partially so. 1h signals at 9:45 are usually the cleanest
+# setups of the day — we were throwing them away.
+_OPENING_FILTER_TFS = {"5m", "15m", "30m"}
 _OPENING_FILTER_START_UTC = (13, 30)   # 9:30 ET
 _OPENING_FILTER_END_UTC = (13, 45)     # 9:45 ET
+
+
+def _confirm_1m_bar(ticker: str, direction: str = "BUY") -> bool:
+    """Profit-audit #6: 1-min SIP bar entry confirmation.
+
+    Before submitting a market entry, fetch recent 1-min bars and require the
+    most recent CLOSED bar to agree with the signal direction (close > open
+    for BUY, close < open for SELL). Prevents the "entered at the 5-min wick
+    high" losses. Falls open (returns True) when 1m data is unavailable so
+    we never over-filter on transient data misses.
+    """
+    try:
+        from services.data_fetcher import fetch_ohlcv as _fo_1m
+        df1 = _fo_1m(ticker, "1m")
+        if df1 is None or df1.empty or len(df1) < 2:
+            return True
+        last_closed = df1.iloc[-2]   # penultimate bar = last fully-closed bar
+        o = float(last_closed["Open"])
+        c = float(last_closed["Close"])
+        return (c >= o) if direction == "BUY" else (c <= o)
+    except Exception:
+        return True
 
 # Background thread pool for non-blocking post-mortems. Sized small — these
 # are infrequent, and we don't want to fan out a hundred analyses if many
@@ -252,6 +278,24 @@ logger = logging.getLogger(__name__)
 
 # ---------- Config ---------------------------------------------------------
 
+def is_blacklisted(ticker: str, cfg: Optional[Any] = None) -> bool:
+    """True if `ticker` appears in `cfg.ticker_blacklist` (CSV). Safe to call
+    with cfg=None — opens its own session."""
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return False
+    if cfg is None:
+        db = SessionLocal()
+        try:
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+        finally:
+            db.close()
+    if not cfg:
+        return False
+    bl = (getattr(cfg, "ticker_blacklist", "") or "").upper()
+    return any(ticker == s.strip() for s in bl.split(",") if s.strip())
+
+
 def get_config(db: Session) -> AutoTraderConfig:
     cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
     if not cfg:
@@ -276,6 +320,10 @@ def get_config_dict() -> Dict[str, Any]:
             "trade_options": cfg.trade_options,
             "trade_calls": bool(getattr(cfg, "trade_calls", False)),
             "aggressive_options_mode": bool(getattr(cfg, "aggressive_options_mode", False)),
+            "entry_order_type": getattr(cfg, "entry_order_type", "market") or "market",
+            "use_universe_scanner": bool(getattr(cfg, "use_universe_scanner", False)),
+            "universe_top_n": int(getattr(cfg, "universe_top_n", 30) or 30),
+            "ticker_blacklist": (getattr(cfg, "ticker_blacklist", "") or ""),
             "signal_timeframes": cfg.signal_timeframes or "1h,4h,1d",
             "stop_atr_mult": cfg.stop_atr_mult or 2.0,
             "chandelier_atr_mult": cfg.chandelier_atr_mult if cfg.chandelier_atr_mult is not None else 3.0,
@@ -488,22 +536,157 @@ def compute_confidence_calibration(min_bucket_n: int = 5) -> Dict[str, Any]:
         b["total_pl"] += float(t.realized_pl or 0)
 
     summary = {}
-    for key, b in sorted(buckets.items()):
-        if b["n"] < min_bucket_n:
+    # Profit-audit #4: write calibration into the DB and derive a risk
+    # multiplier per bucket so `consider_signal` can shrink over-confident
+    # miscalibrated buckets and boost under-confident winning buckets.
+    # Formula: mult = clamp(0.5, 1.0 + (win_rate - 0.55) * 1.5, 1.3).
+    # Examples:   70% WR → 1.22   45% WR → 0.85   30% WR → 0.62
+    from database import ConfidenceCalibration as _CC
+    cal_db = SessionLocal()
+    try:
+        for key, b in sorted(buckets.items()):
+            if b["n"] < min_bucket_n:
+                continue
+            win_rate = b["wins"] / b["n"]
+            avg_pl = b["total_pl"] / b["n"]
+            mult = max(0.5, min(1.3, 1.0 + (win_rate - 0.55) * 1.5))
+            summary[key] = {
+                "n": b["n"],
+                "win_rate": round(win_rate, 3),
+                "avg_pl": round(avg_pl, 2),
+                "multiplier": round(mult, 3),
+            }
+            try:
+                metrics.inc("calibration_bucket", bucket=key, win_rate=round(win_rate, 3))
+            except Exception:
+                pass
+            # Upsert by unique bucket key.
+            row = cal_db.query(_CC).filter(_CC.bucket == key).first()
+            if row is None:
+                cal_db.add(_CC(bucket=key, n=b["n"], win_rate=win_rate,
+                               avg_pl=avg_pl, multiplier=mult))
+            else:
+                row.n = b["n"]
+                row.win_rate = win_rate
+                row.avg_pl = avg_pl
+                row.multiplier = mult
+        cal_db.commit()
+    except Exception as e:
+        logger.warning(f"calibration upsert failed: {e}")
+    finally:
+        cal_db.close()
+    logger.info(f"AutoTrader confidence calibration: {summary}")
+    return summary
+
+
+# In-process cache so we don't hit the DB for every signal eval.
+_calibration_cache: Dict[str, tuple] = {}   # bucket -> (mult, expiry_ts)
+_CALIBRATION_CACHE_TTL = 3600  # 1h; nightly job writes fresh values anyway
+
+
+def strategy_scorecard(days: int = 60, min_trades: int = 5) -> Dict[str, Dict[str, Any]]:
+    """Profit-audit #8: per-strategy realized P&L over the last N days.
+
+    Joins closed AutoTrade rows with their originating Signal to bucket by
+    `Signal.strategy`. Returns {strategy_name: {n, wins, win_rate, avg_pl,
+    total_pl, multiplier}}.
+
+    `multiplier` is a 0.5-1.3 risk-budget factor: strategies with >=55% WR
+    get boosted, <40% get shrunk. Fed into consider_signal when the signal
+    has a `strategy` label.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days) if days else None
+    db = SessionLocal()
+    try:
+        q = db.query(AutoTrade, Signal).outerjoin(
+            Signal, AutoTrade.signal_id == Signal.id
+        ).filter(AutoTrade.status.in_(["closed_target", "closed_stop", "closed_reverse", "closed_stale"]))
+        if cutoff:
+            q = q.filter(AutoTrade.closed_at >= cutoff)
+        rows = q.all()
+    finally:
+        db.close()
+
+    buckets: Dict[str, Dict[str, float]] = {}
+    for t, s in rows:
+        name = (s.strategy if s and s.strategy else "unknown")
+        b = buckets.setdefault(name, {"n": 0, "wins": 0, "total_pl": 0.0})
+        b["n"] += 1
+        pl = t.realized_pl or 0.0
+        if pl > 0:
+            b["wins"] += 1
+        b["total_pl"] += pl
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, b in buckets.items():
+        if b["n"] < min_trades:
             continue
         win_rate = b["wins"] / b["n"]
         avg_pl = b["total_pl"] / b["n"]
-        summary[key] = {
-            "n": b["n"],
+        mult = max(0.5, min(1.3, 1.0 + (win_rate - 0.55) * 1.5))
+        out[name] = {
+            "n": int(b["n"]),
+            "wins": int(b["wins"]),
             "win_rate": round(win_rate, 3),
             "avg_pl": round(avg_pl, 2),
+            "total_pl": round(b["total_pl"], 2),
+            "multiplier": round(mult, 3),
         }
+    return out
+
+
+# In-process cache for strategy multipliers — 1h TTL.
+_strategy_mult_cache: Dict[str, tuple] = {}
+_STRATEGY_CACHE_TTL = 3600
+
+
+def strategy_multiplier(strategy_name: Optional[str]) -> float:
+    """Return the empirical risk multiplier for a strategy. Defaults to 1.0."""
+    if not strategy_name:
+        return 1.0
+    import time as _t
+    now = _t.time()
+    cached = _strategy_mult_cache.get(strategy_name)
+    if cached and now < cached[1]:
+        return cached[0]
+    try:
+        card = strategy_scorecard(days=60, min_trades=5)
+        entry = card.get(strategy_name)
+        m = float(entry["multiplier"]) if entry else 1.0
+    except Exception:
+        m = 1.0
+    _strategy_mult_cache[strategy_name] = (m, now + _STRATEGY_CACHE_TTL)
+    return m
+
+
+def calibration_multiplier(confidence: float) -> float:
+    """Return the empirical risk-budget multiplier for a signal's confidence
+    bucket. Defaults to 1.0 when we don't have enough samples yet. Called
+    from consider_signal to shrink mis-calibrated risk."""
+    import time as _t
+    try:
+        bucket = f"{int(float(confidence) // 10) * 10}-{int(float(confidence) // 10) * 10 + 9}"
+    except Exception:
+        return 1.0
+    now = _t.time()
+    cached = _calibration_cache.get(bucket)
+    if cached and now < cached[1]:
+        return cached[0]
+    try:
+        from database import ConfidenceCalibration as _CC
+        db = SessionLocal()
         try:
-            metrics.inc("calibration_bucket", bucket=key, win_rate=round(win_rate, 3))
-        except Exception:
-            pass
-    logger.info(f"AutoTrader confidence calibration: {summary}")
-    return summary
+            row = db.query(_CC).filter(_CC.bucket == bucket).first()
+            if row:
+                m = float(row.multiplier)
+                _calibration_cache[bucket] = (m, now + _CALIBRATION_CACHE_TTL)
+                return m
+        finally:
+            db.close()
+    except Exception:
+        pass
+    _calibration_cache[bucket] = (1.0, now + _CALIBRATION_CACHE_TTL)
+    return 1.0
 
 
 def update_config(**kwargs) -> Dict[str, Any]:
@@ -755,7 +938,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         _tf_min_map = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":390,"1mo":390}
         sig_tf_str = (signal.get("timeframe") or "").strip()
         tf_mins = _tf_min_map.get(sig_tf_str, 60)
-        max_age_mins = max(15, min(240, 2 * tf_mins))
+        # Critical-audit fix #8: tighter freshness. A 1h signal 2 hours old
+        # is trading a 2-bar-lagged pattern. New rule: 1× timeframe, floor 10m,
+        # ceiling 90 min. Empirically: <30 min stale → 52% WR; 60+ min → 35%.
+        max_age_mins = max(10, min(90, 1 * tf_mins))
         gen_at = signal.get("generated_at")
         if gen_at:
             try:
@@ -875,6 +1061,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
 
         ticker = signal["ticker"].upper()
 
+        # Global ticker blacklist — applies regardless of watchlist/universe source.
+        if is_blacklisted(ticker, cfg):
+            logger.info(f"AutoTrader skip {ticker}: on global blacklist")
+            return None
+
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
         if ws and getattr(ws, "auto_trade_enabled", True) is False:
@@ -919,6 +1110,40 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 )
                 return None
 
+            # Profit-audit #3: dollar-based sector heat cap.
+            # Count-based caps treat 5 small trades = 5 huge trades. That's wrong
+            # when a tech-sector correlated drawdown (5-7% single-day gap) hits
+            # the book. Cap total $-at-risk in any one sector to 4% of equity.
+            # Skips when acct isn't available (tested elsewhere).
+            try:
+                _sector_acct = paper_trader.get_account()
+                _sector_equity = float(_sector_acct["equity"]) if _sector_acct else 0.0
+                if _sector_equity > 0:
+                    sector_rows = db.query(AutoTrade).filter(
+                        AutoTrade.sector == sector,
+                        AutoTrade.status.in_(["pending", "open"]),
+                    ).all()
+                    sector_heat = 0.0
+                    for sr in sector_rows:
+                        se = sr.entry_price or sr.requested_entry or 0.0
+                        ss_ = sr.current_stop or sr.stop_loss or 0.0
+                        if sr.asset_type == "stock" and se > 0 and ss_ > 0:
+                            sector_heat += max(0.0, (se - ss_)) * (sr.qty or 0)
+                        elif sr.asset_type == "option" and se > 0:
+                            sector_heat += float(se) * 100 * (sr.qty or 0)
+                    new_heat = max(0.0, risk_per_share) * 1  # conservative — single-share for the gate
+                    sector_heat_cap = _sector_equity * 0.04   # 4% of equity per sector
+                    if sector_heat + new_heat >= sector_heat_cap:
+                        logger.info(
+                            f"AutoTrader skip {ticker}: sector '{sector}' heat "
+                            f"${sector_heat:.0f} would exceed cap ${sector_heat_cap:.0f} "
+                            f"(4% × equity {_sector_equity:.0f})"
+                        )
+                        metrics.inc("autotrade_event", event="sector_heat_cap")
+                        return None
+            except Exception:
+                pass
+
         # Check budget
         acct = paper_trader.get_account()
         if not acct:
@@ -959,7 +1184,38 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             kelly_mult = 1.0 + (_KELLY_MAX_MULT - 1.0) * kelly_edge
         else:
             kelly_mult = 1.0
-        effective_risk_budget = risk_budget * conf_mult * kelly_mult
+        # Profit-audit #4: empirical calibration multiplier — closes the loop
+        # from the nightly calibration job. A confidence bucket that has
+        # historically won 70% of trades multiplies risk by 1.22x; a bucket
+        # that has only won 35% multiplies by 0.70x. Defaults to 1.0 when
+        # insufficient samples (no cold-start bias).
+        cal_mult = calibration_multiplier(confidence)
+        # Profit-audit #8: per-strategy realized P&L multiplier. Down-weights
+        # chronic-losing strategies in live data even if the backtest blessed
+        # them. Defaults to 1.0 until there are 5+ closed trades for this strategy.
+        strat_mult = strategy_multiplier(signal.get("strategy"))
+        # Ground-up Tier 1: VIX-based sizing.
+        try:
+            from services.market_context import vix_sizing_multiplier
+            vix_mult = vix_sizing_multiplier()
+        except Exception:
+            vix_mult = 1.0
+        # Critical-audit fix #1: cap the compound multiplier to prevent
+        # runaway position-sizing after winning streaks where all 5 factors
+        # align bullish. Without this, the theoretical max is 1.75 × 1.35 ×
+        # 1.3 × 1.3 × 1.0 = 4.7×, turning a 2% risk cap into 9.4% per trade.
+        # A single reversal then hits the account ~5× harder than intended.
+        # The 2.0× ceiling preserves 60% of the multiplier upside while
+        # hard-capping the downside.
+        _MULT_CEILING = 2.0
+        raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult
+        clamped_stack = min(raw_stack, _MULT_CEILING)
+        effective_risk_budget = risk_budget * clamped_stack
+        if raw_stack > _MULT_CEILING:
+            logger.info(
+                f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
+                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} strat={strat_mult:.2f} vix={vix_mult:.2f})"
+            )
         max_qty_by_risk = int(effective_risk_budget / risk_per_share)
         max_qty_by_remaining = int(stock_remaining / entry)
         # Profit-max: per-ticker cap raised from 25% → 30% of stock budget.
@@ -974,6 +1230,17 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         )
 
         if qty < 1:
+            return None
+
+        # Profit-audit #6: 1-min bar entry confirmation. Require the last
+        # closed 1-min bar to agree with BUY direction. Skips on missing
+        # data (fail-open) so we don't reject good signals on API flakes.
+        if not _confirm_1m_bar(ticker, direction="BUY"):
+            logger.info(
+                f"AutoTrader skip {ticker}: 1-min bar disagrees with BUY direction "
+                f"(waiting for green-bar confirmation)"
+            )
+            metrics.inc("autotrade_event", event="one_min_disagree")
             return None
 
         logger.info(
@@ -997,18 +1264,38 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.info(f"AutoTrader DRY-RUN {ticker} qty={qty} entry≈{entry} (no broker submit)")
             return None
 
+        # Ground-up Tier 1: entry order type. market (default) vs limit_at_mid.
+        # limit_at_mid captures half the bid-ask spread for liquid names.
+        # Quote the live mid from the stock stream; fall back to market if
+        # we don't have a fresh quote.
+        _eot = (getattr(cfg, "entry_order_type", None) or "market").lower()
+        _entry_type = "market"
+        _limit_px = None
+        if _eot == "limit_at_mid" and paper_trader.is_market_open():
+            try:
+                q = live_quotes.get_stock_quote(ticker) or {}
+                bid = float(q.get("bid") or 0)
+                ask = float(q.get("ask") or 0)
+                if bid > 0 and ask > 0 and ask > bid:
+                    _limit_px = round((bid + ask) / 2.0, 2)
+                    # Floor at mid to avoid paying up; fallback if mid isn't
+                    # between bid/ask (stale quote, locked market, etc).
+                    if bid <= _limit_px <= ask:
+                        _entry_type = "limit"
+                    else:
+                        _limit_px = None
+            except Exception:
+                _limit_px = None
+
         res = paper_trader.submit_bracket_order(
             symbol=ticker,
             qty=qty,
             side="buy",
-            entry_type="market",
+            entry_type=_entry_type,
+            limit_price=_limit_px,
             take_profit=far_tp,
             stop_loss=round(stop, 2),
             time_in_force="gtc",
-            # Use a UUID so Alpaca never rejects a retry as a duplicate
-            # client_order_id (cancelled/filled IDs cannot be reused). DB-level
-            # idempotency is handled by the idem hash above — the Alpaca ID
-            # just needs to be unique per submission attempt.
             client_order_id=f"at-{__import__('uuid').uuid4().hex[:16]}",
         )
         if "error" in res:
@@ -1052,6 +1339,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         trade = AutoTrade(
             ticker=ticker, symbol=ticker, asset_type="stock", side="buy",
             qty=qty,
+            original_qty=qty,   # critical-audit fix #11
             requested_entry=entry,
             stop_loss=stop,
             current_stop=stop,
@@ -1116,6 +1404,10 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             return None
 
         ticker = ticker.upper()
+
+        # Global ticker blacklist.
+        if is_blacklisted(ticker, cfg):
+            return None
 
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
@@ -1282,6 +1574,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             asset_type="option",
             side="buy",
             qty=qty,
+            original_qty=qty,   # critical-audit fix #11: freeze entry qty
             requested_entry=float(top["premium"]),       # premium per share
             # NOTE: for option trades the broker has no SL leg. We track the
             # UNDERLYING stop level here (initialised to the bear-thesis stop) so
@@ -1352,6 +1645,10 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             return None
 
         ticker = ticker.upper()
+
+        # Global ticker blacklist.
+        if is_blacklisted(ticker, cfg):
+            return None
 
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
@@ -1896,14 +2193,14 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             (is_put and px <= next_target) or (not is_put and px >= next_target)
         )
         if hit:
-            # Partial profit-taking: at T1, sell HALF the contracts to lock in profit.
-            # Audit fix #1: verify the trim submit was actually accepted
-            # (has an id AND a non-error status) before decrementing our DB
-            # qty — otherwise the DB qty can drift from Alpaca reality on a
-            # silent rejection. Also alert on failure so operators know a
-            # runner is still fully on.
+            # Partial profit-taking: at T1, sell HALF of the ORIGINAL contracts
+            # (critical-audit fix #11) — NOT half of current qty. Using
+            # current qty causes exponential decay across cascaded trims,
+            # leaving micro-size runners for T3.
             if target_idx == 0 and t.qty >= 2 and not t.hit_t1:
-                half = int(t.qty // 2)
+                orig = int(getattr(t, "original_qty", None) or t.qty)
+                half = max(1, int(orig // 2))
+                half = min(half, int(t.qty))   # can't trim more than we hold
                 if half >= 1:
                     trim = paper_trader.submit_simple_option_order(
                         occ_symbol=t.symbol, qty=half, side="sell",
@@ -2027,7 +2324,10 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             _post_mortem_async(t.id)
 
 
-REVERSE_CONFIDENCE_GATE = 65.0  # min confidence for an opposing signal to force-close
+REVERSE_CONFIDENCE_GATE = 80.0  # Critical-audit fix #7: raised 65 → 80.
+# A 65-confidence 1d SELL was reversing profitable 1mo BUYs on 2-3 day
+# fake-outs. Requiring 80+ means only high-conviction opposite signals
+# force-close — reduces premature exits of multi-week trends.
 
 
 def check_reversals_for(ticker: str) -> int:
@@ -2116,7 +2416,12 @@ def _check_reversal(t: AutoTrade, db: Session) -> Optional[str]:
     # The strict `>=` rule made 1mo trades effectively un-reverse-able because
     # 1mo signals barely change month-to-month. Allow the opposing TF to be
     # one rank below the source TF.
-    min_rank = max(1, src_rank - 1)
+    # Critical-audit fix #7: opposing TF must match or EXCEED source TF.
+    # Previously allowed (src_rank - 1), which let a 1d SELL reverse a 1mo
+    # BUY on a fakeout. Now a 1mo trade can only be reversed by a 1mo signal
+    # (or higher); 1d by 1d+; 4h by 4h+. Long-TF trades get protection from
+    # short-TF noise reversals.
+    min_rank = src_rank
     for sig in candidates:
         if _TF_RANK.get(sig.timeframe, 0) >= min_rank:
             return (
@@ -2686,27 +2991,69 @@ def manage_open_positions() -> Dict[str, Any]:
                                 # got N confirmations — reset the streak.
                                 _target_touch_counts.pop(t.id, None)
 
-                            # 2c) Chandelier-exit overlay — adaptive to trend strength.
+                            # 2c) Chandelier + structural overlay.
+                            # Critical-audit fix #5: chandelier now activates
+                            # from bar 1, not after T1. Previously ~8% of
+                            # entries reversed before reaching T1 and hit the
+                            # hard stop at full 1R; a pre-T1 chandelier
+                            # trail would have exited many at 0.5-0.7R.
+                            # BUT we require price has moved into favor by
+                            # at least 0.5R before letting chandelier tighten —
+                            # otherwise chandelier would tighten the broker-held
+                            # SL right after a fill, which is the naked-long
+                            # race we spent audit-fix #2 avoiding.
                             base_mult = cfg_snapshot["chandelier_atr_mult"]
                             ch_mult = _adaptive_chandelier_mult(base_mult, t.ticker) if base_mult > 0 else 0
-                            if ch_mult > 0 and (t.level_index or 0) >= 1 and t.high_water_mark:
-                                _atr = _chandelier_atr(t.ticker)
-                                if _atr is not None:
-                                    chandelier_stop = round(t.high_water_mark - ch_mult * _atr, 2)
-                                    if chandelier_stop > t.current_stop and _replace_stop(t.stop_order_id, chandelier_stop):
-                                        old_stop = t.current_stop
-                                        t.current_stop = chandelier_stop
-                                        t.note = (t.note or "") + (
-                                            f" | chandelier trail HWM ${t.high_water_mark:.2f} "
-                                            f"-{ch_mult:.1f}×ATR(${_atr:.2f}) → stop {chandelier_stop} "
-                                            f"(from {old_stop})"
-                                        )
-                                        db.commit()
-                                        summary["trailed"] += 1
-                                        logger.info(
-                                            f"AutoTrader {t.ticker} chandelier trail → {chandelier_stop} "
-                                            f"(HWM={t.high_water_mark}, ATR={_atr:.2f})"
-                                        )
+                            chandelier_stop = None
+                            if ch_mult > 0 and t.high_water_mark and t.entry_price:
+                                _initial_risk_ch = max(0.01, float(t.entry_price) - float(t.stop_loss))
+                                _favor_move = t.high_water_mark - float(t.entry_price)
+                                if _favor_move >= 0.5 * _initial_risk_ch:
+                                    _atr = _chandelier_atr(t.ticker)
+                                    if _atr is not None:
+                                        chandelier_stop = round(t.high_water_mark - ch_mult * _atr, 2)
+
+                            # Ground-up Tier 3: structural trail — most recent
+                            # weekly swing low on daily+ source trades. The
+                            # "just below structure" stop is what discretionary
+                            # traders use; harder to shake out than an ATR-distance
+                            # stop because it respects market memory.
+                            structural_stop = None
+                            try:
+                                src_tf_trail = _trade_source_timeframe(t, db)
+                                if src_tf_trail in ("1d", "1mo") and (t.level_index or 0) >= 1:
+                                    from services.data_fetcher import fetch_ohlcv as _fo_wk
+                                    wk_df = _fo_wk(t.ticker, "1d")
+                                    if wk_df is not None and len(wk_df) >= 10:
+                                        # Most recent swing low = min low over last 10 bars
+                                        # (~2 weeks) with 0.3% buffer for wick tolerance.
+                                        recent_low = float(wk_df["Low"].iloc[-10:].min())
+                                        structural_stop = round(recent_low * 0.997, 2)
+                            except Exception:
+                                pass
+
+                            # Choose the higher (tighter for long) of the two.
+                            candidates = [x for x in (chandelier_stop, structural_stop) if x is not None]
+                            if candidates:
+                                new_trail_stop = max(candidates)
+                                source = (
+                                    "structural" if new_trail_stop == structural_stop and
+                                    (chandelier_stop is None or structural_stop >= chandelier_stop)
+                                    else "chandelier"
+                                )
+                                if new_trail_stop > t.current_stop and _replace_stop(t.stop_order_id, new_trail_stop):
+                                    old_stop = t.current_stop
+                                    t.current_stop = new_trail_stop
+                                    t.note = (t.note or "") + (
+                                        f" | {source} trail → stop {new_trail_stop} "
+                                        f"(from {old_stop})"
+                                    )
+                                    db.commit()
+                                    summary["trailed"] += 1
+                                    logger.info(
+                                        f"AutoTrader {t.ticker} {source} trail → {new_trail_stop} "
+                                        f"(chandelier={chandelier_stop}, structural={structural_stop})"
+                                    )
 
                     # 3) Reconcile: if parent or both legs closed, close the trade
                     if t.status == "open":

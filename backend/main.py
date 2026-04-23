@@ -125,19 +125,28 @@ _app_health = {
 
 
 def scheduled_scan():
-    """Scan all watchlist stocks in parallel and update signals in DB.
-
-    Performance upgrade: previously serial (~N × per-ticker-latency). Now uses
-    a small worker pool so the whole watchlist finishes in the time of the
-    slowest ticker, not the sum of all tickers. Each worker opens its own
-    short-lived DB session — SQLite WAL + Neon pool both handle this fine,
-    and the existing entry_lock in auto_trader serialises the sensitive bits.
-    """
+    """Scan tickers (watchlist + optional universe-scanner candidates) in
+    parallel and update signals in DB."""
     from datetime import datetime as _dt, timezone as _tz
     from concurrent.futures import ThreadPoolExecutor
     db = SessionLocal()
     try:
         tickers = [s.ticker for s in db.query(WatchlistStock).all()]
+        # Ground-up Tier 1: universe scanner candidates.
+        cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+        if cfg and getattr(cfg, "use_universe_scanner", False):
+            try:
+                from services.universe_scanner import get_candidate_tickers
+                pool = get_candidate_tickers()
+                # Union (watchlist first for UI-priority, then candidates).
+                seen = set(tickers)
+                for t in pool:
+                    if t not in seen:
+                        tickers.append(t)
+                        seen.add(t)
+                logger.info(f"Scan universe: watchlist={len(tickers) - len(pool) + len(seen - set(pool))}, candidates={len(pool)}")
+            except Exception as e:
+                logger.warning(f"universe_scanner read failed: {e}")
     finally:
         db.close()
 
@@ -207,6 +216,45 @@ async def lifespan(app: FastAPI):
         news_svc.poll_watchlist, "interval", minutes=2, id="news_poll",
         max_instances=1, coalesce=True, misfire_grace_time=60,
     )
+    # Ground-up Tier 1: universe scanner every 15 min.
+    # Scans ~500 liquid US equities, scores by RVOL/ADX/RS/52w-high proximity,
+    # keeps top 30 in candidate_pool. Auto-trader reads from this when
+    # cfg.use_universe_scanner=True. No-op when off.
+    # Ground-up Tier 1: universe scanner. Runs 4× per day at market-relevant
+    # UTC slots (~pre-open, ~10am ET, midday, ~3pm ET during EDT):
+    #   12:00 UTC  — 08:00 ET pre-market warm-up (catches overnight movers)
+    #   14:30 UTC  — 10:30 ET mid-morning (first hour of RTH has played out)
+    #   17:00 UTC  — 13:00 ET midday lull (fresh afternoon setups)
+    #   19:30 UTC  — 15:30 ET final hour (captures closing-auction flow)
+    try:
+        from services import universe_scanner as _usnv
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        for hh, mm in [(12, 0), (14, 30), (17, 0), (19, 30)]:
+            scheduler.add_job(
+                _usnv.run_scan,
+                trigger=_Cron(hour=hh, minute=mm),
+                id=f"universe_scan_{hh:02d}{mm:02d}",
+                max_instances=1, coalesce=True, misfire_grace_time=900,
+            )
+    except Exception as _e:
+        logger.warning(f"universe_scanner job not scheduled: {_e}")
+
+    # Ground-up Tier 2: weekly best-strategy-per-ticker recompute.
+    # Walk-forward backtest across every tracked ticker; persist the winning
+    # (strategy, direction) per ticker into best_strategy_per_ticker. Signal
+    # generator preferentially emits signals from these winners. Runs Sunday
+    # 04:00 UTC so it lands before Monday's open.
+    try:
+        from services import best_strategy as _bs
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            _bs.recompute_all,
+            trigger=_Cron(day_of_week="sun", hour=4, minute=0),
+            id="best_strategy_weekly",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+    except Exception as _e:
+        logger.warning(f"best_strategy job not scheduled: {_e}")
     # F1: Nightly confidence-vs-realized calibration (03:10 UTC = 23:10 ET).
     # Pure read-only aggregation — logs the win-rate per confidence bucket
     # so miscalibration (e.g. "80-conf bucket wins less than 60-conf")
