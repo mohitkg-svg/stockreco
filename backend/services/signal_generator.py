@@ -557,6 +557,18 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
+        # Analyst-rating consensus (±12%). Strong Wall Street agreement with
+        # the BUY direction nudges confidence up; strong SELL consensus nudges
+        # it down. Neutral when coverage < 3 or data stale > 10 days.
+        try:
+            from services.analyst_ratings import rating_multiplier as _ar_mult, rating_reason_line as _ar_reason
+            _regime_mult *= _ar_mult(ticker, "BUY")
+            _ar_line = _ar_reason(ticker, "BUY")
+            if _ar_line:
+                reasons.append(_ar_line)
+        except Exception:
+            pass
+
         confidence = min(round(confidence_bull * _regime_mult), 95)
         entry = round(price, 2)
 
@@ -689,6 +701,16 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         try:
             from services.best_strategy import confidence_boost
             _regime_mult *= confidence_boost(ticker, "Composite (multi-factor)", "SELL")
+        except Exception:
+            pass
+
+        # Analyst-rating consensus — mirror of BUY side.
+        try:
+            from services.analyst_ratings import rating_multiplier as _ar_mult, rating_reason_line as _ar_reason
+            _regime_mult *= _ar_mult(ticker, "SELL")
+            _ar_line = _ar_reason(ticker, "SELL")
+            if _ar_line:
+                reasons.append(_ar_line)
         except Exception:
             pass
 

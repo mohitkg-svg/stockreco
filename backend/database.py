@@ -309,6 +309,29 @@ class NewsEvent(Base):
     severity = Column(Integer, nullable=True)
 
 
+class AnalystRating(Base):
+    """Aggregated Wall Street analyst consensus per ticker.
+
+    Pulled from yfinance .info: `recommendationMean` is a 1-5 scale where
+    1=StrongBuy, 2=Buy, 3=Hold, 4=Sell, 5=StrongSell. `recommendationKey`
+    is the string label, `numberOfAnalystOpinions` is coverage count.
+
+    Refreshed 4× per day. Signal generator reads this to apply a light
+    confidence multiplier — strong consensus in the direction of the signal
+    nudges confidence up, consensus against nudges it down. Slow-moving
+    signal, so ±10-12% is the correct weighting envelope.
+    """
+    __tablename__ = "analyst_ratings"
+    ticker = Column(String, primary_key=True)
+    mean = Column(Float, nullable=True)            # 1.0 (StrongBuy) .. 5.0 (StrongSell)
+    key = Column(String, nullable=True)            # "strong_buy" | "buy" | "hold" | "sell" | "strong_sell"
+    analyst_count = Column(Integer, nullable=True)
+    target_mean = Column(Float, nullable=True)     # consensus price target
+    target_high = Column(Float, nullable=True)
+    target_low = Column(Float, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
 def _ensure_column(table: str, column: str, ddl: str):
     """Tiny SQLite migration helper — ALTER TABLE ADD COLUMN if missing.
 

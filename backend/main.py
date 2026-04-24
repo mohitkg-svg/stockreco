@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
-from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
@@ -273,6 +273,21 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"calibration job not scheduled: {_e}")
+    # Analyst ratings refresh, 4×/day. Aligned with universe scanner slots so
+    # freshly-ranked candidates get ratings before the next scan cycle reads
+    # them. Ratings move slowly — more-frequent polling adds no signal.
+    try:
+        from services import analyst_ratings as _ar
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        for hh, mm in [(11, 45), (14, 15), (16, 45), (19, 15)]:
+            scheduler.add_job(
+                _ar.refresh_all,
+                trigger=_Cron(hour=hh, minute=mm),
+                id=f"analyst_ratings_{hh:02d}{mm:02d}",
+                max_instances=1, coalesce=True, misfire_grace_time=900,
+            )
+    except Exception as _e:
+        logger.warning(f"analyst_ratings job not scheduled: {_e}")
     scheduler.start()
     _app_health["scheduler_started"] = True
     logger.info("Scheduler started — auto-scan 15m, auto-trader manage 60s")
@@ -418,6 +433,7 @@ app.include_router(trading.router)
 app.include_router(news.router)
 app.include_router(alerts_router.router)
 app.include_router(chat_router.router)
+app.include_router(analyst_ratings_router.router)
 
 
 @app.get("/api/health")
