@@ -187,8 +187,12 @@ async def lifespan(app: FastAPI):
     create_tables()
     # Audit fix D3: explicit max_instances=1 + coalesce so a slow scan doesn't
     # stack a second one. Also ties both jobs to a 60s misfire grace window.
+    # Scan cadence 15m → 5m: 3× more entry opportunities per session. The
+    # signal_generator short-circuits on cached data when inputs haven't
+    # changed, so cost scales sub-linearly. Freshness fix (Critical #8)
+    # caps signal age at 90m, so 5m scans align with the new gate.
     scheduler.add_job(
-        scheduled_scan, "interval", minutes=15, id="watchlist_scan",
+        scheduled_scan, "interval", minutes=5, id="watchlist_scan",
         max_instances=1, coalesce=True, misfire_grace_time=60,
     )
     # Audit fix #2: manage loop cadence 60s → 20s. Previously any broker-

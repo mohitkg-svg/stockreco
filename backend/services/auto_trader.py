@@ -329,6 +329,9 @@ def get_config_dict() -> Dict[str, Any]:
             "chandelier_atr_mult": cfg.chandelier_atr_mult if cfg.chandelier_atr_mult is not None else 3.0,
             "dry_run": bool(cfg.dry_run),
             "max_per_sector": cfg.max_per_sector or 3,
+            "max_concurrent_positions": int(getattr(cfg, "max_concurrent_positions", 10) or 10),
+            "daily_loss_limit_pct": float(getattr(cfg, "daily_loss_limit_pct", 0.03) or 0.03),
+            "flatten_by_eod": bool(getattr(cfg, "flatten_by_eod", False)),
         }
     finally:
         db.close()
