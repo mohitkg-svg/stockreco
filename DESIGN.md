@@ -712,7 +712,86 @@ All browsers get 401 on next request and prompt for the new key.
 
 ## 14. Changelog (current → past)
 
-### Current deployment — revision `stockrecs-00011-jnm`
+### Revision 19 — ML scorer (LightGBM, shadow mode) + Alpaca tape microstructure
+- `services/ml_features.py` — single feature-extractor used at both
+  train and inference time. ~30 features: technicals, macro proximity,
+  VIX regime, correlated-asset 20d returns (GLD/SLV/USO/UUP/TLT/QQQ/SPY),
+  signal shape, microstructure (Alpaca tape, 30-min lookback), analyst.
+- `services/alpaca_tape.py` — pulls Alpaca SIP-tape trades. Per-day cache
+  during training; 60s live cache for inference.
+- `services/ml_trainer.py` — walk-forward over historical daily bars,
+  generates labeled samples (BUY/SELL win-loss within 10-bar horizon),
+  4-fold chronological CV, persists LightGBM `model.txt` + `meta.json`.
+- `services/ml_scorer.py` — lazy-loads model, predicts P(win), maps to
+  multiplier 0.88..1.12. **Shadow mode default** — predictions logged
+  to `ml_predictions` but multiplier returns 1.0 unless
+  `cfg.ml_scoring_enabled = True`.
+- Wired into `signal_generator` BUY + SELL paths. Reasoning line
+  surfaces "🤖 ML P(win)=X (shadow|×N.NN)".
+- `MLPrediction` table; `auto_trader_config.ml_scoring_enabled` flag.
+- Routers `/api/ml/{train, scorecard, predict/{ticker}, calibration}`.
+- Weekly retrain (Sun 06:00 UTC); 30-min outcome backfill that joins
+  predictions to closed AutoTrades.
+
+### Revision 18 — Macro release calendar + blackout gates
+- `MacroEvent` table + `services/macro_calendar.py`. 60-day rolling
+  window of US releases (NFP/CPI/PPI/FOMC/PCE/GDP/ISM/Sentiment) from
+  recurrence rules + hardcoded FOMC list.
+- Pre/post-release blackout: 30m / 60m for high-importance, 15m / 30m
+  for medium. Options paths use 1.5× window for IV-crush + gamma.
+- Wired into `consider_signal`, `consider_put_play`, `consider_call_play`.
+- Daily 05:00 UTC populate; 15-min FRED actuals fetch (no-op without
+  `FRED_API_KEY`).
+- `/api/macro/{calendar, recent, blackout, refresh, fetch-actuals}`.
+
+### Revision 17 — Analyst ratings as a signal input
+- `AnalystRating` table + `services/analyst_ratings.py`. Pulls
+  `recommendationMean`, `recommendationKey`, analyst count, target from
+  yfinance `.info`. Refreshed 4× daily for watchlist + candidate pool.
+- `rating_multiplier(ticker, direction)` returns 0.88..1.10 envelope for
+  signal-generator confidence. Asymmetric — disagreement penalty heavier
+  than agreement boost.
+- `/api/analyst-ratings/{ticker, /{ticker}/refresh, /refresh-all}`.
+
+### Revision 16 — In-app Claude chat widget
+- New `/api/chat` SSE endpoint (Anthropic SDK, Opus 4.7, adaptive
+  thinking, prompt caching on context snapshot).
+- Floating chat button in the SPA. Streaming UI, theme-aware.
+- Context: live config + open positions + last 25 closed trades + alerts.
+- `ANTHROPIC_API_KEY` env var enables; "not configured" UX otherwise.
+
+### Revision 15 — Trade frequency increase + readiness
+- Watchlist scan cadence 15m → 5m (3× more entry opportunities).
+- Universe top-N 30 → 50 candidates per scan.
+- `max_concurrent_positions` 10 → 15.
+- Surfaced `max_concurrent_positions`, `daily_loss_limit_pct`,
+  `flatten_by_eod` in `/auto/status` config dict.
+
+### Revision 14 — Losing-trade post-mortem fixes
+- Options conf floor: aggressive 45 → 60, non-aggressive 0.7× → 0.85×.
+  Prevents conf-53 entries with weak volume.
+- `expirations[:3]` MIN_DTE bypass closed in options_analyzer.
+- EOD guard: refuse new options entries within 45 min of close
+  (`paper_trader.minutes_to_close()`).
+- Post-mortem for options: anchors ATR/stop/target analysis to underlying
+  instead of premium. Direction-aware path analysis (Low vs T1 for SHORT).
+
+### Revision 13 — Critical audit fixes
+- Multiplier stack cap at 2× (raw conf × kelly × cal × strategy × VIX).
+- WF confidence fold-count penalty.
+- Theta-efficiency weeklies: skip dte_score double-count for DTE ≤ 7.
+- Chandelier activates from bar 1 with 0.5R favor gate.
+- Universe scanner price floor $5 → $10; sub-$20 score penalty.
+- Reverse-thesis gate raised: same-or-higher TF + ≥80 conf.
+- Signal freshness 2× TF (cap 240m) → 1× TF (cap 90m).
+- Options trim uses `original_qty` instead of current qty.
+
+### Revision 12 — Cloud SQL migration + stability
+- Migrated DB from Neon to Cloud SQL `stockrecs-db` (us-central1, db-g1-small).
+- 1.9MB dump + 6 tables, zero data loss.
+- Pool config: `pool_size=8`, `max_overflow=7`, `pool_recycle=3600`.
+
+### Revision 11
 - Collapsible scrolling frames for Auto-Trades / Positions / Orders
 - `CollapsibleSection` reusable component
 
@@ -771,30 +850,26 @@ All browsers get 401 on next request and prompt for the new key.
 
 ## 15. Future Work
 
-### Phase 2 (conditional on news-alignment data)
-- Wire news into `consider_signal` as a reject gate (high-severity
-  negative < 30 min old on a BUY candidate).
-- News exit in `manage_open_positions` (flatten long on breaking
-  negative news above severity threshold).
-- Confidence boost/dampen based on 4h rolling sentiment.
-
-### Data upgrades
-- FinBERT swap-in for VADER (financial-domain BERT, 75–80% accuracy vs
-  VADER's ~65%).
-- SEC EDGAR RSS (8-K filings, Form 4 insider trades).
-- Options flow data (unusual activity).
-- Historical news replay for backtest validation.
+> **Detailed ML data-source backlog with cost/lift estimates lives in
+> [BACKLOG.md](./BACKLOG.md).** This section keeps non-ML deferred work.
 
 ### Strategy
 - Short-selling for SELL signals (currently long-only stocks).
 - Debit-spread options (verticals, calendars) for defined-risk exposure.
-- ML confidence calibration model (input: bucket win-rates from nightly
-  job; output: recalibrated confidence).
 - Portfolio-heat-aware risk-per-trade (scale down when net unrealized
   drawdown is large).
 - Per-timeframe backtest blending (currently only 2y daily).
 
+### News pipeline (already-collecting, not yet consuming in entries)
+- Wire news into `consider_signal` as a reject gate (high-severity
+  negative < 30 min old on a BUY candidate).
+- News exit in `manage_open_positions` (flatten long on breaking
+  negative news above severity threshold).
+- FinBERT swap-in for VADER (75–80% sentiment accuracy vs ~65%).
+- Historical news replay for backtest validation.
+
 ### UX
 - Push notifications on T1/T2/T3 hits via existing WS channel.
-- Chart overlay: news markers at their timestamps, with hover preview.
-- Mobile-first layout pass.
+- Chart overlay: news markers + macro-event markers at their timestamps.
+- ML calibration plot in the SPA (read `/api/ml/calibration`, render bar
+  chart of predicted vs actual win-rate).
