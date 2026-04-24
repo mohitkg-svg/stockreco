@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 _MODEL_DIR = os.environ.get("ML_MODEL_DIR", "/tmp/ml_models")
 _MODEL_PATH = os.path.join(_MODEL_DIR, "model.txt")
 _META_PATH = os.path.join(_MODEL_DIR, "meta.json")
+_STATUS_PATH = os.path.join(_MODEL_DIR, "status.json")
 
 # Label horizon: how many daily bars to look forward to determine win/loss.
 _LABEL_HORIZON_BARS = 10
@@ -269,3 +270,53 @@ def model_meta() -> Optional[Dict[str, Any]]:
             return json.load(f)
     except Exception:
         return None
+
+
+def _write_status(state: str, **extra) -> None:
+    os.makedirs(_MODEL_DIR, exist_ok=True)
+    payload = {"state": state, "updated_at": datetime.utcnow().isoformat(), **extra}
+    try:
+        with open(_STATUS_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        logger.warning(f"ml_trainer: status write failed: {e}")
+
+
+def get_status() -> Dict[str, Any]:
+    if not os.path.exists(_STATUS_PATH):
+        return {"state": "no_status_file"}
+    try:
+        with open(_STATUS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {"state": "unreadable"}
+
+
+def train_async(max_tickers: int = 40) -> Dict[str, Any]:
+    """Kick training in a background thread and return immediately. Status
+    polled via /api/ml/status or /api/ml/scorecard."""
+    import threading
+    cur = get_status()
+    if cur.get("state") in ("collecting", "training"):
+        return {"accepted": False, "reason": f"already running (state={cur.get('state')})", "status": cur}
+
+    def _job():
+        try:
+            _write_status("collecting", max_tickers=max_tickers)
+            samples = collect_samples(max_tickers=max_tickers)
+            n = 0 if samples is None else len(samples)
+            if n < _MIN_TOTAL_SAMPLES:
+                _write_status("done", trained=False, n_samples=n,
+                              reason=f"too few samples ({n} < {_MIN_TOTAL_SAMPLES})")
+                return
+            _write_status("training", n_samples=n)
+            result = train(samples)
+            _write_status("done", **{k: v for k, v in result.items() if k != "feature_columns"})
+        except Exception as e:
+            logger.exception("ml train_async failed")
+            _write_status("error", error=str(e)[:500])
+
+    t = threading.Thread(target=_job, name="ml-train", daemon=True)
+    t.start()
+    _write_status("queued", max_tickers=max_tickers)
+    return {"accepted": True, "max_tickers": max_tickers, "note": "poll /api/ml/status"}

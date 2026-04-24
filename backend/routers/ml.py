@@ -16,14 +16,17 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("/train")
-def train(max_tickers: int = Query(60, ge=5, le=200)):
-    """Re-train the model on a freshly collected sample. Sync — can take
-    several minutes for large universes (each ticker = ~50 signal evaluations
-    × tape fetch). Returns scorecard incl. mean OOF AUC + feature importance."""
-    samples = ml_trainer.collect_samples(max_tickers=max_tickers)
-    if samples is None or samples.empty:
-        return {"trained": False, "reason": "no samples collected"}
-    return ml_trainer.train(samples)
+def train(max_tickers: int = Query(40, ge=5, le=200)):
+    """Kick training in a background thread and return immediately.
+    Cloud Run's 300s request timeout is shorter than the training run, so
+    the work runs detached. Poll /api/ml/status or /api/ml/scorecard."""
+    return ml_trainer.train_async(max_tickers=max_tickers)
+
+
+@router.get("/status")
+def status():
+    """Current training state (queued|collecting|training|done|error)."""
+    return ml_trainer.get_status()
 
 
 @router.get("/scorecard")
