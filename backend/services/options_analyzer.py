@@ -233,10 +233,13 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
     if not expirations:
         return {"contracts": [], "note": "No option expirations available for this ticker."}
 
-    # Only consider expirations within DTE window
+    # Only consider expirations within DTE window. Previously fell back to
+    # expirations[:3] when empty — that silently bypassed MIN_DTE and let a
+    # NFLX 3-DTE put through that lost $1020 held overnight into expiry week.
+    # If the chain has no contracts in [MIN_DTE, MAX_DTE], we pass.
     eligible_exps = [e for e in expirations if MIN_DTE <= _dte(e) <= MAX_DTE]
     if not eligible_exps:
-        eligible_exps = expirations[:3]
+        return {"contracts": [], "note": f"No expirations in DTE window [{MIN_DTE}, {MAX_DTE}]."}
 
     contracts: List[dict] = []
     for exp_ts in eligible_exps[:8]:  # first 8 expirations: covers weeklies + monthlies

@@ -123,11 +123,27 @@ def analyze_losing_trade(trade: AutoTrade, db: Session) -> Optional[Dict[str, An
         return None
 
     path = _slice_window(df, window_start, window_end)
-    entry_px = _safe(trade.entry_price) or _safe(entry_row.get("Close"))
+    # For options, trade.entry_price is the PREMIUM (e.g. $4.20) while
+    # trade.stop_loss / target1 are UNDERLYING levels (e.g. $63.33). Mixing
+    # the two against underlying ATR gave nonsense findings like
+    # "stop -143× ATR from entry". Anchor analysis to the underlying on
+    # options trades; keep premium-based for stock trades.
+    is_option = (getattr(trade, "asset_type", None) == "option")
+    if is_option:
+        entry_px = _safe(entry_row.get("Close"))
+        premium_entry = _safe(trade.entry_price)
+    else:
+        entry_px = _safe(trade.entry_price) or _safe(entry_row.get("Close"))
+        premium_entry = None
     stop_px = _safe(trade.stop_loss)
     target1 = _safe(trade.target1)
     if entry_px is None or stop_px is None:
         return None
+    # Direction-aware risk: for BUY (stock long / CALL) stop sits below entry;
+    # for SELL / PUT stop sits above. Use absolute distance so sub-1×ATR test
+    # is meaningful in either direction.
+    side = (getattr(trade, "side", "") or "").lower()
+    is_short_side = (side == "sell") or (is_option and stop_px > entry_px)
 
     findings: List[Dict[str, Any]] = []
     lessons: List[str] = []
@@ -135,15 +151,16 @@ def analyze_losing_trade(trade: AutoTrade, db: Session) -> Optional[Dict[str, An
 
     # --- 1. Stop-distance vs ATR at entry ---
     atr_entry = _safe(entry_row.get("ATR_14")) if "ATR_14" in entry_row else None
-    risk = entry_px - stop_px
+    risk = abs(entry_px - stop_px)
     if atr_entry and atr_entry > 0:
         atr_mult = risk / atr_entry
         if atr_mult < 1.0:
+            _ctx = "Underlying" if is_option else "Entry"
             findings.append({
                 "title": f"Stop placed {atr_mult:.2f}× ATR from entry — too tight",
                 "body": (
-                    f"Entry ${entry_px:.2f}, stop ${stop_px:.2f} is only "
-                    f"${risk:.2f} away while one daily ATR was ${atr_entry:.2f}. "
+                    f"{_ctx} ${entry_px:.2f}, stop ${stop_px:.2f} — {risk:.2f} "
+                    f"away while one-bar ATR was ${atr_entry:.2f}. "
                     "Normal noise in this name routinely exceeds the stop distance, "
                     "so the trade was statistically likely to be shaken out without "
                     "the underlying setup being invalidated."
@@ -227,12 +244,20 @@ def analyze_losing_trade(trade: AutoTrade, db: Session) -> Optional[Dict[str, An
 
     # --- 5. Path analysis: did the stop wick or did the trade just decay? ---
     if not path.empty and len(path) >= 3:
-        max_high = float(path["High"].max())
-        peak_pct = (max_high - entry_px) / entry_px * 100
-        if target1 and max_high < target1 * 0.995:
-            shortfall_pct = (target1 - max_high) / (target1 - entry_px) * 100 if target1 > entry_px else 0
+        if is_short_side:
+            # For SELL/PUT: favorable peak is the lowest low. Target sits below entry.
+            extremum = float(path["Low"].min())
+            peak_pct = (extremum - entry_px) / entry_px * 100
+            reached = target1 is not None and extremum <= target1 * 1.005
+            shortfall_pct = ((extremum - target1) / (entry_px - target1) * 100) if (target1 and entry_px > target1) else 0
+        else:
+            extremum = float(path["High"].max())
+            peak_pct = (extremum - entry_px) / entry_px * 100
+            reached = target1 is not None and extremum >= target1 * 0.995
+            shortfall_pct = ((target1 - extremum) / (target1 - entry_px) * 100) if (target1 and target1 > entry_px) else 0
+        if target1 and not reached:
             findings.append({
-                "title": f"Never approached T1 (peak ${max_high:.2f} = {peak_pct:+.2f}% from entry)",
+                "title": f"Never approached T1 (peak ${extremum:.2f} = {peak_pct:+.2f}% from entry)",
                 "body": (
                     f"Price didn't reach even {(100 - shortfall_pct):.0f}% of the way to T1 (${target1:.2f}). "
                     "The setup never produced the expected thrust — likely the breakout structure was already broken before entry."
@@ -240,7 +265,7 @@ def analyze_losing_trade(trade: AutoTrade, db: Session) -> Optional[Dict[str, An
                 "severity": "high",
             })
             verdict_candidates.append("No follow-through (never reached T1)")
-        elif target1 and max_high >= target1:
+        elif target1 and reached:
             findings.append({
                 "title": "Hit T1 then reversed into the stop",
                 "body": (
@@ -280,10 +305,13 @@ def analyze_losing_trade(trade: AutoTrade, db: Session) -> Optional[Dict[str, An
 
     # --- 7. Summary line + verdict ---
     loss = trade.realized_pl or 0.0
+    # Underlying move sign: adverse move is positive % for PUT/SELL, negative for BUY.
     pct = ((stop_px - entry_px) / entry_px * 100) if entry_px else 0
     primary = verdict_candidates[0] if verdict_candidates else "Stop hit on normal pullback"
+    _kind = f"{('PUT' if is_short_side else 'CALL')} " if is_option else ""
     summary = (
-        f"{trade.ticker}: closed at stop for ${loss:.2f} ({pct:+.2f}%). "
+        f"{trade.ticker}: {_kind}closed at stop for ${loss:.2f} "
+        f"(underlying moved {pct:+.2f}%). "
         f"Primary cause: {primary}. " + (verdict_candidates[1] if len(verdict_candidates) > 1
                                          else "")
     ).strip()

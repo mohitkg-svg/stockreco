@@ -1439,10 +1439,10 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         thesis = build_bear_thesis(ticker, "1d")
         if not thesis:
             return None
-        # Aggressive mode: drop bear-thesis floor to 45 (from ~53). Lets more
-        # bearish setups through — capital deployment is the goal.
+        # Floor: aggressive 60, non-aggressive 0.85×threshold. Previously 45 /
+        # 0.7× let a conf-53 GFS put through that lost $360 on weak volume.
         aggressive = bool(getattr(cfg, "aggressive_options_mode", False))
-        min_bear_conf = 45.0 if aggressive else (cfg.confidence_threshold * 0.7)
+        min_bear_conf = 60.0 if aggressive else (cfg.confidence_threshold * 0.85)
         if thesis["confidence"] < min_bear_conf:
             return None
 
@@ -1542,6 +1542,15 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Alpaca rejects option MARKET orders outside RTH (code 42210000).
         if not paper_trader.is_market_open():
             logger.info(f"AutoTrader skip PUT {ticker} {occ}: market closed")
+            return None
+
+        # EOD guard: refuse new option entries within 45 min of close. Prevents
+        # NFLX-style loss where a short-dated put was opened near close and
+        # held overnight, then closed next morning after theta + gap risk.
+        _mtc = paper_trader.minutes_to_close()
+        if _mtc is not None and _mtc <= 45.0:
+            logger.info(f"AutoTrader skip PUT {ticker} {occ}: {_mtc:.0f}m to close (EOD guard)")
+            metrics.inc("autotrade_event", event="eod_guard_put")
             return None
 
         logger.info(
@@ -1706,9 +1715,9 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         thesis = build_bull_thesis(ticker, "1d")
         if not thesis:
             return None
-        # Aggressive mode: drop bull-thesis floor to 45 (from ~53). Lets more
-        # bullish setups trigger — capital deployment is the whole point.
-        min_bull_conf = 45.0 if aggressive else (cfg.confidence_threshold * 0.7)
+        # Floor: aggressive 60, non-aggressive 0.85×threshold. Mirrors put gate
+        # tightening after GFS conf-53 loss.
+        min_bull_conf = 60.0 if aggressive else (cfg.confidence_threshold * 0.85)
         if thesis["confidence"] < min_bull_conf:
             return None
 
@@ -1790,6 +1799,13 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
 
         if not paper_trader.is_market_open():
             logger.info(f"AutoTrader skip CALL {ticker} {occ}: market closed")
+            return None
+
+        # EOD guard: mirror of put-side — no new option entries in final 45m.
+        _mtc = paper_trader.minutes_to_close()
+        if _mtc is not None and _mtc <= 45.0:
+            logger.info(f"AutoTrader skip CALL {ticker} {occ}: {_mtc:.0f}m to close (EOD guard)")
+            metrics.inc("autotrade_event", event="eod_guard_call")
             return None
 
         logger.info(

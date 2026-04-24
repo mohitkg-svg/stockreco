@@ -75,6 +75,30 @@ def is_market_open() -> bool:
     return is_open
 
 
+def minutes_to_close() -> Optional[float]:
+    """Minutes until the next regular-session close, or None if unavailable.
+    Returns a negative number if market is currently closed and next_close is
+    actually the *next* session's close (caller should treat that as "closed").
+    """
+    c = _get_client()
+    if not c:
+        return None
+    try:
+        clk = c.get_clock()
+        if not clk.is_open:
+            return None
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        nc = clk.next_close
+        if nc.tzinfo is None:
+            nc = nc.replace(tzinfo=_dt.timezone.utc)
+        delta = (nc - now).total_seconds() / 60.0
+        return max(0.0, delta)
+    except Exception as e:
+        logger.warning(f"minutes_to_close failed: {e}")
+        return None
+
+
 def get_account() -> Optional[Dict[str, Any]]:
     c = _get_client()
     if not c:
