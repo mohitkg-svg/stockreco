@@ -1069,6 +1069,20 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.info(f"AutoTrader skip {ticker}: on global blacklist")
             return None
 
+        # Macro release blackout — skip new entries near high/medium impact
+        # economic releases (CPI, NFP, FOMC, etc.) to avoid entering into
+        # the gap. Pre-release: 30m before high, 15m before medium.
+        # Post-release: 60m / 30m respectively.
+        try:
+            from services.macro_calendar import is_in_blackout as _macro_blk
+            in_blk, ev, why = _macro_blk()
+            if in_blk:
+                logger.info(f"AutoTrader skip {ticker}: macro blackout — {why}")
+                metrics.inc("autotrade_event", event="macro_blackout_stock")
+                return None
+        except Exception:
+            pass
+
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
         if ws and getattr(ws, "auto_trade_enabled", True) is False:
@@ -1412,6 +1426,18 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         if is_blacklisted(ticker, cfg):
             return None
 
+        # Macro release blackout — options-strict (1.5× window) to account for
+        # IV crush and gamma whipsaw around CPI/NFP/FOMC releases.
+        try:
+            from services.macro_calendar import is_in_blackout as _macro_blk
+            in_blk, _ev, why = _macro_blk(options_only_strict=True)
+            if in_blk:
+                logger.info(f"AutoTrader skip PUT {ticker}: macro blackout — {why}")
+                metrics.inc("autotrade_event", event="macro_blackout_put")
+                return None
+        except Exception:
+            pass
+
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
         if ws and getattr(ws, "auto_trade_enabled", True) is False:
@@ -1661,6 +1687,17 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Global ticker blacklist.
         if is_blacklisted(ticker, cfg):
             return None
+
+        # Macro release blackout — options-strict mirror of put-side guard.
+        try:
+            from services.macro_calendar import is_in_blackout as _macro_blk
+            in_blk, _ev, why = _macro_blk(options_only_strict=True)
+            if in_blk:
+                logger.info(f"AutoTrader skip CALL {ticker}: macro blackout — {why}")
+                metrics.inc("autotrade_event", event="macro_blackout_call")
+                return None
+        except Exception:
+            pass
 
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()

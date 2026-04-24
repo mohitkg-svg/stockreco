@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
-from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
@@ -288,6 +288,27 @@ async def lifespan(app: FastAPI):
             )
     except Exception as _e:
         logger.warning(f"analyst_ratings job not scheduled: {_e}")
+    # Macro calendar — populate daily at 05:00 UTC (pre-US open) so the
+    # window of upcoming events is fresh before the trading day. Hourly job
+    # tries to backfill `actual` values from FRED for releases that just
+    # happened (no-op if FRED_API_KEY is unset; calendar+blackout gate works
+    # without it).
+    try:
+        from services import macro_calendar as _mc
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            lambda: _mc.populate_calendar(60),
+            trigger=_Cron(hour=5, minute=0),
+            id="macro_calendar_populate",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+        scheduler.add_job(
+            lambda: _mc.fetch_actuals_for_recent_releases(24),
+            "interval", minutes=15, id="macro_actuals_fetch",
+            max_instances=1, coalesce=True, misfire_grace_time=300,
+        )
+    except Exception as _e:
+        logger.warning(f"macro_calendar job not scheduled: {_e}")
     scheduler.start()
     _app_health["scheduler_started"] = True
     logger.info("Scheduler started — auto-scan 15m, auto-trader manage 60s")
@@ -434,6 +455,7 @@ app.include_router(news.router)
 app.include_router(alerts_router.router)
 app.include_router(chat_router.router)
 app.include_router(analyst_ratings_router.router)
+app.include_router(macro_router.router)
 
 
 @app.get("/api/health")

@@ -309,6 +309,34 @@ class NewsEvent(Base):
     severity = Column(Integer, nullable=True)
 
 
+class MacroEvent(Base):
+    """Scheduled US macroeconomic releases with consensus expectation and
+    (post-release) actual value.
+
+    Populated daily by services/macro_calendar.py. Auto-trader reads this to
+    impose pre-release / post-release blackout windows on new entries.
+
+    Importance: high = market-moving (CPI/PPI/NFP/FOMC/GDP/PCE),
+                medium = ISM/Retail/Sentiment,
+                low = minor data points.
+    """
+    __tablename__ = "macro_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String, index=True, nullable=False)  # e.g. "CPI", "FOMC"
+    event_name = Column(String, nullable=False)             # human-readable
+    country = Column(String, default="US", nullable=False)
+    importance = Column(String, index=True, nullable=False) # high|medium|low
+    release_time_utc = Column(DateTime, index=True, nullable=False, unique=False)
+    consensus = Column(Float, nullable=True)                # market expectation
+    actual = Column(Float, nullable=True)                   # post-release value
+    unit = Column(String, nullable=True)                    # %, M, K, etc.
+    surprise_pct = Column(Float, nullable=True)             # (actual-consensus)/consensus
+    released_at = Column(DateTime, nullable=True)           # when actual was fetched
+    fred_series_id = Column(String, nullable=True)          # optional FRED series for fetch
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class AnalystRating(Base):
     """Aggregated Wall Street analyst consensus per ticker.
 
