@@ -49,6 +49,7 @@ class AutoTraderConfigRequest(BaseModel):
     stop_atr_mult: Optional[float] = Field(None, gt=0, le=10)
     chandelier_atr_mult: Optional[float] = Field(None, ge=0, le=10)
     dry_run: Optional[bool] = None
+    ml_scoring_enabled: Optional[bool] = None
 
 
 class KillSwitchRequest(BaseModel):

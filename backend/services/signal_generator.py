@@ -569,6 +569,23 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
+        # ML scorer: predicts P(win). Always runs (logs prediction); multiplier
+        # is 1.0 unless ml_scoring_enabled=True in config (shadow-mode default).
+        try:
+            from services.ml_scorer import score_and_apply, predict_winrate
+            from services.auto_trader import get_config_dict as _cfg_dict
+            _ml_enabled = bool(_cfg_dict().get("ml_scoring_enabled", False))
+            _stub_signal = {"signal_type": "BUY", "confidence": confidence_bull,
+                            "entry": price, "stop_loss": None, "target1": None}
+            _ml_mult = score_and_apply(ticker, _stub_signal, scoring_enabled=_ml_enabled)
+            _regime_mult *= _ml_mult
+            _p = predict_winrate(ticker, _stub_signal)
+            if _p is not None:
+                tag = "shadow" if not _ml_enabled else f"×{_ml_mult:.2f}"
+                reasons.append(f"🤖 ML P(win)={_p:.2f} ({tag})")
+        except Exception:
+            pass
+
         confidence = min(round(confidence_bull * _regime_mult), 95)
         entry = round(price, 2)
 
@@ -711,6 +728,22 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
             _ar_line = _ar_reason(ticker, "SELL")
             if _ar_line:
                 reasons.append(_ar_line)
+        except Exception:
+            pass
+
+        # ML scorer mirror — see BUY-side comment.
+        try:
+            from services.ml_scorer import score_and_apply, predict_winrate
+            from services.auto_trader import get_config_dict as _cfg_dict
+            _ml_enabled = bool(_cfg_dict().get("ml_scoring_enabled", False))
+            _stub_signal = {"signal_type": "SELL", "confidence": confidence_bear,
+                            "entry": price, "stop_loss": None, "target1": None}
+            _ml_mult = score_and_apply(ticker, _stub_signal, scoring_enabled=_ml_enabled)
+            _regime_mult *= _ml_mult
+            _p = predict_winrate(ticker, _stub_signal)
+            if _p is not None:
+                tag = "shadow" if not _ml_enabled else f"×{_ml_mult:.2f}"
+                reasons.append(f"🤖 ML P(win)={_p:.2f} ({tag})")
         except Exception:
             pass
 

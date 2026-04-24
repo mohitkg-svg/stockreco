@@ -104,6 +104,10 @@ class AutoTraderConfig(Base):
     # prevented stacking calls on top of existing stock longs. Meant to be
     # used alongside a 30/70 stock/option budget split.
     aggressive_options_mode = Column(Boolean, default=False)
+    # ML scorer toggle. False = shadow mode (predictions logged but multiplier
+    # is 1.0 — no effect on signals). Flip to True after evaluating logged
+    # predictions vs realized outcomes (typically 1-2 weeks of paper data).
+    ml_scoring_enabled = Column(Boolean, default=False)
     # Entry order type: "market" (default) or "limit_at_mid".
     # limit_at_mid submits a limit at (bid+ask)/2 with a 3-min cancel timer.
     # Saves ~half the bid-ask spread on liquid names. For illiquid or
@@ -309,6 +313,30 @@ class NewsEvent(Base):
     severity = Column(Integer, nullable=True)
 
 
+class MLPrediction(Base):
+    """Logged ML scorer predictions vs realized outcomes.
+
+    Every signal that reaches the scorer produces a row. After the trade
+    closes (if it becomes a trade), we backfill `realized_pl` and `outcome`
+    so calibration plots can compare predicted P(win) to actual win rate.
+
+    Drives shadow-mode evaluation: train + log for 1-2 weeks, plot bucket
+    win rates, decide whether to flip ml_scoring_enabled=True.
+    """
+    __tablename__ = "ml_predictions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String, index=True, nullable=False)
+    signal_type = Column(String, nullable=False)        # BUY|SELL
+    timeframe = Column(String, nullable=False)
+    predicted_winrate = Column(Float, nullable=False)   # 0..1
+    signal_confidence = Column(Float, nullable=True)    # confidence at gen time
+    trade_id = Column(Integer, nullable=True, index=True)  # set if a trade fired
+    outcome = Column(Integer, nullable=True)            # 1=win, 0=loss, null=open
+    realized_pl = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    closed_at = Column(DateTime, nullable=True)
+
+
 class MacroEvent(Base):
     """Scheduled US macroeconomic releases with consensus expectation and
     (post-release) actual value.
@@ -450,6 +478,7 @@ def create_tables():
     _ensure_column("auto_trader_config", "flatten_by_eod", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "trade_calls", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "aggressive_options_mode", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "ml_scoring_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "entry_order_type", "VARCHAR DEFAULT 'market'")
     _ensure_column("auto_trader_config", "use_universe_scanner", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "universe_top_n", "INTEGER DEFAULT 30")

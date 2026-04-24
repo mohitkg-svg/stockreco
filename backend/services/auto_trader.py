@@ -30,6 +30,17 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 import hashlib
+from pydantic import BaseModel
+
+class SignalData(BaseModel):
+    ticker: str
+    signal_type: str
+    confidence: float
+    entry: float
+    stop_loss: float
+    target1: float
+    timeframe: str
+
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -332,6 +343,7 @@ def get_config_dict() -> Dict[str, Any]:
             "max_concurrent_positions": int(getattr(cfg, "max_concurrent_positions", 10) or 10),
             "daily_loss_limit_pct": float(getattr(cfg, "daily_loss_limit_pct", 0.03) or 0.03),
             "flatten_by_eod": bool(getattr(cfg, "flatten_by_eod", False)),
+            "ml_scoring_enabled": bool(getattr(cfg, "ml_scoring_enabled", False)),
         }
     finally:
         db.close()

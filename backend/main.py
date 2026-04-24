@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
-from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router, ml as ml_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
@@ -182,6 +182,46 @@ def _scheduled_manage():
         _record_manage_tick()
 
 
+def _ml_outcome_backfill():
+    """For each MLPrediction without an outcome, look up the most recent
+    closed AutoTrade for the same (ticker, signal_type, ~created_at window)
+    and copy realized_pl + outcome. Drives the /api/ml/calibration endpoint."""
+    from datetime import datetime as _dt, timedelta as _td
+    from database import SessionLocal, MLPrediction, AutoTrade
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(MLPrediction)
+            .filter(MLPrediction.outcome.is_(None))
+            .filter(MLPrediction.created_at >= _dt.utcnow() - _td(days=30))
+            .all()
+        )
+        n = 0
+        for p in rows:
+            window_start = p.created_at - _td(minutes=10)
+            window_end = p.created_at + _td(minutes=10)
+            t = (
+                db.query(AutoTrade)
+                .filter(AutoTrade.ticker == p.ticker,
+                        AutoTrade.opened_at >= window_start,
+                        AutoTrade.opened_at <= window_end,
+                        AutoTrade.status.like("closed%"))
+                .order_by(AutoTrade.closed_at.desc())
+                .first()
+            )
+            if t and t.realized_pl is not None:
+                p.trade_id = t.id
+                p.realized_pl = t.realized_pl
+                p.outcome = 1 if t.realized_pl > 0 else 0
+                p.closed_at = t.closed_at
+                n += 1
+        if n:
+            db.commit()
+            logger.info(f"ml_outcome_backfill: backfilled {n} predictions")
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_tables()
@@ -309,6 +349,28 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"macro_calendar job not scheduled: {_e}")
+    # ML: weekly retrain on Sunday 06:00 UTC. Heavy job (5-15 min depending
+    # on universe size). Initial training has to be triggered manually via
+    # POST /api/ml/train after first deploy.
+    try:
+        from services import ml_trainer as _mt
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            lambda: _mt.train(),
+            trigger=_Cron(day_of_week="sun", hour=6, minute=0),
+            id="ml_weekly_retrain",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+        # Hourly outcome backfill: for closed AutoTrades that have an MLPrediction
+        # row, copy the realized outcome onto the prediction so the calibration
+        # endpoint can plot predicted-vs-actual.
+        scheduler.add_job(
+            _ml_outcome_backfill,
+            "interval", minutes=30, id="ml_outcome_backfill",
+            max_instances=1, coalesce=True, misfire_grace_time=300,
+        )
+    except Exception as _e:
+        logger.warning(f"ml jobs not scheduled: {_e}")
     scheduler.start()
     _app_health["scheduler_started"] = True
     logger.info("Scheduler started — auto-scan 15m, auto-trader manage 60s")
@@ -456,6 +518,7 @@ app.include_router(alerts_router.router)
 app.include_router(chat_router.router)
 app.include_router(analyst_ratings_router.router)
 app.include_router(macro_router.router)
+app.include_router(ml_router.router)
 
 
 @app.get("/api/health")
