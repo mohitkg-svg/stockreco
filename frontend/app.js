@@ -2847,6 +2847,156 @@ function LoginScreen({ onSuccess }) {
 // Thin dispatcher: gate on auth and only mount the real UI once authenticated.
 // Keeping hooks in two components avoids the "rendered more hooks than
 // previous render" crash when the auth guard is in the same component.
+function ChatWidget() {
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState([]);  // [{role, content}]
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [configured, setConfigured] = useState(null);  // null=unknown, true/false
+  const scrollRef = useRef(null);
+
+  // One-shot: check whether ANTHROPIC_API_KEY is set on the server.
+  useEffect(() => {
+    if (!open || configured !== null) return;
+    api.get('/api/chat/status').then(d => setConfigured(!!d.configured))
+       .catch(() => setConfigured(false));
+  }, [open, configured]);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, busy]);
+
+  async function send() {
+    const trimmed = input.trim();
+    if (!trimmed || busy) return;
+    setErr('');
+    const next = [...messages, { role: 'user', content: trimmed }];
+    setMessages(next);
+    setInput('');
+    setBusy(true);
+    // Add an empty assistant bubble we stream into.
+    setMessages(m => [...m, { role: 'assistant', content: '' }]);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ messages: next }),
+      });
+      if (res.status === 401) { on401(); throw new Error('unauthorized'); }
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(txt || `HTTP ${res.status}`);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          const line = chunk.split('\n').find(l => l.startsWith('data:'));
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line.slice(5).trim());
+            if (evt.error) { setErr(evt.error); break; }
+            if (evt.delta) {
+              setMessages(m => {
+                const copy = m.slice();
+                const last = copy[copy.length - 1];
+                if (last && last.role === 'assistant') copy[copy.length - 1] = { ...last, content: last.content + evt.delta };
+                return copy;
+              });
+            }
+          } catch (_) { /* ignore malformed SSE line */ }
+        }
+      }
+    } catch (e) {
+      setErr(String(e && e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  }
+
+  return (
+    <>
+      {!open && (
+        <button
+          onClick={() => setOpen(true)}
+          className="fixed bottom-5 right-5 z-40 w-12 h-12 rounded-full app-surface app-border border shadow-xl flex items-center justify-center text-xl hover:scale-105 transition"
+          title="Ask Claude about trades & config"
+          aria-label="Open chat"
+        >💬</button>
+      )}
+      {open && (
+        <div className="fixed bottom-5 right-5 z-40 w-[min(420px,calc(100vw-1.5rem))] h-[min(620px,calc(100vh-2rem))] app-surface app-border border rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+          <div className="flex items-center justify-between px-3 py-2 app-border border-b">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-xs">🤖</div>
+              <div className="text-sm font-semibold">Ask Claude</div>
+              {configured === false && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-400">not configured</span>}
+            </div>
+            <div className="flex gap-1">
+              {messages.length > 0 && <button onClick={() => { setMessages([]); setErr(''); }} className="text-xs app-text-secondary hover:app-text px-2 py-1" title="New chat">↻</button>}
+              <button onClick={() => setOpen(false)} className="text-xs app-text-secondary hover:app-text px-2 py-1" aria-label="Close">✕</button>
+            </div>
+          </div>
+          <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-thin px-3 py-2 space-y-2 text-sm">
+            {messages.length === 0 && (
+              <div className="app-text-secondary text-xs leading-relaxed">
+                <div className="mb-2">Ask anything about your bot:</div>
+                <ul className="space-y-1 list-disc ml-4">
+                  <li>"Why did trade #29 close as reverse?"</li>
+                  <li>"What's my current config for options?"</li>
+                  <li>"Which tickers are in my candidate pool today?"</li>
+                  <li>"Summarize my last 5 losing trades."</li>
+                </ul>
+                {configured === false && (
+                  <div className="mt-3 p-2 rounded bg-yellow-500/10 border border-yellow-500/30 text-yellow-300">
+                    Set <code>ANTHROPIC_API_KEY</code> in the Cloud Run env vars to enable chat.
+                  </div>
+                )}
+              </div>
+            )}
+            {messages.map((m, i) => (
+              <div key={i} className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+                <div className={`max-w-[85%] px-3 py-2 rounded-lg whitespace-pre-wrap ${m.role === 'user' ? 'bg-blue-500/15 border border-blue-500/30' : 'app-surface-alt app-border border'}`}>
+                  {m.content || (busy && i === messages.length - 1 ? <span className="app-text-secondary">…</span> : '')}
+                </div>
+              </div>
+            ))}
+            {err && <div className="text-xs text-red-400 px-2">Error: {err}</div>}
+          </div>
+          <div className="app-border border-t p-2 flex gap-2">
+            <textarea
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={onKey}
+              placeholder={configured === false ? 'Chat disabled — set ANTHROPIC_API_KEY' : 'Ask about trades, config, positions…'}
+              disabled={busy || configured === false}
+              rows={1}
+              className="flex-1 resize-none app-surface-alt app-border border rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/40"
+            />
+            <button
+              onClick={send}
+              disabled={busy || !input.trim() || configured === false}
+              className="px-3 py-1.5 rounded-lg bg-blue-500 text-white text-sm disabled:opacity-40"
+            >{busy ? '…' : 'Send'}</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 function App() {
   const [authed, setAuthed] = useState(!!getApiKey());
   useEffect(() => {
@@ -3025,6 +3175,7 @@ function AuthedApp({ onLogout }) {
           </div>
         )}
       </div>
+      <ChatWidget />
     </div>
   );
 }

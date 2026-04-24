@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
-from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
@@ -417,6 +417,7 @@ app.include_router(stream.router)
 app.include_router(trading.router)
 app.include_router(news.router)
 app.include_router(alerts_router.router)
+app.include_router(chat_router.router)
 
 
 @app.get("/api/health")
