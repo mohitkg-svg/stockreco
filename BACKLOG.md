@@ -288,6 +288,54 @@ observability. Graded as follows:
   Sharpe by month for at least 90 days before increasing weight.
   Revisit when shadow log accumulates ≥200 closed trades.
 
+## External review backlog (2026-04-25, fourth pass — strategy + execution)
+
+Reviewer flagged divergence between backtest and live, plus refinements
+to ATR fallback, OCC consolidation, runner sizing, and restart safety.
+
+### ✅ Applied (r37, commit `3241065`, 2026-04-25)
+
+- ✅ **Backtest partial-exit simulation (Ghost Alpha fix)** —
+  `_simulate(partial_exits=True)` now banks 33% at T1 (50% of distance
+  to final target), 33% at T2 (85%), runner exits at the full target.
+  Stop tightens to soft-BE at T1, full BE at T2. Closes the divergence
+  where the all-in/all-out backtester systematically overstated upside
+  AND drawdown vs what live actually captures. Legacy single-exit
+  retained under `partial_exits=False` for sanity comparison.
+- ✅ **Liquidity gate in `run_multi_strategy`** — rejects backtests
+  with median 20-bar daily $-volume < $10M (matches the live
+  `consider_signal` gate). Stops backtest stats from being inflated by
+  spread-driven micro-cap fills the live bot wouldn't take.
+- ✅ **ATR fallback chain repair** — real ATR → 14-bar median H–L range
+  → stdev of 14 closes → 2% of Close → 0.01 floor. (A previous merge
+  had a trailing else that silently overwrote good values with raw
+  2%-of-Close.)
+- ✅ **OCC parser cleanup** — removed residual inline P/C parse in
+  `_manage_option_trade`; `_is_call_option` is now truly the only
+  direction source. Tightens the AMKR direction-drift guard.
+- ✅ **Extreme-trend skip-T1** — `trim_fraction_for_adx` returns 0.0
+  at ADX ≥ 45 for the T1 site (parabolic regime — runner is the trade).
+  T2 unchanged. Wired through option + stock T1 paths with 0-frac
+  short-circuit.
+- ✅ **Persisted `target_touch_count`** — column on `auto_trades` +
+  `_touch_get / _touch_set / _touch_clear` helpers. The 2-tick debounce
+  now survives Cloud Run instance cycles instead of being bypassed
+  whenever an instance restarts mid-target-test.
+- ✅ **Chop-regime risk halving** — `adaptive_risk_multiplier` now also
+  applies 0.5× when SPY daily ADX_14 < 20. Range-bound markets chew up
+  trend-following entries via false breakouts; half-size during these
+  periods recovers the EV the chop chops out.
+
+### Closed via r36 (independent of this review pass)
+
+- ✅ **AI judge layer** — `services/ai_judge.py` wraps three Claude
+  (Haiku) call sites: entry veto, news-driven exit, sizing multiplier.
+  Each independently mode-gated (off / shadow / active). Decision log
+  in `ai_decision_log` table; review endpoints under `/api/ai-judge/*`.
+  Fail-open guarantee — Claude unavailability never blocks live trading.
+  Bounded influence — outputs clamped + enum-validated; no prices/sizes.
+  Different from "ML scorer graduation" still on the Tier D list.
+
 ### Rejected — low ROI or empirically weak
 
 - **Join-the-Bid entry** — bid-chase with cancel/replace. Saves

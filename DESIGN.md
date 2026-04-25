@@ -250,6 +250,8 @@ Per-entry lifecycle. Status values: `pending`, `open`, `closed_target`,
 - `target1/2/3` + `level_index` (state machine cursor)
 - `high_water_mark` / `low_water_mark` — chandelier calculation
 - `realized_pl` — accumulates partial-fill gains (T1 + T2 trims)
+- `original_qty` — fixed denominator for partial trims (prevents exponential decay across cascades)
+- `target_touch_count` — persisted 2-tick debounce counter (r37; survives instance restarts)
 - `parent_order_id`, `stop_order_id`, `tp_order_id` — broker refs
 - `idempotency_key` — SHA1 of ticker|side|rounded levels|tf|conf bucket|UTC day
 - `sector` — captured at entry for correlation cap
@@ -302,6 +304,7 @@ or quarterly-stale-tolerant designs.
 | `CandidatePool` | Universe scanner output — top-N tickers ranked by composite RVOL/ADX/RS/52w-high score. Refreshed 4×/day. |
 | `BestStrategyPerTicker` | Walk-forward winner per (ticker, direction) updated weekly Sun 04:00 UTC. |
 | `ConfidenceCalibration` | Per-confidence-bucket realized win rate from closed auto-trades, computed nightly. |
+| `AIDecisionLog` | r36: every AI judge call (entry_veto / news_exit / confidence_multiplier) — call_site, mode, prompt summary, response, latency, honored flag. Source of truth for shadow-mode review before promoting a call site to active. |
 
 ---
 
@@ -359,14 +362,23 @@ Every gate short-circuits on failure. Order matters — cheap checks first.
 | 18 | No existing open/pending trade on this ticker | One-per-ticker |
 | 19 | Idempotency hash not seen in last 12h | Dedupe retries |
 | 20 | Sector count < `max_per_sector` (5) | Correlation cap |
-| 21 | Position qty ≥ 1 after sizing | Capital check |
+| 21 | **AI judge entry-veto** (`AI_ENTRY_VETO_MODE=active`) | r36: Claude veto for semantic reasons rule engine can't see; off/shadow by default |
+| 22 | Position qty ≥ 1 after sizing | Capital check |
 
 ### 5.3 Position Sizing
 
 ```
 risk_budget = equity × max_risk_per_trade_pct
+           × adaptive_risk_mult       # 0.5×–1.0× based on VIX, recent WR, SPY chop ADX (r34, r37)
            × confidence_multiplier    # 1.0 at threshold → 1.75 at 100%
-           × kelly_multiplier         # 1.0 below 55% WR → 1.35 at 100% WR
+           × kelly_multiplier         # 1.0 below 55% WR → 1.20 at 100% WR (tightened r33 pre-live)
+           × calibration_multiplier   # per-confidence-bucket empirical
+           × strategy_multiplier      # per-strategy realized-PnL empirical
+           × vix_sizing_multiplier
+           × ai_confidence_mult       # r36: Claude opinion in [0.6, 1.4], shadow by default
+           ⇒ all multipliers compound CAPPED at RISK_MULT_CEILING = 2.0×
+           × heat_aware_mult          # r35: 1.0 / 0.85 / 0.6 / 0.4 as live heat → 50/70/85% of cap (after ceiling)
+
 qty = min(
   risk_budget / risk_per_share,
   stock_remaining / entry,
@@ -397,13 +409,18 @@ For each open trade:
    timeframe ≥ source TF (with 60s grace) → close at market.
 5. **Stale-trade guard**: trades not hitting T1 after `8 × timeframe_min`
    get closed if price is not meaningfully winning (< 0.3×R above entry).
-6. **Trailing state machine** with `_TARGET_CONFIRM_TICKS=2` debounce:
+6. **Trailing state machine** with `_TARGET_CONFIRM_TICKS=2` debounce
+   (counter is **persisted** to `auto_trades.target_touch_count` since
+   r37 so an instance restart mid-target-test can't bypass the
+   confirmation requirement):
    - **T1**: trim **ADX-aware fraction** (r34, `trim_fraction_for_adx`):
-     ADX ≤ 25 → 33% (stocks) / 50% (options); ADX ≥ 40 → 15% (let the
-     runner run); linear in between. Then move to **soft BE** at
-     `entry − 0.3×initial_risk` (not full entry — post-mortem found full BE
-     chopped out winners on 1% retraces). If T1 is < 0.5×ATR from entry
-     (NaN-safe check), BE is skipped and the chandelier overlay takes over.
+     ADX ≤ 25 → 33% (stocks) / 50% (options); ADX ≥ 40 → 15%; **ADX ≥ 45
+     → 0% (skip the trim entirely, r37)** — parabolic regime, the runner
+     IS the trade; stop still trails to soft-BE. Otherwise linear.
+     Then move to **soft BE** at `entry − 0.3×initial_risk` (not full
+     entry — post-mortem found full BE chopped out winners on 1%
+     retraces). If T1 is < 0.5×ATR from entry (NaN-safe check), BE is
+     skipped and the chandelier overlay takes over.
    - **T2**: trim ADX-aware fraction (default 33% of remaining runner) →
      stop to **entry (full BE)**. Runner now ~45% of original position.
    - **T3**: stop → T2 AND **recompute T1/T2/T3 from current price**.
@@ -415,6 +432,11 @@ For each open trade:
    - `20 ≤ ADX ≤ 30`: config default (3.0×ATR)
 8. **Reconcile**: parent/leg filled → compute realized P/L, set status,
    enqueue post-mortem for losing stops.
+9. **AI news-exit (r36)**: out-of-band — when fresh news lands on the
+   ticker mid-trade, the post-news-ingest hook calls `ai_judge.
+   news_exit_decision` with the trade context. Honored `close` triggers
+   `force_close_trade(status=closed_news_ai)`; honored `trim` halves the
+   position. Mode-gated by `AI_NEWS_EXIT_MODE` (off/shadow/active).
 
 ### 5.5 Options Strategy
 
@@ -435,11 +457,14 @@ strong BUY exists.
   - Score = R:R × DTE-sweet-spot × liquidity × delta-proxy
 
 Exit conditions (whichever fires first):
-- Underlying hits T1/T2/T3 → ADX-aware trim on T1 (15-50% of original
-  contracts), trail underlying-stop tighter
+- Underlying hits T1/T2/T3 → ADX-aware trim on T1 (0–50% of original
+  contracts; 0% at ADX ≥ 45 per r37), trail underlying-stop tighter
 - Premium decay ≥ 50% (skipped within first 5 min if underlying not against
   thesis — spread-artifact guard)
 - **Theta stop (r34)**: held ≥ 48h with < 0.2R underlying progress → close
+- **AI news exit (r36)**: when fresh news arrives on the underlying,
+  Claude classifies thesis-relevance → hold/trim/close. Honored only when
+  `AI_NEWS_EXIT_MODE=active`; off/shadow by default
 - Underlying breaches bear stop
 - Reverse-thesis BUY on higher TF
 
@@ -679,6 +704,13 @@ Header also carries: live-stream indicator, theme toggle pill, log-out.
 
 ### Backtest
 - `POST /api/backtest/{ticker}` — evaluate all strategies on 2y daily
+- `POST /api/backtest/portfolio/run?stress_window=<key>` — composite portfolio backtest (r35) over trailing window or canned stress range
+- `GET /api/backtest/portfolio/stress-windows` — list canned drawdown windows
+
+### AI judge (r36)
+- `GET /api/ai-judge/decisions?call_site=<name>&only_honored=true&limit=50` — recent Claude-judge decisions (newest first)
+- `GET /api/ai-judge/summary` — aggregate: count, honored count, avg latency, by call_site × mode
+- `GET /api/ai-judge/modes` — current mode for each call site + whether `ANTHROPIC_API_KEY` is set
 
 ### Health & WS
 - `GET /api/health` — subsystem heartbeat (open, no auth)
@@ -716,14 +748,25 @@ auth is a no-op (local dev).
 
 ## 11. Safety & Risk Controls
 
-### Entry-side gates (~27 total — expanded since r19)
-Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, **liquidity gate** (median 20-day $-volume ≥ $10M, r34), earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), **regime-tightened concurrent cap** (cap÷3 in VIX>25 or SPY<200EMA; cap×2/3 in VIX>20, r34), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55%), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), ticker blacklist.
+### Entry-side gates (~28 total — expanded since r19)
+Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, **liquidity gate** (median 20-day $-volume ≥ $10M, r34), earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), **regime-tightened concurrent cap** (cap÷3 in VIX>25 or SPY<200EMA; cap×2/3 in VIX>20, r34), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55% OR **SPY daily ADX_14 < 20** [chop, r37]), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), **AI judge entry-veto** (r36, off/shadow by default; when active, Claude can skip after every other gate has passed), ticker blacklist.
 
 ### Multiplier stack (~10 factors, hard-capped at 2.0×)
 Confidence-headroom × Kelly × calibration × per-strategy × VIX × analyst-rating × fundamentals-quality × short-interest × Stocktwits × WSB × institutional × insider × ML-scorer (shadow) × **AI judge (r36, shadow by default, 0.6×–1.4× envelope)**. Compound is clamped to `RISK_MULT_CEILING = 2.0` (Critical-audit fix #1) so a winning streak across all factors can't compound to runaway risk. Heat-aware throttle (r35: 0.85× / 0.60× / 0.40× as live heat crosses 50% / 70% / 85% of cap) applies AFTER the ceiling.
 
 ### Exit-side guarantees
-SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis close (gate ≥80 conf + same-or-higher TF, with correct CALL/PUT direction post-r22), stale-trade recycle, debounced target touches (2-tick confirm), atomic stop-replacement (broker ack gates DB update), adaptive chandelier (ADX-driven 0.83-1.33× of base mult, never loosens existing stop), **ADX-aware T1/T2 trim fractions** (r34: 15% in strong trend, default in chop), ATR-capped Soft BE (`max(0.3R, 0.25×ATR)` to survive 1-bar wicks), premium-stop spread-artifact guard (skip when held < 5 min AND underlying not against thesis), **options theta stop** (r34: close when held ≥ 48h with < 0.2R underlying progress).
+SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis close (gate ≥80 conf + same-or-higher TF, with correct CALL/PUT direction post-r22), stale-trade recycle, debounced target touches (2-tick confirm, **persisted to `target_touch_count` column** since r37 so the debounce isn't bypassed on instance restarts), atomic stop-replacement (broker ack gates DB update), adaptive chandelier (ADX-driven 0.83-1.33× of base mult, never loosens existing stop), **ADX-aware T1/T2 trim fractions** (r34: 15% in strong trend, default in chop; r37: **0% at ADX ≥ 45 — skip T1 trim entirely on parabolic moves**), ATR-capped Soft BE (`max(0.3R, 0.25×ATR)` to survive 1-bar wicks), premium-stop spread-artifact guard (skip when held < 5 min AND underlying not against thesis), **options theta stop** (r34: close when held ≥ 48h with < 0.2R underlying progress), **AI news exit** (r36: Claude classifies fresh news on open positions → hold/trim/close; off/shadow by default).
+
+### AI judge layer (r36, shadow by default)
+- **Three call sites**, each independently gated by env var:
+  - `AI_ENTRY_VETO_MODE` — Claude reviews entries after every other gate; can `skip` semantically.
+  - `AI_CONFIDENCE_MULT_MODE` — returns sizing multiplier in `[0.6, 1.4]`, joins the multiplier stack (capped at 2.0× by `RISK_MULT_CEILING`).
+  - `AI_NEWS_EXIT_MODE` — on fresh news on open positions, returns `hold` / `trim` / `close`.
+- **Mode cycle**: `off` → `shadow` (log only) → `active` (honor verdict). Defaults `off`. The recommended rollout is shadow for ≥ 200 decisions, review via `GET /api/ai-judge/decisions`, then promote to active.
+- **Fail open guarantee**: any failure (no API key, network, schema mismatch, timeout) returns the abstain value (proceed / 1.0 / hold). Live trading is never blocked by Claude availability. 6 unit tests pin this contract.
+- **Bounded influence**: numeric outputs are clamped (multiplier to `[0.6, 1.4]`), categorical outputs are validated against an enum (proceed/skip, hold/trim/close). Claude never emits prices, sizes, or order parameters.
+- **Audit trail**: every call (off/shadow/active) writes a row to `ai_decision_log`. Operator review via `/api/ai-judge/decisions`, `/summary`, `/modes`.
+- **Cost**: ~$0.001/Haiku call × ≤ 50 high-conf signals/day ≈ $0.05/day per active site.
 
 ### Crash-resilience (r33)
 - **Dual-service architecture**: position management runs in a dedicated `stockrecs-manager` Cloud Run service (internal-ingress, min/max=1 instance). The `stockrecs` (api) service handles HTTP + scanner + alt-data; a crash there cannot leave open positions unmanaged.
@@ -738,7 +781,7 @@ SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis cl
 - Persistent kill switch — survives deploys; unkill does NOT re-enable trading (two-step re-arm).
 - Idempotency hash deduping retries within 12h, bucket-aware on confidence.
 - Post-mortem auto-generated on every losing stop (skipped for `closed_reverse`).
-- Synthetic-data regression suite (93 tests) gates every deploy via `deploy.sh`.
+- Synthetic-data regression suite (125 tests) gates every deploy via `deploy.sh`.
 
 ### Auth & access
 - Shared-secret `APP_API_KEY` gating all `/api/*` and `/ws/quotes`.
