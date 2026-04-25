@@ -472,13 +472,14 @@ Exit conditions (whichever fires first):
 
 - Equity: **~$98,600**
 - Stock bucket: 50% = **$49,300**
-- Options bucket: 50% = **$49,300**
-- Max risk per trade: 2% = **$1,972**
+- Options bucket: 50% = **$49,300** (VIX-scaled, r34: × 0.3/0.5/0.75 at VIX > 30/25/20)
+- Max risk per trade: 2% = **$1,972** (further scaled by adaptive + heat-aware throttles, r34/r35/r37/r38)
 - Confidence-scaled risk multiplier: 1.0 → 1.75× at 100% confidence
-- Kelly-lite multiplier: 1.0 → 1.35× with backtest win rate ≥ 55%
+- Kelly-lite multiplier: 1.0 → **1.20×** with backtest win rate ≥ 55% (tightened from 1.35× in r33 pre-live)
+- AI confidence multiplier: 0.6×–1.4× (r36, shadow by default)
 - Per-ticker cap: 30% of stock bucket = **$14,790**
-- Portfolio heat cap: 10% of equity = **$9,860** max $-at-risk across all open trades
-- Max concurrent positions: 15
+- Portfolio heat cap: 10% of equity = **$9,860** max $-at-risk across all open trades (beta-weighted; throttled to 0.85/0.60/0.40× as it fills, r35)
+- Max concurrent positions: 15 (regime-tightened to base÷3 in VIX>25 / SPY<200EMA, base×2/3 in VIX>20, r34)
 - Max per sector: 5
 
 ---
@@ -685,6 +686,7 @@ Header also carries: live-stream indicator, theme toggle pill, log-out.
 - `DELETE /api/trading/orders/{id}` — cancel order
 - `GET /api/trading/auto/status` — budget snapshot + config
 - `GET /api/trading/auto/trades?limit=50` — trade ledger
+- `GET /api/trading/auto/pdt` — r39: PDT day-trade counter (trailing 5 business days). Informational on paper; becomes a hard pre-entry gate when live margin < $25k.
 - `POST /api/trading/auto/config` — update singleton config (now accepts
   `max_per_sector`, `signal_timeframes`, `stop_atr_mult`,
   `chandelier_atr_mult`, `dry_run` in addition to original fields)
@@ -731,18 +733,32 @@ auth is a no-op (local dev).
   stream_stale_secs, last_scan_at, last_manage_at, realized_pnl_today,
   open_positions, auth_configured, alpaca_live.
 - **Metrics counters** (`services/metrics.py`): `autotrade_event` tagged
-  by event. Current event taxonomy:
+  by event + `autotrade_skip{reason=...}` on every rejection path.
+  Current event taxonomy:
   - `opened`, `opened_put`
   - `closed_target`, `closed_stop`, `closed_reverse`, `closed_stale`,
-    `closed_slippage`, `closed_manual`
-  - `partial_t1`, `partial_t2`
+    `closed_slippage`, `closed_manual`, `closed_news_ai` (r36)
+  - `partial_t1`, `partial_t2`, `theta_stop` (r34)
   - `sl_resubmitted`, `bp_exhausted`, `entry_lock_timeout`
   - `fat_finger_reject`, `bad_t1_geometry`, `stop_too_tight_atr`,
     `gap_open_reject`, `portfolio_heat_cap`, `opening_filter`,
-    `daily_loss_halt`, `earnings_skip`, `earnings_skip_put`
+    `daily_loss_halt`, `earnings_skip`, `earnings_skip_put`,
+    `illiquid_skip` (r34/r39), `ai_veto` (r36), `malformed_signal` (r36)
   - `killed`, `unkilled`
+- **Operator alert categories** (`services/alerts.py`, persisted to
+  `alerts` table, 5-min dedup):
+  - `bp_breaker` — buying power exhausted (Alpaca 422)
+  - `broker_down` — Alpaca 5xx
+  - `manage_loop_stuck` — manage tick > 120s stale during RTH
+  - `stream_stale` — quote stream > 30s stale during RTH
+  - `stream_reconnect_loop` — WS reconnect at backoff cap
+  - `option_trim_failed` — T1 partial-trim rejected by broker
+  - `strategy_drawdown` (r39) — 30d realized-PnL DD ≥ 10% of equity
+  - `low_signal_volume` (r39) — today's signal count < 30% of 7d avg
 - **Nightly calibration job** (03:10 UTC): buckets closed trades by
   confidence and logs per-bucket win-rate + avg P/L.
+- **Daily health-check job** (22:00 UTC, r39): runs
+  `risk_manager.check_low_signal_volume` to detect scanner degradation.
 
 ---
 
@@ -811,7 +827,16 @@ gcloud services enable run.googleapis.com cloudbuild.googleapis.com
 ```
 
 `deploy.sh` sources `backend/.env` and sets: `APCA_API_KEY_ID`,
-`APCA_API_SECRET_KEY`, `DATABASE_URL`, `APP_API_KEY`, `CORS_ALLOW_ORIGINS=*`.
+`APCA_API_SECRET_KEY`, `DATABASE_URL`, `APP_API_KEY`, `CORS_ALLOW_ORIGINS=*`,
+`ANTHROPIC_API_KEY` (when set), AI judge mode flags (when set).
+
+**Pre-deploy gates** (in order; both block deploy on failure):
+1. **Ruff lint** (r39) — conservative ruleset (syntax errors, undefined
+   names, redefinitions). Skipped if `ruff` isn't installed locally.
+   Set `SKIP_LINT=1` to force-skip. Install via
+   `pip install -r backend/requirements-dev.txt`.
+2. **Regression test suite** — 128 tests, gated since r23.
+   Set `SKIP_TESTS=1` to force-skip.
 
 ### 12.3 Environment Variables
 
@@ -826,11 +851,17 @@ See `.env.example` at repo root for the full list. Summary:
 | `DATABASE_URL` | Cloud SQL Postgres connection string |
 | `CORS_ALLOW_ORIGINS` | Comma-separated origins |
 | `ALPACA_DATA_FEED` | `sip` (Algo Trader Plus) or `iex` (free tier) |
-| `ANTHROPIC_API_KEY` | Enables in-app Claude chat widget |
+| `ANTHROPIC_API_KEY` | Enables in-app Claude chat widget AND the AI judge layer (r36) |
+| `AI_ENTRY_VETO_MODE` | r36: AI judge entry-veto mode — `off` (default) / `shadow` / `active` |
+| `AI_NEWS_EXIT_MODE` | r36: AI news-driven exit — `off` (default) / `shadow` / `active` |
+| `AI_CONFIDENCE_MULT_MODE` | r36: AI sizing multiplier — `off` (default) / `shadow` / `active` |
+| `APP_RATE_LIMIT_PER_MIN` | r38: per-key rate limit refill (default 300, set 0 to disable) |
+| `APP_RATE_LIMIT_BURST` | r38: per-key burst capacity (default 60) |
 | `FRED_API_KEY` | Enables post-release macro values |
 | `SENTIMENT_BACKEND` | `vader` (default) or `finbert` |
 | `LOG_JSON` | `1` (default Cloud Run) for structured stdout, `0` for plaintext |
 | `LOG_DIR` | Rotating-file log location |
+| `SKIP_TESTS` / `SKIP_LINT` | Override the deploy-time pre-flight gates (use sparingly) |
 
 ### 12.4 Rotating the API key
 
@@ -857,8 +888,25 @@ All browsers get 401 on next request and prompt for the new key.
 ./deploy-manager.sh us-central1
 ```
 
-Both scripts gate on the regression suite (78+ tests, ~3s) before
-building. `SKIP_TESTS=1` to override.
+Both scripts gate on **ruff lint + the regression suite (128 tests, ~3s)**
+before building. `SKIP_LINT=1` / `SKIP_TESTS=1` to override either gate.
+
+### Backup + restore (Cloud SQL)
+
+Cloud SQL takes automatic daily backups (7-day retention) with PITR.
+On-demand backup before risky migrations:
+
+```bash
+gcloud sql backups create --instance=stockrecs-db \
+  --description="pre-migration $(date +%Y%m%d)"
+gcloud sql backups list --instance=stockrecs-db
+```
+
+Local off-cloud archive: `pg_dump "$DATABASE_URL" --no-owner --no-acl
+--clean --if-exists --file="stockrecs-$(date +%Y%m%d).sql"`. Restore with
+`psql "$DATABASE_URL" < dump.sql`. Test recovery to a fresh instance with
+`gcloud sql backups restore <ID> --restore-instance=stockrecs-db-restore
+--backup-instance=stockrecs-db`. Full procedure in README.
 
 ### Post-loss triage
 1. Check `/api/trading/auto/trades` for the losing trade id.
@@ -907,6 +955,38 @@ building. `SKIP_TESTS=1` to override.
    into `consider_signal` (reject on high-severity adverse news < 30 min
    old).
 4. If alignment rate ~ 50% → news is noise for our strategy; don't wire.
+
+### AI judge rollout (r36)
+1. Start with `AI_ENTRY_VETO_MODE=shadow`. Let it run ≥ 1 week.
+2. Review decisions: `GET /api/ai-judge/decisions?call_site=entry_veto&limit=50`.
+3. Skim the `skip` verdicts. If reasons are concrete (specific news,
+   sector event, recent management change), accuracy is good.
+   If they're vague ("market feels weak", "VIX is elevated"), tighten
+   the system prompt before promoting.
+4. When confident, flip to `AI_ENTRY_VETO_MODE=active`. Honored skips
+   surface as `autotrade_skip{reason=ai_veto}`.
+5. Repeat the same off → shadow → active rollout for `AI_NEWS_EXIT_MODE`
+   and `AI_CONFIDENCE_MULT_MODE` independently — each on its own
+   review cycle.
+
+### PDT day-trade monitoring
+- `GET /api/trading/auto/pdt` — count of same-day open+close trades in
+  trailing 5 business days.
+- On Alpaca paper: informational. The bot's recent paper-trading run
+  showed 6/5 day-trades, all losses — strong vote for theta-stop +
+  stale-trade + ADX trim safeguards already in place.
+- On Alpaca live with margin < $25k: 4+ day trades in 5 days blocks
+  new opens for 90 days. **Pre-entry hard-gate not yet wired** — when
+  going live with margin, gate `consider_signal` on this counter.
+
+### Strategy-drawdown response (r38)
+- `adaptive_risk_multiplier` halves risk when 30d realized-PnL DD ≥ 10%
+  of equity.
+- An operator alert (`strategy_drawdown`) fires alongside.
+- If the alert persists > 24h: investigate. Check whether the recent
+  losing trades share a regime (chop, high VIX, specific sector) —
+  the right response may be raising `confidence_threshold`, narrowing
+  `signal_timeframes`, or pausing via `kill` until the regime changes.
 
 ---
 
@@ -1481,26 +1561,26 @@ Investigation of $-10K paper loss on 2026-04-24 surfaced four bugs:
 
 ## 15. Future Work
 
-> **Detailed ML data-source backlog with cost/lift estimates lives in
-> [BACKLOG.md](./BACKLOG.md).** This section keeps non-ML deferred work.
+> **Canonical deferral register is in [BACKLOG.md](./BACKLOG.md).** Every
+> deferred item lives there with an explicit revisit trigger; every
+> rejected item has a rationale. The working principle (codified at
+> the top of BACKLOG.md): with each new revision, scan the ⏸️ Deferred
+> section before scoping the work, surface candidates whose triggers
+> have fired or that fit naturally into the change in flight.
 
-### Strategy
+This section is preserved for items that are too small for BACKLOG but
+worth tracking inline:
+
+### Small UX / wiring items
+- Chart overlay: news markers + macro-event markers at their timestamps.
+- ML calibration plot in the SPA (read `/api/ml/calibration`, render
+  bar chart of predicted vs actual win-rate).
 - Short-selling for SELL signals (currently long-only stocks).
-- Debit-spread options (verticals, calendars) for defined-risk exposure.
-- Portfolio-heat-aware risk-per-trade (scale down when net unrealized
-  drawdown is large).
 - Per-timeframe backtest blending (currently only 2y daily).
-
-### News pipeline (already-collecting, not yet consuming in entries)
-- Wire news into `consider_signal` as a reject gate (high-severity
-  negative < 30 min old on a BUY candidate).
-- News exit in `manage_open_positions` (flatten long on breaking
-  negative news above severity threshold).
-- FinBERT swap-in for VADER (75–80% sentiment accuracy vs ~65%).
 - Historical news replay for backtest validation.
 
-### UX
-- Push notifications on T1/T2/T3 hits via existing WS channel.
-- Chart overlay: news markers + macro-event markers at their timestamps.
-- ML calibration plot in the SPA (read `/api/ml/calibration`, render bar
-  chart of predicted vs actual win-rate).
+### Already done (moved here for record)
+- ✅ Portfolio-heat-aware risk-per-trade (r35) — heat throttle 0.85/0.60/0.40×
+- ✅ News exit in `manage_open_positions` (r36) — AI judge news_exit
+- ✅ FinBERT swap-in for VADER (already opt-in via `SENTIMENT_BACKEND=finbert`)
+- ✅ Push notifications on T1/T2/T3 hits (r35) — target_hit + trade_closed toasts
