@@ -154,6 +154,10 @@ def adaptive_risk_multiplier() -> float:
     Returns a multiplier to apply to cfg.max_risk_per_trade_pct:
       * VIX > 25 or recent-30d realized win-rate < 55% → 0.5× (halve risk)
       * VIX > 20 (elevated but not extreme) → 0.75×
+      * SPY daily ADX_14 < 20 (chop regime, reviewer feedback r37) → 0.5×
+        Range-bound markets chew up trend-following entries via false
+        breakouts — half-size during these periods recovers the EV that
+        the chop chops out.
       * Otherwise 1.0×
 
     Missing data defaults to 1.0 (no tightening) — erring on the operator's
@@ -166,6 +170,21 @@ def adaptive_risk_multiplier() -> float:
         px = current_price("^VIX")
         if px and px > 0:
             vix_level = px
+    except Exception:
+        pass
+
+    # SPY daily ADX — chop signal when < 20.
+    spy_adx = None
+    try:
+        from services.data_fetcher import fetch_ohlcv
+        from services.indicators import compute_indicators
+        spy_df = fetch_ohlcv("SPY", "1d")
+        if spy_df is not None and not spy_df.empty:
+            ind = compute_indicators(spy_df)
+            if "ADX_14" in ind.columns and len(ind) > 0:
+                _adx = ind["ADX_14"].iloc[-1]
+                if not (_adx is None) and _adx == _adx:  # NaN check
+                    spy_adx = float(_adx)
     except Exception:
         pass
 
@@ -195,6 +214,8 @@ def adaptive_risk_multiplier() -> float:
     elif vix_level is not None and vix_level > 20:
         mult = min(mult, 0.75)
     if recent_wr is not None and recent_wr < 55.0:
+        mult = min(mult, 0.5)
+    if spy_adx is not None and spy_adx < 20.0:
         mult = min(mult, 0.5)
     return mult
 

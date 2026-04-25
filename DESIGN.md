@@ -867,6 +867,44 @@ building. `SKIP_TESTS=1` to override.
 
 ## 14. Changelog (current → past)
 
+### Revision 37 — Backtest/live alignment + extreme-trend runner + persisted debounce + chop sizing
+- **Ghost-Alpha fix**: `services/backtester._simulate` now mirrors the live
+  trim ladder by default (`partial_exits=True`). Banks 33% at T1 (50% of
+  distance to final target), 33% at T2 (85%), runner exits at the full
+  target. Stop tightens to soft-BE at T1, full BE at T2. Without this the
+  backtest's all-in/all-out fills systematically overstated upside AND
+  drawdown vs what live actually captures. Legacy single-exit kept under
+  `partial_exits=False` for sanity comparison.
+- **Liquidity gate in run_multi_strategy**: rejects backtests where
+  median 20-bar daily $-volume < $10M, matching the live entry gate. Stops
+  inflated stats from spread-driven micro-cap fills the live bot
+  wouldn't take.
+- **ATR fallback chain repair**: real ATR → trailing 14-bar median
+  High–Low range → stdev of 14 closes → 2% of Close → 0.01 floor.
+  (A previous merge had collapsed the chain so any successful
+  median-range value got overwritten by raw 2%-of-Close.)
+- **Extreme-trend skip-T1**: `trim_fraction_for_adx` returns 0.0 at
+  ADX ≥ 45 for the T1 site (parabolic regime — the runner IS the trade).
+  Stop still trails to soft-BE; just no profit-banking there. T2 is
+  unchanged (never pure-runner past T2). Wired through the option-side
+  call path with a 0-frac short-circuit.
+- **Persisted target-touch counter**: new `auto_trades.target_touch_count`
+  column + `_touch_get/_touch_set/_touch_clear` helpers. Survives Cloud
+  Run instance restarts so the 2-tick debounce isn't bypassed when an
+  instance cycles right at a target-test moment. In-memory dict kept
+  as a read-through cache; writes go straight to the row + commit.
+- **Chop-regime risk halving**: `adaptive_risk_multiplier` now also
+  applies 0.5× when daily SPY ADX_14 < 20. Range-bound markets chew up
+  trend-following entries via false breakouts; half-size during these
+  periods recovers the EV that the chop chops out.
+- **OCC parser cleanup**: removed the residual inline P/C parse in
+  `_manage_option_trade` (was dead code — overridden by the canonical
+  `_is_call_option` line below it, but the reviewer flagged it as the
+  shape of bug that produced the AMKR direction-drift incident). Now
+  truly single source of truth.
+- 7 new tests (5 trim_fraction_for_adx incl. ADX≥45 skip; 2 backtest
+  partial-exit; 125 total).
+
 ### Revision 36 — AI judge layer: entry veto + news-driven exit + sizing multiplier (shadow by default)
 - **`services/ai_judge.py`** wraps three Claude (Haiku) call sites with a
   shared client, tool-use-forced JSON schemas, latency budget, and a

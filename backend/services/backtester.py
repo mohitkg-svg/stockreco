@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import numpy as np
 import os
@@ -5,6 +6,8 @@ from typing import Dict, Any, List, Optional
 from services.indicators import compute_indicators
 from services.strategies import all_strategies
 from services.config import STOP_ATR_MULT_BY_TF
+
+logger = logging.getLogger(__name__)
 
 
 # Trading cost model — applied as a per-side haircut to entry/exit prices so
@@ -68,12 +71,24 @@ def _simulate(
     direction: str,
     atr: pd.Series,
     timeframe: Optional[str] = None,
+    partial_exits: bool = True,
 ) -> Dict[str, Any]:
     """Simulate trades given an entry signal series. direction = 'BUY' or 'SELL'.
 
     Gap-aware: if an unfilled bear-gap sits above the entry (long) or an unfilled
     bull-gap sits below (short), we treat the gap-fill midpoint as a *secondary*
     target and exit at whichever fires first (gap-fill or ATR-target).
+
+    `partial_exits=True` (default, r37): match the LIVE auto_trader's
+    state machine — bank 33% at T1 (1×R), bank another 33% of original at
+    T2 (2×R), runner exits at the full ATR target. Stop tightens to
+    soft-BE (entry − 0.3R) at T1, then full BE at T2. Without this the
+    backtest's all-in/all-out fills systematically diverge from live (the
+    "Ghost Alpha" gap — backtest claims more upside than live captures
+    AND more drawdown than live actually takes).
+
+    `partial_exits=False`: legacy single-exit behavior, kept for sanity
+    comparison and any tests that depend on the old shape.
 
     Audit fix C2: stop multiplier sources from STOP_ATR_MULT_BY_TF (same table
     the live signal generator uses) so backtest stats reflect live risk.
@@ -110,6 +125,14 @@ def _simulate(
         if not pd.isna(_atr_val) and float(_atr_val) > 0:
             a = float(_atr_val)
         else:
+            # Fallback chain when ATR is missing/zero. Best → worst:
+            #   1. Trailing 14-bar median High–Low range (adapts to actual
+            #      realized volatility for THIS symbol+TF).
+            #   2. Stdev of trailing 14 closes — captures direction-only
+            #      moves the median-range can miss.
+            #   3. Flat 2% of Close — wrong for low-vol utilities AND
+            #      high-beta growth, but never zero.
+            #   4. Hard floor 0.01 so stop/target math never blows up.
             a = None
             if i >= 14:
                 try:
@@ -121,10 +144,18 @@ def _simulate(
                             a = med_rng
                 except Exception:
                     a = None
+            if a is None and i >= 14:
+                try:
+                    sd = float(d["Close"].iloc[i - 14:i].std())
+                    if not pd.isna(sd) and sd > 0:
+                        a = sd
+                except Exception:
+                    pass
             if a is None and not pd.isna(_close_val) and float(_close_val) > 0:
-                a = max(float(_close_val) * 0.02, 0.01)
+                a = float(_close_val) * 0.02
             if a is None or a <= 0:
                 a = 0.01
+            a = max(a, 0.01)
 
         if not in_trade and bool(entries.iloc[i - 1]):
             entry_price = _apply_costs(float(row["Open"]), "entry", direction)
@@ -141,72 +172,185 @@ def _simulate(
                     gap_target = fills_below[0] if fills_below else None
             except Exception:
                 gap_target = None
+            r = stop_mult * a   # risk distance in $
             if direction == "BUY":
-                stop = entry_price - stop_mult * a
+                stop = entry_price - r
                 target = entry_price + target_mult * a
+                # Partial-exit ladder: T1 at 50% of distance to final
+                # target, T2 at 85%. This keeps T1 < T2 < target regardless
+                # of the configured R:R (live engine uses S/R-based pivots
+                # which don't always fall at integer R-multiples; this is
+                # a 1:1-with-distance approximation that captures the
+                # banking cadence without needing S/R data).
+                t1_px = entry_price + 0.5 * (target - entry_price)
+                t2_px = entry_price + 0.85 * (target - entry_price)
+                soft_be = entry_price - 0.3 * r
             else:
-                stop = entry_price + stop_mult * a
+                stop = entry_price + r
                 target = entry_price - target_mult * a
+                t1_px = entry_price - 0.5 * (entry_price - target)
+                t2_px = entry_price - 0.85 * (entry_price - target)
+                soft_be = entry_price + 0.3 * r
+            # Per-trade state for partial-exit simulation. Live engine trims
+            # 33% at T1, 33% of original at T2, runner at target. Stop
+            # tightens to soft-BE then BE as targets hit.
+            frac_remaining = 1.0
+            hit_t1 = False
+            hit_t2 = False
+            partial_pl_dollars = 0.0     # accumulated $-PnL per dollar of original exposure
             in_trade = True
 
         elif in_trade:
-            exit_price = None
-            exit_reason = None
             # Gap-target sanity: must sit at least 1 cent past the entry, otherwise
             # any random bar's high/low instantly "fills" it and labels the exit
             # "gap_fill" with effectively-flat P/L.
             _GAP_MIN_DIST = 0.01
-            # Audit fix C1/H15: a bar that GAPS THROUGH the stop or target opens
-            # past the level — the realistic fill is the open price, not the
-            # level itself. The old code silently filled at the level and
-            # produced understated losses / overstated gains on gap bars.
             open_price = float(row["Open"])
-            if direction == "BUY":
-                if open_price <= stop:
-                    # Gap-down through stop: fill at open (worse than stop).
-                    exit_price, exit_reason = open_price, "stop_gap"
-                elif open_price >= target:
-                    # Gap-up through target: fill at open (better than target).
-                    exit_price, exit_reason = open_price, "target_gap"
-                elif float(row["Low"]) <= stop:
-                    # Intrabar stop — when a bar touches BOTH stop and target we
-                    # can't know which printed first, so we conservatively take
-                    # the stop (pessimistic bias, standard backtest convention).
-                    exit_price, exit_reason = stop, "stop"
-                elif (gap_target and (gap_target - entry_price) >= _GAP_MIN_DIST
-                      and float(row["High"]) >= gap_target and gap_target < target):
-                    exit_price, exit_reason = gap_target, "gap_fill"
-                elif float(row["High"]) >= target:
-                    exit_price, exit_reason = target, "target"
-            else:
-                if open_price >= stop:
-                    exit_price, exit_reason = open_price, "stop_gap"
-                elif open_price <= target:
-                    exit_price, exit_reason = open_price, "target_gap"
-                elif float(row["High"]) >= stop:
-                    exit_price, exit_reason = stop, "stop"
-                elif (gap_target and (entry_price - gap_target) >= _GAP_MIN_DIST
-                      and float(row["Low"]) <= gap_target and gap_target > target):
-                    exit_price, exit_reason = gap_target, "gap_fill"
-                elif float(row["Low"]) <= target:
-                    exit_price, exit_reason = target, "target"
+            hi = float(row["High"])
+            lo = float(row["Low"])
 
-            if exit_price is not None:
-                exit_price = _apply_costs(exit_price, "exit", direction)
-                pnl_pct = ((exit_price - entry_price) / entry_price) if direction == "BUY" \
-                          else ((entry_price - exit_price) / entry_price)
-                portfolio += portfolio * pnl_pct
-                trades.append({
-                    "entry_date": str(entry_date.date()),
-                    "exit_date": str(d.index[i].date()),
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(exit_price, 2),
-                    "pnl_pct": round(pnl_pct * 100, 2),
-                    "exit_reason": exit_reason,
-                    "type": direction,
-                })
-                in_trade = False
-                gap_target = None
+            if not partial_exits:
+                # Legacy single-exit path. Kept for sanity comparison.
+                exit_price = None
+                exit_reason = None
+                if direction == "BUY":
+                    if open_price <= stop:
+                        exit_price, exit_reason = open_price, "stop_gap"
+                    elif open_price >= target:
+                        exit_price, exit_reason = open_price, "target_gap"
+                    elif lo <= stop:
+                        exit_price, exit_reason = stop, "stop"
+                    elif (gap_target and (gap_target - entry_price) >= _GAP_MIN_DIST
+                          and hi >= gap_target and gap_target < target):
+                        exit_price, exit_reason = gap_target, "gap_fill"
+                    elif hi >= target:
+                        exit_price, exit_reason = target, "target"
+                else:
+                    if open_price >= stop:
+                        exit_price, exit_reason = open_price, "stop_gap"
+                    elif open_price <= target:
+                        exit_price, exit_reason = open_price, "target_gap"
+                    elif hi >= stop:
+                        exit_price, exit_reason = stop, "stop"
+                    elif (gap_target and (entry_price - gap_target) >= _GAP_MIN_DIST
+                          and lo <= gap_target and gap_target > target):
+                        exit_price, exit_reason = gap_target, "gap_fill"
+                    elif lo <= target:
+                        exit_price, exit_reason = target, "target"
+                if exit_price is not None:
+                    exit_price = _apply_costs(exit_price, "exit", direction)
+                    pnl_pct = ((exit_price - entry_price) / entry_price) if direction == "BUY" \
+                              else ((entry_price - exit_price) / entry_price)
+                    portfolio += portfolio * pnl_pct
+                    trades.append({
+                        "entry_date": str(entry_date.date()),
+                        "exit_date": str(d.index[i].date()),
+                        "entry_price": round(entry_price, 2),
+                        "exit_price": round(exit_price, 2),
+                        "pnl_pct": round(pnl_pct * 100, 2),
+                        "exit_reason": exit_reason,
+                        "type": direction,
+                    })
+                    in_trade = False
+                    gap_target = None
+            else:
+                # Partial-exit path matching the live state machine.
+                #
+                # Order of evaluation within a single bar (pessimistic bias):
+                #   1. Gap-through stop  → flatten remainder at open
+                #   2. Gap-through final target → flatten remainder at open
+                #   3. Intrabar stop  → flatten remainder at stop
+                #   4. T1 hit (if !hit_t1, BUY: hi>=t1) → bank 33%, stop→soft-BE
+                #   5. T2 hit (if !hit_t2, BUY: hi>=t2) → bank 33% of original, stop→entry
+                #   6. Final target → flatten remainder at target
+                # We re-process the same bar for T1→T2→target so a strong
+                # bar that crosses multiple levels banks profit at each.
+                #
+                # `pnl_for_exit(px, frac)` returns the contribution to total
+                # PnL-per-dollar-of-original-exposure for selling `frac` of
+                # the *original* position at px.
+                def _pnl_per_unit(px: float, frac: float) -> float:
+                    px_net = _apply_costs(px, "exit", direction)
+                    if direction == "BUY":
+                        return ((px_net - entry_price) / entry_price) * frac
+                    return ((entry_price - px_net) / entry_price) * frac
+
+                bar_remainder_exit = False  # set when the runner is fully closed this bar
+
+                def _flush(px: float, reason: str) -> None:
+                    """Close all remaining size at px with the given reason."""
+                    nonlocal frac_remaining, bar_remainder_exit, partial_pl_dollars, portfolio
+                    if frac_remaining <= 0:
+                        return
+                    contrib = _pnl_per_unit(px, frac_remaining)
+                    partial_pl_dollars += contrib
+                    portfolio += portfolio * contrib
+                    trades.append({
+                        "entry_date": str(entry_date.date()),
+                        "exit_date": str(d.index[i].date()),
+                        "entry_price": round(entry_price, 2),
+                        "exit_price": round(_apply_costs(px, "exit", direction), 2),
+                        "pnl_pct": round(partial_pl_dollars * 100, 2),
+                        "exit_reason": reason,
+                        "type": direction,
+                    })
+                    frac_remaining = 0.0
+                    bar_remainder_exit = True
+
+                # 1) Gap-through stop
+                if direction == "BUY" and open_price <= stop:
+                    _flush(open_price, "stop_gap")
+                elif direction == "SELL" and open_price >= stop:
+                    _flush(open_price, "stop_gap")
+                # 2) Gap-through final target (rare but real on opens)
+                if not bar_remainder_exit:
+                    if direction == "BUY" and open_price >= target:
+                        _flush(open_price, "target_gap")
+                    elif direction == "SELL" and open_price <= target:
+                        _flush(open_price, "target_gap")
+                # 3) Intrabar stop
+                if not bar_remainder_exit:
+                    if direction == "BUY" and lo <= stop:
+                        _flush(stop, "stop")
+                    elif direction == "SELL" and hi >= stop:
+                        _flush(stop, "stop")
+                # 4) T1 partial — bank 33%
+                if not bar_remainder_exit and not hit_t1:
+                    t1_hit = (direction == "BUY" and hi >= t1_px) or \
+                             (direction == "SELL" and lo <= t1_px)
+                    if t1_hit:
+                        contrib = _pnl_per_unit(t1_px, 0.33)
+                        partial_pl_dollars += contrib
+                        portfolio += portfolio * contrib
+                        frac_remaining -= 0.33
+                        hit_t1 = True
+                        # Tighten stop to soft-BE.
+                        stop = soft_be if direction == "BUY" else soft_be
+                # 5) T2 partial — bank another 33%-of-original
+                if not bar_remainder_exit and hit_t1 and not hit_t2:
+                    t2_hit = (direction == "BUY" and hi >= t2_px) or \
+                             (direction == "SELL" and lo <= t2_px)
+                    if t2_hit:
+                        contrib = _pnl_per_unit(t2_px, 0.33)
+                        partial_pl_dollars += contrib
+                        portfolio += portfolio * contrib
+                        frac_remaining -= 0.33
+                        hit_t2 = True
+                        # Tighten stop to entry (full BE).
+                        stop = entry_price
+                # 6) Runner exit at final target
+                if not bar_remainder_exit and frac_remaining > 0:
+                    final_hit = (direction == "BUY" and hi >= target) or \
+                                (direction == "SELL" and lo <= target)
+                    if final_hit:
+                        _flush(target, "target")
+                # If the runner is still alive, the trade carries to the next bar.
+                if bar_remainder_exit:
+                    in_trade = False
+                    gap_target = None
+                    hit_t1 = hit_t2 = False
+                    frac_remaining = 0.0
+                    partial_pl_dollars = 0.0
 
         equity.append({"time": ts, "value": round(portfolio, 2)})
 
@@ -331,6 +475,21 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
             d = d[~bad_vol].copy()
     if len(d) < 60:
         return {"results": [], "best": None}
+
+    # Liquidity Gate: Match the $10M median daily volume gate in auto_trader
+    # so backtest results aren't inflated by spread-driven micro-cap fills
+    # the live bot would never take. Tail 20 bars only — a name might have
+    # been illiquid years ago but tradeable now (or vice-versa). NaN means
+    # too few bars to assess; we don't reject on NaN (let other gates run).
+    try:
+        typ_px = (d["High"] + d["Low"] + d["Close"]) / 3.0
+        dvol_tail = (typ_px * d["Volume"]).tail(20)
+        med_dvol = float(dvol_tail.median())
+        if not pd.isna(med_dvol) and 0 < med_dvol < 10_000_000:
+            logger.info(f"Backtest skipped: fails $10M liquidity gate (median ${med_dvol/1e6:.1f}M)")
+            return {"results": [], "best": None}
+    except Exception as _e:
+        logger.debug(f"backtester: liquidity gate skipped ({_e})")
 
     atr_col = next((c for c in d.columns if c.startswith("ATR_")), None)
 

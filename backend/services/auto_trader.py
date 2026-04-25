@@ -83,9 +83,44 @@ from services.risk_manager import (
 # was a single 5m wick to 148.75 immediately followed by a print to 146.21,
 # which moved the stop to BE and chopped the trade out for $0. We now
 # require N>=2 consecutive manage-loop ticks above the target before
-# trailing. Module-level (lost on restart, that's fine — it's a debounce).
+# trailing. r37: Backed by AutoTrade.target_touch_count so the debounce
+# survives Cloud Run instance restarts. The in-memory dict is kept as a
+# read-through cache to avoid hammering the DB on hot iterations of the
+# manage loop, but writes go straight to the row + commit.
 _TARGET_CONFIRM_TICKS = 2
 _target_touch_counts: Dict[int, int] = {}
+
+
+def _touch_get(t) -> int:
+    """Read the touch counter, preferring the persisted value on the row."""
+    try:
+        persisted = int(getattr(t, "target_touch_count", 0) or 0)
+    except Exception:
+        persisted = 0
+    cached = _target_touch_counts.get(t.id, 0)
+    return max(persisted, cached)
+
+
+def _touch_set(t, db, n: int) -> None:
+    """Increment / set the touch counter on the row + cache + commit."""
+    _target_touch_counts[t.id] = n
+    try:
+        t.target_touch_count = int(n)
+        db.commit()
+    except Exception as _e:
+        logger.debug(f"_touch_set: persist skipped for #{t.id}: {_e}")
+
+
+def _touch_clear(t, db=None) -> None:
+    """Reset both cache + persisted counter (called on close, target advance,
+    or when the prospective target is no longer being touched)."""
+    _target_touch_counts.pop(t.id, None)
+    if db is not None:
+        try:
+            t.target_touch_count = 0
+            db.commit()
+        except Exception as _e:
+            logger.debug(f"_touch_clear: persist skipped for #{t.id}: {_e}")
 
 # Slippage thresholds (multiples of daily ATR_14). Fills that drift up to
 # ±0.3×ATR are normal market-order behaviour. ±0.3-1.0×ATR shifts targets
@@ -116,6 +151,7 @@ _T1_BE_MIN_ATR = 0.5
 # 0.33 of 2/3 original = 22% of original, leaving a 45% runner for T3+.
 # Lowered from 0.50 (old = 33% runner) — post-mortem showed winners died
 # too small because we banked 67% before T3 ever fired.
+_T2_PARTIAL_FRAC = 0.33
 _T2_PARTIAL_FRAC = 0.33  # default; trim_fraction_for_adx() adapts by trend strength
 
 
@@ -123,9 +159,13 @@ def trim_fraction_for_adx(ticker: str, level: str, default_frac: float = 0.33) -
     """ADX-based dynamic trim: weak trends → bank fast, strong trends → let runners run.
     `level` ∈ {"T1","T2"}.
 
-      * ADX > 40 (powerful trend) → trim only 15% (leave 70% runner past T2)
-      * ADX < 25 (weak trend)     → keep default 33% (bank profit faster)
-      * In between → linear interpolation between 33% and 15%
+      * ADX ≥ 45 (parabolic / extreme trend) → trim 0% at T1 (skip the trim
+        entirely; just move stop to soft-BE). Empirically the strongest
+        trends are exactly when partial trims leave the most money on the
+        table — the runner is the trade. Caller treats 0.0 as "no trim".
+      * ADX ≥ 40 (powerful trend) → trim only 15% (leave 70% past T2)
+      * ADX ≤ 25 (weak trend)     → keep default 33% (bank profit faster)
+      * In between → linear interpolation between default and 15%
 
     Falls back to `default_frac` if ADX can't be read.
     """
@@ -136,11 +176,16 @@ def trim_fraction_for_adx(ticker: str, level: str, default_frac: float = 0.33) -
         adx = None
     if adx is None:
         return default_frac
+    # Only skip the T1 trim entirely on parabolic moves — at T2 we still
+    # want to bank some profit even in extreme trends (T2 is a 2:1 win;
+    # never pure-runner past T2).
+    if adx >= 45 and level.upper() == "T1":
+        return 0.0
     if adx >= 40:
         return 0.15
     if adx <= 25:
         return default_frac
-    # Linear interp 25→33%, 40→15%
+    # Linear interp 25→default, 40→15%
     span = (adx - 25.0) / (40.0 - 25.0)
     return default_frac + (0.15 - default_frac) * span
 # Stale-trade exit: close an open trade that hasn't hit T1 after
@@ -902,6 +947,8 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 metrics.inc("autotrade_event", event="daily_loss_halt")
                 return None
 
+        # C1: Max concurrent positions guard.
+        mcp = int(getattr(cfg, "max_concurrent_positions", 0) or 0)
         # C1: Max concurrent positions guard. Tightened in adverse regimes
         # (VIX > 25 or SPY below 200-EMA → cap // 3; VIX > 20 → cap × 2/3).
         from services.risk_manager import regime_concurrent_cap as _regime_cap
@@ -1347,8 +1394,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.debug(f"ai_judge confidence_multiplier wrapper failed: {_e}")
 
         from services.config import RISK_MULT_CEILING as _MULT_CEILING
+        raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult
         raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult * ai_mult
         clamped_stack = min(raw_stack, _MULT_CEILING)
+        effective_risk_budget = risk_budget * clamped_stack
         # Heat-aware throttle: applies AFTER the multiplier-stack ceiling so
         # the heat-throttle still pulls things smaller even when other
         # factors maxed out the 2× cap. This is a downward-only adjustment
@@ -1360,6 +1409,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if raw_stack > _MULT_CEILING:
             logger.info(
                 f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
+                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} strat={strat_mult:.2f} vix={vix_mult:.2f})"
                 f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} "
                 f"strat={strat_mult:.2f} vix={vix_mult:.2f} ai={ai_mult:.2f})"
             )
@@ -1696,6 +1746,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Adaptive risk: halve the cap under high VIX (>25) or when recent
         # win-rate is below 55%. Catches regime changes the static cap misses.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
         from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
         risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
@@ -2003,6 +2054,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Adaptive risk: halve the cap under high VIX (>25) or when recent
         # win-rate is below 55%. Catches regime changes the static cap misses.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
         from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
         risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
@@ -2179,7 +2231,11 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
     pos = paper_trader.get_option_position(t.symbol)
     cur_premium = pos["current_price"] if pos and pos.get("current_price") else None
 
-    # CALL vs PUT detection — single source of truth in position_manager.is_call_option.
+    # CALL vs PUT detection — single source of truth in
+    # position_manager.is_call_option (parses the OCC symbol's P/C
+    # indicator at position [-9]). Reviewer flagged duplicated
+    # inline parsing here as the AMKR-style direction-drift bug
+    # source — the inline parse has been removed.
     is_put = not _is_call_option(t)
     exit_reason = None
     final_status = None
@@ -2210,11 +2266,16 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             # leaving micro-size runners for T3.
             if target_idx == 0 and t.qty >= 2 and not t.hit_t1:
                 orig = int(getattr(t, "original_qty", None) or t.qty)
+                half = max(1, int(orig // 2))
                 # ADX-aware T1 trim: weak trend (ADX<25) → 50% of original,
-                # strong trend (ADX>40) → 15% of original (leave 85% runner).
+                # strong trend (ADX>40) → 15%, parabolic (ADX≥45) → 0% (skip
+                # trim entirely — let the runner run; just trail the stop).
                 _t1_frac = trim_fraction_for_adx(t.ticker, "T1", default_frac=0.50)
-                half = max(1, int(orig * _t1_frac))
-                half = min(half, int(t.qty))   # can't trim more than we hold
+                if _t1_frac <= 0.0:
+                    half = 0   # extreme-trend short-circuit; stop trail still runs below
+                else:
+                    half = max(1, int(orig * _t1_frac))
+                    half = min(half, int(t.qty))   # can't trim more than we hold
                 if half >= 1:
                     trim = paper_trader.submit_simple_option_order(
                         occ_symbol=t.symbol, qty=half, side="sell",
@@ -2447,7 +2508,7 @@ def _force_close_trade(
     from services.execution_engine import force_close_trade as _ee_force_close
     _ee_force_close(
         t, db, reason, summary, status_override=status_override,
-        on_close=lambda closed_t: _target_touch_counts.pop(closed_t.id, None),
+        on_close=lambda closed_t: _touch_clear(closed_t, db),
     )
 
 
@@ -2650,6 +2711,7 @@ def manage_open_positions() -> Dict[str, Any]:
                             t.status = "closed_manual"
                             t.closed_at = datetime.utcnow()
                             t.note = (t.note or "") + f" | parent {pstatus}"
+                            t.target_touch_count = 0
                             _target_touch_counts.pop(t.id, None)
                             db.commit()
                             summary["closed"] += 1
@@ -2753,8 +2815,8 @@ def manage_open_positions() -> Dict[str, Any]:
                                 # so a single 5m wick (MRVL: 148.75 spike then
                                 # immediate 146.21 print) doesn't move the stop
                                 # to BE and chop us out flat.
-                                touches = _target_touch_counts.get(t.id, 0) + 1
-                                _target_touch_counts[t.id] = touches
+                                touches = _touch_get(t) + 1
+                                _touch_set(t, db, touches)
                                 if touches < _TARGET_CONFIRM_TICKS:
                                     # Audit fix #12: demoted INFO → DEBUG.
                                     # Target touches can fire 10+ times/min in
@@ -2806,6 +2868,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                                 f" | T1 hit @ {px:.2f}, BE skipped (T1 too tight); "
                                                 f"chandelier active"
                                             )
+                                            t.target_touch_count = 0
                                             _target_touch_counts.pop(t.id, None)
                                             db.commit()
 
@@ -2843,7 +2906,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                         # once per trade (guarded by hit_t1).
                                         if target_idx == 0 and not t.hit_t1 and t.qty >= 3:
                                             _t1_frac = trim_fraction_for_adx(t.ticker, "T1", default_frac=0.33)
-                                            trim_qty = max(1, int(t.qty * _t1_frac))
+                                            # ADX≥45 → 0.0 → skip the trim
+                                            # entirely. Stop still trails to
+                                            # soft-BE below.
+                                            trim_qty = 0 if _t1_frac <= 0.0 else max(1, int(t.qty * _t1_frac))
                                             if trim_qty >= 1:
                                                 try:
                                                     from alpaca.trading.requests import MarketOrderRequest
@@ -2959,17 +3025,16 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     f" | level_index ≥ 3, chandelier-only trail "
                                                     f"(no more target recompute)"
                                                 )
-                                            _target_touch_counts.pop(t.id, None)
-                                            db.commit()
+                                            _touch_clear(t, db)
                                             summary["trailed"] += 1
                                             logger.info(
                                                 f"AutoTrader {t.ticker} {tag} hit, stop→{new_stop} "
                                                 f"(level_index={t.level_index})"
                                             )
-                            elif next_target and t.id in _target_touch_counts:
+                            elif next_target and (t.id in _target_touch_counts or (t.target_touch_count or 0) > 0):
                                 # Price fell back below the target before we
                                 # got N confirmations — reset the streak.
-                                _target_touch_counts.pop(t.id, None)
+                                _touch_clear(t, db)
 
                             # 2c) Chandelier + structural overlay.
                             # Critical-audit fix #5: chandelier now activates
@@ -3053,6 +3118,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                 # Postmortem fix H1: clean up state-machine
                                 # bookkeeping so the touch-counts dict doesn't
                                 # leak by trade id over months of operation.
+                                t.target_touch_count = 0
                                 _target_touch_counts.pop(t.id, None)
                                 db.commit()
                                 summary["closed"] += 1

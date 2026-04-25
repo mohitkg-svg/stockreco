@@ -182,6 +182,104 @@ class TestMetricsNoOpFallback(unittest.TestCase):
             pass
 
 
+class TestTrimFractionForADX(unittest.TestCase):
+    """ADX-driven trim fractions, including the r37 ADX≥45 skip-T1 case."""
+
+    def setUp(self):
+        from services import auto_trader
+        self.fn = auto_trader.trim_fraction_for_adx
+        self._orig_adx = None
+        from services import position_manager
+        self._orig_chand = position_manager.chandelier_adx
+        # Replace chandelier_adx with an injectable function
+        self._adx_value = None
+        position_manager.chandelier_adx = lambda _t: self._adx_value
+
+    def tearDown(self):
+        from services import position_manager
+        position_manager.chandelier_adx = self._orig_chand
+
+    def test_default_when_adx_missing(self):
+        self._adx_value = None
+        self.assertEqual(self.fn("AAPL", "T1", default_frac=0.33), 0.33)
+
+    def test_chop_returns_default(self):
+        self._adx_value = 18.0
+        self.assertEqual(self.fn("AAPL", "T1", default_frac=0.33), 0.33)
+
+    def test_strong_returns_15pct(self):
+        self._adx_value = 42.0
+        self.assertEqual(self.fn("AAPL", "T1", default_frac=0.33), 0.15)
+
+    def test_extreme_returns_zero_at_T1(self):
+        # r37: ADX ≥ 45 → skip the T1 trim entirely (parabolic — runner is the trade)
+        self._adx_value = 50.0
+        self.assertEqual(self.fn("AAPL", "T1", default_frac=0.33), 0.0)
+
+    def test_extreme_does_NOT_skip_T2(self):
+        # T2 still trims even in extreme trend — never pure-runner past T2
+        self._adx_value = 50.0
+        self.assertEqual(self.fn("AAPL", "T2", default_frac=0.33), 0.15)
+
+
+class TestPartialExitBacktest(unittest.TestCase):
+    """Verify the partial-exit simulation path mirrors the live trim ladder
+    (33% at T1, 33% at T2, runner at target) and produces a different
+    aggregate PnL than the legacy single-exit path.
+    """
+
+    def _make_uptrend_df(self, n=40, start=100.0, drift_per_bar=0.5):
+        idx = pd.date_range("2025-01-01", periods=n, freq="D")
+        # Build arrays directly — using pd.Series here would index-misalign
+        # against the DatetimeIndex assigned to the DataFrame and produce
+        # NaN in Open/High/Low (silent corruption).
+        close = [start + i * drift_per_bar for i in range(n)]
+        d = pd.DataFrame({
+            "Open":  [c - 0.1 for c in close],
+            "High":  [c + 0.5 for c in close],
+            "Low":   [c - 0.5 for c in close],
+            "Close": close,
+            "Volume": [1_000_000] * n,
+        }, index=idx)
+        return d
+
+    def test_partial_exits_emit_one_trade_with_aggregate_pnl(self):
+        from services.backtester import _simulate
+        d = self._make_uptrend_df(n=60, start=100.0, drift_per_bar=0.6)
+        entries = pd.Series(False, index=d.index)
+        entries.iloc[1] = True   # entry on bar 2
+        atr = pd.Series([1.0] * len(d), index=d.index)
+        out = _simulate(d, entries, "BUY", atr, timeframe="1d", partial_exits=True)
+        # Trade list contains exactly one consolidated trade row (final exit).
+        self.assertEqual(len(out["trades"]), 1)
+        t = out["trades"][0]
+        self.assertIn("pnl_pct", t)
+        # Drift ~ 0.6/bar on $100 → ~3% to T1, ~6% to T2, ~10% to final target
+        # Aggregate P/L on 33%+33%+34% blend should be POSITIVE in this clean uptrend.
+        self.assertGreater(t["pnl_pct"], 0)
+
+    def test_partial_vs_legacy_diverge_on_strong_trend(self):
+        # Strong-trend tape: legacy (single full-target exit) and partial
+        # (banks at T1 + T2 + target) produce DIFFERENT aggregate PnL.
+        # This is the divergence the reviewer flagged ("Ghost Alpha").
+        from services.backtester import _simulate
+        d = self._make_uptrend_df(n=80, start=100.0, drift_per_bar=0.4)
+        entries = pd.Series(False, index=d.index)
+        entries.iloc[1] = True
+        atr = pd.Series([1.0] * len(d), index=d.index)
+        legacy = _simulate(d, entries, "BUY", atr, timeframe="1d", partial_exits=False)
+        partial = _simulate(d, entries, "BUY", atr, timeframe="1d", partial_exits=True)
+        # Both should produce a single trade row in our setup
+        self.assertEqual(len(legacy["trades"]), 1)
+        self.assertEqual(len(partial["trades"]), 1)
+        # Aggregate PnL is generally lower in partial mode for a clean
+        # trend (banking 33% at T1 reduces upside) but still positive.
+        # The exact relationship depends on bar-level dynamics; assert
+        # only that the values differ — that's the point of the change.
+        self.assertNotEqual(legacy["trades"][0]["pnl_pct"],
+                             partial["trades"][0]["pnl_pct"])
+
+
 class TestAIJudgeAbstainPaths(unittest.TestCase):
     """Hard guarantee: Claude unreachable / disabled MUST NOT block trading.
 

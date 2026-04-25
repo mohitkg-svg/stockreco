@@ -207,6 +207,12 @@ class AutoTrade(Base):
     # T1/T2 reference a fixed denominator, not the shrinking current qty.
     # Prevents exponential position decay across cascaded trims.
     original_qty = Column(Float, nullable=True)
+    # r37: Persisted target-touch counter so the 2-tick debounce survives
+    # Cloud Run instance restarts. Without persistence, a price spike that
+    # crosses a target right after a redeploy would advance the trail on
+    # the very first tick (no debounce state to consult), occasionally
+    # chopping out winners on a 1-bar wick.
+    target_touch_count = Column(Integer, default=0)
 
 
 class CandidatePool(Base):
@@ -684,6 +690,7 @@ def create_tables():
     _ensure_column("auto_trader_config", "universe_top_n", "INTEGER DEFAULT 30")
     _ensure_column("auto_trader_config", "ticker_blacklist", "VARCHAR DEFAULT ''")
     _ensure_column("auto_trades", "original_qty", "DOUBLE PRECISION")
+    _ensure_column("auto_trades", "target_touch_count", "INTEGER DEFAULT 0")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:
