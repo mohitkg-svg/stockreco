@@ -5,6 +5,7 @@ uvicorn[standard]==0.34.0
 sqlalchemy==2.0.36
 pydantic==2.10.4
 yfinance==0.2.50
+curl_cffi==0.7.4
 pandas==2.2.3
 numpy==2.2.1
 ta==0.11.0

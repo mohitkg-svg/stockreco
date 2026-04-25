@@ -93,7 +93,7 @@ gcloud run deploy "$SERVICE" \
   --min-instances 1 \
   --max-instances 3 \
   --timeout 300s \
-  --startup-cpu-boost \
+  --cpu-boost \
   --add-cloudsql-instances "$CSQL_INSTANCE" \
   --update-env-vars "$ENV_VARS"
 
