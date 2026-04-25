@@ -63,6 +63,19 @@ ENV_VARS="APCA_API_KEY_ID=${APCA_API_KEY_ID},APCA_API_SECRET_KEY=${APCA_API_SECR
 if [ -n "${APP_API_KEY:-}" ]; then
   ENV_VARS="${ENV_VARS},APP_API_KEY=${APP_API_KEY}"
 fi
+# Anthropic key (chat widget + AI judge layer). Only forwarded when set
+# in the local shell — so an unset local var doesn't blank the value
+# already on the live service.
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  ENV_VARS="${ENV_VARS},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+fi
+# AI judge call-site modes. Only forwarded when explicitly set, so the
+# default off-everywhere stays put unless you flip the env var.
+for _m in AI_ENTRY_VETO_MODE AI_NEWS_EXIT_MODE AI_CONFIDENCE_MULT_MODE; do
+  if [ -n "${!_m:-}" ]; then
+    ENV_VARS="${ENV_VARS},${_m}=${!_m}"
+  fi
+done
 # CORS: Cloud Run URL is unknown until deploy — allow any origin by default
 # (the X-API-Key gate is the real access control). Tighten after first deploy
 # by setting CORS_ALLOW_ORIGINS to the exact Cloud Run URL.
