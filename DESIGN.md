@@ -719,8 +719,8 @@ auth is a no-op (local dev).
 ### Entry-side gates (~27 total — expanded since r19)
 Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, **liquidity gate** (median 20-day $-volume ≥ $10M, r34), earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), **regime-tightened concurrent cap** (cap÷3 in VIX>25 or SPY<200EMA; cap×2/3 in VIX>20, r34), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55%), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), ticker blacklist.
 
-### Multiplier stack (~9 factors, hard-capped at 2.0×)
-Confidence-headroom × Kelly × calibration × per-strategy × VIX × analyst-rating × fundamentals-quality × short-interest × Stocktwits × WSB × institutional × insider × ML-scorer (shadow). Compound is clamped to `RISK_MULT_CEILING = 2.0` (Critical-audit fix #1) so a winning streak across all factors can't compound to runaway risk.
+### Multiplier stack (~10 factors, hard-capped at 2.0×)
+Confidence-headroom × Kelly × calibration × per-strategy × VIX × analyst-rating × fundamentals-quality × short-interest × Stocktwits × WSB × institutional × insider × ML-scorer (shadow) × **AI judge (r36, shadow by default, 0.6×–1.4× envelope)**. Compound is clamped to `RISK_MULT_CEILING = 2.0` (Critical-audit fix #1) so a winning streak across all factors can't compound to runaway risk. Heat-aware throttle (r35: 0.85× / 0.60× / 0.40× as live heat crosses 50% / 70% / 85% of cap) applies AFTER the ceiling.
 
 ### Exit-side guarantees
 SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis close (gate ≥80 conf + same-or-higher TF, with correct CALL/PUT direction post-r22), stale-trade recycle, debounced target touches (2-tick confirm), atomic stop-replacement (broker ack gates DB update), adaptive chandelier (ADX-driven 0.83-1.33× of base mult, never loosens existing stop), **ADX-aware T1/T2 trim fractions** (r34: 15% in strong trend, default in chop), ATR-capped Soft BE (`max(0.3R, 0.25×ATR)` to survive 1-bar wicks), premium-stop spread-artifact guard (skip when held < 5 min AND underlying not against thesis), **options theta stop** (r34: close when held ≥ 48h with < 0.2R underlying progress).
@@ -866,6 +866,40 @@ building. `SKIP_TESTS=1` to override.
 ---
 
 ## 14. Changelog (current → past)
+
+### Revision 36 — AI judge layer: entry veto + news-driven exit + sizing multiplier (shadow by default)
+- **`services/ai_judge.py`** wraps three Claude (Haiku) call sites with a
+  shared client, tool-use-forced JSON schemas, latency budget, and a
+  fail-open guarantee. Each call site has its own env mode flag
+  (`AI_ENTRY_VETO_MODE`, `AI_NEWS_EXIT_MODE`, `AI_CONFIDENCE_MULT_MODE`)
+  that cycles `off → shadow → active`. **Defaults to `off` everywhere** —
+  no behavior change at deploy. Flip to `shadow` first, review ≥ 200
+  decisions in `AIDecisionLog`, then promote to `active`.
+- **Hard guarantee**: any failure (no API key, network, schema mismatch,
+  malformed response, timeout) returns the abstain value
+  (proceed / hold / 1.0×). Live trading is never blocked by Claude
+  unavailability. 6 unit tests pin this contract.
+- **Entry veto** (`consider_signal`, after every other gate passes):
+  Claude reviews `{signal, fundamentals, recent_news, same-sector
+  positions, analyst rating, insider, social}` and returns
+  `{verdict: proceed | skip, reason}`. Active-mode skip → `autotrade_skip
+  {reason=ai_veto}`.
+- **Confidence multiplier** in the sizing stack: returns
+  `multiplier ∈ [0.6, 1.4]` that joins `conf × kelly × cal × strat ×
+  vix × ai_mult`. Already bounded by `RISK_MULT_CEILING=2.0×`. Shadow
+  mode logs the requested value but feeds 1.0 to the sizer.
+- **News-driven exit** (post-ingest hook in `services/news.py`): on
+  each freshly-inserted medium+ severity news item that matches an open
+  position, Claude returns `{is_thesis_relevant, action: hold | trim |
+  close, reason}`. Honored `close` triggers `force_close_trade` with
+  `status=closed_news_ai`; honored `trim` halves the position at market.
+- **`AIDecisionLog`** table — every call (off / shadow / active) logged
+  with prompt summary, response, latency, honored flag. Operator review
+  via `GET /api/ai-judge/decisions` (filterable by call_site +
+  honored), `GET /api/ai-judge/summary`, `GET /api/ai-judge/modes`.
+- **Cost**: ~$0.001/Haiku call × ≤ 50 high-conf signals/day ≈ $0.05/day
+  per active call site. Move to Opus only after measuring shadow
+  accuracy.
 
 ### Revision 35 — Pre-live BACKLOG sweep: backtest stress windows, heat-aware sizing, signal validation, close notifications
 - **Portfolio backtest stress windows** (`portfolio_backtest.STRESS_WINDOWS`):

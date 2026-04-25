@@ -559,6 +559,31 @@ class AnalystRating(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
 
 
+class AIDecisionLog(Base):
+    """Audit log for every Claude judge call (entry_veto, news_exit,
+    confidence_multiplier).
+
+    Used to review shadow-mode decisions before flipping a call site to
+    `active`. Each row captures the inputs (compressed), the model's
+    response, latency, and whether we honored the verdict. Indexed on
+    `created_at` so the operator can filter recent decisions; on
+    `call_site` so per-channel analysis is fast.
+
+    `prompt_summary` and `response` are stored as JSON strings to keep
+    the table schema flat across DB engines (SQLite + Postgres).
+    """
+    __tablename__ = "ai_decision_log"
+    id = Column(Integer, primary_key=True)
+    call_site = Column(String, index=True)            # entry_veto | news_exit | confidence_multiplier
+    mode = Column(String)                             # off | shadow | active
+    prompt_summary = Column(String)                   # JSON-stringified compact context
+    response = Column(String)                         # JSON-stringified verdict + reason
+    latency_ms = Column(Integer)
+    honored = Column(Boolean, default=False)
+    error = Column(String, nullable=True)             # null on success, "abstain" / msg otherwise
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 def _ensure_column(table: str, column: str, ddl: str):
     """Tiny SQLite migration helper — ALTER TABLE ADD COLUMN if missing.
 

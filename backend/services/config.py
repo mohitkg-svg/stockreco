@@ -73,3 +73,19 @@ ML_MULT_LOW = 0.88       # P(win) < 0.35
 # claude-haiku-4-5 to cut chat token cost ~5× at the expense of nuance.
 CHAT_MODEL = "claude-opus-4-7"
 CHAT_MAX_TOKENS = 8000
+
+# ---- AI judge — entry veto, exit decision, confidence multiplier -----------
+# Defaults to Haiku (fast + cheap) — the AI judge is in the trade-decision
+# critical path so latency matters. Override to Opus only if accuracy of
+# semantic judgments measurably trails (track in shadow mode for ≥ 200
+# entries before switching).
+AI_JUDGE_MODEL = "claude-haiku-4-5-20251001"
+AI_JUDGE_MAX_TOKENS = 512
+# Latency budget per call. Trade is held in `consider_signal` for at most
+# this long; on timeout we abstain (proceed without veto).
+AI_JUDGE_TIMEOUT_SEC = 5.0
+# AI confidence multiplier is a downward-bias range — symmetric envelope
+# would let "AI loves it" double the bet; not what we want from an LLM.
+# Stack ceiling RISK_MULT_CEILING already caps everything at 2.0×.
+AI_MULT_MIN = 0.6
+AI_MULT_MAX = 1.4

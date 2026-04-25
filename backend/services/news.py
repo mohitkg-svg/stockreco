@@ -141,6 +141,25 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
     out = {"inserted": 0, "skipped_dup": 0, "errors": 0}
     if not items:
         return out
+    # Pre-compute the open-position set so we can flag freshly-inserted
+    # news for AI exit-decision review without an extra DB query per row.
+    _open_pos_tickers: set = set()
+    try:
+        from database import AutoTrade as _AT
+        _db_pos = SessionLocal()
+        try:
+            _open_pos_tickers = {
+                t for (t,) in _db_pos.query(_AT.ticker).filter(
+                    _AT.status.in_(["pending", "open"])
+                ).all()
+            }
+        finally:
+            _db_pos.close()
+    except Exception:
+        pass
+    # Buffer of (ticker, NewsEvent-as-dict) for post-commit AI dispatch.
+    _new_for_open: List[Dict[str, Any]] = []
+
     db = SessionLocal()
     try:
         # Batch the existence check — one query vs N per-article selects.
@@ -194,6 +213,24 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
                 )
                 db.add(row)
                 out["inserted"] += 1
+                # Flag for AI exit-decision review if any open position
+                # matches one of this article's symbols.
+                if _open_pos_tickers:
+                    for s in symbols:
+                        s_up = s.upper()
+                        if s_up in _open_pos_tickers:
+                            _new_for_open.append({
+                                "ticker": s_up,
+                                "title": headline,
+                                "summary": summary,
+                                "source": source,
+                                "url": url,
+                                "published_at": published_at.isoformat() if published_at else None,
+                                "sentiment_label": sent["label"],
+                                "sentiment_score": sent["score"],
+                                "severity": sent["severity"],
+                            })
+                            break
             except Exception as e:
                 out["errors"] += 1
                 logger.debug(f"news: ingest row error: {e}")
@@ -203,7 +240,112 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
         out["errors"] += 1
     finally:
         db.close()
+
+    # Post-commit AI exit-decision dispatch. Only fires when AI_NEWS_EXIT_MODE
+    # is shadow/active AND the news is at least medium-severity (skip
+    # routine PR / sector blurbs). Each call is best-effort — failures
+    # never propagate back into ingest's return value.
+    if _new_for_open:
+        try:
+            _dispatch_ai_news_exit(_new_for_open)
+        except Exception as e:
+            logger.debug(f"news: AI exit dispatch skipped: {e}")
     return out
+
+
+def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
+    """For each news item on an open ticker, fire the AI judge and act on
+    its verdict (close/trim) when honored. Runs synchronously after each
+    ingest batch — small N (≤ 5 typical), Claude calls bounded by
+    AI_JUDGE_TIMEOUT_SEC."""
+    from services import ai_judge
+    if ai_judge.news_exit_mode() == "off":
+        return
+    from database import AutoTrade
+    db = SessionLocal()
+    try:
+        for item in news_for_open:
+            # Only escalate medium+ severity; "low" is routine flow.
+            if (item.get("severity") or "").lower() in ("low", ""):
+                continue
+            ticker = item["ticker"]
+            open_trades = db.query(AutoTrade).filter(
+                AutoTrade.ticker == ticker,
+                AutoTrade.status.in_(["pending", "open"]),
+            ).all()
+            for t in open_trades:
+                trade_view = {
+                    "id": t.id,
+                    "ticker": t.ticker,
+                    "asset_type": t.asset_type,
+                    "qty": t.qty,
+                    "entry_price": t.entry_price,
+                    "current_stop": t.current_stop,
+                    "target1": t.target1,
+                    "target2": t.target2,
+                    "target3": t.target3,
+                    "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                }
+                try:
+                    res = ai_judge.news_exit_decision(trade_view, item)
+                except Exception as e:
+                    logger.debug(f"news: AI judge call failed for {ticker} #{t.id}: {e}")
+                    continue
+                if not res.get("honored"):
+                    continue
+                action = res.get("action", "hold")
+                if action == "close":
+                    try:
+                        from services.execution_engine import force_close_trade
+                        force_close_trade(
+                            t, db,
+                            reason=f"AI news_exit: {res.get('reason', '')}",
+                            summary={},
+                            status_override="closed_news_ai",
+                        )
+                    except Exception as e:
+                        logger.warning(f"news: AI-driven close failed for {ticker} #{t.id}: {e}")
+                elif action == "trim":
+                    # Trim half of remaining qty at market.
+                    try:
+                        from services import paper_trader
+                        if t.asset_type == "stock":
+                            half = max(1, int((t.qty or 0) // 2))
+                            from alpaca.trading.requests import MarketOrderRequest
+                            from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+                            c = paper_trader._get_client()
+                            res2 = c.submit_order(order_data=MarketOrderRequest(
+                                symbol=t.ticker, qty=half,
+                                side=_OS.SELL, time_in_force=_TIF.DAY,
+                            ))
+                            if res2 is not None:
+                                t.qty = (t.qty or 0) - half
+                                t.note = (t.note or "") + (
+                                    f" | AI news_trim: -{half} shares ({res.get('reason', '')[:120]})"
+                                )
+                                db.commit()
+                                logger.info(
+                                    f"AI news_exit TRIM {ticker} #{t.id}: -{half} shares"
+                                )
+                        elif t.asset_type == "option":
+                            half = max(1, int((t.qty or 0) // 2))
+                            res2 = paper_trader.submit_simple_option_order(
+                                occ_symbol=t.symbol, qty=half, side="sell",
+                                order_type="market", time_in_force="day",
+                            )
+                            if isinstance(res2, dict) and "error" not in res2:
+                                t.qty = (t.qty or 0) - half
+                                t.note = (t.note or "") + (
+                                    f" | AI news_trim: -{half} contracts ({res.get('reason', '')[:120]})"
+                                )
+                                db.commit()
+                                logger.info(
+                                    f"AI news_exit TRIM {ticker} #{t.id}: -{half} contracts"
+                                )
+                    except Exception as e:
+                        logger.warning(f"news: AI-driven trim failed for {ticker} #{t.id}: {e}")
+    finally:
+        db.close()
 
 
 def poll_watchlist(lookback_minutes: int = 30) -> Dict[str, Any]:

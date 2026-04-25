@@ -182,6 +182,98 @@ class TestMetricsNoOpFallback(unittest.TestCase):
             pass
 
 
+class TestAIJudgeAbstainPaths(unittest.TestCase):
+    """Hard guarantee: Claude unreachable / disabled MUST NOT block trading.
+
+    Each call site has an env-flag (off | shadow | active). Default is off
+    everywhere. These tests pin that the abstain path returns the
+    expected proceed/hold/1.0 values so a missing API key, network blip,
+    or schema mismatch can never alter live trading behavior.
+    """
+
+    def setUp(self):
+        # Force off for the off-path tests
+        for k in ("AI_ENTRY_VETO_MODE", "AI_NEWS_EXIT_MODE", "AI_CONFIDENCE_MULT_MODE"):
+            os.environ.pop(k, None)
+        # Reset client cache so subsequent tests re-evaluate the env
+        from services import ai_judge
+        ai_judge._client = None
+        ai_judge._client_init_attempted = False
+
+    def test_off_mode_entry_veto_proceeds(self):
+        from services import ai_judge
+        out = ai_judge.entry_veto({"ticker": "AAPL"}, {})
+        self.assertEqual(out["verdict"], "proceed")
+        self.assertFalse(out["honored"])
+        self.assertEqual(out["mode"], "off")
+
+    def test_off_mode_news_exit_holds(self):
+        from services import ai_judge
+        out = ai_judge.news_exit_decision({"ticker": "AAPL", "id": 1}, {"title": "x"})
+        self.assertEqual(out["action"], "hold")
+        self.assertFalse(out["honored"])
+        self.assertEqual(out["mode"], "off")
+
+    def test_off_mode_confidence_mult_returns_1(self):
+        from services import ai_judge
+        out = ai_judge.confidence_multiplier({"ticker": "AAPL"}, {})
+        self.assertEqual(out["multiplier"], 1.0)
+        self.assertFalse(out["honored"])
+        self.assertEqual(out["mode"], "off")
+
+    def test_no_api_key_shadow_mode_abstains(self):
+        # In shadow mode WITHOUT an API key, _get_client returns None →
+        # _call_with_tool returns None → entry_veto returns proceed.
+        os.environ["AI_ENTRY_VETO_MODE"] = "shadow"
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        from services import ai_judge
+        ai_judge._client = None
+        ai_judge._client_init_attempted = False
+        out = ai_judge.entry_veto({"ticker": "AAPL"}, {})
+        self.assertEqual(out["verdict"], "proceed")
+        self.assertFalse(out["honored"])
+        del os.environ["AI_ENTRY_VETO_MODE"]
+
+    def test_active_mode_with_no_key_still_abstains_safely(self):
+        # Even in `active`, if the API key is missing the call abstains
+        # to "proceed" — never blocks the trade.
+        os.environ["AI_ENTRY_VETO_MODE"] = "active"
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        from services import ai_judge
+        ai_judge._client = None
+        ai_judge._client_init_attempted = False
+        out = ai_judge.entry_veto({"ticker": "AAPL"}, {})
+        self.assertEqual(out["verdict"], "proceed")
+        self.assertFalse(out["honored"])
+        del os.environ["AI_ENTRY_VETO_MODE"]
+
+    def test_confidence_multiplier_clamps_to_envelope(self):
+        # Even if Claude returned 99×, the wrapper clamps to AI_MULT_MAX.
+        # Verified by mocking _call_with_tool to return an out-of-range value.
+        os.environ["AI_CONFIDENCE_MULT_MODE"] = "active"
+        os.environ["ANTHROPIC_API_KEY"] = "x"  # presence, value irrelevant due to mock
+        from services import ai_judge
+        from services.config import AI_MULT_MIN, AI_MULT_MAX
+        orig = ai_judge._call_with_tool
+        try:
+            ai_judge._call_with_tool = lambda *a, **kw: {"multiplier": 99.0, "reason": "mock"}
+            ai_judge._client = "fake"  # bypass _get_client guard inside if any
+            # _get_client is called inside _call_with_tool — we override _call_with_tool
+            # so we never actually hit it. But _call_with_tool's signature is the entry.
+            out = ai_judge.confidence_multiplier({"ticker": "AAPL"}, {})
+            self.assertLessEqual(out["multiplier"], AI_MULT_MAX + 1e-9)
+            self.assertGreaterEqual(out["multiplier"], AI_MULT_MIN - 1e-9)
+            ai_judge._call_with_tool = lambda *a, **kw: {"multiplier": -5.0, "reason": "mock"}
+            out2 = ai_judge.confidence_multiplier({"ticker": "AAPL"}, {})
+            self.assertGreaterEqual(out2["multiplier"], AI_MULT_MIN - 1e-9)
+        finally:
+            ai_judge._call_with_tool = orig
+            ai_judge._client = None
+            ai_judge._client_init_attempted = False
+            del os.environ["AI_CONFIDENCE_MULT_MODE"]
+            del os.environ["ANTHROPIC_API_KEY"]
+
+
 class TestSignalPayloadValidation(unittest.TestCase):
     """SignalPayload — validates the signal dict at the consume boundary.
 

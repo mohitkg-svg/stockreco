@@ -614,6 +614,93 @@ def update_config(**kwargs) -> Dict[str, Any]:
     return get_config_dict()
 
 
+# ---------- AI judge context builder --------------------------------------
+
+def _build_ai_context(ticker: str, db: Session) -> Dict[str, Any]:
+    """Compact semantic context for the AI judge calls.
+
+    Each section is best-effort — missing data falls through to None so a
+    cold-cache or DB hiccup degrades gracefully into a less-informed
+    Claude call rather than crashing the entry path.
+    """
+    ctx: Dict[str, Any] = {"ticker": ticker}
+
+    # Recent news (last 24h headlines + sentiment, deduped)
+    try:
+        from database import NewsEvent
+        from datetime import datetime as _dt, timedelta as _td
+        cutoff = _dt.utcnow() - _td(hours=24)
+        news = (
+            db.query(NewsEvent)
+            .filter(NewsEvent.tickers.like(f"%{ticker}%"))
+            .filter(NewsEvent.published_at >= cutoff)
+            .order_by(NewsEvent.published_at.desc())
+            .limit(5).all()
+        )
+        ctx["recent_news"] = [
+            {"title": n.title, "sentiment": n.sentiment_label,
+             "published_at": n.published_at.isoformat() if n.published_at else None}
+            for n in news
+        ]
+    except Exception:
+        ctx["recent_news"] = []
+
+    # Fundamentals snapshot
+    try:
+        from services.fundamentals import get_fundamentals
+        f = get_fundamentals(ticker) or {}
+        ctx["fundamentals"] = {
+            "sector": f.get("sector"),
+            "industry": f.get("industry"),
+            "market_cap": f.get("market_cap"),
+            "pe": f.get("trailing_pe"),
+            "beta": f.get("beta"),
+            "short_pct_float": f.get("short_pct_float"),
+        }
+    except Exception:
+        ctx["fundamentals"] = {}
+
+    # Other open positions in the same sector — context for cross-trade
+    # correlation concern (already enforced by sector cap, but Claude can
+    # spot when the cluster is one news event away from a coordinated drawdown)
+    try:
+        sector = (ctx.get("fundamentals") or {}).get("sector")
+        if sector:
+            from services.fundamentals import get_fundamentals as _gf
+            open_others = db.query(AutoTrade).filter(
+                AutoTrade.status.in_(["pending", "open"])
+            ).all()
+            same = []
+            for ot in open_others:
+                if ot.ticker == ticker: continue
+                try:
+                    s = (_gf(ot.ticker) or {}).get("sector")
+                except Exception:
+                    s = None
+                if s == sector:
+                    same.append(ot.ticker)
+            ctx["open_positions_same_sector"] = same
+    except Exception:
+        ctx["open_positions_same_sector"] = []
+
+    # Analyst rating + insider/institutional/social signals (if available)
+    for src_key, accessor in [
+        ("analyst_rating", "services.fundamentals.get_analyst_rating"),
+        ("insider", "services.insider_trades.get_insider_summary"),
+        ("social", "services.social_sentiment.get_sentiment"),
+    ]:
+        try:
+            mod_name, fn_name = accessor.rsplit(".", 1)
+            mod = __import__(mod_name, fromlist=[fn_name])
+            fn = getattr(mod, fn_name, None)
+            if fn:
+                ctx[src_key] = fn(ticker)
+        except Exception:
+            ctx[src_key] = None
+
+    return ctx
+
+
 # ---------- Budget bookkeeping --------------------------------------------
 
 def _open_allocations(db: Session) -> Dict[str, float]:
@@ -1144,6 +1231,36 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             except Exception:
                 pass
 
+        # AI entry-veto layer (shadow by default; flip via AI_ENTRY_VETO_MODE
+        # env var to "active" only after reviewing ≥200 shadow decisions).
+        # Failure / abstain / off → proceed (rule-engine wins). Honored skips
+        # log via metrics so the operator can graph veto rate.
+        try:
+            from services import ai_judge as _aij
+            if _aij.entry_veto_mode() != "off":
+                _ai_ctx = _build_ai_context(ticker, db)
+                _ai_signal_view = {
+                    "ticker": ticker,
+                    "signal_type": signal.get("signal_type"),
+                    "confidence": signal.get("confidence"),
+                    "timeframe": signal.get("timeframe"),
+                    "entry": signal.get("entry"),
+                    "stop_loss": signal.get("stop_loss"),
+                    "target1": signal.get("target1"),
+                    "strategy": signal.get("strategy"),
+                    "reasoning": (signal.get("reasoning") or "")[:1500],
+                }
+                _veto = _aij.entry_veto(_ai_signal_view, _ai_ctx)
+                if _veto.get("honored") and _veto.get("verdict") == "skip":
+                    logger.info(
+                        f"AutoTrader skip {ticker}: AI veto — {_veto.get('reason', '')}"
+                    )
+                    metrics.inc("autotrade_skip", reason="ai_veto")
+                    return None
+        except Exception as _e:
+            # Hard guarantee: AI judge failure NEVER blocks a trade.
+            logger.debug(f"ai_judge entry_veto wrapper failed: {_e}")
+
         # Check budget
         acct = paper_trader.get_account()
         if not acct:
@@ -1210,8 +1327,27 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # A single reversal then hits the account ~5× harder than intended.
         # The 2.0× ceiling preserves 60% of the multiplier upside while
         # hard-capping the downside.
+        # AI confidence multiplier — joins the multiplier stack and is
+        # bounded by the same RISK_MULT_CEILING. Shadow mode returns 1.0
+        # so this is a no-op until you flip AI_CONFIDENCE_MULT_MODE=active.
+        ai_mult = 1.0
+        try:
+            from services import ai_judge as _aij
+            if _aij.confidence_mult_mode() != "off":
+                _ai_ctx = _build_ai_context(ticker, db)
+                _ai_signal_view = {
+                    "ticker": ticker, "signal_type": signal.get("signal_type"),
+                    "confidence": signal.get("confidence"),
+                    "timeframe": signal.get("timeframe"),
+                    "strategy": signal.get("strategy"),
+                }
+                _r = _aij.confidence_multiplier(_ai_signal_view, _ai_ctx)
+                ai_mult = float(_r.get("multiplier", 1.0))
+        except Exception as _e:
+            logger.debug(f"ai_judge confidence_multiplier wrapper failed: {_e}")
+
         from services.config import RISK_MULT_CEILING as _MULT_CEILING
-        raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult
+        raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult * ai_mult
         clamped_stack = min(raw_stack, _MULT_CEILING)
         # Heat-aware throttle: applies AFTER the multiplier-stack ceiling so
         # the heat-throttle still pulls things smaller even when other
@@ -1224,7 +1360,8 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if raw_stack > _MULT_CEILING:
             logger.info(
                 f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
-                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} strat={strat_mult:.2f} vix={vix_mult:.2f})"
+                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} "
+                f"strat={strat_mult:.2f} vix={vix_mult:.2f} ai={ai_mult:.2f})"
             )
         if heat_mult < 1.0:
             logger.info(
