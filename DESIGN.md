@@ -859,6 +859,39 @@ building. `SKIP_TESTS=1` to override.
 
 ## 14. Changelog (current → past)
 
+### Revision 34 — Tier A from external review: regime tightening + ADX trim + liquidity + theta stop
+- **Regime-aware concurrent-position cap** (`risk_manager.regime_concurrent_cap`):
+  VIX > 25 OR SPY below 200-EMA → base // 3 (typically 5); VIX > 20 → base × 2/3
+  (typically 10). Layered on top of adaptive-risk + VIX-options scaling that
+  already shrink size — this layer additionally limits the *number* of
+  concurrent ideas when regime is hostile. Wired into `consider_signal`.
+- **ADX-aware T1/T2 trim fractions** (`auto_trader.trim_fraction_for_adx`):
+  weak trend (ADX ≤ 25) → default trim (33% stock / 50% option); strong
+  trend (ADX ≥ 40) → 15% trim (let the runner run); linear interpolation
+  between. Applied at three sites: option T1, option T2, stock T1.
+- **Liquidity gate** in `consider_signal`: reject entries on tickers with
+  median 20-day daily $-volume < $10M. Sub-threshold names produce wide
+  spreads that quietly erode R-multiples; threshold deliberately
+  conservative (most large-caps clear $100M+/day).
+- **Options theta stop**: close any option position that has held ≥48h
+  with < 0.2R underlying progress toward target. Catches the slow-bleed
+  failure mode where the thesis isn't wrong enough to trip the underlying-
+  stop but isn't right enough to make money before theta eats the premium.
+- **Sharpe annualization factor by timeframe** (`backtester.py`):
+  `sqrt(bars_per_year)` instead of hardcoded `sqrt(252)`. Equity curve in
+  `_simulate` is per-bar, so annualizing as if it were daily inflated
+  intraday Sharpe by 8.8× on 5m, 14× on 1m. `portfolio_backtest.py` is
+  unchanged (already daily).
+- **ATR fallback improvement**: when ATR_14 is missing/zero, fall back to
+  trailing 14-bar median High–Low range instead of hardcoded 2% of Close.
+  Adapts to the symbol's actual realized range. Applied in `backtester.py`
+  (both `_simulate` and `_evaluate`) and `position_manager.recalculate_targets`.
+- **OCC parser consolidation**: removed dead inline P/C-detection in
+  `_manage_option_trade` — `is_call_option()` in `position_manager` is
+  now the single source of truth.
+- **BACKLOG additions**: IV percentile gate (deferred — needs 252d history
+  ingestion); ML scorer graduation criteria (≥200 closed trades + AUC > 0.60).
+
 ### Revision 33 — Dual-service architecture + observability hardening (Tiers 1+2+3+4)
 - **`RUN_MODE` env-var splits the app across two Cloud Run services**.
   - `stockrecs` (RUN_MODE=api): HTTP, scanner, signal generation, all alt-data

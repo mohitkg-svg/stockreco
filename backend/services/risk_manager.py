@@ -199,6 +199,49 @@ def adaptive_risk_multiplier() -> float:
     return mult
 
 
+def regime_concurrent_cap(base_cap: int) -> int:
+    """Tighten max_concurrent_positions in adverse regimes — reviewer's
+    "don't trade chop" filter. Returns the EFFECTIVE cap to use for the
+    portfolio-heat / concurrent-positions check.
+
+      * VIX > 25 OR SPY below 200-EMA → base // 3 (typically 5)
+      * VIX > 20 → base × 2/3 (typically 10)
+      * else → base unchanged
+
+    Risk envelope and bucket-sizing already shrink under volatility
+    (adaptive_risk_multiplier + vix_options_bucket_multiplier); this
+    layer additionally limits the *number* of concurrent ideas — fewer
+    positions to manage when regime is hostile.
+    """
+    if base_cap <= 0:
+        return base_cap
+    try:
+        from services.position_manager import current_price
+        vix = current_price("^VIX")
+    except Exception:
+        vix = None
+
+    spy_below_200 = False
+    try:
+        from services.data_fetcher import fetch_ohlcv
+        from services.indicators import compute_indicators
+        spy_df = fetch_ohlcv("SPY", "1d")
+        if spy_df is not None and not spy_df.empty:
+            ind = compute_indicators(spy_df)
+            close = float(ind["Close"].iloc[-1])
+            if "EMA_200" in ind.columns:
+                ema200 = float(ind["EMA_200"].iloc[-1])
+                spy_below_200 = close < ema200
+    except Exception:
+        pass
+
+    if (vix is not None and vix > 25) or spy_below_200:
+        return max(3, base_cap // 3)
+    if vix is not None and vix > 20:
+        return max(5, (base_cap * 2) // 3)
+    return base_cap
+
+
 def vix_options_bucket_multiplier() -> float:
     """Scale `option_pct_of_equity` by VIX regime. High VIX = gamma/vega
     exposure is costlier, so we de-allocate from options.

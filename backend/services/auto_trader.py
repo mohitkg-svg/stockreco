@@ -116,7 +116,33 @@ _T1_BE_MIN_ATR = 0.5
 # 0.33 of 2/3 original = 22% of original, leaving a 45% runner for T3+.
 # Lowered from 0.50 (old = 33% runner) — post-mortem showed winners died
 # too small because we banked 67% before T3 ever fired.
-_T2_PARTIAL_FRAC = 0.33
+_T2_PARTIAL_FRAC = 0.33  # default; trim_fraction_for_adx() adapts by trend strength
+
+
+def trim_fraction_for_adx(ticker: str, level: str, default_frac: float = 0.33) -> float:
+    """ADX-based dynamic trim: weak trends → bank fast, strong trends → let runners run.
+    `level` ∈ {"T1","T2"}.
+
+      * ADX > 40 (powerful trend) → trim only 15% (leave 70% runner past T2)
+      * ADX < 25 (weak trend)     → keep default 33% (bank profit faster)
+      * In between → linear interpolation between 33% and 15%
+
+    Falls back to `default_frac` if ADX can't be read.
+    """
+    try:
+        from services.position_manager import chandelier_adx
+        adx = chandelier_adx(ticker)
+    except Exception:
+        adx = None
+    if adx is None:
+        return default_frac
+    if adx >= 40:
+        return 0.15
+    if adx <= 25:
+        return default_frac
+    # Linear interp 25→33%, 40→15%
+    span = (adx - 25.0) / (40.0 - 25.0)
+    return default_frac + (0.15 - default_frac) * span
 # Stale-trade exit: close an open trade that hasn't hit T1 after
 # N × timeframe minutes have elapsed. Frees capital for fresher setups.
 _STALE_TRADE_TF_MULT = 8
@@ -774,12 +800,18 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 metrics.inc("autotrade_event", event="daily_loss_halt")
                 return None
 
-        # C1: Max concurrent positions guard.
-        mcp = int(getattr(cfg, "max_concurrent_positions", 0) or 0)
+        # C1: Max concurrent positions guard. Tightened in adverse regimes
+        # (VIX > 25 or SPY below 200-EMA → cap // 3; VIX > 20 → cap × 2/3).
+        from services.risk_manager import regime_concurrent_cap as _regime_cap
+        mcp_base = int(getattr(cfg, "max_concurrent_positions", 0) or 0)
+        mcp = _regime_cap(mcp_base) if mcp_base > 0 else 0
         if mcp > 0 and count_open_auto_trades() >= mcp:
             logger.info(
+                f"AutoTrader skip {signal.get('ticker')}: max_concurrent {mcp} reached "
+                f"(base {mcp_base}, regime-tightened)" if mcp != mcp_base else
                 f"AutoTrader skip {signal.get('ticker')}: max_concurrent_positions {mcp} reached"
             )
+            metrics.inc("autotrade_skip", reason="max_concurrent_cap")
             return None
 
         # Portfolio-heat cap — total $-at-risk across all open auto-trades
@@ -948,6 +980,29 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                         f"(> {_STALE_GAP_PCT*100:.1f}% threshold)"
                     )
                     metrics.inc("autotrade_event", event="gap_open_reject")
+                    return None
+        except Exception:
+            pass
+
+        # Liquidity gate: require ≥ $10M median daily $-volume over the last
+        # 20 trading days. Sub-threshold names produce wide spreads + slippage
+        # that quietly poisons R-multiples (a 1% slip on a 4R trade gives up
+        # 0.4R/trade; over a year that's the entire edge). Threshold is
+        # deliberately conservative — typical large-caps clear $100M+/day,
+        # mid-caps $20–50M; we only reject true micro/small-caps.
+        try:
+            from services.data_fetcher import fetch_ohlcv as _liq_fo
+            _liq_df = _liq_fo(ticker, "1d")
+            if _liq_df is not None and not _liq_df.empty and len(_liq_df) >= 5:
+                _tail = _liq_df.tail(20)
+                _typ_px = (_tail["High"] + _tail["Low"] + _tail["Close"]) / 3.0
+                _dvol = (_typ_px * _tail["Volume"]).median()
+                if _dvol and _dvol > 0 and _dvol < 10_000_000:
+                    logger.info(
+                        f"AutoTrader skip {ticker}: median daily $-volume "
+                        f"${_dvol/1e6:.1f}M < $10M (illiquid)"
+                    )
+                    metrics.inc("autotrade_event", event="illiquid_skip")
                     return None
         except Exception:
             pass
@@ -1959,14 +2014,8 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
     pos = paper_trader.get_option_position(t.symbol)
     cur_premium = pos["current_price"] if pos and pos.get("current_price") else None
 
-    # Parse the option direction from the OCC symbol (8th-from-end char: 'C' or 'P')
-    is_put = False
-    try:
-        # OCC: AAPL250117P00270000  → ...P0027... ; 'P' is the 9th-from-end char
-        is_put = "P" in t.symbol[-9:-8] or "P" in t.symbol[-15:-14]
-    except Exception:
-        pass
-
+    # CALL vs PUT detection — single source of truth in position_manager.is_call_option.
+    is_put = not _is_call_option(t)
     exit_reason = None
     final_status = None
 
@@ -1996,7 +2045,10 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             # leaving micro-size runners for T3.
             if target_idx == 0 and t.qty >= 2 and not t.hit_t1:
                 orig = int(getattr(t, "original_qty", None) or t.qty)
-                half = max(1, int(orig // 2))
+                # ADX-aware T1 trim: weak trend (ADX<25) → 50% of original,
+                # strong trend (ADX>40) → 15% of original (leave 85% runner).
+                _t1_frac = trim_fraction_for_adx(t.ticker, "T1", default_frac=0.50)
+                half = max(1, int(orig * _t1_frac))
                 half = min(half, int(t.qty))   # can't trim more than we hold
                 if half >= 1:
                     trim = paper_trader.submit_simple_option_order(
@@ -2128,6 +2180,32 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             else:
                 exit_reason = f"premium decayed to ${cur_premium:.2f} (≥50% of entry ${t.entry_price:.2f})"
                 final_status = "closed_stop"
+
+    # 5b) Theta stop — if the underlying has barely moved after 48h of holding,
+    # the thesis is failing slowly via theta decay rather than via a clean
+    # stop-out. Cut the trade rather than bleeding to expiration. Threshold:
+    # < 0.2R toward target after 48h. R is measured against the underlying's
+    # initial-risk distance (entry → bear/bull stop on the underlying).
+    if not exit_reason and px is not None:
+        try:
+            from datetime import datetime as _dt_th
+            opened = t.filled_at or t.opened_at
+            held_h = (_dt_th.utcnow() - opened).total_seconds() / 3600 if opened else 0
+            req_entry = float(getattr(t, "requested_entry", None) or 0)
+            req_stop = float(getattr(t, "stop_loss", None) or 0)
+            if held_h >= 48 and req_entry > 0 and req_stop > 0:
+                R_under = abs(req_entry - req_stop)
+                if R_under > 0:
+                    progress = (req_entry - px) / R_under if is_put else (px - req_entry) / R_under
+                    if progress < 0.2:
+                        exit_reason = (
+                            f"theta stop: held {held_h:.0f}h, underlying progress "
+                            f"{progress:.2f}R < 0.2R — thesis stalled"
+                        )
+                        final_status = "closed_stop"
+                        metrics.inc("autotrade_event", event="theta_stop")
+        except Exception:
+            pass
 
     if exit_reason:
         sell = paper_trader.submit_simple_option_order(
@@ -2584,7 +2662,8 @@ def manage_open_positions() -> Dict[str, Any]:
                                         # the SL leg to the remainder. Only
                                         # once per trade (guarded by hit_t1).
                                         if target_idx == 0 and not t.hit_t1 and t.qty >= 3:
-                                            trim_qty = int(t.qty // 3)
+                                            _t1_frac = trim_fraction_for_adx(t.ticker, "T1", default_frac=0.33)
+                                            trim_qty = max(1, int(t.qty * _t1_frac))
                                             if trim_qty >= 1:
                                                 try:
                                                     from alpaca.trading.requests import MarketOrderRequest
@@ -2620,7 +2699,9 @@ def manage_open_positions() -> Dict[str, Any]:
                                         # runner at T2 to lock in another chunk of gains while still
                                         # leaving a runner for T3 and recalc extensions.
                                         if target_idx == 1 and t.qty >= 2:
-                                            trim_qty = max(1, int(t.qty * _T2_PARTIAL_FRAC))
+                                            # ADX-aware T2 trim: tight in chop, loose in trends
+                                            _t2_frac = trim_fraction_for_adx(t.ticker, "T2", default_frac=_T2_PARTIAL_FRAC)
+                                            trim_qty = max(1, int(t.qty * _t2_frac))
                                             if trim_qty < t.qty:
                                                 try:
                                                     from alpaca.trading.requests import MarketOrderRequest

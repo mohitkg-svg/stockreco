@@ -152,11 +152,23 @@ def recalculate_targets(ticker: str, direction: str,
         if df is None or df.empty:
             return None
         levels = swing_levels(df, window=10, max_levels=12)
+        atr = None
         try:
             ind = compute_indicators(df)
             atr = float(ind["ATR_14"].iloc[-1])
         except Exception:
-            atr = current_price_value * 0.02
+            atr = None
+        # Better fallback than 2%-of-price: trailing 14-day median High-Low
+        # range adapts to the symbol's actual realized vol.
+        if not atr or atr <= 0:
+            try:
+                rng = (df["High"] - df["Low"]).tail(14).dropna()
+                if len(rng) >= 5:
+                    med = float(rng.median())
+                    if med > 0:
+                        atr = med
+            except Exception:
+                pass
         if not atr or atr <= 0:
             atr = current_price_value * 0.02
 

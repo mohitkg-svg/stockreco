@@ -24,6 +24,30 @@ DEFAULT_STOP_ATR_MULT = 1.5
 DEFAULT_RR = 2.5 / 1.5  # target:risk ratio (preserved when stop mult changes)
 
 
+# Bars-per-year by timeframe for Sharpe annualization. Equity in `_simulate`
+# is appended per bar, so per-bar pct_change → bar-frequency stdev. Multiplying
+# by sqrt(252) (the daily factor) blindly was the bug — a 5m strategy got
+# annualized as if it had 252 returns/year when it actually had ~19,656,
+# which UNDERSTATES the proper sqrt-N factor by 8.8× and produced inflated
+# Sharpe numbers on intraday TFs. Trading-day basis: 6.5h × 60 = 390 min/day.
+_BARS_PER_YEAR = {
+    "1m": 390 * 252,
+    "5m": 78 * 252,
+    "15m": 26 * 252,
+    "30m": 13 * 252,
+    "1h": int(6.5 * 252),
+    "4h": int(1.625 * 252),  # ~2 bars/day rounded for cash session
+    "1d": 252,
+    "1wk": 52,
+    "1mo": 12,
+}
+
+
+def _annualization_factor(timeframe: Optional[str]) -> float:
+    n = _BARS_PER_YEAR.get(timeframe, 252)
+    return float(n ** 0.5)
+
+
 def _apply_costs(price: float, side: str, direction: str) -> float:
     """
     Worsen the price by COST_PER_SIDE in the direction that hurts the trader.
@@ -74,17 +98,33 @@ def _simulate(
     for i in range(1, n):
         row = d.iloc[i]
         ts = int(d.index[i].timestamp())
-        # ATR fallback chain: real ATR → 2% of Close → hard floor 0.01.
-        # Without the Close-NaN guard, NaN poisoned ATR propagates into stop/target
-        # math and silently corrupts the equity curve.
+        # ATR fallback chain: real ATR → recent realized stdev × √2 (proxy for
+        # daily range) → 2% of Close → hard floor 0.01. The stdev fallback
+        # uses the trailing 14 bars of high-low ranges so a low-vol name (utility)
+        # gets a tighter fallback and a high-vol name (small-cap biotech) gets
+        # a wider one — the old hardcoded 2% misclassified both. Without the
+        # Close-NaN guard, NaN-poisoned ATR propagates into stop/target math
+        # and silently corrupts the equity curve.
         _atr_val = atr.iloc[i]
         _close_val = row["Close"]
         if not pd.isna(_atr_val) and float(_atr_val) > 0:
             a = float(_atr_val)
-        elif not pd.isna(_close_val) and float(_close_val) > 0:
-            a = max(float(_close_val) * 0.02, 0.01)
         else:
-            a = 0.01
+            a = None
+            if i >= 14:
+                try:
+                    win = d.iloc[max(0, i - 14):i]
+                    rng = (win["High"] - win["Low"]).dropna()
+                    if len(rng) >= 5:
+                        med_rng = float(rng.median())
+                        if med_rng > 0:
+                            a = med_rng
+                except Exception:
+                    a = None
+            if a is None and not pd.isna(_close_val) and float(_close_val) > 0:
+                a = max(float(_close_val) * 0.02, 0.01)
+            if a is None or a <= 0:
+                a = 0.01
 
         if not in_trade and bool(entries.iloc[i - 1]):
             entry_price = _apply_costs(float(row["Open"]), "entry", direction)
@@ -170,10 +210,10 @@ def _simulate(
 
         equity.append({"time": ts, "value": round(portfolio, 2)})
 
-    return _build_stats(trades, equity, portfolio)
+    return _build_stats(trades, equity, portfolio, timeframe=timeframe)
 
 
-def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float) -> Dict[str, Any]:
+def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float, timeframe: Optional[str] = None) -> Dict[str, Any]:
     if not trades:
         return {
             "stats": _empty_stats(),
@@ -195,8 +235,9 @@ def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float)
     drawdown = (np.array(eq_values) - peak) / peak * 100
     max_dd = float(np.min(drawdown)) if len(drawdown) else 0.0
 
-    daily_ret = pd.Series(eq_values).pct_change().dropna()
-    sharpe = float(daily_ret.mean() / daily_ret.std() * np.sqrt(252)) if daily_ret.std() > 0 else 0.0
+    bar_ret = pd.Series(eq_values).pct_change().dropna()
+    ann_factor = _annualization_factor(timeframe)
+    sharpe = float(bar_ret.mean() / bar_ret.std() * ann_factor) if bar_ret.std() > 0 else 0.0
 
     return {
         "stats": {
@@ -295,7 +336,15 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
 
     def _evaluate(frame: pd.DataFrame):
         """Run all strategies on `frame`. Returns dict keyed by (strategy, direction)."""
-        a = frame[atr_col] if atr_col else frame["Close"] * 0.02
+        if atr_col:
+            a = frame[atr_col]
+        else:
+            # Better fallback than hardcoded 2%: 14-bar rolling High-Low range
+            # (median over the trailing window). Adapts to actual realized
+            # range for the symbol+TF rather than a flat assumption.
+            rng = (frame["High"] - frame["Low"]).rolling(14, min_periods=5).median()
+            close_2pct = frame["Close"] * 0.02
+            a = rng.where(rng > 0, close_2pct).fillna(close_2pct)
         out = {}
         for strat in all_strategies(frame):
             for direction, series in [("BUY", strat["entry_long"]), ("SELL", strat["entry_short"])]:

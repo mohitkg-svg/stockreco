@@ -245,6 +245,32 @@ observability. Graded as follows:
 - **Full async I/O migration** — still deferred with documented triggers
   (see "Async I/O migration" section above).
 
+### ⏸️ Deferred — Tier D (review 2026-04-25, multi-week scope)
+
+- **IV percentile gate for option entries** — sized work: ~3-5 days of work
+  spread over 2-3 weeks of historical-IV ingestion. Need 252-day rolling
+  history of ATM IV per ticker to compute IV-percentile. Today we use
+  realized-vol % from `_iv_estimate()` which is a passable proxy but
+  systematically lags actual IV regime around earnings. Once available,
+  gate option entries: skip new long calls/puts when IV percentile > 80
+  (option premium is overpriced; theta decay is faster than expected
+  underlying move can recover). Source: yfinance options chain (free) or
+  fold into the ORATS-style provider when we eventually pay for IV data.
+  Revisit when option win-rate plateaus or theta-decay losses exceed
+  underlying-stop losses materially.
+
+- **ML scorer graduation from shadow → live (10% weight)** — the LightGBM
+  scorer has been running in shadow mode logging predictions vs realized
+  outcomes for several weeks. Graduation criteria: ≥200 closed live
+  trades with shadow predictions logged; AUC > 0.60 on hold-out;
+  calibration plot shows monotonic relationship between predicted prob
+  and realized win-rate. Once met, blend: `final_conf = 0.9 × rule_conf
+  + 0.1 × ml_prob_normalized` and gate auto-trade entries on `final_conf`.
+  Risk: if rule-conf and ml-prob disagree systematically (low correlation),
+  the blend can DECREASE Sharpe in some regimes — track post-graduation
+  Sharpe by month for at least 90 days before increasing weight.
+  Revisit when shadow log accumulates ≥200 closed trades.
+
 ### Rejected — low ROI or empirically weak
 
 - **Join-the-Bid entry** — bid-chase with cancel/replace. Saves
