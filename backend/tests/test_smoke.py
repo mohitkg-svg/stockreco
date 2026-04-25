@@ -182,5 +182,193 @@ class TestMetricsNoOpFallback(unittest.TestCase):
             pass
 
 
+class TestSignalPayloadValidation(unittest.TestCase):
+    """SignalPayload — validates the signal dict at the consume boundary.
+
+    Malformed signals get rejected here instead of being silently coerced
+    to zero downstream by `signal.get("entry") or 0`.
+    """
+
+    def _good(self, **over):
+        base = {
+            "ticker": "AAPL",
+            "timeframe": "1h",
+            "signal_type": "BUY",
+            "confidence": 75.0,
+            "entry": 150.0,
+            "stop_loss": 148.0,
+            "target1": 154.0,
+        }
+        base.update(over)
+        return base
+
+    def test_well_formed_validates(self):
+        from models import SignalPayload
+        m = SignalPayload.model_validate(self._good())
+        self.assertEqual(m.ticker, "AAPL")
+        self.assertTrue(m.is_actionable())
+
+    def test_missing_ticker_rejected(self):
+        from models import SignalPayload
+        from pydantic import ValidationError
+        bad = self._good(); del bad["ticker"]
+        with self.assertRaises(ValidationError):
+            SignalPayload.model_validate(bad)
+
+    def test_invalid_timeframe_rejected(self):
+        from models import SignalPayload
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            SignalPayload.model_validate(self._good(timeframe="2h"))
+
+    def test_invalid_signal_type_rejected(self):
+        from models import SignalPayload
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            SignalPayload.model_validate(self._good(signal_type="LONG"))
+
+    def test_confidence_out_of_range_rejected(self):
+        from models import SignalPayload
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            SignalPayload.model_validate(self._good(confidence=150.0))
+        with self.assertRaises(ValidationError):
+            SignalPayload.model_validate(self._good(confidence=-1.0))
+
+    def test_ticker_uppercased(self):
+        from models import SignalPayload
+        m = SignalPayload.model_validate(self._good(ticker="aapl"))
+        self.assertEqual(m.ticker, "AAPL")
+
+    def test_extras_allowed_for_enrichment(self):
+        # Real signals have a long tail of optional enrichment fields that
+        # aren't enumerated. Strict mode would make every new enrichment
+        # a breaking change — model is configured `extra='allow'`.
+        from models import SignalPayload
+        m = SignalPayload.model_validate(self._good(
+            sentiment_score=0.42, news_count=7, ml_prob=0.61,
+            short_pct_float=0.18, wsb_mentions_24h=12,
+        ))
+        self.assertEqual(m.ticker, "AAPL")
+
+    def test_neutral_signal_not_actionable(self):
+        from models import SignalPayload
+        m = SignalPayload.model_validate({
+            "ticker": "AAPL", "timeframe": "1h", "signal_type": "NEUTRAL",
+            "confidence": 50.0,
+        })
+        self.assertFalse(m.is_actionable())
+
+    def test_buy_without_levels_not_actionable(self):
+        from models import SignalPayload
+        m = SignalPayload.model_validate({
+            "ticker": "AAPL", "timeframe": "1h", "signal_type": "BUY",
+            "confidence": 80.0,
+        })
+        self.assertFalse(m.is_actionable())
+
+
+class TestHeatAwareRiskMultiplier(unittest.TestCase):
+    """Per-trade risk shrinks as live heat approaches the cap."""
+
+    def setUp(self):
+        from services import risk_manager
+        self.rm = risk_manager
+        self._orig_heat_fn = risk_manager.current_portfolio_heat
+        # Inject a fake heat reader so we don't hit the DB
+        self._fake_heat = 0.0
+        risk_manager.current_portfolio_heat = lambda: self._fake_heat
+
+    def tearDown(self):
+        self.rm.current_portfolio_heat = self._orig_heat_fn
+
+    def test_no_heat_no_throttle(self):
+        # 0% used → 1.0
+        self._fake_heat = 0.0
+        self.assertEqual(self.rm.heat_aware_risk_multiplier(100_000.0), 1.0)
+
+    def test_below_50pct_no_throttle(self):
+        # 40% of cap (cap = 10% × equity = $10k; heat = $4k = 40%)
+        self._fake_heat = 4_000.0
+        self.assertEqual(self.rm.heat_aware_risk_multiplier(100_000.0), 1.0)
+
+    def test_50_to_70_pct(self):
+        self._fake_heat = 6_500.0    # 65% of $10k cap
+        self.assertEqual(self.rm.heat_aware_risk_multiplier(100_000.0), 0.85)
+
+    def test_70_to_85_pct(self):
+        self._fake_heat = 8_000.0    # 80% of $10k cap
+        self.assertEqual(self.rm.heat_aware_risk_multiplier(100_000.0), 0.60)
+
+    def test_85_to_100_pct(self):
+        self._fake_heat = 9_500.0    # 95% of $10k cap
+        self.assertEqual(self.rm.heat_aware_risk_multiplier(100_000.0), 0.40)
+
+    def test_zero_equity_no_op(self):
+        self._fake_heat = 5_000.0
+        self.assertEqual(self.rm.heat_aware_risk_multiplier(0.0), 1.0)
+
+    def test_negative_equity_no_op(self):
+        self._fake_heat = 5_000.0
+        self.assertEqual(self.rm.heat_aware_risk_multiplier(-1.0), 1.0)
+
+
+class TestPortfolioBacktest(unittest.TestCase):
+    """Smoke-level tests for the portfolio-level backtest helpers.
+
+    Doesn't run the full simulation (needs network for fetch_ohlcv) — just
+    asserts the public surface and stress-window registry are intact.
+    """
+
+    def test_stress_window_registry_consistent(self):
+        from services.portfolio_backtest import STRESS_WINDOWS
+        self.assertGreater(len(STRESS_WINDOWS), 0)
+        for key, spec in STRESS_WINDOWS.items():
+            self.assertEqual(len(spec), 3, f"{key}: (start, end, label) tuple")
+            start, end, label = spec
+            # Parses as a date
+            s = pd.Timestamp(start)
+            e = pd.Timestamp(end)
+            self.assertLess(s, e, f"{key}: start {start} must precede end {end}")
+            self.assertTrue(label and len(label) > 5)
+
+    def test_unknown_stress_window_returns_note(self):
+        # Path uses STRESS_WINDOWS lookup before any data fetch — safe to call
+        # without network.
+        from services.portfolio_backtest import run_portfolio_backtest
+        out = run_portfolio_backtest(
+            tickers=["AAPL"],  # never fetched because stress_window invalid → early return
+            stress_window="not-a-real-window",
+        )
+        self.assertIn("note", out)
+        self.assertIn("unknown stress_window", out["note"])
+        self.assertIsNone(out.get("stats"))
+
+    def test_corr_calc_pair_correlation(self):
+        # Verify the upper-triangle correlation extraction against deliberately
+        # constructed price series whose pct-returns are known.
+        # A: returns alternate +0.10 / -0.10
+        # B: same returns as A  → corr(A,B) = +1
+        # C: opposite returns   → corr(A,C) = -1
+        a_rets = [0.10, -0.10, 0.10, -0.10, 0.10, -0.10]
+        c_rets = [-0.10, 0.10, -0.10, 0.10, -0.10, 0.10]
+        a = [100.0]
+        b = [50.0]
+        c = [100.0]
+        for ar, cr in zip(a_rets, c_rets):
+            a.append(a[-1] * (1 + ar))
+            b.append(b[-1] * (1 + ar))   # identical returns to A
+            c.append(c[-1] * (1 + cr))   # mirrored returns
+        df = pd.DataFrame({"A": a, "B": b, "C": c})
+        corr = df.pct_change().corr()
+        iu = np.triu_indices(len(corr), k=1)
+        pairs = corr.values[iu]
+        pairs = pairs[~pd.isna(pairs)]
+        # Three pairs: (A,B)=+1, (A,C)=-1, (B,C)=-1
+        self.assertEqual(len(pairs), 3)
+        self.assertAlmostEqual(float(pairs.max()), 1.0, places=4)
+        self.assertAlmostEqual(float(pairs.min()), -1.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

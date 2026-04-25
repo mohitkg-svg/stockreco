@@ -7,7 +7,7 @@ from models import (
 )
 from services.data_fetcher import fetch_ohlcv
 from services.backtester import run_multi_strategy
-from services.portfolio_backtest import run_portfolio_backtest
+from services.portfolio_backtest import run_portfolio_backtest, STRESS_WINDOWS
 from routers._auth import require_api_key
 import logging
 
@@ -71,10 +71,16 @@ def backtest_portfolio(
     daily_loss_limit_pct: float = 0.03,
     max_tickers: int = 50,
     lookback_days: int = 365,
+    stress_window: str = "",
 ):
     """Portfolio-level walk-forward backtest that honours the live-trader's
     caps (concurrent positions, per-sector, beta-weighted heat, daily loss).
-    Returns composite equity curve, drawdown, sharpe, cap-rejection count."""
+    Returns composite equity curve, drawdown, sharpe, cap-rejection count.
+
+    `stress_window` (optional): one of the canned historical drawdown
+    windows from `/api/backtest/portfolio/stress-windows`. When set, the
+    backtest runs over that fixed date range instead of the trailing
+    `lookback_days` window."""
     return run_portfolio_backtest(
         starting_equity=starting_equity,
         risk_per_trade_pct=risk_per_trade_pct,
@@ -84,4 +90,17 @@ def backtest_portfolio(
         daily_loss_limit_pct=daily_loss_limit_pct,
         max_tickers=max_tickers,
         lookback_days=lookback_days,
+        stress_window=stress_window or None,
     )
+
+
+@router.get("/portfolio/stress-windows")
+def list_stress_windows():
+    """List the canned historical drawdown windows the portfolio backtest
+    can replay. Pre-live "what if I'd been live during X" answer."""
+    return {
+        "windows": [
+            {"key": k, "start": s, "end": e, "label": l}
+            for k, (s, e, l) in STRESS_WINDOWS.items()
+        ]
+    }

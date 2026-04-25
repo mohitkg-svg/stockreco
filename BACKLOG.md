@@ -76,8 +76,15 @@ All three free high-impact sources shipped together:
 
 - **FinBERT** swap for VADER (75–80% sentiment accuracy vs ~65%)
 - **Debit spreads** for defined-risk exposure
-- **Portfolio-heat-aware risk-per-trade**
-- **Push notifications** on T1/T2/T3 hits
+- ✅ **Portfolio-heat-aware risk-per-trade** (r35, 2026-04-25): per-trade
+  risk shrinks 0.85× / 0.60× / 0.40× as live heat crosses 50% / 70% / 85%
+  of the cap. The hard reject at 100% protects the book; this softens the
+  approach so the last few entries before the cap are smaller probes.
+- ✅ **Push notifications on T1/T2/T3 hits** (already wired in `target_hit`
+  WS broadcast → `TargetHitToasts` component → browser Notification when
+  tab is backgrounded). r35 added a **`trade_closed`** event covering all
+  exit paths (target / stop / reverse / theta / stale) with win/loss
+  styling and sticky toast.
 
 ## Architecture / refactor backlog
 
@@ -104,11 +111,15 @@ rollout). Revisit ~4 weeks after live trading is stable.
   4–6 weeks post-live once behavior is stable and well-monitored.
 
 ### Pydantic models for internal data shapes
-- **What**: Replace `Dict[str, Any]` with `SignalData`, `TradeContext`, etc.
-  Catches `KeyError` at construction time instead of randomly during a trade.
-- **Why defer**: Mass refactor affecting most of `signal_generator`,
-  `auto_trader`, `routers/trading`. Better to add models for *new* code first
-  and migrate existing call sites incrementally.
+- **r35 (2026-04-25)**: First pass landed — `SignalPayload` model in
+  `models.py` with required-field + range validation, validates the signal
+  dict at the consume boundary in `consider_signal`. Existing callers
+  still pass dicts (validation only); a malformed signal logs +
+  short-circuits instead of getting silently coerced to 0 downstream.
+- **Remaining** (still deferred): full migration of `signal_generator.py`
+  output and `auto_trader` decision-context dicts to typed models. That's
+  the multi-week refactor BACKLOG was originally about — add models for
+  *new* code first and migrate existing call sites incrementally.
 
 ### Full AutoTraderService class encapsulation
 - **Status**: Substantially reduced in scope after the 2026-04-25
@@ -191,11 +202,17 @@ timing pre-real-money.
 
 ### Deferred — valid ideas, wrong timing
 
-- **Portfolio-level backtest with correlation** — `backtester.py` currently
-  evaluates tickers in isolation. A portfolio backtest that respects the
-  sector cap + heat cap during historical periods (Aug 2024 carry-trade
-  unwind, etc.) would tell us if our rules actually protect the account
-  in a correlated drawdown. 2-3 days work; revisit post-real-money.
+- ✅ **Portfolio-level backtest with correlation** (r35, 2026-04-25):
+  `services/portfolio_backtest.py` with caps-aware composite simulation
+  was already there; r35 added (a) **stress windows** (canned date
+  ranges for Aug 2024 carry / Mar 2020 COVID / Feb 2018 volmageddon /
+  Q4 2018 Powell / Aug 2015 China — replays the strategy with today's
+  caps over those periods), (b) **^VIX always preloaded** so regime
+  tagging is never silently None, (c) **realized pair-correlation
+  diagnostic** in stats (avg + max upper-triangle correlation across
+  traded tickers). Endpoint: `POST /api/backtest/portfolio/run` with
+  `stress_window=<key>`. Pairwise-correlation cap enforcement remains
+  Tier C deferred.
 - **Vertical debit spreads** for long-call/long-put replacement — reduces
   theta drag on runner positions. Requires multi-leg Alpaca orders,
   spread-aware strike selection, spread-adjusted targets. ~3 days.

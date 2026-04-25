@@ -152,6 +152,23 @@ def force_close_trade(
         f"AutoTrader {t.status.upper()} {t.ticker} ({t.asset_type}) — {reason} "
         f"PL≈${(t.realized_pl or 0):.2f}"
     )
+    # Broadcast a trade_closed event so the UI can surface a toast +
+    # browser notification (paired with target_hit, the closure events
+    # are the other half the operator wants pushed). Non-fatal — a
+    # broadcast failure must not block the close path.
+    try:
+        from services import live_quotes as _lq
+        _lq.broadcast_event_safe({
+            "type": "trade_closed",
+            "trade_id": t.id,
+            "ticker": t.ticker,
+            "asset_type": t.asset_type,
+            "status": t.status,
+            "reason": reason,
+            "realized_pl": round(float(t.realized_pl or 0), 2),
+        })
+    except Exception:
+        pass
     if on_close is not None:
         try:
             on_close(t)

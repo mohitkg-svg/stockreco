@@ -867,6 +867,44 @@ building. `SKIP_TESTS=1` to override.
 
 ## 14. Changelog (current → past)
 
+### Revision 35 — Pre-live BACKLOG sweep: backtest stress windows, heat-aware sizing, signal validation, close notifications
+- **Portfolio backtest stress windows** (`portfolio_backtest.STRESS_WINDOWS`):
+  five canned historical drawdown periods (Aug 2024 carry unwind, Mar 2020
+  COVID, Feb 2018 volmageddon, Q4 2018 Powell, Aug 2015 China). Replays the
+  strategy over the fixed range with today's caps. Pre-2024 windows
+  auto-trigger an extended-history fetch (`10y` instead of cached `2y`).
+  Endpoint: `POST /api/backtest/portfolio/run?stress_window=<key>` and
+  `GET /api/backtest/portfolio/stress-windows`.
+- **Always preload ^VIX** in portfolio backtest so regime tagging actually
+  works (silent None bug previously collapsed `high_vix` regime into
+  `normal`).
+- **Realized pair-correlation diagnostic** in portfolio-backtest stats
+  (`avg_pair_corr`, `max_pair_corr` over the traded ticker universe).
+  Read-only — pairwise cap enforcement is still Tier C.
+- **Heat-aware risk-per-trade** (`risk_manager.heat_aware_risk_multiplier`):
+  per-trade risk shrinks 0.85× / 0.60× / 0.40× as live beta-weighted heat
+  crosses 50% / 70% / 85% of the 10%-of-equity cap. Applied at all three
+  sizing call sites (stock, option, option-2nd-site). The hard reject at
+  100% in `consider_signal` still protects the book; this softens the
+  approach so the last few entries before the cap are smaller probes
+  rather than full 2% positions.
+- **Pydantic `SignalPayload` model** (in `models.py`): validates the
+  signal dict at the `consider_signal` boundary. Required fields
+  (`ticker`, `timeframe`, `signal_type`, `confidence`) + range checks
+  (`0 ≤ confidence ≤ 100`); enums (`Timeframe`, `SignalType`) catch
+  string-typo bugs. `extra='allow'` so the long tail of enrichment
+  fields (sentiment, news, ml_prob, …) doesn't break on every new add.
+  Failed validation → log + skip (`autotrade_skip{reason=malformed_signal}`)
+  instead of letting `signal.get("entry") or 0` silently coerce 0
+  downstream.
+- **`trade_closed` push notifications**: companion to `target_hit`. WS
+  broadcast on every exit path (target / stop / reverse / theta / stale)
+  with `realized_pl`. Frontend `TargetHitToasts` component now renders
+  win/loss-styled close toasts (12s sticky vs 8s for trails) + browser
+  Notification when tab is backgrounded.
+- 12 new tests (3 portfolio-backtest, 7 heat-aware multiplier, 9
+  signal-validation; 112 total now).
+
 ### Revision 34 — Tier A from external review: regime tightening + ADX trim + liquidity + theta stop
 - **Regime-aware concurrent-position cap** (`risk_manager.regime_concurrent_cap`):
   VIX > 25 OR SPY below 200-EMA → base // 3 (typically 5); VIX > 20 → base × 2/3

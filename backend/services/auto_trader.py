@@ -750,6 +750,21 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     the budget/cap/idempotency checks. Two concurrent calls (same or different
     tickers) serialize so a 3rd same-sector trade can't slip past the cap.
     """
+    # Validate the signal shape at the boundary. Failed validation is a
+    # malformed signal — log + skip cleanly rather than letting `signal.get`
+    # downstream silently coerce missing fields to 0. We don't pass the
+    # validated model further (consumers still take dicts) — this is a
+    # parsing layer, not a refactor target.
+    try:
+        from models import SignalPayload
+        SignalPayload.model_validate(signal)
+    except Exception as _e:
+        logger.warning(
+            f"consider_signal: malformed signal rejected "
+            f"(ticker={signal.get('ticker')}, err={_e})"
+        )
+        metrics.inc("autotrade_skip", reason="malformed_signal")
+        return None
     # Short-circuit if the buying-power breaker tripped recently.
     if bp_breaker_active():
         metrics.inc("autotrade_skip", reason="bp_breaker")
@@ -1198,11 +1213,22 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         from services.config import RISK_MULT_CEILING as _MULT_CEILING
         raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult
         clamped_stack = min(raw_stack, _MULT_CEILING)
-        effective_risk_budget = risk_budget * clamped_stack
+        # Heat-aware throttle: applies AFTER the multiplier-stack ceiling so
+        # the heat-throttle still pulls things smaller even when other
+        # factors maxed out the 2× cap. This is a downward-only adjustment
+        # and not part of the upside-stack so it doesn't interact with the
+        # ceiling.
+        from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
+        heat_mult = _heat_mult(equity)
+        effective_risk_budget = risk_budget * clamped_stack * heat_mult
         if raw_stack > _MULT_CEILING:
             logger.info(
                 f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
                 f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} strat={strat_mult:.2f} vix={vix_mult:.2f})"
+            )
+        if heat_mult < 1.0:
+            logger.info(
+                f"AutoTrader {ticker}: heat-aware throttle {heat_mult:.2f}× applied"
             )
         max_qty_by_risk = int(effective_risk_budget / risk_per_share)
         max_qty_by_remaining = int(stock_remaining / entry)
@@ -1533,7 +1559,8 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Adaptive risk: halve the cap under high VIX (>25) or when recent
         # win-rate is below 55%. Catches regime changes the static cap misses.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
+        from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
@@ -1839,7 +1866,8 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Adaptive risk: halve the cap under high VIX (>25) or when recent
         # win-rate is below 55%. Catches regime changes the static cap misses.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
+        from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
@@ -2237,6 +2265,21 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
         summary["closed"] += 1
         metrics.inc("autotrade_event", event=t.status)
         logger.info(f"AutoTrader PUT {t.ticker} {t.symbol} closed: {exit_reason} (PL ${t.realized_pl or 0:.2f})")
+        # Broadcast trade_closed so the UI shows a toast + browser
+        # notification on exit (companion to target_hit on TP trails).
+        try:
+            from services import live_quotes as _lq_close
+            _lq_close.broadcast_event_safe({
+                "type": "trade_closed",
+                "trade_id": t.id,
+                "ticker": t.ticker,
+                "asset_type": t.asset_type,
+                "status": t.status,
+                "reason": exit_reason,
+                "realized_pl": round(float(t.realized_pl or 0), 2),
+            })
+        except Exception:
+            pass
         if t.status == "closed_stop" and (t.realized_pl or 0) < 0:
             _post_mortem_async(t.id)
 
@@ -2878,6 +2921,21 @@ def manage_open_positions() -> Dict[str, Any]:
                                 summary["closed"] += 1
                                 metrics.inc("autotrade_event", event=t.status)
                                 logger.info(f"AutoTrader {t.ticker} closed @ {exit_px} ({t.status}) PL={t.realized_pl:.2f}")
+                                # Push trade_closed event so the UI surfaces
+                                # a toast + browser notification.
+                                try:
+                                    from services import live_quotes as _lq_sc
+                                    _lq_sc.broadcast_event_safe({
+                                        "type": "trade_closed",
+                                        "trade_id": t.id,
+                                        "ticker": t.ticker,
+                                        "asset_type": t.asset_type,
+                                        "status": t.status,
+                                        "reason": "broker leg fill",
+                                        "realized_pl": round(float(t.realized_pl or 0), 2),
+                                    })
+                                except Exception:
+                                    pass
                                 if t.status == "closed_stop" and (t.realized_pl or 0) < 0:
                                     _post_mortem_async(t.id)
                 except (ConnectionError, ConnectionResetError, TimeoutError) as e:

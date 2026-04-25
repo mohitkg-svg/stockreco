@@ -143,3 +143,81 @@ class OverviewItem(BaseModel):
     timeframe: Optional[str] = None
     is_new: bool = False
     auto_trade_enabled: Optional[bool] = True
+
+
+# ----------------------------------------------------------------------------
+# Internal flow schemas — NOT API-facing. Used to validate the dict that
+# `services/signal_generator.py` produces and that `services/auto_trader.
+# consider_signal` consumes. Failing fast on a malformed signal at this
+# boundary catches typos, missing keys, and bad types BEFORE they get
+# silently coerced to 0 by `signal.get("entry") or 0` further downstream.
+# ----------------------------------------------------------------------------
+
+from pydantic import field_validator, ConfigDict
+
+
+class SignalPayload(BaseModel):
+    """The signal dict produced by signal_generator and read by auto_trader.
+
+    Required fields are minimal — only what `consider_signal` would
+    short-circuit on. Optional fields enrich downstream behavior but
+    don't gate entry. NEUTRAL signals never enter the auto-trade path,
+    so for those we relax the entry/stop requirements.
+
+    Used as a *validation layer* — not as a refactor target. Existing
+    callers can keep passing dicts; we validate at the consume boundary
+    and re-emit the dict for backward-compat. Migration to model-typed
+    flow is a separate, multi-week refactor (BACKLOG → "Pydantic models").
+    """
+
+    # Use forbid=False (allow_extra) — the live signal carries a long tail of
+    # enrichment fields (sentiment_score, news_count, ml_prob, …) that this
+    # model intentionally doesn't enumerate. Strict-mode on these would make
+    # every new enrichment a breaking change.
+    model_config = ConfigDict(extra="allow")
+
+    ticker: str
+    timeframe: Timeframe
+    signal_type: SignalType
+    confidence: float
+    entry: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target1: Optional[float] = None
+    target2: Optional[float] = None
+    target3: Optional[float] = None
+    reasoning: Optional[str] = None
+    patterns: Optional[str] = None
+    strategy: Optional[str] = None
+    generated_at: Optional[datetime] = None
+    backtest_win_rate: Optional[float] = None
+    adx: Optional[float] = None
+
+    @field_validator("ticker")
+    @classmethod
+    def _ticker_uppercase_nonempty(cls, v: str) -> str:
+        v = (v or "").strip().upper()
+        if not v:
+            raise ValueError("ticker required")
+        return v
+
+    @field_validator("confidence")
+    @classmethod
+    def _confidence_in_range(cls, v: float) -> float:
+        if v is None:
+            raise ValueError("confidence required")
+        v = float(v)
+        if not (0.0 <= v <= 100.0):
+            raise ValueError(f"confidence {v} outside [0,100]")
+        return v
+
+    def is_actionable(self) -> bool:
+        """A signal is actionable iff it's directional AND has the levels
+        consider_signal needs to size + place a bracket. This is the same
+        triage the existing dict-based code does — encoded once."""
+        if self.signal_type not in ("BUY", "SELL"):
+            return False
+        return (
+            self.entry is not None and self.entry > 0
+            and self.stop_loss is not None and self.stop_loss > 0
+            and self.target1 is not None and self.target1 > 0
+        )

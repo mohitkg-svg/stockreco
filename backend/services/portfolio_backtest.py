@@ -80,9 +80,32 @@ class PortfolioStats:
     by_regime: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     equity_curve: List[Tuple[str, float]] = field(default_factory=list)
     per_sector_exposure_max: Dict[str, int] = field(default_factory=dict)
+    # Pairwise daily-return correlation across the *traded* tickers over the
+    # backtest window. Diagnostic only — not enforced as a cap (that's
+    # pairwise-correlation Tier C work). High avg_corr means the book wasn't
+    # diversified beyond what beta-weighting captures; one shock moves
+    # everything together. Useful as a "is my universe really diverse?" check.
+    avg_pair_corr: Optional[float] = None
+    max_pair_corr: Optional[float] = None
+    stress_window: Optional[str] = None
+    stress_window_label: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+# Canned historical drawdown windows. Pre-live stress test: re-run the
+# strategy with today's caps over a date range when correlated drawdowns
+# actually happened. The question this answers is "would my caps have
+# protected the account in <event>?". The end date adds 30 calendar days
+# of recovery so we observe how the book behaved AFTER the shock too.
+STRESS_WINDOWS: Dict[str, Tuple[str, str, str]] = {
+    "aug2024_carry":      ("2024-07-25", "2024-09-15", "Aug 2024 yen-carry unwind"),
+    "mar2020_covid":      ("2020-02-15", "2020-04-30", "Mar 2020 COVID crash"),
+    "feb2018_volmageddon": ("2018-01-25", "2018-03-15", "Feb 2018 volmageddon (XIV blow-up)"),
+    "dec2018_powell":     ("2018-10-01", "2019-01-15", "Q4 2018 Powell pivot drawdown"),
+    "aug2015_china":      ("2015-08-15", "2015-10-15", "Aug 2015 China devaluation"),
+}
 
 
 def _beta_of(ticker: str) -> float:
@@ -138,8 +161,15 @@ def run_portfolio_backtest(
     lookback_days: int = 365,
     min_hold_bars: int = 3,
     max_hold_bars: int = 30,
+    stress_window: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run the composite backtest. Returns {stats, trades, rejections}."""
+    """Run the composite backtest. Returns {stats, trades, rejections}.
+
+    `stress_window`: optional key from STRESS_WINDOWS. When set, the
+    backtest runs over the canned date range instead of the trailing
+    `lookback_days` window — answers "would my caps have protected the
+    account during <historical event>?".
+    """
     from database import SessionLocal, WatchlistStock, CandidatePool
     from services.data_fetcher import fetch_ohlcv
     from services.indicators import compute_indicators
@@ -154,12 +184,38 @@ def run_portfolio_backtest(
             db.close()
         tickers = sorted(t)[:max_tickers]
 
+    # Validate stress_window BEFORE any data fetch — unknown key returns
+    # cleanly without a 60-second yfinance round-trip.
+    if stress_window and stress_window not in STRESS_WINDOWS:
+        return {"stats": None, "trades": [], "rejections": 0,
+                "note": f"unknown stress_window {stress_window!r}; "
+                        f"valid keys: {sorted(STRESS_WINDOWS)}"}
+
+    # Always load ^VIX for regime tagging — without this, every entry's
+    # `entry_vix` is None and the by-regime breakdown collapses 'high_vix'
+    # into 'normal'. Cheap (one extra fetch) and only loaded into `data`
+    # so signal generation iteration over `tickers` is unaffected.
+    fetch_tickers = list(tickers)
+    if "^VIX" not in fetch_tickers:
+        fetch_tickers.append("^VIX")
+
     # Preload + index daily bars for every ticker, aligned on a common date
-    # index. Skip tickers with insufficient history.
+    # index. Skip tickers with insufficient history. For pre-2024 stress
+    # windows the cached 2y range isn't enough — fall through to the raw
+    # chart fetcher with a longer range string. This path is one-shot
+    # (operator-triggered backtest, not the live scan loop).
+    from services.data_fetcher import _fetch_chart as _fc_raw  # internal, but cheap
+    needs_extended_history = stress_window and pd.Timestamp(
+        STRESS_WINDOWS[stress_window][0]
+    ) < pd.Timestamp.today() - pd.Timedelta(days=730)
     data: Dict[str, pd.DataFrame] = {}
-    for t in tickers:
+    for t in fetch_tickers:
         try:
-            df = fetch_ohlcv(t, "1d")
+            if needs_extended_history:
+                # 10y covers every canned window we have. Yahoo accepts up to "max".
+                df = _fc_raw(t, "1d", "10y")
+            else:
+                df = fetch_ohlcv(t, "1d")
             if df is None or df.empty or len(df) < 260:
                 continue
             df = compute_indicators(df)
@@ -170,9 +226,15 @@ def run_portfolio_backtest(
         return {"stats": None, "trades": [], "rejections": 0,
                 "note": "no tickers with sufficient history"}
 
-    # Common date set — intersect of all loaded tickers' trailing window
-    latest = min(d.index[-1] for d in data.values())
-    earliest = latest - pd.Timedelta(days=lookback_days)
+    # Date range: stress window overrides trailing lookback when set.
+    if stress_window:
+        sw_start, sw_end, sw_label = STRESS_WINDOWS[stress_window]
+        earliest = pd.Timestamp(sw_start)
+        latest = pd.Timestamp(sw_end)
+    else:
+        sw_label = None
+        latest = min(d.index[-1] for d in data.values())
+        earliest = latest - pd.Timedelta(days=lookback_days)
     dates = pd.date_range(earliest, latest, freq="B")
 
     open_trades: List[PortfolioTrade] = []
@@ -373,6 +435,36 @@ def run_portfolio_backtest(
         bucket["win_rate"] = round(bucket["wins"] / n, 3)
         bucket["avg_pl"] = round(bucket["total_pl"] / n, 2)
 
+    # Realized pair-correlation across traded tickers over the test window.
+    # Cheap to compute (≤ 50 tickers × 250 bars). Skip when fewer than 2
+    # tickers were actually traded.
+    avg_pair_corr: Optional[float] = None
+    max_pair_corr: Optional[float] = None
+    traded_tickers = sorted({t.ticker for t in closed_trades})
+    if len(traded_tickers) >= 2:
+        try:
+            ret_frames = []
+            for tk in traded_tickers:
+                df_tk = data.get(tk)
+                if df_tk is None: continue
+                window = df_tk.loc[(df_tk.index >= earliest) & (df_tk.index <= latest)]
+                if len(window) < 5: continue
+                ret_frames.append(window["Close"].pct_change().rename(tk))
+            if len(ret_frames) >= 2:
+                rets_df = pd.concat(ret_frames, axis=1).dropna(how="all")
+                if len(rets_df) >= 5:
+                    corr = rets_df.corr()
+                    # Upper triangle (excluding diagonal)
+                    import numpy as np
+                    iu = np.triu_indices(len(corr), k=1)
+                    pairs = corr.values[iu]
+                    pairs = pairs[~pd.isna(pairs)]
+                    if len(pairs):
+                        avg_pair_corr = float(round(float(pairs.mean()), 3))
+                        max_pair_corr = float(round(float(pairs.max()), 3))
+        except Exception as e:
+            logger.debug(f"portfolio_bt: corr calc skipped ({e})")
+
     stats = PortfolioStats(
         starting_equity=starting_equity,
         ending_equity=ending_equity,
@@ -386,6 +478,10 @@ def run_portfolio_backtest(
         by_regime=by_regime,
         equity_curve=equity_curve,
         per_sector_exposure_max=per_sector_exposure_max,
+        avg_pair_corr=avg_pair_corr,
+        max_pair_corr=max_pair_corr,
+        stress_window=stress_window,
+        stress_window_label=sw_label,
     )
     return {
         "stats": stats.as_dict(),

@@ -173,6 +173,9 @@ function useLiveQuotes(onSignalUpdate) {
         } else if (msg.type === 'target_hit') {
           // Fire a toast + browser notification for T1/T2/T3 hits.
           try { window.dispatchEvent(new CustomEvent('app:target_hit', { detail: msg })); } catch (_) {}
+        } else if (msg.type === 'trade_closed') {
+          // Same fan-out — close-side toast + notification.
+          try { window.dispatchEvent(new CustomEvent('app:trade_closed', { detail: msg })); } catch (_) {}
         }
       };
     };
@@ -3088,26 +3091,88 @@ function TargetHitToasts() {
         }
       }
     };
+    const onClose = (ev) => {
+      const d = ev.detail || {};
+      const id = `${d.trade_id}-close-${Date.now()}`;
+      const pl = Number(d.realized_pl || 0);
+      const win = pl > 0;
+      const toast = {
+        id,
+        kind: 'close',
+        ticker: d.ticker,
+        status: d.status,        // closed_target | closed_stop | closed_reverse | closed_stale | closed_manual
+        reason: d.reason,
+        pl,
+        win,
+        asset: d.asset_type,
+      };
+      setToasts(ts => [...ts, toast]);
+      // Closes hang around longer than trails — operator wants to read why
+      setTimeout(() => setToasts(ts => ts.filter(t => t.id !== id)), 12000);
+
+      if (document.visibilityState === 'hidden') {
+        if (!requestedRef.current && 'Notification' in window && Notification.permission === 'default') {
+          try { Notification.requestPermission(); } catch (_) {}
+          requestedRef.current = true;
+        }
+        if ('Notification' in window && Notification.permission === 'granted') {
+          try {
+            const sign = win ? '+' : '';
+            new Notification(`${d.ticker} closed (${d.status}) · ${sign}$${pl.toFixed(2)}`, {
+              body: d.reason ? String(d.reason).slice(0, 120) : undefined,
+              tag: `close-${d.trade_id}`,
+            });
+          } catch (_) {}
+        }
+      }
+    };
     window.addEventListener('app:target_hit', onHit);
-    return () => window.removeEventListener('app:target_hit', onHit);
+    window.addEventListener('app:trade_closed', onClose);
+    return () => {
+      window.removeEventListener('app:target_hit', onHit);
+      window.removeEventListener('app:trade_closed', onClose);
+    };
   }, []);
 
   if (toasts.length === 0) return null;
   return (
     <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-xs">
-      {toasts.map(t => (
-        <div key={t.id} className="surface rounded-lg p-3 border border-emerald-500/40 shadow-xl animate-in">
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-lg">🎯</span>
-            <span className="font-bold">{t.ticker}</span>
-            <span className="pill pill-success text-[10px]">{t.level}</span>
-            <span className="text-[10px] app-text-muted uppercase">{t.asset}</span>
+      {toasts.map(t => {
+        if (t.kind === 'close') {
+          const borderClass = t.win ? 'border-emerald-500/40' : 'border-rose-500/40';
+          const pillClass = t.win ? 'pill-success' : 'pill-danger';
+          const sign = t.win ? '+' : '';
+          return (
+            <div key={t.id} className={`surface rounded-lg p-3 border ${borderClass} shadow-xl animate-in`}>
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-lg">{t.win ? '✅' : '🛑'}</span>
+                <span className="font-bold">{t.ticker}</span>
+                <span className={`pill ${pillClass} text-[10px]`}>{t.status}</span>
+                <span className="text-[10px] app-text-muted uppercase">{t.asset}</span>
+              </div>
+              <div className="text-xs font-mono mb-1">
+                P/L {sign}${(t.pl || 0).toFixed(2)}
+              </div>
+              {t.reason ? (
+                <div className="text-[11px] app-text-muted">{String(t.reason).slice(0, 120)}</div>
+              ) : null}
+            </div>
+          );
+        }
+        return (
+          <div key={t.id} className="surface rounded-lg p-3 border border-emerald-500/40 shadow-xl animate-in">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-lg">🎯</span>
+              <span className="font-bold">{t.ticker}</span>
+              <span className="pill pill-success text-[10px]">{t.level}</span>
+              <span className="text-[10px] app-text-muted uppercase">{t.asset}</span>
+            </div>
+            <div className="text-xs font-mono">
+              hit @ ${t.price}{t.newStop ? ` · stop→$${t.newStop}` : ''}
+            </div>
           </div>
-          <div className="text-xs font-mono">
-            hit @ ${t.price}{t.newStop ? ` · stop→$${t.newStop}` : ''}
-          </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

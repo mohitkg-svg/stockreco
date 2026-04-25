@@ -242,6 +242,78 @@ def regime_concurrent_cap(base_cap: int) -> int:
     return base_cap
 
 
+def current_portfolio_heat() -> float:
+    """Beta-weighted dollar-at-risk across all open + pending auto trades.
+    Returns 0.0 on any DB / fundamentals lookup failure (errs on the
+    "no throttling, just use default sizing" side rather than over-shrinking
+    entries on a transient hiccup). Reads only — no writes."""
+    try:
+        from database import SessionLocal, AutoTrade
+        try:
+            from services.fundamentals import beta_weight
+        except Exception:
+            beta_weight = lambda _t, default=1.0, **_: default  # noqa: E731
+        db = SessionLocal()
+        try:
+            open_trades = db.query(AutoTrade).filter(
+                AutoTrade.status.in_(["pending", "open"])
+            ).all()
+            total = 0.0
+            for ot in open_trades:
+                oe = ot.entry_price or ot.requested_entry or 0.0
+                os_ = ot.current_stop or ot.stop_loss or 0.0
+                raw = 0.0
+                if ot.asset_type == "stock" and oe > 0 and os_ > 0:
+                    raw = max(0.0, (oe - os_)) * (ot.qty or 0)
+                elif ot.asset_type == "option" and oe > 0:
+                    raw = float(oe) * 100 * (ot.qty or 0)
+                total += raw * beta_weight(ot.ticker)
+            return total
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"current_portfolio_heat: {e}")
+        return 0.0
+
+
+def heat_aware_risk_multiplier(equity: float) -> float:
+    """Throttle per-trade risk as live portfolio heat approaches the cap.
+
+    The hard heat-cap reject in `consider_signal` (at 100% of cap) protects
+    the *book*, but without this throttle the 14th simultaneous trade is
+    still sized at full 2% — splatting a fresh full-size position right at
+    95% heat usage. This makes the last few entries before the cap smaller
+    probes:
+
+      ≤ 50% heat used  → 1.00× (plenty of room)
+      50–70%           → 0.85×
+      70–85%           → 0.60×
+      85–100%          → 0.40× (last quarter — small probes only)
+
+    Returns 1.0 on missing data / equity ≤ 0 (no-op).
+    """
+    if equity <= 0:
+        return 1.0
+    try:
+        from services.config import RISK_PORTFOLIO_HEAT_CAP_PCT as _CAP_PCT
+    except Exception:
+        _CAP_PCT = 0.10
+    cap = equity * _CAP_PCT
+    if cap <= 0:
+        return 1.0
+    heat = current_portfolio_heat()
+    if heat <= 0:
+        return 1.0
+    used = heat / cap
+    if used <= 0.50:
+        return 1.0
+    if used <= 0.70:
+        return 0.85
+    if used <= 0.85:
+        return 0.60
+    return 0.40
+
+
 def vix_options_bucket_multiplier() -> float:
     """Scale `option_pct_of_equity` by VIX regime. High VIX = gamma/vega
     exposure is costlier, so we de-allocate from options.
