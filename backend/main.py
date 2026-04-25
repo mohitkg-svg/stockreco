@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
-from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router, ml as ml_router
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router, ml as ml_router, fundamentals as fundamentals_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
@@ -401,6 +401,22 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"macro_calendar job not scheduled: {_e}")
+    # Fundamentals refresh — weekly Sunday 04:30 UTC. Lands BEFORE the
+    # best_strategy job at 04:00 UTC (no, that's 04:00 — order is
+    # best_strategy@04:00 → fundamentals@04:30 → ml@06:00). Most fundamental
+    # fields only update quarterly with earnings, so weekly is plenty.
+    # Hash-based change detection means unchanged tickers don't churn the DB.
+    try:
+        from services import fundamentals as _fnd
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            _fnd.refresh_all,
+            trigger=_Cron(day_of_week="sun", hour=4, minute=30),
+            id="fundamentals_weekly",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+    except Exception as _e:
+        logger.warning(f"fundamentals job not scheduled: {_e}")
     # ML: weekly retrain on Sunday 06:00 UTC. Heavy job (5-15 min depending
     # on universe size). Initial training has to be triggered manually via
     # POST /api/ml/train after first deploy.
@@ -571,6 +587,7 @@ app.include_router(chat_router.router)
 app.include_router(analyst_ratings_router.router)
 app.include_router(macro_router.router)
 app.include_router(ml_router.router)
+app.include_router(fundamentals_router.router)
 
 
 @app.get("/api/health")

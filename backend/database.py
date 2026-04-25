@@ -380,6 +380,63 @@ class MacroEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class Fundamentals(Base):
+    """Per-ticker fundamental snapshot.
+
+    Pulled weekly (and on-demand) from yfinance .info. Most fields update
+    quarterly with earnings — they don't change between fetches in the same
+    week. We hash the stable fields and skip writes when nothing changed,
+    so the table records a *history of changes* rather than weekly noise.
+
+    Signal generator uses `quality_score` (a -100..+100 composite) to apply
+    a small confidence multiplier — high-quality balance sheet + growth
+    boosts BUY conviction; junk fundamentals dampen it.
+    """
+    __tablename__ = "fundamentals"
+    ticker = Column(String, primary_key=True)
+    sector = Column(String, nullable=True, index=True)
+    industry = Column(String, nullable=True)
+    market_cap = Column(Float, nullable=True)
+    shares_outstanding = Column(Float, nullable=True)
+
+    # Valuation
+    pe_ratio = Column(Float, nullable=True)            # trailing P/E
+    pe_forward = Column(Float, nullable=True)
+    peg_ratio = Column(Float, nullable=True)
+    price_to_book = Column(Float, nullable=True)
+    price_to_sales = Column(Float, nullable=True)
+    ev_to_ebitda = Column(Float, nullable=True)
+
+    # Growth
+    revenue_growth_yoy = Column(Float, nullable=True)  # decimal e.g. 0.18 = 18%
+    earnings_growth_yoy = Column(Float, nullable=True)
+
+    # Profitability
+    profit_margin = Column(Float, nullable=True)
+    operating_margin = Column(Float, nullable=True)
+    return_on_equity = Column(Float, nullable=True)
+    return_on_assets = Column(Float, nullable=True)
+
+    # Balance sheet / liquidity
+    debt_to_equity = Column(Float, nullable=True)
+    current_ratio = Column(Float, nullable=True)
+
+    # Cash flow / income
+    free_cash_flow = Column(Float, nullable=True)
+    dividend_yield = Column(Float, nullable=True)
+
+    # Composite — see services.fundamentals.compute_quality_score
+    quality_score = Column(Float, nullable=True, index=True)
+
+    # Change-detection: SHA256 over the stable numeric fields. If the new
+    # fetch hashes identical, we only update last_checked_at — saves write
+    # I/O and produces a clean "what actually changed" timeline.
+    data_hash = Column(String, nullable=True, index=True)
+
+    last_checked_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_changed_at = Column(DateTime, default=datetime.utcnow)
+
+
 class AnalystRating(Base):
     """Aggregated Wall Street analyst consensus per ticker.
 

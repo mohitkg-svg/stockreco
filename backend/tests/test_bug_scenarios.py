@@ -401,5 +401,123 @@ class TestMLMultiplier(unittest.TestCase):
             prev = m
 
 
+# ============================================================================
+# CATEGORY H: Fundamentals quality score + multiplier
+# ----------------------------------------------------------------------------
+# Score is the sum of contributions from profitability, growth, balance
+# sheet, valuation. Tests pin the boundaries so accidental tuning shifts
+# get caught.
+# ============================================================================
+
+class TestFundamentalsScore(unittest.TestCase):
+
+    def test_excellent_balance_sheet_growth_scores_high(self):
+        from services.fundamentals import compute_quality_score
+        # NVDA-shaped: high margins, fast growth, low debt, reasonable PEG
+        s = compute_quality_score({
+            "profit_margin": 0.55, "operating_margin": 0.62, "return_on_equity": 0.95,
+            "revenue_growth_yoy": 0.50, "earnings_growth_yoy": 0.80,
+            "debt_to_equity": 0.20, "current_ratio": 4.2,
+            "peg_ratio": 0.9, "pe_ratio": 35, "ev_to_ebitda": 28,
+        })
+        self.assertGreaterEqual(s, 60, f"expected strong score, got {s}")
+
+    def test_distressed_company_scores_low(self):
+        from services.fundamentals import compute_quality_score
+        # Negative margins, shrinking revenue, debt-heavy
+        s = compute_quality_score({
+            "profit_margin": -0.20, "operating_margin": -0.10, "return_on_equity": -0.30,
+            "revenue_growth_yoy": -0.25, "earnings_growth_yoy": -0.50,
+            "debt_to_equity": 5.0, "current_ratio": 0.7,
+            "peg_ratio": -1.0, "pe_ratio": 0, "ev_to_ebitda": 80,
+        })
+        self.assertLessEqual(s, -30, f"expected distressed score, got {s}")
+
+    def test_partial_data_doesnt_blow_up(self):
+        """Small/foreign-listed tickers may only have a couple of fields populated."""
+        from services.fundamentals import compute_quality_score
+        s = compute_quality_score({"pe_ratio": 18})
+        self.assertIsInstance(s, float)
+        self.assertGreaterEqual(s, -100)
+        self.assertLessEqual(s, 100)
+
+    def test_score_clamped(self):
+        from services.fundamentals import compute_quality_score
+        # Pile every positive contributor on
+        s = compute_quality_score({
+            "profit_margin": 0.99, "operating_margin": 0.99, "return_on_equity": 0.99,
+            "revenue_growth_yoy": 0.99, "earnings_growth_yoy": 0.99,
+            "debt_to_equity": 0.0, "current_ratio": 99,
+            "peg_ratio": 0.5, "pe_ratio": 5, "ev_to_ebitda": 1,
+        })
+        self.assertLessEqual(s, 100)
+        self.assertGreaterEqual(s, 50)
+
+
+class TestFundamentalsMultiplier(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+        self.db = SessionLocal()
+
+    def tearDown(self):
+        self.db.close()
+
+    def _store(self, ticker: str, score: float):
+        from database import Fundamentals
+        row = Fundamentals(ticker=ticker.upper(), quality_score=score, data_hash="x")
+        self.db.add(row); self.db.commit()
+
+    def test_strong_buy_for_excellent_fundamentals(self):
+        from services.fundamentals import quality_multiplier
+        self._store("AAA", 85)
+        self.assertEqual(quality_multiplier("AAA", "BUY"), 1.08)
+
+    def test_penalty_for_junk_on_buy(self):
+        from services.fundamentals import quality_multiplier
+        self._store("ZZZ", -60)
+        self.assertEqual(quality_multiplier("ZZZ", "BUY"), 0.92)
+
+    def test_mirror_on_sell(self):
+        from services.fundamentals import quality_multiplier
+        self._store("WWW", -60)
+        # Junk fundamentals confirm a bearish thesis
+        self.assertEqual(quality_multiplier("WWW", "SELL"), 1.08)
+        self._store("VVV", 85)
+        # Excellent fundamentals fight a SELL thesis
+        self.assertEqual(quality_multiplier("VVV", "SELL"), 0.92)
+
+    def test_neutral_when_no_data(self):
+        from services.fundamentals import quality_multiplier
+        # No row stored
+        self.assertEqual(quality_multiplier("MISSING", "BUY"), 1.0)
+
+    def test_envelope_bounds(self):
+        from services.fundamentals import quality_multiplier
+        # All persisted values across the spectrum stay in [0.92, 1.08]
+        for s in [-100, -75, -50, -30, -10, 0, 15, 30, 50, 70, 85, 100]:
+            self._store(f"T{s}", s)
+            for d in ("BUY", "SELL"):
+                m = quality_multiplier(f"T{s}", d)
+                self.assertGreaterEqual(m, 0.92)
+                self.assertLessEqual(m, 1.08)
+
+
+class TestFundamentalsHashing(unittest.TestCase):
+
+    def test_same_inputs_produce_same_hash(self):
+        from services.fundamentals import _hash_payload
+        a = {"pe_ratio": 25, "revenue_growth_yoy": 0.18, "profit_margin": 0.22}
+        b = {"profit_margin": 0.22, "pe_ratio": 25, "revenue_growth_yoy": 0.18}
+        self.assertEqual(_hash_payload(a), _hash_payload(b),
+                         "key order must not affect hash")
+
+    def test_change_in_any_field_changes_hash(self):
+        from services.fundamentals import _hash_payload
+        a = {"pe_ratio": 25, "revenue_growth_yoy": 0.18}
+        b = {"pe_ratio": 25, "revenue_growth_yoy": 0.19}
+        self.assertNotEqual(_hash_payload(a), _hash_payload(b))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

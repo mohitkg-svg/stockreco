@@ -569,6 +569,17 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
+        # Fundamentals quality score (±8%). Strong balance sheet + growth
+        # + reasonable valuation boosts BUY; junk fundamentals dampen.
+        try:
+            from services.fundamentals import quality_multiplier as _f_mult, quality_reason_line as _f_reason
+            _regime_mult *= _f_mult(ticker, "BUY")
+            _f_line = _f_reason(ticker, "BUY")
+            if _f_line:
+                reasons.append(_f_line)
+        except Exception:
+            pass
+
         # ML scorer: predicts P(win). Always runs (logs prediction); multiplier
         # is 1.0 unless ml_scoring_enabled=True in config (shadow-mode default).
         try:
@@ -728,6 +739,17 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
             _ar_line = _ar_reason(ticker, "SELL")
             if _ar_line:
                 reasons.append(_ar_line)
+        except Exception:
+            pass
+
+        # Fundamentals quality — mirror of BUY side. Junk fundamentals
+        # confirm a bearish thesis.
+        try:
+            from services.fundamentals import quality_multiplier as _f_mult, quality_reason_line as _f_reason
+            _regime_mult *= _f_mult(ticker, "SELL")
+            _f_line = _f_reason(ticker, "SELL")
+            if _f_line:
+                reasons.append(_f_line)
         except Exception:
             pass
 
