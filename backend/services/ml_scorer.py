@@ -27,10 +27,35 @@ _booster_loaded_at: Optional[float] = None
 _load_lock = threading.Lock()
 
 
+def _hydrate_from_db_if_missing() -> bool:
+    """If model.txt isn't on this container's /tmp, try pulling from DB.
+    Returns True if a model is available locally after the call."""
+    if os.path.exists(_MODEL_PATH):
+        return True
+    try:
+        from services.ml_trainer import _db_get  # type: ignore
+        text = _db_get("model")
+    except Exception:
+        text = None
+    if not text:
+        return False
+    try:
+        os.makedirs(_MODEL_DIR, exist_ok=True)
+        with open(_MODEL_PATH, "w") as f:
+            f.write(text)
+        logger.info("ml_scorer: hydrated model from DB")
+        return True
+    except Exception as e:
+        logger.warning(f"ml_scorer: hydrate failed: {e}")
+        return False
+
+
 def _load_if_needed():
     global _booster, _booster_loaded_at
+    if not _hydrate_from_db_if_missing():
+        _booster = None
+        return
     if _booster is not None and _booster_loaded_at is not None:
-        # reload if disk file is newer
         try:
             mtime = os.path.getmtime(_MODEL_PATH)
             if mtime <= _booster_loaded_at:
@@ -45,7 +70,7 @@ def _load_if_needed():
             import lightgbm as lgb
             _booster = lgb.Booster(model_file=_MODEL_PATH)
             _booster_loaded_at = os.path.getmtime(_MODEL_PATH)
-            logger.info("ml_scorer: model loaded from disk")
+            logger.info("ml_scorer: model loaded")
         except Exception as e:
             logger.warning(f"ml_scorer: failed to load model: {e}")
             _booster = None

@@ -32,6 +32,34 @@ _MODEL_PATH = os.path.join(_MODEL_DIR, "model.txt")
 _META_PATH = os.path.join(_MODEL_DIR, "meta.json")
 _STATUS_PATH = os.path.join(_MODEL_DIR, "status.json")
 
+
+def _db_put(name: str, content: str, is_binary: bool = False) -> None:
+    """Upsert a row in ml_artifacts. Survives container churn."""
+    from database import SessionLocal, MLArtifact
+    db = SessionLocal()
+    try:
+        row = db.query(MLArtifact).filter(MLArtifact.name == name).first()
+        if row is None:
+            row = MLArtifact(name=name, content=content, is_binary=is_binary)
+            db.add(row)
+        else:
+            row.content = content
+            row.is_binary = is_binary
+            row.updated_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _db_get(name: str) -> Optional[str]:
+    from database import SessionLocal, MLArtifact
+    db = SessionLocal()
+    try:
+        row = db.query(MLArtifact).filter(MLArtifact.name == name).first()
+        return row.content if row else None
+    finally:
+        db.close()
+
 # Label horizon: how many daily bars to look forward to determine win/loss.
 _LABEL_HORIZON_BARS = 10
 # Minimum daily bars of history before we'll generate signals (warm-up).
@@ -242,6 +270,12 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     # Persist
     os.makedirs(_MODEL_DIR, exist_ok=True)
     final_booster.save_model(_MODEL_PATH)
+    # Mirror to DB so the artifact survives container churn / scale events.
+    try:
+        with open(_MODEL_PATH) as f:
+            _db_put("model", f.read(), is_binary=False)
+    except Exception as e:
+        logger.warning(f"ml_trainer: db model persist failed: {e}")
     importance = dict(zip(cols, [int(v) for v in final_booster.feature_importance(importance_type="gain")]))
     importance_sorted = sorted(importance.items(), key=lambda kv: -kv[1])
     meta = {
@@ -258,38 +292,60 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     }
     with open(_META_PATH, "w") as f:
         json.dump(meta, f, indent=2)
+    try:
+        _db_put("meta", json.dumps(meta), is_binary=False)
+    except Exception as e:
+        logger.warning(f"ml_trainer: db meta persist failed: {e}")
     logger.info(f"ml_trainer: model saved (AUC mean {mean_auc}, n={n})")
     return {"trained": True, **meta}
 
 
 def model_meta() -> Optional[Dict[str, Any]]:
-    if not os.path.exists(_META_PATH):
-        return None
-    try:
-        with open(_META_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return None
+    """Read meta from DB first (durable), fall back to local file."""
+    payload = _db_get("meta")
+    if payload:
+        try:
+            return json.loads(payload)
+        except Exception:
+            pass
+    if os.path.exists(_META_PATH):
+        try:
+            with open(_META_PATH) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 def _write_status(state: str, **extra) -> None:
-    os.makedirs(_MODEL_DIR, exist_ok=True)
     payload = {"state": state, "updated_at": datetime.utcnow().isoformat(), **extra}
     try:
+        _db_put("status", json.dumps(payload), is_binary=False)
+    except Exception as e:
+        logger.warning(f"ml_trainer: db status write failed: {e}")
+    # Local file mirror (cheap; useful for in-process inspection).
+    try:
+        os.makedirs(_MODEL_DIR, exist_ok=True)
         with open(_STATUS_PATH, "w") as f:
             json.dump(payload, f, indent=2)
-    except Exception as e:
-        logger.warning(f"ml_trainer: status write failed: {e}")
+    except Exception:
+        pass
 
 
 def get_status() -> Dict[str, Any]:
-    if not os.path.exists(_STATUS_PATH):
-        return {"state": "no_status_file"}
-    try:
-        with open(_STATUS_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {"state": "unreadable"}
+    payload = _db_get("status")
+    if payload:
+        try:
+            return json.loads(payload)
+        except Exception:
+            pass
+    if os.path.exists(_STATUS_PATH):
+        try:
+            with open(_STATUS_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"state": "no_status"}
 
 
 def train_async(max_tickers: int = 40) -> Dict[str, Any]:

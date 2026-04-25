@@ -313,6 +313,21 @@ class NewsEvent(Base):
     severity = Column(Integer, nullable=True)
 
 
+class MLArtifact(Base):
+    """Persisted ML training artifacts (model bytes, meta JSON, status JSON).
+
+    Cloud Run /tmp is per-instance, so a model trained on instance A is
+    invisible to instance B. Storing artifacts here makes them durable
+    across container churn and scale events. Single-row-per-name pattern
+    so writes overwrite cleanly.
+    """
+    __tablename__ = "ml_artifacts"
+    name = Column(String, primary_key=True)         # 'model' | 'meta' | 'status'
+    content = Column(Text, nullable=True)           # base64 for binary, json for text
+    is_binary = Column(Boolean, default=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class MLPrediction(Base):
     """Logged ML scorer predictions vs realized outcomes.
 
