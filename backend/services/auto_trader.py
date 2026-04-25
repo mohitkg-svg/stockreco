@@ -912,6 +912,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         return None
     db = SessionLocal()
     try:
+        # Bind canonical ticker upfront so EVERY downstream gate (including
+        # the liquidity gate that previously referenced ticker before it was
+        # bound — silently swallowed by a bare except) can use it. Bug
+        # introduced in r34, surfaced by ruff in r39.
+        ticker = (signal.get("ticker") or "").strip().upper()
         cfg = get_config(db)
         if not cfg.enabled:
             metrics.inc("autotrade_skip", reason="disabled")
@@ -1179,9 +1184,8 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         risk_per_share = entry - stop
         far_tp = round(entry + 10 * risk_per_share, 2)
 
-        ticker = signal["ticker"].upper()
-
-        # Global ticker blacklist — applies regardless of watchlist/universe source.
+        # `ticker` already bound at function top (r39 fix). Global ticker
+        # blacklist — applies regardless of watchlist/universe source.
         if is_blacklisted(ticker, cfg):
             logger.info(f"AutoTrader skip {ticker}: on global blacklist")
             return None

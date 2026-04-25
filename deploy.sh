@@ -20,6 +20,24 @@ set -euo pipefail
 REGION="${1:-us-central1}"
 SERVICE="stockrecs"
 
+# ---- Pre-deploy lint (ruff) -------------------------------------------------
+# Conservative ruleset (syntax errors, undefined names, redefinitions only).
+# Skip with SKIP_LINT=1; doesn't block if ruff isn't installed locally.
+if [ "${SKIP_LINT:-0}" != "1" ]; then
+  echo "── Running pre-deploy ruff lint ──"
+  if command -v ruff >/dev/null 2>&1; then
+    if (cd backend && ruff check . 2>&1 | tail -20); then
+      echo "✅ ruff passed"
+    else
+      echo "❌ ruff found issues — aborting. Set SKIP_LINT=1 to override."
+      echo "   To run locally: cd backend && ruff check ."
+      exit 1
+    fi
+  else
+    echo "ℹ️  ruff not installed locally; skipping (pip install -r backend/requirements-dev.txt to enable)"
+  fi
+fi
+
 # ---- Pre-deploy regression tests --------------------------------------------
 # Cheap (<3s) regression suite that catches the bug families surfaced in
 # production losses. Skip with SKIP_TESTS=1 if you really need to.

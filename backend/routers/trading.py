@@ -208,6 +208,17 @@ def auto_trades(limit: int = 50):
     return auto_trader.list_trades(limit=limit)
 
 
+@router.get("/auto/pdt")
+def auto_pdt():
+    """PDT (Pattern Day Trader) day-trade counter for the trailing 5
+    business days. On Alpaca paper this is informational; on live margin
+    accounts < $25k, 4+ day-trades in 5 days blocks new opens for 90d.
+    Day-trade definition: open + close of same security same calendar day.
+    """
+    from services.risk_manager import pdt_day_trade_count
+    return pdt_day_trade_count(window_business_days=5)
+
+
 @router.get("/auto/calibration")
 def auto_calibration(min_bucket_n: int = 5):
     """Confidence-bucket calibration — observed win-rate and the risk

@@ -263,7 +263,130 @@ def adaptive_risk_multiplier() -> float:
         mult = min(mult, 0.5)
     if drawdown_pct is not None and drawdown_pct >= 10.0:
         mult = min(mult, 0.5)
+        # Raise an explicit operator alert. Dedup is handled inside
+        # `alerts.alert` (5-min window per category+message), so this is
+        # safe to call from a hot path.
+        try:
+            from services.alerts import alert as _raise
+            _raise(
+                "warning", "strategy_drawdown",
+                f"30d strategy drawdown {drawdown_pct:.1f}% ≥ 10% — risk halved (×0.5)",
+            )
+        except Exception:
+            pass
     return mult
+
+
+# ---------- Health monitors (operator alerts) ------------------------------
+
+def check_low_signal_volume(min_ratio: float = 0.30,
+                             min_trailing_days: int = 7) -> Optional[Dict[str, Any]]:
+    """Compare today's emitted-signal count against the trailing N-day avg.
+    Raise a `low_signal_volume` alert when today < min_ratio × trailing_avg.
+
+    Both numbers come from the `signals` table (any signal_type counts —
+    NEUTRAL signals are scan output and their absence indicates a real
+    problem with the scan pipeline, not just market quiet).
+
+    Returns the comparison dict for logging/telemetry, or None on error.
+    Designed to be called from a daily scheduler job after market close.
+    """
+    try:
+        from database import SessionLocal, Signal
+        from datetime import datetime, timedelta
+        db = SessionLocal()
+        try:
+            now = datetime.utcnow()
+            today_start = datetime(now.year, now.month, now.day)
+            today_count = db.query(Signal).filter(
+                Signal.generated_at >= today_start
+            ).count()
+            trail_start = today_start - timedelta(days=min_trailing_days)
+            trail_count = db.query(Signal).filter(
+                Signal.generated_at >= trail_start,
+                Signal.generated_at < today_start,
+            ).count()
+            trail_avg = trail_count / max(1, min_trailing_days)
+            ratio = (today_count / trail_avg) if trail_avg > 0 else None
+            result = {
+                "today_count": today_count,
+                "trailing_days": min_trailing_days,
+                "trailing_avg": round(trail_avg, 1),
+                "ratio": round(ratio, 2) if ratio is not None else None,
+            }
+            # Alert only when we have a baseline AND today is materially below.
+            # Don't alert on a fresh DB (trail_avg=0) or pre-open (still gathering).
+            if (
+                trail_avg >= 5            # need a meaningful baseline
+                and ratio is not None
+                and ratio < min_ratio
+            ):
+                try:
+                    from services.alerts import alert as _raise
+                    _raise(
+                        "warning", "low_signal_volume",
+                        f"Today's signal count {today_count} is {ratio*100:.0f}% "
+                        f"of {min_trailing_days}-day average ({trail_avg:.1f}) "
+                        f"— scanner may be degraded",
+                    )
+                except Exception:
+                    pass
+            return result
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"check_low_signal_volume: {e}")
+        return None
+
+
+def pdt_day_trade_count(window_business_days: int = 5) -> Dict[str, Any]:
+    """Count day-trades in the trailing 5 business days.
+
+    A "day trade" per FINRA: open + close of the same security on the
+    same calendar day. We approximate from `auto_trades` by counting
+    rows whose `opened_at.date() == closed_at.date()`. PDT rule (live
+    margin accounts < $25k): 4+ day trades in 5 business days blocks
+    new opens for 90 days.
+
+    On paper this is informational only — Alpaca paper accounts aren't
+    PDT-restricted. On live margin it becomes a hard pre-entry gate
+    (not yet wired). Returns `{count, trades, threshold, would_block}`.
+    """
+    try:
+        from database import SessionLocal, AutoTrade
+        from datetime import datetime, timedelta
+        db = SessionLocal()
+        try:
+            since = datetime.utcnow() - timedelta(days=window_business_days * 2)
+            rows = (
+                db.query(AutoTrade)
+                .filter(AutoTrade.status.like("closed%"),
+                        AutoTrade.opened_at.isnot(None),
+                        AutoTrade.closed_at.isnot(None),
+                        AutoTrade.closed_at >= since)
+                .all()
+            )
+            day_trades = []
+            for r in rows:
+                if r.opened_at and r.closed_at and r.opened_at.date() == r.closed_at.date():
+                    day_trades.append({
+                        "trade_id": r.id, "ticker": r.ticker,
+                        "date": r.opened_at.date().isoformat(),
+                        "realized_pl": float(r.realized_pl or 0),
+                    })
+            count = len(day_trades)
+            return {
+                "count": count,
+                "trades": day_trades,
+                "window_days": window_business_days,
+                "pdt_threshold": 4,
+                "would_block_under_pdt": count >= 4,
+            }
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"pdt_day_trade_count: {e}")
+        return {"count": 0, "trades": [], "would_block_under_pdt": False}
 
 
 def regime_concurrent_cap(base_cap: int) -> int:

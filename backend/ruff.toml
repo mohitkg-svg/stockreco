@@ -1,0 +1,29 @@
+# Ruff config — intentionally conservative.
+#
+# Goal: catch ACTUAL BUGS (syntax errors, undefined names, unused imports
+# that mask typos) without forcing a stylistic rewrite of an established
+# codebase. We don't enable formatting, line-length, naming, or
+# import-order rules — those are too disruptive to add post-hoc.
+#
+# Rule families enabled:
+#   E9   — syntax errors (will block deploy if introduced)
+#   F63  — invalid print/syntax patterns
+#   F7   — semantic errors (e.g., late-binding closure mistakes)
+#   F82  — undefined names / typos
+#   F821 — undefined name (catches the common "did you mean..." typo)
+#   F811 — redefinition of unused name (often a bug)
+#
+# Add new rule families slowly; each one should be evaluated against the
+# existing codebase before turning on.
+
+target-version = "py312"
+line-length = 120   # generous; we don't enforce this
+
+[lint]
+select = ["E9", "F63", "F7", "F82", "F821", "F811"]
+# Don't fail on per-file ignores or noqa lines we haven't added yet.
+ignore = []
+
+[lint.per-file-ignores]
+# Tests can have unused imports (sometimes needed for side effects)
+"tests/*" = ["F811"]

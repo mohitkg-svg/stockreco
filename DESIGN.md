@@ -782,6 +782,7 @@ SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis cl
 - Idempotency hash deduping retries within 12h, bucket-aware on confidence.
 - Post-mortem auto-generated on every losing stop (skipped for `closed_reverse`).
 - Synthetic-data regression suite (128 tests) gates every deploy via `deploy.sh`.
+- **Ruff lint gate (r39)**: conservative ruleset (syntax, undefined names, redefinitions) runs pre-test in `deploy.sh`. Set `SKIP_LINT=1` to bypass. Caught a real bug (silently broken liquidity gate) on first run.
 
 ### Auth & access
 - Shared-secret `APP_API_KEY` gating all `/api/*` and `/ws/quotes`.
@@ -910,6 +911,36 @@ building. `SKIP_TESTS=1` to override.
 ---
 
 ## 14. Changelog (current → past)
+
+### Revision 39 — Partial-item cleanup: Sortino/Calmar/turnover, alerts, PDT, ruff CI gate (caught real bug)
+- **Sortino, Calmar, turnover** added to `portfolio_backtest` stats.
+  Sortino = downside-vol-only Sharpe; Calmar = annualized return /
+  |max DD| (>1 means yearly return exceeds worst observed drawdown);
+  turnover = trades per year.
+- **Strategy-drawdown alert** wired: r38 was triggering risk halving on
+  ≥10% DD silently — now also raises a `strategy_drawdown` operator
+  alert (5-min dedup via the existing alerts pipeline).
+- **Low-signal-volume alert**: daily 22:00 UTC scheduler job compares
+  today's emitted-signal count against the trailing 7-day avg; raises
+  `low_signal_volume` alert when today < 30% of baseline (with a ≥5
+  baseline floor so a fresh DB doesn't fire).
+- **PDT day-trade counter** — `risk_manager.pdt_day_trade_count` +
+  `GET /api/trading/auto/pdt`. Detects same-day open+close from
+  `auto_trades`. Informational on paper; becomes a hard pre-entry gate
+  when we go live with a margin account < $25k (not yet wired).
+- **Ruff lint in `deploy.sh`** — conservative ruleset (E9/F63/F7/F82/
+  F821/F811): syntax errors, undefined names, redefinitions only.
+  Doesn't enforce style. **Caught a real bug on first run**: the r34
+  liquidity gate referenced `ticker` before it was bound, and the bare
+  `except Exception: pass` was silently swallowing the NameError —
+  meaning the gate had been a no-op since r34. Fix: bind `ticker` at
+  the top of `consider_signal`.
+- **`backend/requirements-dev.txt`** for ruff (and any future dev-only
+  deps). Not installed in the production container.
+- **DB backup + restore procedure** documented in README — Cloud SQL
+  automatic daily backups, on-demand `gcloud sql backups create`,
+  `pg_dump` for off-cloud archive, restore-to-new-instance for testing
+  recovery.
 
 ### Revision 38 — External review pass 5: Monte Carlo, expectancy, drawdown trigger, API rate limit
 - **Monte Carlo bootstrap** in `portfolio_backtest`: 1000 paths × N

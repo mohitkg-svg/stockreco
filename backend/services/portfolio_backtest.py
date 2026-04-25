@@ -109,6 +109,18 @@ class PortfolioStats:
     mc_ending_equity_p50: Optional[float] = None
     mc_ending_equity_p95: Optional[float] = None
     mc_paths: Optional[int] = None
+    # Sortino: like Sharpe but penalizes only downside volatility. Same
+    # annualization factor as Sharpe (sqrt(252) for daily). Strategies
+    # with right-skewed returns score higher under Sortino than Sharpe.
+    sortino_ratio: Optional[float] = None
+    # Calmar: annualized_return / |max_drawdown|. Drawdown-focused — the
+    # most ruthless way to compare strategies pre-live. Calmar > 1 means
+    # the strategy makes more per year than its worst observed drawdown.
+    calmar_ratio: Optional[float] = None
+    # Turnover: round-trips per year on the average dollar deployed.
+    # A high-turnover strategy is more sensitive to costs — even at our
+    # conservative 6bps round-trip, 200 turns/yr → 1.2% drag per year.
+    turnover_per_year: Optional[float] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -428,13 +440,46 @@ def run_portfolio_backtest(
                 days = (pd.Timestamp(ds) - dd_start).days
                 if days > max_dd_days:
                     max_dd_days = days
-    # Sharpe (simplified, daily)
+    # Sharpe (simplified, daily). Sortino: same numerator, denominator
+    # is stdev of NEGATIVE returns only — penalizes only downside vol.
     sharpe = None
+    sortino = None
     if len(equity_curve) > 30:
         eqs = pd.Series([eq for _, eq in equity_curve])
         rets = eqs.pct_change().dropna()
         if len(rets) and rets.std() > 0:
             sharpe = float(round((rets.mean() / rets.std()) * (252 ** 0.5), 2))
+        downside = rets[rets < 0]
+        if len(downside) and downside.std() > 0:
+            sortino = float(round((rets.mean() / downside.std()) * (252 ** 0.5), 2))
+
+    # Calmar: annualized_return / |max_drawdown|. Drawdown-adjusted return.
+    # period_years derived from the equity curve span; capped at ≥ 0.25y
+    # to avoid blow-up on very short backtests.
+    calmar = None
+    if max_dd_pct > 0 and len(equity_curve) >= 30:
+        try:
+            t0 = pd.Timestamp(equity_curve[0][0])
+            t1 = pd.Timestamp(equity_curve[-1][0])
+            period_years = max(0.25, (t1 - t0).days / 365.25)
+            total_return = (ending_equity - starting_equity) / starting_equity
+            ann_return = (1 + total_return) ** (1 / period_years) - 1
+            calmar = float(round(ann_return / max_dd_pct, 2))
+        except Exception as e:
+            logger.debug(f"portfolio_bt: calmar calc skipped ({e})")
+
+    # Turnover: round-trips per year on average deployed capital.
+    # round_trips = total closed trades. avg_deployed = mean equity over
+    # the curve (proxy for avg invested $); period_years from curve span.
+    turnover = None
+    if total > 0 and len(equity_curve) >= 30:
+        try:
+            t0 = pd.Timestamp(equity_curve[0][0])
+            t1 = pd.Timestamp(equity_curve[-1][0])
+            period_years = max(0.25, (t1 - t0).days / 365.25)
+            turnover = float(round(total / period_years, 1))
+        except Exception:
+            pass
 
     # Profit factor: gross wins / |gross losses|. Handles div-by-zero cleanly.
     gross_wins = sum(t.pnl for t in closed_trades if t.pnl > 0)
@@ -553,6 +598,9 @@ def run_portfolio_backtest(
         mc_ending_equity_p50=mc_eq_p50,
         mc_ending_equity_p95=mc_eq_p95,
         mc_paths=mc_paths,
+        sortino_ratio=sortino,
+        calmar_ratio=calmar,
+        turnover_per_year=turnover,
     )
     return {
         "stats": stats.as_dict(),

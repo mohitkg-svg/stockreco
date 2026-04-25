@@ -209,10 +209,66 @@ README.md                  This file
 - `POST /api/trading/auto/config` — update any config field
 - `POST /api/trading/auto/kill` — emergency flatten + cancel all
 - `GET /api/trading/auto/rationale/{trade_id}` — full "why this trade?" view
+- `GET /api/trading/auto/pdt` — PDT day-trade count for trailing 5 business days
 - `GET /api/ml/calibration` — predicted vs realized win-rate buckets
+- `GET /api/ai-judge/decisions` — Claude entry-veto / news-exit / sizing-mult audit log
+- `GET /api/ai-judge/summary` — aggregate stats per call site + mode
+- `GET /api/ai-judge/modes` — current mode (off / shadow / active) per call site
 - `POST /api/backtest/portfolio/run` — book-level walk-forward with cap enforcement
+- `GET /api/backtest/portfolio/stress-windows` — list canned historical drawdown periods
 - `GET /api/macro/blackout` — am I currently in a pre/post-release window?
 - `GET /metrics` — Prometheus-format internal counters
+
+---
+
+## Database backup + restore
+
+Cloud SQL Postgres takes automatic daily backups (7-day retention by default).
+The instance also has point-in-time recovery (PITR) enabled — you can restore
+to any second within the retention window.
+
+### One-shot manual backup (before risky migrations)
+
+```bash
+# List the instance name
+gcloud sql instances list
+
+# Trigger an on-demand backup
+gcloud sql backups create \
+  --instance=stockrecs-db \
+  --description="pre-migration $(date +%Y%m%d)"
+
+# List backups + IDs
+gcloud sql backups list --instance=stockrecs-db
+```
+
+### Restore to a new instance (test recovery before doing it live)
+
+```bash
+gcloud sql backups restore <BACKUP_ID> \
+  --restore-instance=stockrecs-db-restore \
+  --backup-instance=stockrecs-db
+```
+
+### Local dump (for off-cloud archive)
+
+```bash
+# Read DATABASE_URL from .env, then:
+pg_dump "$DATABASE_URL" --no-owner --no-acl --clean --if-exists \
+  --file="stockrecs-$(date +%Y%m%d).sql"
+```
+
+Restore the local dump into a fresh Postgres with `psql "$DATABASE_URL" < dump.sql`.
+
+### What's actually in the DB
+
+- `auto_trades` — every entry, fill, exit (the audit trail of the bot's behavior)
+- `signals` — every emitted signal, including NEUTRAL
+- `ai_decision_log` — every Claude judge call
+- `news_events` — ingested Alpaca + scraped articles
+- `alerts` — operator alert inbox
+
+`auto_trades` is the most important table to preserve. The rest can be regenerated.
 
 Every `/api/*` endpoint requires the `X-API-Key: <APP_API_KEY>` header.
 

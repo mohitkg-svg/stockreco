@@ -485,6 +485,22 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"wsb_scraper job not scheduled: {_e}")
+    # Daily health check: low-signal-volume alert (r38). Fires at 22:00 UTC
+    # (~5pm ET, after the close + scan settle). Compares today's signal
+    # count against the trailing 7-day avg; alerts when scanner appears
+    # degraded (today < 30% of baseline). Self-deduped via alerts.alert.
+    try:
+        from services.risk_manager import check_low_signal_volume
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            check_low_signal_volume,
+            trigger=_Cron(hour=22, minute=0),
+            id="health_low_signal_volume",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+    except Exception as _e:
+        logger.warning(f"low_signal_volume job not scheduled: {_e}")
+
     # Institutional holdings (13F proxy via yfinance) — weekly Sunday 05:15
     # UTC. 13F cadence is quarterly-with-lag so weekly is plenty.
     try:
