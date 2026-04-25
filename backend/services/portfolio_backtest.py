@@ -40,10 +40,20 @@ class PortfolioTrade:
     target_price: float
     beta: float
     shares: float
+    entry_adx: Optional[float] = None    # regime tagging at entry
+    entry_vix: Optional[float] = None
     exit_date: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
     outcome: Optional[str] = None   # win | loss | open
     pnl: float = 0.0
+
+    def regime_label(self) -> str:
+        if self.entry_vix is not None and self.entry_vix > 25:
+            return "high_vix"
+        if self.entry_adx is not None:
+            if self.entry_adx > 25: return "trending"
+            if self.entry_adx < 20: return "chop"
+        return "normal"
 
 
 @dataclass
@@ -57,7 +67,17 @@ class PortfolioStats:
     max_drawdown_pct: float
     max_drawdown_days: int
     sharpe_ratio: Optional[float]
-    cap_rejection_count: int  # how many candidate trades were rejected by portfolio caps
+    cap_rejection_count: int
+    # Profit factor = gross wins / |gross losses|. >1.5 is solid, <1.0 is
+    # a losing strategy even at >50% win rate.
+    profit_factor: Optional[float] = None
+    # Per-regime win-rate / count / avg PL. Regimes determined by the
+    # entry-bar's ADX + VIX context:
+    #   'trending'  = entry ADX > 25
+    #   'chop'      = entry ADX < 20
+    #   'high_vix'  = VIX > 25 at entry
+    #   'normal'    = everything else
+    by_regime: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     equity_curve: List[Tuple[str, float]] = field(default_factory=list)
     per_sector_exposure_max: Dict[str, int] = field(default_factory=dict)
 
@@ -174,22 +194,39 @@ def run_portfolio_backtest(
             todays_unrealized += (close - tr.entry_price) * tr.shares * (1 if tr.direction == "BUY" else -1)
 
         # Close-out check: did any open trades hit target/stop today?
+        # Overnight-gap modeling: if today's OPEN gapped through the stop (or
+        # target), the realistic fill was at the OPEN, not the stop price. In
+        # a gap-down, a BUY stop at $100 is filled at whatever the bar opened
+        # at — potentially $95, widening the loss. Models the actual behavior
+        # of a GTC stop resting overnight.
         still_open = []
         for tr in open_trades:
             df = data.get(tr.ticker)
             if df is None or d not in df.index:
                 still_open.append(tr)
                 continue
+            day_open = float(df["Open"].at[d])
             hi = float(df["High"].at[d])
             lo = float(df["Low"].at[d])
             exit_px = None; outcome = None
             if tr.direction == "BUY":
-                if lo <= tr.stop_price:
+                # Gap-through-stop: today opened at or below the stop → realistic
+                # fill is the open (worse than stop_price).
+                if day_open <= tr.stop_price:
+                    exit_px, outcome = day_open, "loss"
+                elif day_open >= tr.target_price:
+                    # Unusual but possible — opened above T1, fill at open.
+                    exit_px, outcome = day_open, "win"
+                elif lo <= tr.stop_price:
                     exit_px, outcome = tr.stop_price, "loss"
                 elif hi >= tr.target_price:
                     exit_px, outcome = tr.target_price, "win"
             else:
-                if hi >= tr.stop_price:
+                if day_open >= tr.stop_price:
+                    exit_px, outcome = day_open, "loss"
+                elif day_open <= tr.target_price:
+                    exit_px, outcome = day_open, "win"
+                elif hi >= tr.stop_price:
                     exit_px, outcome = tr.stop_price, "loss"
                 elif lo <= tr.target_price:
                     exit_px, outcome = tr.target_price, "win"
@@ -254,11 +291,27 @@ def run_portfolio_backtest(
                 if (current_heat + weighted_heat) > equity * max_portfolio_heat_pct:
                     rejections += 1
                     continue
+                # Regime tagging at entry — ADX_14 from this bar, VIX
+                # from the shared VIX series if available.
+                entry_adx = None
+                try:
+                    if "ADX_14" in sliced.columns:
+                        entry_adx = float(sliced["ADX_14"].iat[-1])
+                except Exception:
+                    pass
+                entry_vix = None
+                vix_df = data.get("^VIX")
+                if vix_df is not None and d in vix_df.index:
+                    try:
+                        entry_vix = float(vix_df["Close"].at[d])
+                    except Exception:
+                        pass
                 # Enter
                 open_trades.append(PortfolioTrade(
                     ticker=ticker, sector=sector, direction=sig["signal_type"],
                     entry_date=d, entry_price=entry, stop_price=stop,
                     target_price=target, beta=beta, shares=shares,
+                    entry_adx=entry_adx, entry_vix=entry_vix,
                 ))
                 # Track peak per-sector concentration
                 per_sector_exposure_max[sector] = max(
@@ -301,6 +354,25 @@ def run_portfolio_backtest(
         if len(rets) and rets.std() > 0:
             sharpe = float(round((rets.mean() / rets.std()) * (252 ** 0.5), 2))
 
+    # Profit factor: gross wins / |gross losses|. Handles div-by-zero cleanly.
+    gross_wins = sum(t.pnl for t in closed_trades if t.pnl > 0)
+    gross_losses = sum(-t.pnl for t in closed_trades if t.pnl < 0)
+    profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else (None if gross_wins == 0 else float("inf"))
+
+    # By-regime breakdown
+    by_regime: Dict[str, Dict[str, Any]] = {}
+    for t in closed_trades:
+        label = t.regime_label()
+        bucket = by_regime.setdefault(label, {"trades": 0, "wins": 0, "losses": 0, "total_pl": 0.0})
+        bucket["trades"] += 1
+        if t.pnl > 0: bucket["wins"] += 1
+        elif t.pnl < 0: bucket["losses"] += 1
+        bucket["total_pl"] += t.pnl
+    for label, bucket in by_regime.items():
+        n = bucket["trades"] or 1
+        bucket["win_rate"] = round(bucket["wins"] / n, 3)
+        bucket["avg_pl"] = round(bucket["total_pl"] / n, 2)
+
     stats = PortfolioStats(
         starting_equity=starting_equity,
         ending_equity=ending_equity,
@@ -310,6 +382,8 @@ def run_portfolio_backtest(
         max_drawdown_days=int(max_dd_days),
         sharpe_ratio=sharpe,
         cap_rejection_count=rejections,
+        profit_factor=round(profit_factor, 2) if profit_factor not in (None, float("inf")) else profit_factor,
+        by_regime=by_regime,
         equity_curve=equity_curve,
         per_sector_exposure_max=per_sector_exposure_max,
     )

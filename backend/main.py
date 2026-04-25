@@ -669,6 +669,21 @@ def health():
     except Exception:
         pass
 
+    # Stale-stream alert: fire once when quotes stop flowing for >30s during RTH.
+    # Operator needs to know BEFORE positions go unmanaged.
+    try:
+        if stream_stale_secs is not None and stream_stale_secs > 30:
+            from services import alerts as _alerts
+            from services import paper_trader as _pt_clk
+            if _pt_clk.is_market_open():
+                _alerts.alert(
+                    severity="warning",
+                    category="stream_stale",
+                    message=f"Alpaca WS quotes stale {stream_stale_secs:.0f}s during RTH — positions may not be priced live",
+                )
+    except Exception:
+        pass
+
     # Today's realized PnL across all auto-trades (used by daily loss gate).
     realized_today = 0.0
     open_positions = 0

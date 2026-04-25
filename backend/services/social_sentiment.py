@@ -160,13 +160,37 @@ def get_sentiment(ticker: str) -> Optional[Dict[str, Any]]:
         db.close()
 
 
+_MAX_MARKETCAP_FOR_SOCIAL_SIGNAL = 50_000_000_000  # $50B — above this the tape already priced it in
+
+
+def _is_retail_moveable(ticker: str) -> bool:
+    """Retail sentiment only informative on small/mid caps. Above $50B market
+    cap the tape already reflects retail flow; sentiment adds noise, not signal."""
+    try:
+        from services.fundamentals import get_fundamentals
+        f = get_fundamentals(ticker)
+        if not f:
+            # No fundamentals yet → default to trusting sentiment.
+            # Erring on the side of applying the signal when we don't know.
+            return True
+        mcap = f.get("market_cap")
+        if mcap is None:
+            return True
+        return float(mcap) < _MAX_MARKETCAP_FOR_SOCIAL_SIGNAL
+    except Exception:
+        return True
+
+
 def sentiment_multiplier(ticker: str, direction: str) -> float:
-    """±4% envelope. Requires min message volume to be trusted."""
+    """±4% envelope. Requires min message volume to be trusted AND market cap
+    below $50B (retail sentiment has near-zero signal on mega-caps)."""
     r = get_sentiment(ticker)
     if r is None:
         return _MULT_NEUTRAL
     total = r.get("message_count_24h") or 0
     if total < _MIN_MESSAGES:
+        return _MULT_NEUTRAL
+    if not _is_retail_moveable(ticker):
         return _MULT_NEUTRAL
     bull = r.get("bullish_pct_24h")
     if bull is None:

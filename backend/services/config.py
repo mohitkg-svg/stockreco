@@ -42,8 +42,11 @@ MTF_WEIGHTS = {"1mo": 4, "1d": 3, "4h": 2, "1h": 1}
 # ---- Risk envelope (auto_trader) -------------------------------------------
 # Confidence-risk multiplier ramps from 1.0 at threshold to this at 100% conf.
 RISK_MAX_CONFIDENCE_MULT = 1.75
-# Kelly-criterion multiplier cap. Above this, calibration drift dominates.
-RISK_KELLY_MAX_MULT = 1.35
+# Kelly-criterion multiplier cap. Tightened from 1.35 to 1.2 during the
+# pre-live phase: with <100 closed trades we don't trust bucket win-rates
+# enough to let Kelly size up aggressively. Raise back to 1.35 once
+# calibration is validated against 100+ realized outcomes.
+RISK_KELLY_MAX_MULT = 1.2
 # Below this historical win rate, don't trust the bucket — force kelly_mult=1.0.
 RISK_KELLY_MIN_WIN_RATE = 55.0
 # Hard ceiling on the COMPOUND risk multiplier

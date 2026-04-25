@@ -222,14 +222,31 @@ _MULT_CONTRA = 0.97
 _MIN_MENTIONS_24H = 10   # below this, noise > signal
 
 
+_MAX_MARKETCAP_FOR_WSB_SIGNAL = 50_000_000_000  # $50B — WSB signal decays fast on mega-caps
+
+
+def _retail_moveable(ticker: str) -> bool:
+    try:
+        from services.fundamentals import get_fundamentals
+        f = get_fundamentals(ticker)
+        if not f or f.get("market_cap") is None:
+            return True   # unknown → apply the signal
+        return float(f["market_cap"]) < _MAX_MARKETCAP_FOR_WSB_SIGNAL
+    except Exception:
+        return True
+
+
 def wsb_multiplier(ticker: str, direction: str) -> float:
     """Tilt for BUY if mentions spiking + bullish hints dominate; mirror for
-    SELL. Requires min 10 mentions/24h and a clear lean (2:1 ratio)."""
+    SELL. Requires min 10 mentions/24h, clear lean (2:1 ratio), AND market
+    cap < $50B (WSB noise dominates on mega-caps)."""
     r = get_mentions(ticker)
     if r is None:
         return _MULT_NEUTRAL
     m24 = r.get("mentions_24h") or 0
     if m24 < _MIN_MENTIONS_24H:
+        return _MULT_NEUTRAL
+    if not _retail_moveable(ticker):
         return _MULT_NEUTRAL
     bull = r.get("bullish_hint_24h") or 0
     bear = r.get("bearish_hint_24h") or 0

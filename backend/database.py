@@ -153,7 +153,10 @@ class AutoTraderConfig(Base):
     # max_per_sector (which only bounds correlated exposure).
     max_concurrent_positions = Column(Integer, default=10)
     # Flatten open positions at 15:55 ET (intraday strategy guardrail).
-    flatten_by_eod = Column(Boolean, default=False)
+    # Pre-live default: flatten everything by EOD so overnight gap risk is
+    # contained during the initial live-trading phase. Flip to False after
+    # calibration is solid and gap risk has been stress-tested.
+    flatten_by_eod = Column(Boolean, default=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -643,6 +646,7 @@ def create_tables():
     _ensure_column("auto_trader_config", "killed_at", "TIMESTAMP")
     _ensure_column("auto_trader_config", "killed_reason", "VARCHAR")
     _ensure_column("auto_trader_config", "max_concurrent_positions", "INTEGER DEFAULT 10")
+    # Legacy default (FALSE) preserved for existing rows; new rows get TRUE via ORM default
     _ensure_column("auto_trader_config", "flatten_by_eod", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "trade_calls", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "aggressive_options_mode", "BOOLEAN DEFAULT FALSE")

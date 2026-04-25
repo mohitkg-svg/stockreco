@@ -148,6 +148,79 @@ def sl_resubmit_failures_1h() -> int:
         return sum(1 for t in _sl_resubmit_failures if t > cutoff)
 
 
+def adaptive_risk_multiplier() -> float:
+    """Tighten the max-risk-per-trade envelope under adverse conditions.
+
+    Returns a multiplier to apply to cfg.max_risk_per_trade_pct:
+      * VIX > 25 or recent-30d realized win-rate < 55% → 0.5× (halve risk)
+      * VIX > 20 (elevated but not extreme) → 0.75×
+      * Otherwise 1.0×
+
+    Missing data defaults to 1.0 (no tightening) — erring on the operator's
+    already-set cap rather than over-interpreting noisy inputs.
+    """
+    # VIX level
+    vix_level = None
+    try:
+        from services.position_manager import current_price
+        px = current_price("^VIX")
+        if px and px > 0:
+            vix_level = px
+    except Exception:
+        pass
+
+    # 30-day realized win rate from closed auto-trades
+    try:
+        from database import SessionLocal, AutoTrade
+        from datetime import datetime, timedelta
+        db = SessionLocal()
+        try:
+            since = datetime.utcnow() - timedelta(days=30)
+            closed = db.query(AutoTrade).filter(
+                AutoTrade.status.like("closed%"),
+                AutoTrade.closed_at >= since,
+                AutoTrade.realized_pl.isnot(None),
+            ).all()
+            n = len(closed)
+            wins = sum(1 for t in closed if (t.realized_pl or 0) > 0)
+            recent_wr = (wins / n * 100) if n >= 10 else None
+        finally:
+            db.close()
+    except Exception:
+        recent_wr = None
+
+    mult = 1.0
+    if vix_level is not None and vix_level > 25:
+        mult = min(mult, 0.5)
+    elif vix_level is not None and vix_level > 20:
+        mult = min(mult, 0.75)
+    if recent_wr is not None and recent_wr < 55.0:
+        mult = min(mult, 0.5)
+    return mult
+
+
+def vix_options_bucket_multiplier() -> float:
+    """Scale `option_pct_of_equity` by VIX regime. High VIX = gamma/vega
+    exposure is costlier, so we de-allocate from options.
+
+      * VIX > 30 → 0.3× (strongly reduce)
+      * VIX > 25 → 0.5×
+      * VIX > 20 → 0.75×
+      * else    → 1.0×
+    """
+    try:
+        from services.position_manager import current_price
+        px = current_price("^VIX")
+    except Exception:
+        return 1.0
+    if px is None or px <= 0:
+        return 1.0
+    if px > 30: return 0.3
+    if px > 25: return 0.5
+    if px > 20: return 0.75
+    return 1.0
+
+
 def reset_for_tests() -> None:
     """Clear every cache + circuit-breaker. Use only in tests."""
     global _in_flight_bp_reserved, _bp_exhausted_until, _broker_down_until

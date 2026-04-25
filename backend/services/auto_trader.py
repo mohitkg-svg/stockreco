@@ -613,7 +613,11 @@ def status_snapshot() -> Dict[str, Any]:
         equity = float(acct["equity"]) if acct else 0.0
         alloc = _open_allocations(db)
         stock_budget = equity * cfg.stock_pct_of_equity
-        option_budget = equity * cfg.option_pct_of_equity
+        # VIX-scaled option allocation: options are punished harder than stocks
+        # during vol spikes (IV crush, gamma whipsaw), so we shrink the options
+        # bucket when VIX elevates. Stocks bucket is left untouched.
+        from services.risk_manager import vix_options_bucket_multiplier as _vix_opt_mult
+        option_budget = equity * cfg.option_pct_of_equity * _vix_opt_mult()
         total_cap = equity * cfg.max_pct_of_equity
         deployed = alloc["stock"] + alloc["option"]
         return {
@@ -722,28 +726,36 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     """
     # Short-circuit if the buying-power breaker tripped recently.
     if bp_breaker_active():
+        metrics.inc("autotrade_skip", reason="bp_breaker")
         return None
     # Broker-down (Alpaca 5xx) breaker
     if broker_down():
+        metrics.inc("autotrade_skip", reason="broker_down")
         return None
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_signal({signal.get('ticker')}): entry lock busy >30s, skipping")
         metrics.inc("autotrade_event", event="entry_lock_timeout")
+        metrics.inc("autotrade_skip", reason="entry_lock_timeout")
         return None
     db = SessionLocal()
     try:
         cfg = get_config(db)
         if not cfg.enabled:
+            metrics.inc("autotrade_skip", reason="disabled")
             return None
         # C1/G5: persistent kill flag — never re-arm silently on restart.
         if getattr(cfg, "killed", False):
+            metrics.inc("autotrade_skip", reason="killed")
             return None
         if not paper_trader.is_enabled():
+            metrics.inc("autotrade_skip", reason="broker_not_enabled")
             return None
         if signal.get("signal_type") != "BUY":
+            metrics.inc("autotrade_skip", reason="non_buy_signal")
             return None  # long-only stock entries; puts are handled separately
         confidence = float(signal.get("confidence") or 0)
         if confidence < cfg.confidence_threshold:
+            metrics.inc("autotrade_skip", reason="below_confidence_threshold")
             return None
 
         # C1: Daily loss limit — halt new entries once realized PnL today is
@@ -864,6 +876,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         allowed_tfs = {s.strip() for s in (cfg.signal_timeframes or "1h,4h,1d").split(",") if s.strip()}
         sig_tf = (signal.get("timeframe") or "").strip()
         if allowed_tfs and sig_tf not in allowed_tfs:
+            metrics.inc("autotrade_skip", reason="tf_not_allowed")
             return None
         entry = signal.get("entry")
         stop = signal.get("stop_loss")
@@ -871,6 +884,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         t2 = signal.get("target2")
         t3 = signal.get("target3")
         if not (entry and stop and t1):
+            metrics.inc("autotrade_skip", reason="missing_levels")
             return None
         if stop >= entry:
             return None  # malformed signal
@@ -1085,7 +1099,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # rejects the submit with code 40310000 and we log noise.
         if risk_per_share <= 0:
             return None
-        risk_budget = equity * cfg.max_risk_per_trade_pct
+        # Adaptive risk: halve the cap under high VIX (>25) or when recent
+        # win-rate is below 55%. Catches regime changes the static cap misses.
+        from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
         # Profit-max: scale risk budget with confidence headroom above threshold.
         # Signals that clear the gate by a wide margin deserve a bigger bet.
         conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
@@ -1427,7 +1444,11 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         buying_power = max(0.0, buying_power - in_flight)
         cash = max(0.0, cash - in_flight)
         alloc = _open_allocations(db)
-        option_budget = equity * cfg.option_pct_of_equity
+        # VIX-scaled option allocation: options are punished harder than stocks
+        # during vol spikes (IV crush, gamma whipsaw), so we shrink the options
+        # bucket when VIX elevates. Stocks bucket is left untouched.
+        from services.risk_manager import vix_options_bucket_multiplier as _vix_opt_mult
+        option_budget = equity * cfg.option_pct_of_equity * _vix_opt_mult()
         option_remaining = option_budget - alloc["option"]
 
         # Aggressive mode raises per-ticker cap from 33% → 50% to allow more
@@ -1454,7 +1475,10 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         if risk_per_contract <= 0:
             return None
         notional_per_contract = _prem * 100
-        risk_budget = equity * cfg.max_risk_per_trade_pct
+        # Adaptive risk: halve the cap under high VIX (>25) or when recent
+        # win-rate is below 55%. Catches regime changes the static cap misses.
+        from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
@@ -1728,7 +1752,11 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         buying_power = max(0.0, buying_power - in_flight)
         cash = max(0.0, cash - in_flight)
         alloc = _open_allocations(db)
-        option_budget = equity * cfg.option_pct_of_equity
+        # VIX-scaled option allocation: options are punished harder than stocks
+        # during vol spikes (IV crush, gamma whipsaw), so we shrink the options
+        # bucket when VIX elevates. Stocks bucket is left untouched.
+        from services.risk_manager import vix_options_bucket_multiplier as _vix_opt_mult
+        option_budget = equity * cfg.option_pct_of_equity * _vix_opt_mult()
         option_remaining = option_budget - alloc["option"]
 
         # Audit fix #10: in aggressive mode we also enforce a hard cap
@@ -1753,7 +1781,10 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         if risk_per_contract <= 0:
             return None
         notional_per_contract = _prem * 100
-        risk_budget = equity * cfg.max_risk_per_trade_pct
+        # Adaptive risk: halve the cap under high VIX (>25) or when recent
+        # win-rate is below 55%. Catches regime changes the static cap misses.
+        from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0

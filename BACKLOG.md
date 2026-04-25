@@ -201,6 +201,50 @@ timing pre-real-money.
   spread-aware strike selection, spread-adjusted targets. ~3 days.
   Already in this BACKLOG's earlier section.
 
+## External review backlog (2026-04-25, third pass)
+
+Review covered architecture, risk, signals, execution, backtest,
+observability. Graded as follows:
+
+### ✅ Applied (commit `tier-a-b`, 2026-04-25)
+
+- **Market-cap filter on retail sentiment multipliers** — Stocktwits + WSB
+  multipliers now return neutral above $50B market cap where the tape
+  already reflects retail flow.
+- **Kelly cap 1.35 → 1.2** — tightened pre-live (not enough realized trades
+  to trust bucket win-rates aggressively).
+- **`flatten_by_eod` default-true for new configs** — overnight-gap risk
+  contained during initial live phase. Existing rows keep their setting.
+- **Adaptive risk sizing** — `max_risk_per_trade_pct` is multiplied by 0.5
+  when VIX > 25 OR recent-30d realized win-rate < 55%; 0.75× when VIX 20-25.
+- **VIX-scaled options bucket** — `option_pct_of_equity` × 0.3/0.5/0.75
+  at VIX > 30 / > 25 / > 20. Stocks bucket untouched.
+- **Gate-by-gate skip-reason metrics** — key rejection paths now
+  `metrics.inc("autotrade_skip", reason=...)`. Operator can graph
+  reject-reason frequency to spot gate miscalibration.
+- **WebSocket staleness alert** — health endpoint raises a
+  `stream_stale` alert when RTH quote stream is > 30s stale (deduped 5m).
+- **Profit factor + per-regime stats in portfolio backtest** — each
+  trade tagged with entry ADX + VIX; stats broken out by `trending` /
+  `chop` / `high_vix` / `normal`. Profit factor computed from gross
+  wins / |gross losses|.
+- **Overnight-gap simulation** — portfolio backtest now checks whether
+  the day's OPEN gapped through the stop/target and fills at OPEN price
+  if so (realistic slippage for gap-down days on resting stops).
+
+### ⏸️ Deferred — Tier C (low ROI or wrong-scope)
+
+- **Pairwise correlation matrix beyond beta** — 1+ day of work, marginal
+  over the beta-weighted heat cap we already have. Revisit if position
+  count routinely exceeds 20 (currently capped at 15).
+- **Separate position-manager process (Pub/Sub/Redis)** — genuine
+  infrastructure complexity (~2 weeks including monitoring + deploy
+  pipeline changes) for marginal resilience gain on a single-user bot.
+  Current single-process + Cloud Run min-instances=1 handles the load.
+  Revisit if single-process failure modes show up in practice.
+- **Full async I/O migration** — still deferred with documented triggers
+  (see "Async I/O migration" section above).
+
 ### Rejected — low ROI or empirically weak
 
 - **Join-the-Bid entry** — bid-chase with cancel/replace. Saves
