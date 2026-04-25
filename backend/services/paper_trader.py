@@ -99,6 +99,34 @@ def minutes_to_close() -> Optional[float]:
         return None
 
 
+def minutes_since_open() -> Optional[float]:
+    """Minutes since the most recent regular-session open, or None if market
+    is currently closed. Used to gate options entries during the wide-spread
+    opening period."""
+    c = _get_client()
+    if not c:
+        return None
+    try:
+        clk = c.get_clock()
+        if not clk.is_open:
+            return None
+        import datetime as _dt
+        # If market is open, the previous open is `next_open - 24h * trading_days_back`.
+        # Easier: use Alpaca's clock — when is_open=True, the session started at
+        # 9:30 ET. We don't have direct prev_open, but next_close gives session end;
+        # session start is next_close - 6.5h.
+        nc = clk.next_close
+        if nc.tzinfo is None:
+            nc = nc.replace(tzinfo=_dt.timezone.utc)
+        session_open = nc - _dt.timedelta(hours=6, minutes=30)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        delta = (now - session_open).total_seconds() / 60.0
+        return max(0.0, delta)
+    except Exception as e:
+        logger.warning(f"minutes_since_open failed: {e}")
+        return None
+
+
 def get_account() -> Optional[Dict[str, Any]]:
     c = _get_client()
     if not c:

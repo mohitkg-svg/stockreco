@@ -1556,11 +1556,23 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # of equity. Max 2% of equity per option position in aggressive
         # mode (1% otherwise — tighter than the bucket-fraction cap).
         per_ticker_frac = 0.50 if aggressive else 0.33
-        per_contract_dollar_cap = equity * (0.02 if aggressive else 0.01)
+        # Cheap-options gamma guard. Sub-$1 premium options have huge
+        # contract-count-per-dollar — CNTA paper $0.30 call took 122 contracts
+        # for a $3.7K notional position, then a 1% adverse move wiped $2,440.
+        # Tighten the per-position dollar cap for cheap premium so the count
+        # stays sane.
+        _prem = float(top["premium"])
+        if _prem < 0.50:
+            per_contract_dollar_cap_frac = 0.005   # 0.5% equity for sub-$0.50 premium
+        elif _prem < 2.00:
+            per_contract_dollar_cap_frac = 0.010   # 1% for $0.50-2 premium
+        else:
+            per_contract_dollar_cap_frac = (0.02 if aggressive else 0.01)  # original
+        per_contract_dollar_cap = equity * per_contract_dollar_cap_frac
         risk_per_contract = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
         if risk_per_contract <= 0:
             return None
-        notional_per_contract = float(top["premium"]) * 100
+        notional_per_contract = _prem * 100
         risk_budget = equity * cfg.max_risk_per_trade_pct
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
@@ -1593,6 +1605,16 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         if _mtc is not None and _mtc <= 45.0:
             logger.info(f"AutoTrader skip PUT {ticker} {occ}: {_mtc:.0f}m to close (EOD guard)")
             metrics.inc("autotrade_event", event="eod_guard_put")
+            return None
+
+        # Opening-bell guard: refuse new option entries in the first 15 min of
+        # the session. Bid-ask spreads are at their widest right after the bell
+        # (paper VTWO -$6,500 in 24s where the "decay" was entirely the spread
+        # cross at 13:48 UTC = 9:48 ET, only 18 min after open).
+        _mso = paper_trader.minutes_since_open()
+        if _mso is not None and _mso < 15.0:
+            logger.info(f"AutoTrader skip PUT {ticker} {occ}: only {_mso:.0f}m since open (opening-bell guard)")
+            metrics.inc("autotrade_event", event="opening_guard_put")
             return None
 
         logger.info(
@@ -1833,11 +1855,23 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # of equity. Max 2% of equity per option position in aggressive
         # mode (1% otherwise — tighter than the bucket-fraction cap).
         per_ticker_frac = 0.50 if aggressive else 0.33
-        per_contract_dollar_cap = equity * (0.02 if aggressive else 0.01)
+        # Cheap-options gamma guard. Sub-$1 premium options have huge
+        # contract-count-per-dollar — CNTA paper $0.30 call took 122 contracts
+        # for a $3.7K notional position, then a 1% adverse move wiped $2,440.
+        # Tighten the per-position dollar cap for cheap premium so the count
+        # stays sane.
+        _prem = float(top["premium"])
+        if _prem < 0.50:
+            per_contract_dollar_cap_frac = 0.005   # 0.5% equity for sub-$0.50 premium
+        elif _prem < 2.00:
+            per_contract_dollar_cap_frac = 0.010   # 1% for $0.50-2 premium
+        else:
+            per_contract_dollar_cap_frac = (0.02 if aggressive else 0.01)  # original
+        per_contract_dollar_cap = equity * per_contract_dollar_cap_frac
         risk_per_contract = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
         if risk_per_contract <= 0:
             return None
-        notional_per_contract = float(top["premium"]) * 100
+        notional_per_contract = _prem * 100
         risk_budget = equity * cfg.max_risk_per_trade_pct
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
@@ -1859,6 +1893,14 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         if _mtc is not None and _mtc <= 45.0:
             logger.info(f"AutoTrader skip CALL {ticker} {occ}: {_mtc:.0f}m to close (EOD guard)")
             metrics.inc("autotrade_event", event="eod_guard_call")
+            return None
+
+        # Opening-bell guard — mirror of put-side. First 15 min has the widest
+        # spreads of the day; cost VTWO/CNTA/AMKR ~$10K combined on 2026-04-24.
+        _mso = paper_trader.minutes_since_open()
+        if _mso is not None and _mso < 15.0:
+            logger.info(f"AutoTrader skip CALL {ticker} {occ}: only {_mso:.0f}m since open (opening-bell guard)")
+            metrics.inc("autotrade_event", event="opening_guard_call")
             return None
 
         logger.info(
@@ -2353,11 +2395,39 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             exit_reason = f"underlying broke trailing u-stop ${t.current_stop:.2f} (now ${px:.2f})"
             final_status = "closed_stop"
 
-    # 5) Premium decay safety — still exit if the option has lost ≥ 50% of premium
+    # 5) Premium decay safety — still exit if the option has lost ≥ 50% of premium.
+    # Two anti-spread-artifact guards:
+    #  (a) Don't fire within 5 minutes of opening — paper VTWO -$6,500 in 24s
+    #      where the "decay" was ~entirely the bid-ask cross at market open
+    #      (entered at ask $4.90, valuation went to bid $2.30 instantly).
+    #      Real theta-driven 50% decay over 22 DTE takes hours, not seconds.
+    #  (b) Require the underlying to be moving against the thesis — if we're
+    #      a long CALL and underlying is FLAT or UP vs entry, a "50% decay"
+    #      reading is almost certainly a stale/wide quote. Don't exit on
+    #      premium alone; let the underlying-stop in step 4 handle real losses.
     if not exit_reason and cur_premium is not None and t.entry_price:
         if cur_premium <= t.entry_price * 0.5:
-            exit_reason = f"premium decayed to ${cur_premium:.2f} (≥50% of entry ${t.entry_price:.2f})"
-            final_status = "closed_stop"
+            from datetime import datetime as _dt_pm, timedelta as _td_pm
+            opened = t.filled_at or t.opened_at
+            held_secs = (_dt_pm.utcnow() - opened).total_seconds() if opened else 99999
+            spread_artifact_window = held_secs < 300  # 5 min
+            # Check underlying direction against thesis
+            underlying_against_us = False
+            if px is not None and getattr(t, "requested_entry", None):
+                # For CALL: against = price < entry; for PUT: against = price > entry
+                if is_put:
+                    underlying_against_us = px > float(t.requested_entry) * 1.001
+                else:
+                    underlying_against_us = px < float(t.requested_entry) * 0.999
+            if spread_artifact_window and not underlying_against_us:
+                logger.info(
+                    f"AutoTrader skip premium-stop {t.ticker} {t.symbol}: held {held_secs:.0f}s, "
+                    f"underlying not against us (px={px} entry={t.requested_entry}) — likely spread artifact"
+                )
+                metrics.inc("autotrade_event", event="premium_stop_spread_skip")
+            else:
+                exit_reason = f"premium decayed to ${cur_premium:.2f} (≥50% of entry ${t.entry_price:.2f})"
+                final_status = "closed_stop"
 
     if exit_reason:
         sell = paper_trader.submit_simple_option_order(
@@ -2443,13 +2513,25 @@ def _trade_source_timeframe(t: AutoTrade, db: Session) -> str:
     return "1d"  # safe default
 
 
+def _is_call_option(t: AutoTrade) -> bool:
+    """Parse OCC symbol to detect CALL vs PUT. OCC format has the C/P
+    indicator immediately before the 8-digit strike, so it's at position
+    [-9] from end. AMKR260515C00075000 → 'C'."""
+    sym = (getattr(t, "symbol", None) or "")
+    return bool(sym) and len(sym) >= 9 and sym[-9].upper() == "C"
+
+
 def _check_reversal(t: AutoTrade, db: Session) -> Optional[str]:
     """
     Detect a strong opposing signal that landed AFTER this trade was opened.
     Returns a reason string if we should close, else None.
 
       • Long stock     → opposing = SELL signal ≥ gate
-      • Long put       → opposing = BUY  signal ≥ gate (bull thesis invalidates short)
+      • Long PUT       → opposing = BUY  signal ≥ gate (bull thesis invalidates put)
+      • Long CALL      → opposing = SELL signal ≥ gate (bear thesis invalidates call)
+
+    Pre-fix bug: all options used BUY as opposing, which closed CALL plays
+    on confirming-bull signals (lost ~$1,190 on AMKR before this fix).
 
     The opposing signal must be on a timeframe ≥ the trade's source TF — a 5m
     fakeout shouldn't be allowed to close a 1d-conviction position.
@@ -2457,7 +2539,11 @@ def _check_reversal(t: AutoTrade, db: Session) -> Optional[str]:
     opened_at = t.filled_at or t.opened_at
     if not opened_at:
         return None
-    opposing = "SELL" if t.asset_type == "stock" else "BUY"
+    if t.asset_type == "stock":
+        opposing = "SELL"
+    else:
+        # Options: direction depends on call vs put
+        opposing = "SELL" if _is_call_option(t) else "BUY"
     src_tf = _trade_source_timeframe(t, db)
     src_rank = _TF_RANK.get(src_tf, 6)
 
