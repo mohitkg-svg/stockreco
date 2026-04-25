@@ -153,6 +153,18 @@ async def _broadcast(event: Dict[str, Any]) -> None:
         _subscribers.discard(cb)
 
 
+def broadcast_event_safe(event: Dict[str, Any]) -> None:
+    """Thread-safe broadcast for callers that aren't running in the asyncio
+    loop (e.g. the scheduler thread that runs auto_trader.manage_open_positions).
+    No-ops silently if the loop isn't running.
+    """
+    if _loop and _loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(_broadcast(event), _loop)
+        except Exception as e:
+            logger.debug(f"broadcast_event_safe failed: {e}")
+
+
 # ------------------------------------------------------------------
 # Option quote ingestion (public — callable from REST pollers)
 # ------------------------------------------------------------------

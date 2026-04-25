@@ -313,6 +313,30 @@ class NewsEvent(Base):
     severity = Column(Integer, nullable=True)
 
 
+class InstitutionalHoldings(Base):
+    """Aggregated institutional-ownership snapshot per ticker.
+
+    Sourced from yfinance `.institutional_holders` + `.mutualfund_holders`
+    (which under the hood come from SEC 13F filings). Weekly refresh.
+    Slow-moving signal (quarterly, ~45d lag). Useful mostly as a
+    rising-vs-falling institutional-interest tilt.
+
+    - `total_holders` = count of top-10 institutional + top-10 mutual fund holders
+    - `weighted_pct_change_qoq` = position-weighted mean of pctChange across
+      the top holders (positive = net institutional accumulation last quarter)
+    - `new_initiation_count` = holders whose position is <=1 quarter old
+    """
+    __tablename__ = "institutional_holdings"
+    ticker = Column(String, primary_key=True)
+    as_of_quarter = Column(String, nullable=True)       # e.g. "2026Q1"
+    total_holders = Column(Integer, nullable=True)
+    weighted_pct_change_qoq = Column(Float, nullable=True)   # -1.0..+inf (0.25 = +25%)
+    new_initiation_count = Column(Integer, nullable=True)
+    top_holder_name = Column(String, nullable=True)
+    top_holder_pct_held = Column(Float, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
 class InsiderSummary(Base):
     """Per-ticker rollup of SEC Form 4 insider transactions.
 
@@ -333,6 +357,26 @@ class InsiderSummary(Base):
     sell_count_90d = Column(Integer, nullable=True)
     net_buy_ratio_90d = Column(Float, nullable=True)      # buys / (buys + sells), None if 0 total
     buy_dollar_90d = Column(Float, nullable=True)         # sum of $ value of insider purchases
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
+class WSBMention(Base):
+    """r/wallstreetbets ticker-mention rollup.
+
+    Pulled every 30 min from Reddit's public JSON API. Counts top-level
+    post + comment mentions of each watchlist/pool ticker. The 7d z-score
+    vs 30d baseline catches squeeze setups (sudden spike in retail
+    attention). Signal is meaningful on retail-driven/meme tickers and
+    low-float squeezes; near-zero on mega-caps where retail flow is
+    already priced into the tape.
+    """
+    __tablename__ = "wsb_mentions"
+    ticker = Column(String, primary_key=True)
+    mentions_24h = Column(Integer, nullable=True)
+    mentions_7d = Column(Integer, nullable=True)
+    mentions_7d_zscore = Column(Float, nullable=True)   # vs 30d rolling baseline
+    bullish_hint_24h = Column(Integer, nullable=True)   # "calls", "moon", "yolo"
+    bearish_hint_24h = Column(Integer, nullable=True)   # "puts", "short", "crash"
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
 
 

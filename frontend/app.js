@@ -170,6 +170,9 @@ function useLiveQuotes(onSignalUpdate) {
           }));
         } else if (msg.type === 'signals_updated' && onSignalUpdate && typeof msg.symbol === 'string') {
           onSignalUpdate(msg.symbol);
+        } else if (msg.type === 'target_hit') {
+          // Fire a toast + browser notification for T1/T2/T3 hits.
+          try { window.dispatchEvent(new CustomEvent('app:target_hit', { detail: msg })); } catch (_) {}
         }
       };
     };
@@ -3002,6 +3005,66 @@ function LoginScreen({ onSuccess }) {
 // Thin dispatcher: gate on auth and only mount the real UI once authenticated.
 // Keeping hooks in two components avoids the "rendered more hooks than
 // previous render" crash when the auth guard is in the same component.
+function TargetHitToasts() {
+  const [toasts, setToasts] = useState([]);
+
+  // Request browser-notification permission once per session (lazy — only
+  // after the first target_hit event arrives, which is user-intent-adjacent).
+  const requestedRef = useRef(false);
+
+  useEffect(() => {
+    const onHit = (ev) => {
+      const d = ev.detail || {};
+      const id = `${d.trade_id}-${d.level}-${Date.now()}`;
+      const toast = {
+        id, ticker: d.ticker, level: d.level,
+        price: d.price, newStop: d.new_stop,
+        asset: d.asset_type,
+      };
+      setToasts(ts => [...ts, toast]);
+      // Auto-dismiss after 8s
+      setTimeout(() => setToasts(ts => ts.filter(t => t.id !== id)), 8000);
+
+      // Browser notification (only when tab is backgrounded — avoids noise)
+      if (document.visibilityState === 'hidden') {
+        if (!requestedRef.current && 'Notification' in window && Notification.permission === 'default') {
+          try { Notification.requestPermission(); } catch (_) {}
+          requestedRef.current = true;
+        }
+        if ('Notification' in window && Notification.permission === 'granted') {
+          try {
+            new Notification(`${d.ticker} ${d.level} hit @ $${d.price}`, {
+              body: d.new_stop ? `Stop trailed to $${d.new_stop}` : undefined,
+              tag: `target-${d.trade_id}-${d.level}`,
+            });
+          } catch (_) {}
+        }
+      }
+    };
+    window.addEventListener('app:target_hit', onHit);
+    return () => window.removeEventListener('app:target_hit', onHit);
+  }, []);
+
+  if (toasts.length === 0) return null;
+  return (
+    <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-xs">
+      {toasts.map(t => (
+        <div key={t.id} className="surface rounded-lg p-3 border border-emerald-500/40 shadow-xl animate-in">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-lg">🎯</span>
+            <span className="font-bold">{t.ticker}</span>
+            <span className="pill pill-success text-[10px]">{t.level}</span>
+            <span className="text-[10px] app-text-muted uppercase">{t.asset}</span>
+          </div>
+          <div className="text-xs font-mono">
+            hit @ ${t.price}{t.newStop ? ` · stop→$${t.newStop}` : ''}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ChatWidget() {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState('');
@@ -3330,6 +3393,7 @@ function AuthedApp({ onLogout }) {
           </div>
         )}
       </div>
+      <TargetHitToasts />
       <ChatWidget />
     </div>
   );

@@ -445,6 +445,30 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"insider_trades job not scheduled: {_e}")
+    # r/wallstreetbets scraper — every 30 min. Reddit rate-limits unauth at
+    # ~60 req/min; we stay well under with 2 pages per run.
+    try:
+        from services import wsb_scraper as _wsb
+        scheduler.add_job(
+            _wsb.refresh_once,
+            "interval", minutes=30, id="wsb_scraper",
+            max_instances=1, coalesce=True, misfire_grace_time=300,
+        )
+    except Exception as _e:
+        logger.warning(f"wsb_scraper job not scheduled: {_e}")
+    # Institutional holdings (13F proxy via yfinance) — weekly Sunday 05:15
+    # UTC. 13F cadence is quarterly-with-lag so weekly is plenty.
+    try:
+        from services import institutional as _inst
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            _inst.refresh_all,
+            trigger=_Cron(day_of_week="sun", hour=5, minute=15),
+            id="institutional_weekly",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+    except Exception as _e:
+        logger.warning(f"institutional job not scheduled: {_e}")
     # ML: weekly retrain on Sunday 06:00 UTC. Heavy job (5-15 min depending
     # on universe size). Initial training has to be triggered manually via
     # POST /api/ml/train after first deploy.

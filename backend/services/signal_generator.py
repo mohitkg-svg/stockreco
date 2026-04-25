@@ -613,6 +613,27 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
+        # WSB crowd sentiment (±3%) — noisy, only tilts on clear bullish/bearish
+        # lean with adequate mention volume.
+        try:
+            from services.wsb_scraper import wsb_multiplier, wsb_reason_line
+            _regime_mult *= wsb_multiplier(ticker, "BUY")
+            _w_line = wsb_reason_line(ticker, "BUY")
+            if _w_line:
+                reasons.append(_w_line)
+        except Exception:
+            pass
+
+        # Institutional accumulation / distribution QoQ (±3%, slow-moving).
+        try:
+            from services.institutional import institutional_multiplier, institutional_reason_line
+            _regime_mult *= institutional_multiplier(ticker, "BUY")
+            _i_line = institutional_reason_line(ticker, "BUY")
+            if _i_line:
+                reasons.append(_i_line)
+        except Exception:
+            pass
+
         # ML scorer: predicts P(win). Always runs (logs prediction); multiplier
         # is 1.0 unless ml_scoring_enabled=True in config (shadow-mode default).
         try:
@@ -814,6 +835,26 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
             _ins_line = insider_reason_line(ticker, "SELL")
             if _ins_line:
                 reasons.append(_ins_line)
+        except Exception:
+            pass
+
+        # WSB — bearish crowd lean confirms SELL.
+        try:
+            from services.wsb_scraper import wsb_multiplier, wsb_reason_line
+            _regime_mult *= wsb_multiplier(ticker, "SELL")
+            _w_line = wsb_reason_line(ticker, "SELL")
+            if _w_line:
+                reasons.append(_w_line)
+        except Exception:
+            pass
+
+        # Institutional distribution confirms bearish.
+        try:
+            from services.institutional import institutional_multiplier, institutional_reason_line
+            _regime_mult *= institutional_multiplier(ticker, "SELL")
+            _i_line = institutional_reason_line(ticker, "SELL")
+            if _i_line:
+                reasons.append(_i_line)
         except Exception:
             pass
 

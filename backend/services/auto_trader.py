@@ -2387,6 +2387,20 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                 if tightened else
                 f" | underlying {tag} hit @ {px:.2f} (u-stop unchanged)"
             )
+            # Push-notify the UI via the live-quotes WebSocket channel.
+            try:
+                from services import live_quotes as _lq
+                _lq.broadcast_event_safe({
+                    "type": "target_hit",
+                    "trade_id": t.id,
+                    "ticker": t.ticker,
+                    "asset_type": t.asset_type,
+                    "level": tag,
+                    "price": round(float(px), 2),
+                    "new_stop": round(float(new_stop), 2) if new_stop else None,
+                })
+            except Exception:
+                pass
             if target_idx == 2:
                 new_targets = _recalculate_targets(t.ticker, "bear" if is_put else "long", px)
                 if new_targets:
@@ -3133,6 +3147,20 @@ def manage_open_positions() -> Dict[str, Any]:
                                                 t.hit_t1 = True
                                             tag = ["T1", "T2", "T3"][target_idx]
                                             t.note = (t.note or "") + f" | {tag} hit @ {px:.2f}, stop→{new_stop}"
+                                            # Push-notify UI
+                                            try:
+                                                from services import live_quotes as _lq
+                                                _lq.broadcast_event_safe({
+                                                    "type": "target_hit",
+                                                    "trade_id": t.id,
+                                                    "ticker": t.ticker,
+                                                    "asset_type": t.asset_type,
+                                                    "level": tag,
+                                                    "price": round(float(px), 2),
+                                                    "new_stop": round(float(new_stop), 2),
+                                                })
+                                            except Exception:
+                                                pass
                                             if target_idx == 2 and (t.level_index or 0) < 3:
                                                 # First T3 cycle — recompute
                                                 # the next rung for one more
