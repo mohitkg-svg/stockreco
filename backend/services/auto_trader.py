@@ -1864,175 +1864,21 @@ from services.execution_engine import (
 )
 
 
-from services.config import PRICE_FALLBACK_TTL_SEC as _PRICE_FALLBACK_TTL
-_price_fallback_cache: Dict[str, tuple] = {}  # ticker -> (price, expiry_ts)
-
-# Daily-ATR cache for the chandelier overlay. ATR_14 on 1d bars only changes
-# meaningfully once per session — recomputing every 60s tick across N open
-# trades wastes CPU + 1d OHLCV fetches. 5-minute TTL is plenty.
-_chandelier_atr_cache: Dict[str, tuple] = {}  # ticker -> (atr, expiry_ts)
-_CHANDELIER_ATR_TTL = 300.0
-
-
-def _chandelier_atr(ticker: str) -> Optional[float]:
-    import time as _t
-    now = _t.time()
-    cached = _chandelier_atr_cache.get(ticker.upper())
-    if cached and now < cached[1]:
-        return cached[0]
-    try:
-        from services.data_fetcher import fetch_ohlcv as _fo
-        from services.indicators import compute_indicators as _ci
-        _df = _fo(ticker, "1d")
-        if _df is None or _df.empty:
-            return None
-        _ind = _ci(_df)
-        atr = float(_ind["ATR_14"].iloc[-1])
-        _chandelier_atr_cache[ticker.upper()] = (atr, now + _CHANDELIER_ATR_TTL)
-        return atr
-    except Exception:
-        return None
+# Chandelier helpers, price lookup, target recalc, and reverse-thesis
+# checks moved to services.position_manager. Back-compat aliases below.
+from services.position_manager import (
+    chandelier_atr as _chandelier_atr,
+    chandelier_adx as _chandelier_adx,
+    adaptive_chandelier_mult as _adaptive_chandelier_mult,
+    current_price as _current_price,
+)
 
 
-# Daily ADX cache for adaptive chandelier — same 5-min TTL as the ATR cache.
-_chandelier_adx_cache: Dict[str, tuple] = {}
-
-
-def _chandelier_adx(ticker: str) -> Optional[float]:
-    """Daily ADX_14 for the ticker — used to loosen/tighten the chandelier
-    trail based on trend strength. Strong trends (ADX > 30) let winners
-    run with a wider trail; chop (ADX < 20) tightens it to reduce bleed."""
-    import time as _t
-    now = _t.time()
-    cached = _chandelier_adx_cache.get(ticker.upper())
-    if cached and now < cached[1]:
-        return cached[0]
-    try:
-        from services.data_fetcher import fetch_ohlcv as _fo
-        from services.indicators import compute_indicators as _ci
-        _df = _fo(ticker, "1d")
-        if _df is None or _df.empty:
-            return None
-        _ind = _ci(_df)
-        if "ADX_14" not in _ind.columns:
-            return None
-        adx = float(_ind["ADX_14"].iloc[-1])
-        _chandelier_adx_cache[ticker.upper()] = (adx, now + _CHANDELIER_ATR_TTL)
-        return adx
-    except Exception:
-        return None
-
-
-def _adaptive_chandelier_mult(base_mult: float, ticker: str) -> float:
-    """Adjust the configured chandelier multiplier based on trend strength:
-      • ADX > 30  (strong trend)     → base × 1.33 (give winners room)
-      • ADX < 20  (chop)             → base × 0.83 (cut bleed)
-      • 20 ≤ ADX ≤ 30 (transitional) → base (config value unchanged)
-    Returns base if ADX cannot be read.
-    """
-    adx = _chandelier_adx(ticker)
-    if adx is None:
-        return base_mult
-    if adx > 30:
-        return base_mult * 1.33
-    if adx < 20:
-        return base_mult * 0.83
-    return base_mult
-
-
-def _current_price(ticker: str) -> Optional[float]:
-    """
-    Use live WS quote first (no network), fall back to a 30-second-memoized
-    Yahoo fetch so the manage loop doesn't hammer external APIs every minute
-    for tickers that aren't streaming.
-    """
-    try:
-        live = live_quotes.get_live_price(ticker)
-        if live and live > 0:
-            return live
-    except Exception:
-        pass
-
-    import time as _t
-    now = _t.time()
-    cached = _price_fallback_cache.get(ticker.upper())
-    if cached and now < cached[1]:
-        return cached[0]
-    try:
-        pi = fetch_current_price(ticker)
-        if pi:
-            px = float(pi[0])
-            _price_fallback_cache[ticker.upper()] = (px, now + _PRICE_FALLBACK_TTL)
-            return px
-    except Exception:
-        return None
-    return None
-
-
-def _recalculate_targets(ticker: str, direction: str, current_price: float) -> Optional[List[float]]:
-    """
-    After T3 is breached and the trend is clearly continuing, compute the next
-    three targets from `current_price`. Uses recent daily swing levels above
-    (long) or below (bear) current price; falls back to ATR-based steps when
-    the chart hasn't formed enough structure beyond.
-    Returns [t1, t2, t3] or None on failure.
-    """
-    try:
-        from services.data_fetcher import fetch_ohlcv
-        from services.support_resistance import swing_levels
-        from services.indicators import compute_indicators
-        from services.gap_detector import gap_targets_above, gap_targets_below
-        df = fetch_ohlcv(ticker, "1d")
-        if df is None or df.empty:
-            return None
-        levels = swing_levels(df, window=10, max_levels=12)
-        # ATR fallback step
-        atr = None
-        try:
-            ind = compute_indicators(df)
-            atr = float(ind["ATR_14"].iloc[-1])
-        except Exception:
-            atr = current_price * 0.02
-        if not atr or atr <= 0:
-            atr = current_price * 0.02
-
-        # Gap-fill levels are high-probability magnets — fold them into the candidate pool.
-        if direction == "long":
-            swing_above = {l["price"] for l in levels if l["price"] > current_price * 1.005}
-            gap_above = set(gap_targets_above(df, current_price))
-            above = sorted(swing_above | gap_above)
-            picks = above[:3]
-        else:
-            swing_below = {l["price"] for l in levels if l["price"] < current_price * 0.995}
-            gap_below = set(gap_targets_below(df, current_price))
-            below = sorted(swing_below | gap_below, reverse=True)
-            picks = below[:3]
-
-        # Top up with ATR-stepped projections if we didn't get 3 swing levels
-        while len(picks) < 3:
-            step = (len(picks) + 1) * 1.5 * atr
-            nxt = current_price + step if direction == "long" else current_price - step
-            picks.append(round(nxt, 2))
-
-        return [round(float(p), 2) for p in picks[:3]]
-    except Exception as e:
-        logger.warning(f"_recalculate_targets({ticker}) failed: {e}")
-        return None
-
-
-def _record_target_history(t: AutoTrade, reason: str, new_targets: List[float]) -> None:
-    """Append a target-recalc event to the JSON audit log on the trade row."""
-    import json as _json
-    try:
-        existing = _json.loads(t.targets_history) if t.targets_history else []
-    except Exception:
-        existing = []
-    existing.append({
-        "at": datetime.utcnow().isoformat(),
-        "reason": reason,
-        "targets": new_targets,
-    })
-    t.targets_history = _json.dumps(existing)
+# Target-recalc helpers moved to services.position_manager.
+from services.position_manager import (
+    recalculate_targets as _recalculate_targets,
+    record_target_history as _record_target_history,
+)
 
 
 def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) -> None:
@@ -2286,128 +2132,18 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             _post_mortem_async(t.id)
 
 
-REVERSE_CONFIDENCE_GATE = 80.0  # Critical-audit fix #7: raised 65 → 80.
-# A 65-confidence 1d SELL was reversing profitable 1mo BUYs on 2-3 day
-# fake-outs. Requiring 80+ means only high-conviction opposite signals
-# force-close — reduces premature exits of multi-week trends.
-
-
-def check_reversals_for(ticker: str) -> int:
-    """
-    Evaluate reverse-thesis closure for any open auto-trade on `ticker`. Called
-    immediately after a fresh analysis run for that ticker so we can react
-    inside the same heartbeat instead of waiting for the next 60s manage tick.
-    Returns count of trades closed.
-    """
-    db = SessionLocal()
-    summary = {"closed": 0}
-    try:
-        cfg = get_config(db)
-        if not cfg.enabled or not paper_trader.is_enabled():
-            return 0
-        trades = db.query(AutoTrade).filter(
-            AutoTrade.ticker == ticker.upper(),
-            AutoTrade.status == "open",
-        ).all()
-        for t in trades:
-            try:
-                rev = _check_reversal(t, db)
-                if rev:
-                    _force_close_trade(t, db, rev, summary)
-            except Exception as e:
-                logger.warning(f"reversal check error on {t.ticker} #{t.id}: {e}")
-        return summary["closed"]
-    finally:
-        db.close()
-
-
-# Timeframe rank — higher TF carries more weight. Reverse-thesis only fires
-# when the opposing signal is on a TF ≥ the original trade-source TF (a 5m
-# blip shouldn't yank a position opened off a 1d signal).
-_TF_RANK = {"5m": 1, "15m": 2, "30m": 3, "1h": 4, "4h": 5, "1d": 6, "1mo": 7}
-
-
-def _trade_source_timeframe(t: AutoTrade, db: Session) -> str:
-    """Best-effort lookup of the timeframe that produced this trade's signal."""
-    if t.signal_id:
-        s = db.query(Signal).filter(Signal.id == t.signal_id).first()
-        if s and s.timeframe:
-            return s.timeframe
-    return "1d"  # safe default
-
-
-def _is_call_option(t: AutoTrade) -> bool:
-    """Parse OCC symbol to detect CALL vs PUT. OCC format has the C/P
-    indicator immediately before the 8-digit strike, so it's at position
-    [-9] from end. AMKR260515C00075000 → 'C'."""
-    sym = (getattr(t, "symbol", None) or "")
-    return bool(sym) and len(sym) >= 9 and sym[-9].upper() == "C"
-
-
-def _check_reversal(t: AutoTrade, db: Session) -> Optional[str]:
-    """
-    Detect a strong opposing signal that landed AFTER this trade was opened.
-    Returns a reason string if we should close, else None.
-
-      • Long stock     → opposing = SELL signal ≥ gate
-      • Long PUT       → opposing = BUY  signal ≥ gate (bull thesis invalidates put)
-      • Long CALL      → opposing = SELL signal ≥ gate (bear thesis invalidates call)
-
-    Pre-fix bug: all options used BUY as opposing, which closed CALL plays
-    on confirming-bull signals (lost ~$1,190 on AMKR before this fix).
-
-    The opposing signal must be on a timeframe ≥ the trade's source TF — a 5m
-    fakeout shouldn't be allowed to close a 1d-conviction position.
-    """
-    opened_at = t.filled_at or t.opened_at
-    if not opened_at:
-        return None
-    if t.asset_type == "stock":
-        opposing = "SELL"
-    else:
-        # Options: direction depends on call vs put
-        opposing = "SELL" if _is_call_option(t) else "BUY"
-    src_tf = _trade_source_timeframe(t, db)
-    src_rank = _TF_RANK.get(src_tf, 6)
-
-    # Postmortem fix C3: 60-second grace window. The same `_run_analysis_for_ticker`
-    # pass that opened the trade also writes signals across all other timeframes;
-    # without a grace period a 1d SELL written milliseconds after the 1h BUY
-    # opens would close the brand-new trade in the same heartbeat. 60s is short
-    # enough that a real reversal still acts in the next manage tick and long
-    # enough to clear out same-pass writes (a multi-TF analyze takes 5-15s).
-    from datetime import timedelta as _td_grace
-    earliest_valid = opened_at + _td_grace(seconds=60)
-
-    candidates = (
-        db.query(Signal)
-        .filter(
-            Signal.ticker == t.ticker,
-            Signal.signal_type == opposing,
-            Signal.generated_at > earliest_valid,
-            Signal.confidence >= REVERSE_CONFIDENCE_GATE,
-        )
-        .order_by(desc(Signal.generated_at))
-        .all()
-    )
-    # Postmortem fix M5: a 1d opposing signal CAN reverse a 1mo-source trade.
-    # The strict `>=` rule made 1mo trades effectively un-reverse-able because
-    # 1mo signals barely change month-to-month. Allow the opposing TF to be
-    # one rank below the source TF.
-    # Critical-audit fix #7: opposing TF must match or EXCEED source TF.
-    # Previously allowed (src_rank - 1), which let a 1d SELL reverse a 1mo
-    # BUY on a fakeout. Now a 1mo trade can only be reversed by a 1mo signal
-    # (or higher); 1d by 1d+; 4h by 4h+. Long-TF trades get protection from
-    # short-TF noise reversals.
-    min_rank = src_rank
-    for sig in candidates:
-        if _TF_RANK.get(sig.timeframe, 0) >= min_rank:
-            return (
-                f"reverse-thesis {opposing} signal landed @ conf {sig.confidence:.0f} "
-                f"on {sig.timeframe} (>= rank {min_rank}, src TF {src_tf}); "
-                f"generated {sig.generated_at.isoformat()}"
-            )
-    return None
+# Reverse-thesis helpers moved to services.position_manager.
+# Back-compat aliases below — REVERSE_CONFIDENCE_GATE is re-exported from
+# position_manager so any external importer of auto_trader.REVERSE_CONFIDENCE_GATE
+# still works.
+from services.position_manager import (
+    check_reversals_for,
+    trade_source_timeframe as _trade_source_timeframe,
+    is_call_option as _is_call_option,
+    check_reversal as _check_reversal,
+    REVERSE_CONFIDENCE_GATE,
+    _TF_RANK,
+)
 
 
 def _force_close_trade(
