@@ -231,7 +231,14 @@ best strategy, score) is blended in when available.
 | `chandelier_atr_mult` | 3.0 | Trailing stop overlay (0 = off; adaptive x0.83/1.33 on live) |
 | `signal_timeframes` | "1h,4h,1d" | Eligible timeframes for entry |
 | `trade_options` | **true** | Enable PUT auto-buy |
-| `flatten_by_eod` | false | 15:55 ET liquidation (intraday mode) |
+| `flatten_by_eod` | **true** (since r32) | 15:55 ET liquidation (intraday mode). Was false; defaulted-true pre-live to bound overnight gap risk. |
+| `ml_scoring_enabled` | false | Flip to True after `/api/ml/calibration` shows aligned predicted-vs-actual buckets (target: ≥2 weeks of paper data). Default False = shadow mode (predictions logged, multiplier 1.0). |
+| `aggressive_options_mode` | false | Lowers option-leg confidence floors and lets sub-threshold setups through. |
+| `trade_calls` | true | CALL play auto-buy. |
+| `use_universe_scanner` | true | Read from `CandidatePool` in addition to watchlist. |
+| `universe_top_n` | 50 | Pool size to consume per scan. |
+| `entry_order_type` | `limit_at_mid` | `market` or `limit_at_mid`. Limit saves ~half the spread on liquid names. |
+| `ticker_blacklist` | "" | Comma-separated symbols never to trade (e.g. "GOOGL"). |
 
 ### 4.4 `AutoTrade`
 Per-entry lifecycle. Status values: `pending`, `open`, `closed_target`,
@@ -248,7 +255,7 @@ Per-entry lifecycle. Status values: `pending`, `open`, `closed_target`,
 - `sector` — captured at entry for correlation cap
 - `post_mortem` — JSON analysis populated only on losing stops
 
-### 4.5 `NewsEvent` (new)
+### 4.5 `NewsEvent`
 One row per Alpaca news article, de-duped on `external_id`.
 
 | Field | Purpose |
@@ -259,13 +266,42 @@ One row per Alpaca news article, de-duped on `external_id`.
 | `headline` / `summary` / `url` | Article content |
 | `published_at` | Article timestamp, indexed |
 | `fetched_at` | When our poller ingested it |
-| `sentiment_score` | VADER compound ∈ [-1, +1] |
+| `sentiment_score` | Compound ∈ [-1, +1] (VADER default; FinBERT opt-in) |
 | `sentiment_label` | positive / negative / neutral |
 | `severity` | `abs(score)` × 100, 0–100 |
 
-Not linked to trades via FK — join at query time by ticker + time overlap
-so the news-context query works for trades that closed before news
-ingestion started.
+Not linked to trades via FK — join at query time by ticker + time overlap.
+
+### 4.6 Alt-data tables (Revisions 24-30)
+
+| Table | Source | Cadence | Used by |
+|---|---|---|---|
+| `Fundamentals` | yfinance .info | Weekly Sun 04:30 UTC | `quality_multiplier` (±8%), `short_interest_multiplier` (±8%), `beta_weight` (heat cap) |
+| `AnalystRating` | yfinance .info | 4×/day | `rating_multiplier` (±10%) |
+| `MacroEvent` | Recurrence rules + FRED | Daily 05:00 UTC + 15min FRED fetch | `is_in_blackout` gate on entries |
+| `InsiderSummary` | SEC EDGAR Form 4 | Weekly Sun 04:45 UTC | `insider_multiplier` (±6%) |
+| `SocialSentiment` | Stocktwits public API | 4×/day | `sentiment_multiplier` (±4%, mcap < $50B only) |
+| `WSBMention` | Reddit r/wallstreetbets | Every 30 min | `wsb_multiplier` (±3%, mcap < $50B only) |
+| `InstitutionalHoldings` | yfinance institutional_holders (13F proxy) | Weekly Sun 05:15 UTC | `institutional_multiplier` (±3%) |
+
+All have hash-based change detection where appropriate (Fundamentals)
+or quarterly-stale-tolerant designs.
+
+### 4.7 ML tables (Revisions 19-20)
+
+| Table | Purpose |
+|---|---|
+| `MLPrediction` | Every signal that hits the scorer logs predicted_winrate + signal_confidence + (post-close) outcome + realized_pl. Drives the calibration endpoint. |
+| `MLArtifact` | Trained model bytes + meta JSON + status JSON, single-row-per-name. Survives container churn since Cloud Run /tmp is per-instance. |
+
+### 4.8 Operational tables
+
+| Table | Purpose |
+|---|---|
+| `Alert` | Operator alert inbox (severity, category, message, ticker, trade_id, ack timestamps). 5-minute dedup on category+message. |
+| `CandidatePool` | Universe scanner output — top-N tickers ranked by composite RVOL/ADX/RS/52w-high score. Refreshed 4×/day. |
+| `BestStrategyPerTicker` | Walk-forward winner per (ticker, direction) updated weekly Sun 04:00 UTC. |
+| `ConfidenceCalibration` | Per-confidence-bucket realized win rate from closed auto-trades, computed nightly. |
 
 ---
 
@@ -672,22 +708,35 @@ auth is a no-op (local dev).
 
 ## 11. Safety & Risk Controls
 
-### Entry-side gates (17 total)
-Confidence, timeframe allow-list, signal freshness, timeframe-of-day (9:30–9:45 ET skip), geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1%–10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, earnings < 48h, idempotency, per-ticker cap, sector cap, concurrent cap, portfolio-heat cap, daily-loss cap, fat-finger guard, BP circuit breaker.
+### Entry-side gates (~25 total — expanded since r19)
+Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55%), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), ticker blacklist.
+
+### Multiplier stack (~9 factors, hard-capped at 2.0×)
+Confidence-headroom × Kelly × calibration × per-strategy × VIX × analyst-rating × fundamentals-quality × short-interest × Stocktwits × WSB × institutional × insider × ML-scorer (shadow). Compound is clamped to `RISK_MULT_CEILING = 2.0` (Critical-audit fix #1) so a winning streak across all factors can't compound to runaway risk.
 
 ### Exit-side guarantees
-SL-invariant check (resubmit if broker drops the leg), slippage reject, reverse-thesis close, stale-trade recycle, debounced target touches, atomic stop-replacement (broker ack gates the DB update), adaptive chandelier never loosens existing stop.
+SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis close (gate ≥80 conf + same-or-higher TF, with correct CALL/PUT direction post-r22), stale-trade recycle, debounced target touches (2-tick confirm), atomic stop-replacement (broker ack gates DB update), adaptive chandelier (ADX-driven 0.83-1.33× of base mult, never loosens existing stop), ATR-capped Soft BE (`max(0.3R, 0.25×ATR)` to survive 1-bar wicks), premium-stop spread-artifact guard (skip when held < 5 min AND underlying not against thesis).
+
+### Crash-resilience (r33)
+- **Dual-service architecture**: position management runs in a dedicated `stockrecs-manager` Cloud Run service (internal-ingress, min/max=1 instance). The `stockrecs` (api) service handles HTTP + scanner + alt-data; a crash there cannot leave open positions unmanaged.
+- **Cloud Run liveness probes** on both services targeting `/api/health`. Manager's probe trips on `manage_loop_stuck` (≥120s since last manage tick) → Cloud Run auto-restarts the container.
+- **Boot-time reconciliation**: manager runs `detect_unexpected_positions` once at startup so any drift from a prior incarnation is reconciled before the manage loop begins normal operation.
+- **WS reconnect**: jittered exponential backoff + escalating `stream_reconnect_loop` alert at cap.
+- **Stuck-job alert**: dedicated `manage_loop_stuck` category, 5-min dedup.
+- **WS staleness alert**: `stream_stale` fires when quote stream > 30s during RTH.
 
 ### Sanity
-- Two-key live-trading gate (`ALPACA_LIVE=1` + `I_UNDERSTAND_LIVE_RISK=yes` + `APP_API_KEY`).
-- Persistent kill switch — survives deploys; unkill does NOT re-enable (two-step re-arm).
-- Idempotency hash deduping retries within 12h.
-- Post-mortem auto-generated on every losing stop.
+- Two-key live-trading gate (`ALPACA_LIVE=1` + `I_UNDERSTAND_LIVE_RISK=yes` + `APP_API_KEY` + explicit `CORS_ALLOW_ORIGINS`).
+- Persistent kill switch — survives deploys; unkill does NOT re-enable trading (two-step re-arm).
+- Idempotency hash deduping retries within 12h, bucket-aware on confidence.
+- Post-mortem auto-generated on every losing stop (skipped for `closed_reverse`).
+- Synthetic-data regression suite (93 tests) gates every deploy via `deploy.sh`.
 
 ### Auth & access
 - Shared-secret `APP_API_KEY` gating all `/api/*` and `/ws/quotes`.
 - Frontend login screen with localStorage cache.
 - 401-global-event flips UI back to login.
+- Manager service is `--ingress internal`, not reachable from public internet at all.
 
 ---
 
@@ -713,15 +762,22 @@ gcloud services enable run.googleapis.com cloudbuild.googleapis.com
 
 ### 12.3 Environment Variables
 
+See `.env.example` at repo root for the full list. Summary:
+
 | Var | Purpose |
 |---|---|
+| `RUN_MODE` | `api` (default) or `manager` — partitions scheduler jobs across the dual-service architecture |
 | `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` | Alpaca credentials |
-| `ALPACA_LIVE` | "1" to flip from paper to live |
-| `I_UNDERSTAND_LIVE_RISK` | "yes" second-key live-gate |
+| `ALPACA_LIVE` / `I_UNDERSTAND_LIVE_RISK` | Live-mode two-key gate |
 | `APP_API_KEY` | Shared-secret auth; empty = dev mode open |
-| `DATABASE_URL` | Postgres connection string (Neon) |
+| `DATABASE_URL` | Cloud SQL Postgres connection string |
 | `CORS_ALLOW_ORIGINS` | Comma-separated origins |
-| `LOG_DIR` | Rotating log location |
+| `ALPACA_DATA_FEED` | `sip` (Algo Trader Plus) or `iex` (free tier) |
+| `ANTHROPIC_API_KEY` | Enables in-app Claude chat widget |
+| `FRED_API_KEY` | Enables post-release macro values |
+| `SENTIMENT_BACKEND` | `vader` (default) or `finbert` |
+| `LOG_JSON` | `1` (default Cloud Run) for structured stdout, `0` for plaintext |
+| `LOG_DIR` | Rotating-file log location |
 
 ### 12.4 Rotating the API key
 
@@ -738,22 +794,57 @@ All browsers get 401 on next request and prompt for the new key.
 
 ## 13. Operational Playbook
 
+### Deploying
+
+```bash
+# Deploy api service (HTTP + scanner + alt-data jobs)
+./deploy.sh us-central1
+
+# Deploy manager service (manage loop only — separate Cloud Run service)
+./deploy-manager.sh us-central1
+```
+
+Both scripts gate on the regression suite (78+ tests, ~3s) before
+building. `SKIP_TESTS=1` to override.
+
 ### Post-loss triage
 1. Check `/api/trading/auto/trades` for the losing trade id.
-2. Expand it in UI: **"Why did this lose?"** shows the auto-generated
-   post-mortem with verdict, findings (severity-tagged), and lessons.
-3. Click **"News during trade"** to see pre / during / post articles with
-   sentiment — catches event-driven losses the post-mortem can't know.
-4. Correlate across trades: Trading view → `News ↔ Trade Alignment`
+2. Click the green **"📊 Why this trade?"** expander on the trade card —
+   shows scanner snapshot (if scanner-picked), full signal reasoning,
+   backtest evidence, fundamentals quality score, analyst consensus,
+   macro events ±48h.
+3. For losers, click **"🔍 Why did this lose?"** — auto-generated
+   post-mortem with verdict, findings (severity-tagged), lessons.
+4. Click **"📰 News during trade"** to see pre / during / post
+   articles with sentiment — catches event-driven losses.
+5. Correlate across trades: Trading view → `News ↔ Trade Alignment`
    summary (3 / 7 / 14 / 30 day windows).
+6. **Codify the bug**: if a post-mortem surfaces a code-path bug,
+   add a synthetic test to `backend/tests/test_bug_scenarios.py`
+   that fails against the bug and passes after the fix. The test
+   gate prevents regression on the next deploy.
 
 ### Config tuning
 - Budget changes: Trading view → Auto-Trader panel → ⚙ Config drawer.
   Changes hit `POST /api/trading/auto/config` and apply from the next
   scan tick.
-- Kill switch: `POST /api/trading/kill` (optionally `flatten=true`).
-  Survives restarts. Unkill with `POST /api/trading/unkill` then flip
-  `enabled=true` via `/auto/config` (deliberate two-step).
+- Kill switch: `POST /api/trading/auto/kill` with `flatten=true`.
+  Survives restarts. Unkill with `POST /api/trading/auto/unkill` then
+  flip `enabled=true` via `/auto/config` (deliberate two-step).
+- ML scoring: `ml_scoring_enabled` defaults False (shadow mode).
+  Watch `/api/ml/calibration` for ≥2 weeks of paper data; flip to
+  True when predicted-vs-actual buckets are aligned within ±5%.
+
+### Resilience verification
+- `/api/health` on **api service**: should always show `degraded=false`
+  with `last_manage_at=None` (api doesn't manage).
+- `/api/health` on **manager service** (internal-only, hit from inside
+  the project): `last_manage_at` should refresh every 20s during RTH.
+  If it stales > 120s, the liveness probe trips and Cloud Run
+  auto-restarts the container.
+- Cloud Logging filter `resource.labels.service_name="stockrecs-manager"
+  AND jsonPayload.message=~".*manage_loop_stuck.*"` surfaces the alert
+  if it ever fires.
 
 ### News analysis workflow (after ≥1 week of ingestion)
 1. Trading view → `News ↔ Trade Alignment` — set window to 7d.
@@ -767,6 +858,238 @@ All browsers get 401 on next request and prompt for the new key.
 ---
 
 ## 14. Changelog (current → past)
+
+### Revision 33 — Dual-service architecture + observability hardening (Tiers 1+2+3+4)
+- **`RUN_MODE` env-var splits the app across two Cloud Run services**.
+  - `stockrecs` (RUN_MODE=api): HTTP, scanner, signal generation, all alt-data
+    refresh jobs. Min 1, max 3 instances.
+  - `stockrecs-manager` (RUN_MODE=manager): internal-ingress only. Runs
+    **only** the 20s manage loop + 60min broker reconciliation + boot-time
+    reconciliation. Min/max 1 instance. 512 MiB.
+  - Both services share the same Cloud SQL DB. api writes new auto_trades;
+    manager reads + updates them. Process-local state (BP reservations,
+    circuit breakers, caches) is per-service by design.
+  - New `deploy-manager.sh` deploys the manager service.
+- **Cloud Run liveness + startup probes** in both deploy scripts. Manager's
+  liveness probe trips when `last_manage_at > 120s` stale during RTH,
+  causing Cloud Run to auto-restart the container.
+- **Stuck-job detector**: `/api/health` on the manager raises a
+  `manage_loop_stuck` alert + flags `degraded=True` if manage hasn't ticked
+  in 120s.
+- **WS reconnect hardening**: jittered exponential backoff (±50% randomization
+  to avoid thundering-herd) + escalating `stream_reconnect_loop` alert when
+  ≥5 consecutive failures with backoff at cap.
+- **Documentation hygiene**: root README.md (setup, runbook, env vars, risk
+  warnings); `.env.example` template; pinned all `requirements.txt` versions
+  with `==` (added `curl_cffi` as transitive yfinance dep).
+- **Prometheus metrics extended**: new `autotrader_skips_total{reason=...}`
+  counter; gate-by-gate `metrics.inc("autotrade_skip", reason=...)` on 10+
+  rejection paths in `consider_signal`.
+- 15 new tests in `test_bug_scenarios.py` (risk_math pure helpers,
+  risk_manager state isolation, adaptive-risk neutral defaults, RUN_MODE
+  resolution). 93 tests total.
+
+### Revision 32 — Tier A+B risk tightening + observability
+- **Retail-sentiment market-cap filter**: Stocktwits + WSB multipliers now
+  return neutral above $50B market cap. Prevents retail-sentiment noise
+  from moving confidence on AAPL/NVDA where the tape already reflects
+  retail flow.
+- **Kelly cap 1.35 → 1.2** (config). Tightened pre-live: not enough closed
+  trades to trust bucket win-rates aggressively.
+- **`flatten_by_eod` default-true** for new `AutoTraderConfig` rows.
+  Existing rows preserved.
+- **Adaptive risk sizing**: `max_risk_per_trade_pct` × 0.5 when VIX > 25 OR
+  recent-30d realized win-rate < 55%; × 0.75 when VIX > 20.
+- **VIX-scaled options bucket**: `option_pct_of_equity` × 0.3/0.5/0.75 at
+  VIX > 30/25/20. Stocks bucket untouched.
+- **Profit factor + by-regime stats** in portfolio backtest. Each trade
+  tagged with entry ADX + VIX; stats split by trending / chop / high_vix /
+  normal. Profit factor = gross wins / |gross losses|.
+- **Overnight-gap simulation** in portfolio backtest. Resting stops fill
+  at the day's OPEN if it gapped through.
+- **WebSocket staleness alert**: fires when stream stale > 30s during RTH
+  (5-min dedup).
+
+### Revision 31 — auto_trader.py decomposition (risk / execution / position modules)
+Three-checkpoint refactor split the 3,200-LOC `auto_trader.py` into
+focused modules. Net 300 LOC reduction with back-compat aliases preserved
+so no external call site changes.
+
+- **`services/risk_manager.py`** (4a): owns BP reservation state +
+  helpers, BP/broker/SL circuit breakers, strategy + calibration multiplier
+  caches, `adaptive_risk_multiplier`, `vix_options_bucket_multiplier`.
+  Module-local `reset_for_tests()`.
+- **`services/execution_engine.py`** (4b): owns Alpaca broker ops —
+  `replace_stop` + idempotency cache, `get_legs`/`identify_legs`,
+  `force_close_trade` (callback-driven for trade-state cleanup).
+- **`services/position_manager.py`** (4c): owns chandelier (ATR/ADX/adaptive)
+  + caches, `current_price` lookup, `recalculate_targets`,
+  `record_target_history`, `is_call_option`, `check_reversal`,
+  `check_reversals_for`, `REVERSE_CONFIDENCE_GATE`, `_TF_RANK`.
+- `auto_trader.py` retains: `consider_signal`/`consider_put_play`/
+  `consider_call_play`, `manage_open_positions`, `_manage_option_trade`,
+  config CRUD, kill switch, calibration job. Plus thin back-compat
+  aliases to the moved helpers.
+
+### Revision 30 — Pydantic schemas + state view + risk_math extract
+- **`services/schemas.py`**: SignalData, TradeContext, MultiplierStack,
+  MacroBlackoutStatus. Additive — existing `Dict[str, Any]` call sites
+  still work; new code constructs the model directly.
+- **`services/auto_trader_state.py`**: read-view of auto_trader module
+  state for monitoring (`state_view()`) and `reset_for_tests()` to clear
+  caches between tests. Avoided full class encapsulation as documented in
+  BACKLOG (Python modules already singletons — wrapper would be ceremony).
+- **`services/risk_math.py`**: pure-function helpers extracted —
+  `signal_idempotency_key`, `clamp_multiplier_stack`,
+  `confidence_risk_mult`, `kelly_risk_mult`, `position_size_by_risk`. Zero
+  module-state coupling; trivially unit-testable.
+
+### Revision 29 — Pluggable sentiment + portfolio backtest
+- **`services/sentiment.py`**: pluggable backend via `SENTIMENT_BACKEND`
+  env. Default VADER (instant, no deps); opt-in FinBERT (`transformers` +
+  `torch`, ~1GB image bloat). Backend choice invisible at the call site
+  (`services.news.score_text` shim preserved).
+- **`services/portfolio_backtest.py`**: book-level walk-forward backtester
+  that respects the live trader's caps (max_concurrent, max_per_sector,
+  beta-weighted portfolio heat, daily loss limit). Returns composite equity
+  curve, max drawdown %/days, Sharpe ratio, cap-rejection count, peak
+  per-sector concentration.
+- `POST /api/backtest/portfolio/run` exposes it.
+
+### Revision 28 — Tier-2 alt-data + push notifications
+- **`services/wsb_scraper.py`**: Reddit JSON API public endpoint poll
+  every 30 min; counts ticker mentions in posts + comments with
+  bullish/bearish keyword hints. `WSBMention` table.
+  `wsb_multiplier` ±3% envelope; requires ≥10 mentions + 2:1 lean to tilt.
+- **`services/institutional.py`**: 13F-proxy via yfinance
+  `.institutional_holders` + `.mutualfund_holders`. `InstitutionalHoldings`
+  table tracks holder count, weighted QoQ pct change, new initiations.
+  Weekly Sun 05:15 UTC. ±3% multiplier envelope.
+- **Push notifications on T1/T2/T3 hits** via existing WS channel.
+  `services.live_quotes.broadcast_event_safe()` thread-safe helper for
+  scheduler-thread emissions; auto_trader manage loop broadcasts
+  `target_hit` events on stock + options paths. Frontend
+  `TargetHitToasts` component renders in-app toast + browser
+  Notification when tab is backgrounded.
+
+### Revision 27 — Tier-1 alt-data: short interest, Stocktwits, SEC Form 4
+- **Short interest** via Fundamentals (yfinance .info already exposes it).
+  New columns `short_pct_float` + `short_ratio`. `short_interest_multiplier`
+  envelope 0.92..1.02. BUY: ≥25% shorted → 0.92 (respect skepticism);
+  15-25% → 1.02 (squeeze tilt). SELL: mirror — already-crowded shorts
+  = 0.92 (late to the party).
+- **`services/social_sentiment.py`**: Stocktwits public stream API,
+  aggregates last 24h bullish/bearish tagged messages. `SocialSentiment`
+  table. 4×/day refresh. 0.96..1.04 envelope; requires ≥20 messages and
+  ≥60% lean.
+- **`services/insider_trades.py`**: SEC EDGAR Atom-feed parser per CIK,
+  extracts Form 4 nonDerivativeTransaction codes (`P` = open-market
+  purchase, `S` = open-market sale; ignores 10b5-1 mechanical codes
+  M/A/F by construction). `InsiderSummary` table tracks 30d/90d buy/sell
+  counts + net buy ratio + $ value. Weekly Sun 04:45 UTC; serial 200ms
+  pacing under SEC's 10 req/s limit. 0.97..1.06 envelope; requires ≥3
+  90d transactions for signal.
+- All three multipliers wired into signal_generator BUY + SELL paths.
+
+### Revision 26 — Beta-weighted portfolio heat + ATR-capped soft BE
+- **Beta-weighted heat**: `beta` column on Fundamentals (yfinance .info,
+  weekly refresh). The 10%-of-equity portfolio heat cap multiplies each
+  open trade's $-at-risk by `clamp(beta, 0.5, 2.0)`. 5 high-beta tech
+  longs now contribute more heat than 5 utilities at the same raw
+  $-at-risk.
+- **ATR-capped Soft BE cleanup**: `services/auto_trader.py` had a
+  duplicate Soft BE block (old `entry − 0.3R` and new `max(0.3R, 0.25×ATR)`
+  side-by-side, both executing). Cleaned up to a single line:
+  `stop_dist = max(0.3R, 0.25×ATR)`.
+
+### Revision 25 — Trade rationale endpoint + UI expander
+- New `GET /api/trading/auto/rationale/{trade_id}` aggregates:
+  origin classification (watchlist | scanner | watchlist+pool | unknown),
+  scanner snapshot (when applicable), originating signal reasoning bullets,
+  best-strategy-per-ticker backtest evidence, fundamentals quality score,
+  analyst consensus + target premium, macro events ±48h of opened_at.
+- Frontend `TradeRationale` component renders themed sections (indigo
+  scanner / emerald signal / blue backtest / purple fundamentals / amber
+  analyst / rose macro) under a green "📊 Why this trade?" expander on
+  every trade card. Lazy-loaded on click.
+
+### Revision 24 — Fundamentals quality score
+- New `Fundamentals` table with hash-based change detection (SHA256 over
+  20 stable fields; unchanged fetches only bump `last_checked_at`). 20
+  metrics from yfinance .info (P/E, PEG, P/B, P/S, EV/EBITDA, revenue +
+  EPS YoY, profit/operating margins, ROE/ROA, D/E, current ratio, FCF,
+  dividend yield, sector/industry).
+- `compute_quality_score` returns -100..+100 composite from 4 buckets
+  (profitability/growth/balance/valuation, 25 pts each).
+- `quality_multiplier` 0.92..1.08 envelope. Asymmetric — penalty heavier
+  than boost (betting against junk fundamentals on a long is the
+  asymmetric risk).
+- Weekly Sun 04:30 UTC refresh. `/api/fundamentals/{ticker}` +
+  `/refresh` + `/refresh-all`.
+
+### Revision 23 — Synthetic-data regression suite + pre-deploy gate
+- New `backend/tests/test_bug_scenarios.py` — 27 initial tests covering
+  the bug families surfaced in production losses (reverse-thesis
+  direction, OCC parser, macro blackout windows, ticker blacklist, risk
+  multiplier ceiling, cheap-options sizing cap, ML multiplier envelope,
+  trade-rationale endpoint shape).
+- Each test class targets a specific bug family that naive code review
+  missed. Verified the suite catches its targets by reintroducing the
+  AMKR bug and watching the test fail.
+- `deploy.sh` now runs the suite as a hard gate before every gcloud
+  build. ~3s. `SKIP_TESTS=1` to override.
+
+### Revision 22 — Options-loss postmortem fixes (4 root-cause items)
+Investigation of $-10K paper loss on 2026-04-24 surfaced four bugs:
+
+1. **Reverse-thesis direction bug for CALL plays**. `_check_reversal`
+   hardcoded `opposing="BUY"` for ALL options. Correct for PUT (long-put
+   = bearish, opposing BUY); WRONG for CALL (long-call = bullish,
+   opposing should be SELL). New `_is_call_option()` parses OCC symbol.
+   The AMKR -$1,190 paper loss was caused by a CONFIRMING BUY signal
+   force-closing the long call.
+2. **Premium-stop spread-artifact guard**. The 50%-premium-decay rule
+   force-closed VTWO in 24 seconds for $-6,500 because the "decay" was
+   bid-ask spread cross at market open. Now skip premium-stop when
+   (held < 5 min) AND (underlying not moving against thesis).
+3. **Opening-bell options entry blackout**. All three losses opened in
+   the first 18 min of the session — bid-ask spreads at their widest.
+   Mirror of the EOD guard: skip new option entries within 15 min of
+   open. New `paper_trader.minutes_since_open()` helper.
+4. **Cheap-options gamma cap**. CNTA $0.30 premium → 122 contracts (122
+   × $30 = $3.7K notional) wiped $2,440 on a 1% adverse move. Tiered
+   per-position dollar cap fraction:
+     * Premium < $0.50 → 0.5% of equity
+     * $0.50 - $2.00   → 1% of equity
+     * $2.00+          → 2% (original aggressive cap)
+
+### Revision 21 — Code-review hygiene
+- **`services/config.py`** extended: cross-cutting `RISK_*` (max-conf-mult,
+  Kelly cap, mult ceiling, portfolio heat, slippage), `ML_MULT_*` envelope,
+  `CHAT_MODEL`/`CHAT_MAX_TOKENS`. auto_trader, ml_scorer, routers/chat
+  import from config. Feature-local thresholds intentionally stay
+  co-located with their logic.
+- **JSON-formatted logs** to stdout (env-gated via `LOG_JSON=1`, default
+  on for Cloud Run). Cloud Logging parses each line into structured
+  fields (severity, logger, message + any `extra` kwargs) instead of
+  regex-grepping flat strings. On-disk rotating file stays plaintext.
+- **Backtester sanity**: skip bars where `High < Low` or `Volume <= 0`
+  before simulating fills. Yahoo / Alpaca occasionally emit malformed
+  bars from corporate-action adjustments or zero-volume halts.
+
+### Revision 20 — ML training resilience (background thread + DB persistence)
+- `POST /api/ml/train` now returns `{accepted: true}` immediately and
+  trains in a background thread. Cloud Run's 300s request timeout was
+  shorter than the training run; sync mode failed.
+- New `MLArtifact` table: model bytes (text), meta JSON, status JSON
+  persisted in Postgres. Single-row-per-name pattern with upsert. Cloud
+  Run /tmp is per-instance, so a model trained on instance A was
+  invisible to instance B; durable storage in DB fixes this.
+- Scorer hydrates model from DB into local /tmp on first inference if
+  the file is missing.
+- `get_status()` reads DB first, falls back to local file. New
+  `/api/ml/status` endpoint exposes training progress (queued |
+  collecting | training | done | error).
 
 ### Revision 19 — ML scorer (LightGBM, shadow mode) + Alpaca tape microstructure
 - `services/ml_features.py` — single feature-extractor used at both
