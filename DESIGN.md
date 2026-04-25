@@ -343,20 +343,23 @@ Every gate short-circuits on failure. Order matters — cheap checks first.
 | 3 | Signal is BUY, confidence ≥ threshold | Direction + quality floor |
 | 4 | Daily loss limit not hit | Realized-PnL-today gate |
 | 5 | `max_concurrent_positions` not reached | Hard portfolio cap |
-| 6 | **Portfolio heat ≤ 10% of equity** | New: Σ live $-at-risk bounded |
-| 7 | **Opening-15-min filter** (intraday TFs 9:30–9:45 ET) | New: whipsaw window |
-| 8 | Signal freshness (age ≤ 2× timeframe, clamped 15m–4h) | Prevents stale entries |
+| 5b | **Regime tightening** (VIX > 25 or SPY < 200EMA → cap÷3; VIX > 20 → cap×2/3) | r34: fewer ideas in chop |
+| 6 | **Portfolio heat ≤ 10% of equity** | Σ live $-at-risk bounded (beta-weighted) |
+| 7 | **Opening-15-min filter** (intraday TFs 9:30–9:45 ET) | Whipsaw window |
+| 8 | Signal freshness (age ≤ 1× timeframe, clamped 10m–90m) | Prevents stale entries |
 | 9 | Timeframe in `signal_timeframes` | Default 1h / 4h / 1d only |
 | 10 | Stop geometry sane (`stop < entry`, risk 0.1–10%) | Fat-finger guard |
-| 11 | **T1 > entry × 1.004** | New: catches inverted-target bugs (MU-style) |
-| 12 | Per-ticker `auto_trade_enabled` | Per-symbol gate |
-| 13 | No existing open/pending trade on this ticker | One-per-ticker |
-| 14 | Idempotency hash not seen in last 12h | Dedupe retries |
-| 15 | Sector count < `max_per_sector` (5) | Correlation cap |
-| 16 | **Stop distance ≥ 0.8 × daily ATR** | New: rejects too-tight stops |
-| 17 | **Gap-open ≤ 2%** from signal entry | New: rejects stale-entry signals |
-| 18 | **No earnings within 48h** (yfinance) | New: event-driven variance |
-| 19 | Position qty ≥ 1 after sizing | Capital check |
+| 11 | **T1 > entry × 1.004** | Catches inverted-target bugs (MU-style) |
+| 12 | **Stop distance ≥ 0.8 × daily ATR** | Rejects too-tight stops |
+| 13 | **Gap-open ≤ 2%** from signal entry | Rejects stale-entry signals |
+| 14 | **Median 20-day daily $-volume ≥ $10M** | r34: liquidity gate (spread/slippage drag) |
+| 15 | **No earnings within 48h** (yfinance) | Event-driven variance |
+| 16 | Macro release blackout (CPI/NFP/FOMC pre+post window) | Event-driven variance |
+| 17 | Per-ticker `auto_trade_enabled` + global blacklist | Per-symbol gate |
+| 18 | No existing open/pending trade on this ticker | One-per-ticker |
+| 19 | Idempotency hash not seen in last 12h | Dedupe retries |
+| 20 | Sector count < `max_per_sector` (5) | Correlation cap |
+| 21 | Position qty ≥ 1 after sizing | Capital check |
 
 ### 5.3 Position Sizing
 
@@ -395,12 +398,14 @@ For each open trade:
 5. **Stale-trade guard**: trades not hitting T1 after `8 × timeframe_min`
    get closed if price is not meaningfully winning (< 0.3×R above entry).
 6. **Trailing state machine** with `_TARGET_CONFIRM_TICKS=2` debounce:
-   - **T1**: trim 1/3 at market → **soft BE** at `entry − 0.3×initial_risk`
-     (not full entry — post-mortem found full BE chopped out winners on 1%
-     retraces). If T1 is < 0.5×ATR from entry (NaN-safe check), BE is
-     skipped and the chandelier overlay takes over.
-   - **T2**: trim 33% of remaining runner → stop to **entry (full BE)**.
-     Runner now ~45% of original position.
+   - **T1**: trim **ADX-aware fraction** (r34, `trim_fraction_for_adx`):
+     ADX ≤ 25 → 33% (stocks) / 50% (options); ADX ≥ 40 → 15% (let the
+     runner run); linear in between. Then move to **soft BE** at
+     `entry − 0.3×initial_risk` (not full entry — post-mortem found full BE
+     chopped out winners on 1% retraces). If T1 is < 0.5×ATR from entry
+     (NaN-safe check), BE is skipped and the chandelier overlay takes over.
+   - **T2**: trim ADX-aware fraction (default 33% of remaining runner) →
+     stop to **entry (full BE)**. Runner now ~45% of original position.
    - **T3**: stop → T2 AND **recompute T1/T2/T3 from current price**.
      Recompute runs **ONCE per trade** — past `level_index ≥ 3` we hand
      exclusively to the chandelier to avoid BE-like resets on extensions.
@@ -430,8 +435,11 @@ strong BUY exists.
   - Score = R:R × DTE-sweet-spot × liquidity × delta-proxy
 
 Exit conditions (whichever fires first):
-- Underlying hits T1/T2/T3 → trim half contracts on T1, trail underlying-stop tighter
-- Premium decay ≥ 50%
+- Underlying hits T1/T2/T3 → ADX-aware trim on T1 (15-50% of original
+  contracts), trail underlying-stop tighter
+- Premium decay ≥ 50% (skipped within first 5 min if underlying not against
+  thesis — spread-artifact guard)
+- **Theta stop (r34)**: held ≥ 48h with < 0.2R underlying progress → close
 - Underlying breaches bear stop
 - Reverse-thesis BUY on higher TF
 
@@ -708,14 +716,14 @@ auth is a no-op (local dev).
 
 ## 11. Safety & Risk Controls
 
-### Entry-side gates (~25 total — expanded since r19)
-Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55%), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), ticker blacklist.
+### Entry-side gates (~27 total — expanded since r19)
+Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, **liquidity gate** (median 20-day $-volume ≥ $10M, r34), earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), **regime-tightened concurrent cap** (cap÷3 in VIX>25 or SPY<200EMA; cap×2/3 in VIX>20, r34), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55%), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), ticker blacklist.
 
 ### Multiplier stack (~9 factors, hard-capped at 2.0×)
 Confidence-headroom × Kelly × calibration × per-strategy × VIX × analyst-rating × fundamentals-quality × short-interest × Stocktwits × WSB × institutional × insider × ML-scorer (shadow). Compound is clamped to `RISK_MULT_CEILING = 2.0` (Critical-audit fix #1) so a winning streak across all factors can't compound to runaway risk.
 
 ### Exit-side guarantees
-SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis close (gate ≥80 conf + same-or-higher TF, with correct CALL/PUT direction post-r22), stale-trade recycle, debounced target touches (2-tick confirm), atomic stop-replacement (broker ack gates DB update), adaptive chandelier (ADX-driven 0.83-1.33× of base mult, never loosens existing stop), ATR-capped Soft BE (`max(0.3R, 0.25×ATR)` to survive 1-bar wicks), premium-stop spread-artifact guard (skip when held < 5 min AND underlying not against thesis).
+SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis close (gate ≥80 conf + same-or-higher TF, with correct CALL/PUT direction post-r22), stale-trade recycle, debounced target touches (2-tick confirm), atomic stop-replacement (broker ack gates DB update), adaptive chandelier (ADX-driven 0.83-1.33× of base mult, never loosens existing stop), **ADX-aware T1/T2 trim fractions** (r34: 15% in strong trend, default in chop), ATR-capped Soft BE (`max(0.3R, 0.25×ATR)` to survive 1-bar wicks), premium-stop spread-artifact guard (skip when held < 5 min AND underlying not against thesis), **options theta stop** (r34: close when held ≥ 48h with < 0.2R underlying progress).
 
 ### Crash-resilience (r33)
 - **Dual-service architecture**: position management runs in a dedicated `stockrecs-manager` Cloud Run service (internal-ingress, min/max=1 instance). The `stockrecs` (api) service handles HTTP + scanner + alt-data; a crash there cannot leave open positions unmanaged.
