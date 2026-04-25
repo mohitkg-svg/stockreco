@@ -1,4 +1,87 @@
-# ML Data-Source Backlog
+# Backlog
+
+Consolidated register of every deferred and rejected enhancement across
+five external review passes (2026-04-25). The chronological per-pass
+sections below capture the original context; the **Master deferral
+register** below is the canonical short-form view used for scoping.
+
+## Working principle (2026-04-25)
+
+**With every new revision, scan this file's ⏸️ Deferred section before
+scoping the work.** Check whether any item's revisit trigger has fired,
+or whether an item naturally fits the scope of what you're about to
+touch. Surface candidates explicitly when proposing the plan, with
+inclusion / continued-deferral rationale. Deferred items whose rationale
+has gone stale should either move to ✅ done or be re-categorized as
+❌ rejected — don't let the list rot into "we'll get to it eventually".
+
+## Master deferral register (canonical short-form, current as of r39)
+
+### ⏸️ Deferred — multi-week, gated on data accumulation
+
+| Item | Revisit trigger |
+|---|---|
+| LSTM / Transformer ML hybrid | LightGBM 90+ days at 10% live blend with measurable lift |
+| SHAP / LIME interpretability | After ML scorer graduation |
+| Optuna hyperparam tuning | After ML scorer graduation |
+| Earnings call transcript NLP | After live data accumulates enough to validate signal |
+| ML scorer graduation (shadow → 10% live blend) | ≥ 200 closed trades with shadow predictions logged + AUC > 0.60 + monotonic calibration |
+| IV percentile gate for option entries | After 252-day ATM-IV history ingestion (~3-5 days work) |
+
+### ⏸️ Deferred — multi-week, gated on operational triggers
+
+| Item | Revisit trigger |
+|---|---|
+| vectorbt / PyBroker backtester rewrite | Per-ticker backtest > 10s (currently ~1s) |
+| Async I/O migration (httpx.AsyncClient + await) | 95p `/api/health` latency > 2s sustained, instances trending > 2, concurrent users > 5, or scheduler thread-pool misfires |
+| Full pairwise correlation matrix | Concurrent positions routinely > 20 (cap is 15) |
+| Debit spreads (multi-leg, defined-risk) | ~4 weeks post-real-money once naked option behavior is well-understood live |
+| AutoTraderService class encapsulation | Multi-tenancy or cross-test isolation requirements |
+
+### ⏸️ Deferred — cost / budget gated
+
+| Item | Revisit trigger |
+|---|---|
+| Cheddar Flow / SpotGamma options flow ($100-300/mo) | After Tier 1 free alt-data shows realized lift |
+| Polygon.io Level 2 + tape ($199/mo) | Defer indefinitely; Alpaca SIP covers us |
+
+### ⏸️ Deferred — single-user / scope-mismatched
+
+| Item | Why deferred |
+|---|---|
+| JWT / OAuth | X-API-Key + rate limiter sufficient for single-user. Revisit if multi-user. |
+| Redis cache | Yahoo TTL cache covers hot path on a single-user app. Revisit if data fetch becomes a bottleneck. |
+| Trivy / Snyk dependency scanning | Pinned requirements + GitHub Dependabot already cover this. Revisit if compliance audit requires it. |
+| Sharpe-based dynamic risk | Recent-WR < 55% trigger covers similar ground. Revisit if Sharpe and WR diverge. |
+| CI/CD performance threshold gate (Sharpe ≥ 1.0 etc.) | Brittle to data flakes; would block deploys on transient yfinance hiccups. Revisit if a regression that this would have caught actually slips through. |
+| Variable slippage by volatility in backtest | Flat 6bps round-trip acceptable for our liquid universe. Revisit if backtest/live divergence shows up systematically. |
+| Strict type hints + mypy in CI | Widespread but not enforced. Costs more in noise than it returns at this codebase size. Revisit at 50K+ LOC. |
+
+### ❌ Rejected — won't do (with rationale)
+
+| Item | Why |
+|---|---|
+| Ichimoku indicator | Duplicates ADX/MA structure already present |
+| Hurst exponent regime detector | ADX-based chop signal already covers it |
+| Pairs / cointegration trading | System trades individual stocks; out of scope |
+| Active sector rotation | Bot reacts to signals; doesn't actively rotate |
+| Latency simulation in backtest | Paper bot doesn't suffer execution latency |
+| Tax modeling | Out of scope |
+| Priority-queue scanner | Open positions managed every 20s already; wrong problem |
+| PDT *enforcement* (vs the counter we built) | Paper account isn't PDT-restricted; revisit when going live with margin < $25k |
+| "Rip out and rebuild" the rule engine to be ML-only | Rule engine is the deterministic floor; ML is a layer on top, not a replacement |
+
+### Pre-live decisions still in operator's hands (not engineering work)
+
+| Decision | Gate |
+|---|---|
+| Flip `AI_NEWS_EXIT_MODE=shadow` (then later active) | After ≥ 1 week of `AI_ENTRY_VETO_MODE=shadow` review |
+| Flip `AI_CONFIDENCE_MULT_MODE=shadow` (then later active) | Same — entry-veto first, multiplier later |
+| Promote AI judge call sites from shadow to active | After reviewing ≥ 200 decisions in `ai_decision_log` |
+
+---
+
+# Per-pass historical context (chronological)
 
 Future enhancements to the ML model that we discussed and chose to defer.
 Listed in **descending order of expected win-rate lift per dollar of cost**.
