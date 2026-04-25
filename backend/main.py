@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
-from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router, ml as ml_router, fundamentals as fundamentals_router
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router, ml as ml_router, fundamentals as fundamentals_router, social as social_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
@@ -417,6 +417,34 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"fundamentals job not scheduled: {_e}")
+    # Social sentiment (Stocktwits) — 4×/day. Rate-limited public API so
+    # we stay conservative (~65 tickers × 2 workers = ~1-2 min per cycle).
+    try:
+        from services import social_sentiment as _ss
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        for hh, mm in [(12, 0), (15, 0), (18, 0), (21, 0)]:
+            scheduler.add_job(
+                _ss.refresh_all,
+                trigger=_Cron(hour=hh, minute=mm),
+                id=f"social_sentiment_{hh:02d}{mm:02d}",
+                max_instances=1, coalesce=True, misfire_grace_time=900,
+            )
+    except Exception as _e:
+        logger.warning(f"social_sentiment job not scheduled: {_e}")
+    # SEC Form 4 — weekly Sunday 04:45 UTC (sits between fundamentals@04:30
+    # and best_strategy@04:00). SEC rate-limits to 10 req/s, so we run
+    # serially with a tiny pacing delay — ~3-5 min for 65 tickers.
+    try:
+        from services import insider_trades as _ins
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            _ins.refresh_all,
+            trigger=_Cron(day_of_week="sun", hour=4, minute=45),
+            id="insider_weekly",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+    except Exception as _e:
+        logger.warning(f"insider_trades job not scheduled: {_e}")
     # ML: weekly retrain on Sunday 06:00 UTC. Heavy job (5-15 min depending
     # on universe size). Initial training has to be triggered manually via
     # POST /api/ml/train after first deploy.
@@ -588,6 +616,7 @@ app.include_router(analyst_ratings_router.router)
 app.include_router(macro_router.router)
 app.include_router(ml_router.router)
 app.include_router(fundamentals_router.router)
+app.include_router(social_router.router)
 
 
 @app.get("/api/health")

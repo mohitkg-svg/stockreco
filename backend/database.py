@@ -313,6 +313,47 @@ class NewsEvent(Base):
     severity = Column(Integer, nullable=True)
 
 
+class InsiderSummary(Base):
+    """Per-ticker rollup of SEC Form 4 insider transactions.
+
+    Populated weekly. 30d + 90d aggregates of director/officer buys and
+    sells. High insider-buy ratios are empirically predictive on small/mid
+    caps (C-suite has information asymmetry + skin in the game). Less
+    informative on mega-caps where insider trades are mostly 10b5-1
+    scheduled dispositions.
+
+    Data source: SEC EDGAR (free, no API key).
+      https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=4&...
+    """
+    __tablename__ = "insider_summary"
+    ticker = Column(String, primary_key=True)
+    buy_count_30d = Column(Integer, nullable=True)
+    buy_count_90d = Column(Integer, nullable=True)
+    sell_count_30d = Column(Integer, nullable=True)
+    sell_count_90d = Column(Integer, nullable=True)
+    net_buy_ratio_90d = Column(Float, nullable=True)      # buys / (buys + sells), None if 0 total
+    buy_dollar_90d = Column(Float, nullable=True)         # sum of $ value of insider purchases
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
+class SocialSentiment(Base):
+    """Per-ticker retail social sentiment snapshot.
+
+    Currently backed by Stocktwits public API. Weighted rolling 24h
+    bullish/bearish message counts + 7d trend. Useful primarily on
+    retail-driven / meme tickers; near-zero signal on liquid mega-caps
+    where the tape itself already reflects retail flow.
+    """
+    __tablename__ = "social_sentiment"
+    ticker = Column(String, primary_key=True)
+    source = Column(String, nullable=False, default="stocktwits")
+    message_count_24h = Column(Integer, nullable=True)
+    bullish_pct_24h = Column(Float, nullable=True)     # 0..1
+    bearish_pct_24h = Column(Float, nullable=True)     # 0..1 (bullish + bearish ≤ 1)
+    message_count_7d_zscore = Column(Float, nullable=True)  # vs 30-day baseline
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
 class MLArtifact(Base):
     """Persisted ML training artifacts (model bytes, meta JSON, status JSON).
 
@@ -428,6 +469,13 @@ class Fundamentals(Base):
     # Risk — 5y beta vs SPY. Used to beta-weight portfolio heat: 5 trades in
     # high-beta tech aren't equivalent to 5 trades in utilities.
     beta = Column(Float, nullable=True)
+
+    # Short interest — % of float shorted + days-to-cover (short ratio).
+    # High SI is bimodal for longs: squeeze-upside vs fundamental-skepticism.
+    # Signal_generator uses it to gate against crowded shorts when going long
+    # and to amplify shorts that already have squeeze pressure.
+    short_pct_float = Column(Float, nullable=True)   # 0..1 (0.15 = 15%)
+    short_ratio = Column(Float, nullable=True)       # days-to-cover
 
     # Composite — see services.fundamentals.compute_quality_score
     quality_score = Column(Float, nullable=True, index=True)
@@ -556,6 +604,8 @@ def create_tables():
     _ensure_column("auto_trader_config", "aggressive_options_mode", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "ml_scoring_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("fundamentals", "beta", "FLOAT")
+    _ensure_column("fundamentals", "short_pct_float", "FLOAT")
+    _ensure_column("fundamentals", "short_ratio", "FLOAT")
     _ensure_column("auto_trader_config", "entry_order_type", "VARCHAR DEFAULT 'market'")
     _ensure_column("auto_trader_config", "use_universe_scanner", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "universe_top_n", "INTEGER DEFAULT 30")

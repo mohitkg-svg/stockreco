@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from typing import Optional
 from unittest.mock import patch
 
 # Use an isolated SQLite file for the test session so we never touch prod DB.
@@ -501,6 +502,133 @@ class TestFundamentalsMultiplier(unittest.TestCase):
                 m = quality_multiplier(f"T{s}", d)
                 self.assertGreaterEqual(m, 0.92)
                 self.assertLessEqual(m, 1.08)
+
+
+class TestShortInterestMultiplier(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+        self.db = SessionLocal()
+
+    def tearDown(self):
+        self.db.close()
+
+    def _store(self, ticker: str, pct: float):
+        from database import Fundamentals
+        self.db.add(Fundamentals(ticker=ticker.upper(), short_pct_float=pct, data_hash="x"))
+        self.db.commit()
+
+    def test_very_crowded_short_penalizes_buy(self):
+        from services.fundamentals import short_interest_multiplier
+        self._store("AAA", 0.30)   # 30% of float shorted — very crowded
+        self.assertEqual(short_interest_multiplier("AAA", "BUY"), 0.92)
+        # SELL-side: already-crowded, penalize fresh short
+        self.assertEqual(short_interest_multiplier("AAA", "SELL"), 0.92)
+
+    def test_moderate_short_gives_buy_squeeze_tilt(self):
+        from services.fundamentals import short_interest_multiplier
+        self._store("BBB", 0.18)
+        self.assertEqual(short_interest_multiplier("BBB", "BUY"), 1.02)
+
+    def test_neutral_below_threshold(self):
+        from services.fundamentals import short_interest_multiplier
+        self._store("CCC", 0.05)
+        self.assertEqual(short_interest_multiplier("CCC", "BUY"), 1.0)
+
+    def test_no_data_neutral(self):
+        from services.fundamentals import short_interest_multiplier
+        self.assertEqual(short_interest_multiplier("UNKNOWN", "BUY"), 1.0)
+
+
+class TestSocialSentimentMultiplier(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+        self.db = SessionLocal()
+
+    def tearDown(self):
+        self.db.close()
+
+    def _store(self, ticker: str, msgs: int, bullish: Optional[float] = None):
+        from database import SocialSentiment
+        self.db.add(SocialSentiment(
+            ticker=ticker.upper(), source="stocktwits",
+            message_count_24h=msgs, bullish_pct_24h=bullish,
+            bearish_pct_24h=(1 - bullish) if bullish is not None else None,
+        ))
+        self.db.commit()
+
+    def test_strong_bullish_lean_confirms_buy(self):
+        from services.social_sentiment import sentiment_multiplier
+        self._store("BULL", 50, 0.75)
+        self.assertEqual(sentiment_multiplier("BULL", "BUY"), 1.04)
+        self.assertEqual(sentiment_multiplier("BULL", "SELL"), 0.96)
+
+    def test_strong_bearish_lean_confirms_sell(self):
+        from services.social_sentiment import sentiment_multiplier
+        self._store("BEAR", 50, 0.30)
+        self.assertEqual(sentiment_multiplier("BEAR", "SELL"), 1.04)
+        self.assertEqual(sentiment_multiplier("BEAR", "BUY"), 0.96)
+
+    def test_low_volume_not_trusted(self):
+        """Below 20-message min, any lean is ignored (too noisy)."""
+        from services.social_sentiment import sentiment_multiplier
+        self._store("LOWVOL", 5, 0.90)  # 5 messages, 90% bullish — ignored
+        self.assertEqual(sentiment_multiplier("LOWVOL", "BUY"), 1.0)
+
+    def test_mixed_sentiment_neutral(self):
+        from services.social_sentiment import sentiment_multiplier
+        self._store("MIXED", 50, 0.50)
+        self.assertEqual(sentiment_multiplier("MIXED", "BUY"), 1.0)
+
+
+class TestInsiderMultiplier(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+        self.db = SessionLocal()
+
+    def tearDown(self):
+        self.db.close()
+
+    def _store(self, ticker: str, buys_90: int, sells_90: int):
+        from database import InsiderSummary
+        total = buys_90 + sells_90
+        ratio = (buys_90 / total) if total else None
+        self.db.add(InsiderSummary(
+            ticker=ticker.upper(),
+            buy_count_30d=buys_90, buy_count_90d=buys_90,
+            sell_count_30d=sells_90, sell_count_90d=sells_90,
+            net_buy_ratio_90d=round(ratio, 3) if ratio is not None else None,
+            buy_dollar_90d=0.0,
+        ))
+        self.db.commit()
+
+    def test_strong_insider_buy_boosts_buy(self):
+        from services.insider_trades import insider_multiplier
+        self._store("INSBUY", buys_90=8, sells_90=2)  # 80% buy ratio
+        self.assertEqual(insider_multiplier("INSBUY", "BUY"), 1.06)
+
+    def test_heavy_selling_penalizes_buy(self):
+        from services.insider_trades import insider_multiplier
+        self._store("INSSELL", buys_90=1, sells_90=5)  # ~17% buy ratio
+        self.assertEqual(insider_multiplier("INSSELL", "BUY"), 0.97)
+
+    def test_heavy_selling_confirms_sell(self):
+        from services.insider_trades import insider_multiplier
+        self._store("INSSELL2", buys_90=1, sells_90=9)
+        self.assertEqual(insider_multiplier("INSSELL2", "SELL"), 1.06)
+
+    def test_thin_sample_neutral(self):
+        """Below min 3-transaction count, ratio is too noisy; stay neutral."""
+        from services.insider_trades import insider_multiplier
+        self._store("THIN", buys_90=1, sells_90=0)
+        self.assertEqual(insider_multiplier("THIN", "BUY"), 1.0)
+
+    def test_balanced_neutral(self):
+        from services.insider_trades import insider_multiplier
+        self._store("EVEN", buys_90=5, sells_90=5)
+        self.assertEqual(insider_multiplier("EVEN", "BUY"), 1.0)
 
 
 class TestBetaWeight(unittest.TestCase):

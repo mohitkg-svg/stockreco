@@ -57,6 +57,7 @@ _HASH_FIELDS = (
     "debt_to_equity", "current_ratio",
     "free_cash_flow", "dividend_yield",
     "beta",
+    "short_pct_float", "short_ratio",
 )
 
 
@@ -102,6 +103,9 @@ def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
         "free_cash_flow": _safe(info.get("freeCashflow")),
         "dividend_yield": _safe(info.get("dividendYield")),
         "beta": _safe(info.get("beta")),
+        # yfinance uses shortPercentOfFloat (decimal, 0.12 = 12%) and shortRatio (days-to-cover)
+        "short_pct_float": _safe(info.get("shortPercentOfFloat")),
+        "short_ratio": _safe(info.get("shortRatio")),
     }
 
 
@@ -286,12 +290,58 @@ def get_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
             "debt_to_equity": r.debt_to_equity, "current_ratio": r.current_ratio,
             "free_cash_flow": r.free_cash_flow, "dividend_yield": r.dividend_yield,
             "beta": r.beta,
+            "short_pct_float": r.short_pct_float, "short_ratio": r.short_ratio,
             "quality_score": r.quality_score, "data_hash": r.data_hash,
             "last_checked_at": r.last_checked_at.isoformat() if r.last_checked_at else None,
             "last_changed_at": r.last_changed_at.isoformat() if r.last_changed_at else None,
         }
     finally:
         db.close()
+
+
+def short_interest_multiplier(ticker: str, direction: str) -> float:
+    """Short-interest signal-confidence multiplier.
+
+    For BUY signals:
+      * Very crowded short (≥ 25% of float) → 0.92 — fundamental skepticism
+        is real; we should assume the shorts might be right.
+      * Moderately shorted (15-25%) → 1.02 slight boost (squeeze potential
+        nudges us in if a bull signal IS firing).
+      * Normal (< 15%) → neutral.
+    For SELL signals: inverse — already-crowded shorts mean the easy money
+    has been made, penalize fresh SELLs on heavily-shorted names.
+    """
+    r = get_fundamentals(ticker)
+    if r is None or r.get("short_pct_float") is None:
+        return _MULT_NEUTRAL
+    pct = float(r["short_pct_float"])
+    direction = (direction or "").upper()
+    if direction == "BUY":
+        if pct >= 0.25: return 0.92  # deeply crowded short — respect the skepticism
+        if pct >= 0.15: return 1.02  # mild squeeze tilt
+        return _MULT_NEUTRAL
+    if direction == "SELL":
+        if pct >= 0.25: return 0.92  # already-crowded trade; late to the party
+        if pct >= 0.15: return 0.96
+        return _MULT_NEUTRAL
+    return _MULT_NEUTRAL
+
+
+def short_interest_reason_line(ticker: str, direction: str) -> Optional[str]:
+    r = get_fundamentals(ticker)
+    if r is None or r.get("short_pct_float") is None:
+        return None
+    pct = float(r["short_pct_float"])
+    mult = short_interest_multiplier(ticker, direction)
+    if mult < _MULT_NEUTRAL:
+        mark = "⚠️"
+    elif mult > _MULT_NEUTRAL:
+        mark = "🔥"
+    else:
+        return None  # don't pollute reasoning with neutral lines
+    ratio = r.get("short_ratio")
+    ratio_bit = f", {ratio:.1f} days-to-cover" if ratio else ""
+    return f"{mark} Short interest: {pct*100:.1f}% of float{ratio_bit} — {'crowded' if pct >= 0.25 else 'elevated'} short vs {direction}"
 
 
 def beta_weight(ticker: str, default: float = 1.0,

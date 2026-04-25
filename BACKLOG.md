@@ -3,39 +3,34 @@
 Future enhancements to the ML model that we discussed and chose to defer.
 Listed in **descending order of expected win-rate lift per dollar of cost**.
 
-## Tier 1 — Free, high-impact (build next)
+## Tier 1 — ✅ DONE (2026-04-25)
 
-### SEC Form 4 — Insider trades
-- **Source**: SEC EDGAR RSS (`https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&type=4&dateb=&owner=include&count=40`)
-- **Frequency**: real-time, push-style RSS
-- **Cost**: $0
-- **Expected lift**: +2–3% win-rate on mid/small caps where insider buying is informative
-- **Features to add**:
-  - `insider_buy_count_30d` — number of distinct insider purchases in last 30 days
-  - `insider_buy_dollar_30d` — total $ value of insider purchases
-  - `insider_net_buy_ratio` — buys / (buys + sells)
-- **Risks**: noisy on mega-caps (insiders sell on schedule via 10b5-1 plans, not sentiment)
+All three free high-impact sources shipped together:
 
-### Stocktwits API — Retail sentiment
-- **Source**: `https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json`
-- **Frequency**: 30-min polling
-- **Cost**: $0 (rate-limited; ~200 req/hr)
-- **Expected lift**: +1–2% win-rate, primarily on retail-driven names (small/mid caps + meme tickers)
-- **Features to add**:
-  - `st_message_count_24h` — message volume (engagement spike = squeeze risk)
-  - `st_bullish_pct` — % of messages tagged Bullish (Stocktwits provides per-message sentiment)
-  - `st_bullish_pct_7d_change` — sentiment trend
-- **Risks**: low signal on AAPL/NVDA where the tape itself reflects retail flow already
+### ✅ SEC Form 4 — Insider trades
+- `services/insider_trades.py` — parses EDGAR Atom feed per CIK, extracts
+  Form 4 nonDerivativeTransaction codes (`P` = buy, `S` = sell), aggregates
+  30d/90d buy-counts and net-buy-ratio with $ value.
+- Weekly refresh Sun 04:45 UTC (SEC rate-limits 10 req/s → serial with 200ms pacing).
+- `InsiderSummary` table, `/api/insider/{ticker}` + `/refresh-all` endpoints.
+- `insider_multiplier(ticker, direction)` — 0.97..1.06 envelope;
+  requires ≥3 transactions for signal. BUY: ≥70% buy-ratio → 1.06, ≤30% → 0.97.
 
-### FINRA Short Interest
-- **Source**: `https://api.finra.org/data/group/otcMarket/name/regShoDaily` (registration required, free)
-- **Frequency**: bimonthly publish, daily indicative via FINRA REGT
-- **Cost**: $0
-- **Expected lift**: +1% baseline, +5% on names with high short interest going into a BUY signal
-- **Features to add**:
-  - `short_interest_pct_float` — % of float shorted
-  - `days_to_cover` — short interest ÷ avg daily volume
-- **Risks**: bimonthly cadence makes it stale; high SI is two-sided (squeeze risk + fundamental skepticism)
+### ✅ Stocktwits — Retail sentiment
+- `services/social_sentiment.py` — calls public Stocktwits stream API,
+  aggregates last 24h bullish/bearish tagged messages.
+- 4×/day refresh (12/15/18/21 UTC).
+- `SocialSentiment` table, `/api/social/sentiment/{ticker}` endpoints.
+- `sentiment_multiplier(ticker, direction)` — 0.96..1.04 envelope;
+  requires ≥20 messages/24h to trust lean; ≥60% tilts the multiplier.
+
+### ✅ Short interest — via Fundamentals
+- Added `short_pct_float` + `short_ratio` columns to Fundamentals (no new
+  module — yfinance .info already provides both, refreshed weekly with
+  the rest of the fundamentals).
+- `short_interest_multiplier(ticker, direction)` — 0.92..1.02 envelope.
+  BUY: ≥25% of float shorted → 0.92 (fundamental skepticism); 15-25% → 1.02
+  (squeeze tilt). SELL: mirror — already-crowded shorts = 0.92 (late-to-party).
 
 ## Tier 2 — Free, moderate-impact
 

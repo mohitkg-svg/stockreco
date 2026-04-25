@@ -580,6 +580,39 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
+        # Short interest (±8%). Crowded shorts on a BUY = fundamental
+        # skepticism is real. Moderate SI = potential squeeze tilt.
+        try:
+            from services.fundamentals import short_interest_multiplier, short_interest_reason_line
+            _regime_mult *= short_interest_multiplier(ticker, "BUY")
+            _si_line = short_interest_reason_line(ticker, "BUY")
+            if _si_line:
+                reasons.append(_si_line)
+        except Exception:
+            pass
+
+        # Stocktwits retail sentiment (±4%). Confirming/contradicting lean
+        # on meaningful volume only (≥20 messages / 24h).
+        try:
+            from services.social_sentiment import sentiment_multiplier as _st_mult, sentiment_reason_line as _st_reason
+            _regime_mult *= _st_mult(ticker, "BUY")
+            _st_line = _st_reason(ticker, "BUY")
+            if _st_line:
+                reasons.append(_st_line)
+        except Exception:
+            pass
+
+        # SEC Form 4 insider activity (±6%). Director/officer buying on
+        # small/mid caps is empirically predictive.
+        try:
+            from services.insider_trades import insider_multiplier, insider_reason_line
+            _regime_mult *= insider_multiplier(ticker, "BUY")
+            _ins_line = insider_reason_line(ticker, "BUY")
+            if _ins_line:
+                reasons.append(_ins_line)
+        except Exception:
+            pass
+
         # ML scorer: predicts P(win). Always runs (logs prediction); multiplier
         # is 1.0 unless ml_scoring_enabled=True in config (shadow-mode default).
         try:
@@ -750,6 +783,37 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
             _f_line = _f_reason(ticker, "SELL")
             if _f_line:
                 reasons.append(_f_line)
+        except Exception:
+            pass
+
+        # Short interest — already-crowded short = easy money has been made,
+        # penalize fresh SELLs on heavily-shorted names.
+        try:
+            from services.fundamentals import short_interest_multiplier, short_interest_reason_line
+            _regime_mult *= short_interest_multiplier(ticker, "SELL")
+            _si_line = short_interest_reason_line(ticker, "SELL")
+            if _si_line:
+                reasons.append(_si_line)
+        except Exception:
+            pass
+
+        # Stocktwits retail sentiment (±4%) — mirror.
+        try:
+            from services.social_sentiment import sentiment_multiplier as _st_mult, sentiment_reason_line as _st_reason
+            _regime_mult *= _st_mult(ticker, "SELL")
+            _st_line = _st_reason(ticker, "SELL")
+            if _st_line:
+                reasons.append(_st_line)
+        except Exception:
+            pass
+
+        # SEC Form 4 — heavy insider selling confirms bearish.
+        try:
+            from services.insider_trades import insider_multiplier, insider_reason_line
+            _regime_mult *= insider_multiplier(ticker, "SELL")
+            _ins_line = insider_reason_line(ticker, "SELL")
+            if _ins_line:
+                reasons.append(_ins_line)
         except Exception:
             pass
 
