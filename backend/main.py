@@ -277,6 +277,51 @@ def _ml_outcome_backfill():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_tables()
+
+    # Dual-service architecture (RUN_MODE):
+    #   "api"     — DEFAULT. Registers everything EXCEPT the manage loop +
+    #               reconciliation. Handles HTTP, scanner, signal generation,
+    #               entries, all alt-data refresh jobs.
+    #   "manager" — Registers ONLY the 20s manage loop + hourly broker
+    #               reconciliation. Runs as a separate Cloud Run service
+    #               (stockrecs-manager) so a crash in the api service can't
+    #               leave open positions unmanaged.
+    # Both services share the same Cloud SQL database. The api service
+    # writes new AutoTrade rows; the manager service reads + updates them.
+    _run_mode = (os.getenv("RUN_MODE") or "api").strip().lower()
+    if _run_mode not in ("api", "manager"):
+        logger.warning(f"Unknown RUN_MODE={_run_mode!r}, defaulting to 'api'")
+        _run_mode = "api"
+    logger.info(f"RUN_MODE={_run_mode}")
+
+    if _run_mode == "manager":
+        # Manager-only schedule: 20s manage + hourly reconciliation. Boot-time
+        # reconciliation also runs once so a fresh container picks up any
+        # state drift from a prior incarnation.
+        scheduler.add_job(
+            _scheduled_manage, "interval", seconds=20, id="auto_trader_manage",
+            max_instances=1, coalesce=True, misfire_grace_time=10,
+        )
+        scheduler.add_job(
+            auto_trader.detect_unexpected_positions, "interval", minutes=60,
+            id="unexpected_positions_audit",
+            max_instances=1, coalesce=True, misfire_grace_time=120,
+        )
+        try:
+            auto_trader.detect_unexpected_positions()
+        except Exception as _e:
+            logger.warning(f"boot reconciliation failed: {_e}")
+        scheduler.start()
+        _app_health["scheduler_started"] = True
+        logger.info("Manager service started — manage every 20s, reconcile every 60min")
+        yield
+        try:
+            scheduler.shutdown()
+        except Exception:
+            pass
+        return
+
+    # ---- api mode below: original lifespan logic unchanged ----------
     # Audit fix D3: explicit max_instances=1 + coalesce so a slow scan doesn't
     # stack a second one. Also ties both jobs to a 60s misfire grace window.
     # Scan cadence 15m → 5m: 3× more entry opportunities per session. The
@@ -286,22 +331,6 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         scheduled_scan, "interval", minutes=5, id="watchlist_scan",
         max_instances=1, coalesce=True, misfire_grace_time=60,
-    )
-    # Audit fix #2: manage loop cadence 60s → 20s. Previously any broker-
-    # side SL drop could leave a position naked for up to 60s before the
-    # next tick detected it. 20s caps the exposure window at ~1/3 of that
-    # while still respecting Alpaca's REST rate limit on status-poll calls.
-    scheduler.add_job(
-        _scheduled_manage, "interval", seconds=20, id="auto_trader_manage",
-        max_instances=1, coalesce=True, misfire_grace_time=10,
-    )
-    # Audit fix #9: hourly detection of unexpected stock positions
-    # (option-assignment surprises, manual trades outside the bot, etc.).
-    # Alerts the operator if Alpaca reports a position we don't track.
-    scheduler.add_job(
-        auto_trader.detect_unexpected_positions, "interval", minutes=60,
-        id="unexpected_positions_audit",
-        max_instances=1, coalesce=True, misfire_grace_time=120,
     )
     # News ingestion — alpaca-py 0.21.1 doesn't yet export NewsDataStream,
     # so the 2-min REST poll remains our news ingestion path. The
@@ -738,10 +767,38 @@ def health():
     except Exception:
         pass
 
+    # Manage-loop staleness — only relevant on the manager service (api
+    # service doesn't run the manage loop, so its last_manage_at is None
+    # and staleness is meaningless).
+    manage_stale_secs = None
+    _is_manager_proc = (os.getenv("RUN_MODE") or "api").strip().lower() == "manager"
+    try:
+        last_m = _app_health.get("last_manage_at")
+        if last_m:
+            from datetime import datetime as _dt_h, timezone as _tz_h
+            last_dt = _dt_h.fromisoformat(last_m.replace("Z", "+00:00")) if isinstance(last_m, str) else last_m
+            manage_stale_secs = (_dt_h.now(_tz_h.utc) - last_dt).total_seconds()
+    except Exception:
+        pass
+
+    # If manager hasn't ticked in >120s, alert. Manage cadence is 20s so
+    # 120s = 6 missed ticks — clearly something's wrong.
+    if _is_manager_proc and manage_stale_secs is not None and manage_stale_secs > 120:
+        try:
+            from services import alerts as _alerts2
+            _alerts2.alert(
+                severity="error",
+                category="manage_loop_stuck",
+                message=f"Manage loop hasn't ticked in {manage_stale_secs:.0f}s — positions may not be tracked",
+            )
+        except Exception:
+            pass
+
     degraded = (
         not _app_health["scheduler_started"]
         or not _app_health["live_quotes_started"]
         or (stream_stale_secs is not None and stream_stale_secs > 120)
+        or (_is_manager_proc and manage_stale_secs is not None and manage_stale_secs > 120)
         or bp_breaker
         or broker_down_flag
         or killed_flag

@@ -93,8 +93,20 @@ gcloud run deploy "$SERVICE" \
   --min-instances 1 \
   --max-instances 3 \
   --timeout 300s \
+  --startup-cpu-boost \
   --add-cloudsql-instances "$CSQL_INSTANCE" \
   --update-env-vars "$ENV_VARS"
+
+# Cloud Run liveness probe — auto-restart instance if /api/health returns
+# non-200 for 3 consecutive checks. /api/health is unauthenticated by
+# design (read-only health). Probe runs against an internal port and
+# does not consume our public quota.
+# These flags require gcloud beta + a recent Cloud Run version. The
+# subcommand may fail on older clients — non-fatal, just warn.
+gcloud beta run services update "$SERVICE" --region "$REGION" \
+  --liveness-probe="httpGet.path=/api/health,initialDelaySeconds=20,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" \
+  --startup-probe="httpGet.path=/api/health,initialDelaySeconds=10,periodSeconds=5,timeoutSeconds=5,failureThreshold=12" \
+  2>/dev/null || echo "(liveness-probe flags unavailable; install gcloud beta or update — non-fatal)"
 
 URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
 echo ""

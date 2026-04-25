@@ -88,17 +88,73 @@ auth layer.
                      └───────────────────┘
 ```
 
-### 2.1 Runtime Topology
-- **Single Cloud Run instance** (1 vCPU, 1 GiB, min-instances=1 to keep the
-  APScheduler ticking). All components live in one Python process.
+### 2.1 Runtime Topology — Dual-service architecture (2026-04-25)
+
+Production runs **two** Cloud Run services that share the same Cloud SQL
+database. They differ only in `RUN_MODE`:
+
+```
+                ┌──────────────────────────┐    ┌──────────────────────────┐
+   Browser ───▶ │ stockrecs (RUN_MODE=api) │    │ stockrecs-manager        │
+                │  HTTP API                │    │  (RUN_MODE=manager)      │
+                │  + scanner schedule      │    │  internal-only           │
+                │  + signal generation     │    │                          │
+                │  + entry submission      │    │  + 20s manage loop       │
+                │  + alt-data refresh jobs │    │  + 60min reconciliation  │
+                └──────────┬───────────────┘    └──────────┬───────────────┘
+                           │                                │
+                           └─────────────┬──────────────────┘
+                                         │
+                              ┌──────────▼───────────┐
+                              │ Cloud SQL Postgres   │
+                              │ (shared state)       │
+                              └──────────────────────┘
+```
+
+**Why two services**: a crash, rate-limit, or scheduler misfire in the
+`api` service (which does heavy work — yfinance polling, scanner runs,
+signal generation, alt-data refresh) cannot leave open positions
+unmanaged. The `manager` service does **only** the position-management
+loop and broker reconciliation; it has near-zero work between ticks and
+fewer failure modes.
+
+**Coordination**:
+- Both services connect to the same `stockrecs-db` Cloud SQL instance.
+- The `api` service writes new `auto_trades` rows (status=pending/open).
+- The `manager` service reads + updates those rows (target hits, stop
+  trails, force-close).
+- Job partitioning is enforced in `main.py:lifespan` based on `RUN_MODE`:
+  manager-mode `return`s early after registering its two jobs; api-mode
+  registers all the rest.
+- BP reservation, circuit breakers, in-memory caches are **per-process**
+  by design — the manager doesn't make new entries (no need for BP
+  reservation), and circuit breakers fire independently in the service
+  that experienced the broker error.
+
+**Resource sizing**:
+- `api`: 1 vCPU / 1 GiB / max-instances 3 — handles concurrent HTTP +
+  scheduled scans + alt-data fetches.
+- `manager`: 1 vCPU / 512 MiB / max-instances 1 — single instance is
+  correct here; doubling would dual-fire the manage loop.
+
+**Deploy**:
+- `./deploy.sh` builds and deploys the api service.
+- `./deploy-manager.sh` builds and deploys the manager service.
+  Same image, different `RUN_MODE`.
+
+### 2.2 Legacy single-process topology (pre-2026-04-25)
+- **Single Cloud Run instance** (1 vCPU, 1 GiB, min-instances=1 to keep
+  the APScheduler ticking). All components in one Python process.
+- The dual-service architecture above replaced this; `RUN_MODE=api`
+  with no manager service deployed reverts to single-process behaviour
+  (manage loop will simply not run).
 - **Static React SPA** is baked into the container image and served at
-  `/`. `index.html` bootstraps a Babel-standalone-transpiled `app.js`
-  with a `?v=${Date.now()}` cache-bust.
+  `/`.
 - **Thread model**: FastAPI event loop + `ThreadPoolExecutor` pools for
   parallel watchlist scans, parallel overview price lookups, and
   non-blocking post-mortems.
-- **Database**: Neon Postgres (pool_size=5, pool_pre_ping=True for
-  serverless wake tolerance). SQLite WAL is still supported for local dev.
+- **Database**: Cloud SQL Postgres (pool_size=8, max_overflow=7,
+  pool_pre_ping=True). Migrated from Neon in revision 12.
 
 ---
 

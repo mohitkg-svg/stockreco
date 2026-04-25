@@ -267,12 +267,14 @@ async def _alpaca_worker():
     _feed_name = os.getenv("ALPACA_DATA_FEED", "iex").lower()
     _feed = DataFeed.SIP if _feed_name == "sip" else DataFeed.IEX
 
-    # Exponential backoff on reconnect. Fixed 10s retries hammered Alpaca
-    # during DNS flakes / 429s, piling up thousands of "connection limit
-    # exceeded" errors in minutes. Caps at 5 min; resets on any tick where
-    # client.run() returned cleanly (connection was established long enough
-    # to exit the blocking call normally).
+    # Exponential backoff on reconnect with jitter. Fixed 10s retries
+    # hammered Alpaca during DNS flakes / 429s, piling up thousands of
+    # "connection limit exceeded" errors in minutes. Caps at 5 min; resets
+    # on any tick where client.run() returned cleanly. Jitter (0.5×..1.5×)
+    # prevents thundering-herd on simultaneous reconnects across instances.
+    import random as _random
     backoff = 10
+    consecutive_failures = 0
     while True:
         try:
             client = StockDataStream(key, secret, feed=_feed)
@@ -281,23 +283,36 @@ async def _alpaca_worker():
 
             # We subscribe lazily as watchlist changes via ensure_symbols()
             while True:
-                # Give the subscription pump a tick to register
                 await asyncio.sleep(1)
                 if _subscribed_symbols:
-                    # alpaca-py's StockDataStream._run_forever is blocking;
-                    # use its internal connection via subscribe then run
                     break
 
             client.subscribe_trades(_handle_trade, *list(_subscribed_symbols))
             client.subscribe_quotes(_handle_quote, *list(_subscribed_symbols))
 
             logger.info(f"Alpaca stream connected, subscribed to {sorted(_subscribed_symbols)}")
-            # client._run_forever is sync — wrap in thread
             await asyncio.get_running_loop().run_in_executor(None, client.run)
-            backoff = 10  # clean return means we actually connected
+            backoff = 10
+            consecutive_failures = 0
         except Exception as e:
-            logger.error(f"Alpaca stream error, reconnecting in {backoff}s: {e}")
-            await asyncio.sleep(backoff)
+            consecutive_failures += 1
+            wait_s = backoff * (0.5 + _random.random())   # ±50% jitter
+            logger.error(f"Alpaca stream error, reconnecting in {wait_s:.0f}s "
+                         f"(attempt #{consecutive_failures}): {e}")
+            # Escalate to alert when we've been failing for a while.
+            # Cap-hit (~5 min backoff) AND ≥5 consecutive failures = ~25 min
+            # of broken stream. Operator needs to know.
+            if backoff >= 300 and consecutive_failures >= 5:
+                try:
+                    from services import alerts as _al
+                    _al.alert(
+                        severity="error",
+                        category="stream_reconnect_loop",
+                        message=f"Alpaca WS stuck reconnecting ({consecutive_failures} failures, {wait_s:.0f}s backoff): {str(e)[:200]}",
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(wait_s)
             backoff = min(300, backoff * 2)
 
 

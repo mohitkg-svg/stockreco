@@ -37,12 +37,17 @@ if _ENABLED:
     AUTOTRADE_EVENTS = Counter(
         "autotrader_events_total",
         "Auto-trader lifecycle events",
-        ["event"],  # opened, closed_target, closed_stop, closed_manual, dry_run, skip_*
+        ["event"],  # opened, closed_target, closed_stop, closed_manual, etc.
+    )
+    AUTOTRADE_SKIPS = Counter(
+        "autotrader_skips_total",
+        "Signals rejected at a specific gate, by reason",
+        ["reason"],  # bp_breaker, broker_down, daily_loss_halt, below_confidence, ...
     )
     DATA_FETCHES = Counter(
         "data_fetcher_calls_total",
         "Outbound OHLCV fetches by source + outcome",
-        ["source", "outcome"],  # source=yahoo|alpaca, outcome=ok|empty|error
+        ["source", "outcome"],
     )
     SIGNAL_LATENCY = Histogram(
         "signal_generation_seconds",
@@ -61,6 +66,7 @@ def inc(name: str, **labels) -> None:
         return
     counter = {
         "autotrade_event": AUTOTRADE_EVENTS,
+        "autotrade_skip": AUTOTRADE_SKIPS,
         "data_fetch": DATA_FETCHES,
     }.get(name)
     if counter is None:

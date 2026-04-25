@@ -818,5 +818,170 @@ class TestTradeRationale(unittest.TestCase):
         self.assertNotIn("LOW", keys)
 
 
+# ============================================================================
+# CATEGORY J: risk_math pure helpers
+# ----------------------------------------------------------------------------
+# Now that risk_math.py extracts these from auto_trader.py, they're trivially
+# unit-testable. Pin the boundaries so accidental tuning shifts get caught.
+# ============================================================================
+
+class TestRiskMath(unittest.TestCase):
+
+    def test_idempotency_key_deterministic(self):
+        from services.risk_math import signal_idempotency_key
+        sig = {"ticker": "AAPL", "signal_type": "BUY", "entry": 200.0,
+               "stop_loss": 195.0, "target1": 210.0, "timeframe": "1d",
+               "confidence": 80}
+        self.assertEqual(signal_idempotency_key(sig), signal_idempotency_key(sig))
+
+    def test_idempotency_key_bucket_aware(self):
+        """Conf 75 and 85 should hash differently (different 10-buckets)."""
+        from services.risk_math import signal_idempotency_key
+        a = signal_idempotency_key({"ticker": "X", "signal_type": "BUY",
+                                    "entry": 100, "stop_loss": 95, "target1": 105,
+                                    "timeframe": "1d", "confidence": 75})
+        b = signal_idempotency_key({"ticker": "X", "signal_type": "BUY",
+                                    "entry": 100, "stop_loss": 95, "target1": 105,
+                                    "timeframe": "1d", "confidence": 85})
+        self.assertNotEqual(a, b)
+
+    def test_clamp_multiplier_stack(self):
+        from services.risk_math import clamp_multiplier_stack
+        # 1.75 × 1.35 × 1.3 × 1.3 × 1.0 = 4.0 raw → clamped to RISK_MULT_CEILING=2.0
+        raw, clamped, was_clamped = clamp_multiplier_stack(1.75, 1.35, 1.3, 1.3, 1.0)
+        self.assertGreater(raw, 2.0)
+        self.assertEqual(clamped, 2.0)
+        self.assertTrue(was_clamped)
+
+    def test_clamp_passthrough_when_under_ceiling(self):
+        from services.risk_math import clamp_multiplier_stack
+        raw, clamped, was_clamped = clamp_multiplier_stack(1.10, 1.05, 1.0, 1.0, 1.0)
+        self.assertAlmostEqual(raw, clamped, places=4)
+        self.assertFalse(was_clamped)
+
+    def test_position_size_by_risk_normal(self):
+        from services.risk_math import position_size_by_risk
+        # $100K equity × 2% = $2000 budget; risk per share $5 → 400 shares
+        self.assertEqual(position_size_by_risk(100_000, 0.02, 5), 400)
+
+    def test_position_size_by_risk_floors_to_zero(self):
+        from services.risk_math import position_size_by_risk
+        self.assertEqual(position_size_by_risk(0, 0.02, 5), 0)
+        self.assertEqual(position_size_by_risk(100, 0.02, 0), 0)
+        self.assertEqual(position_size_by_risk(100, -0.01, 5), 0)
+
+    def test_kelly_thin_data_neutral(self):
+        from services.risk_math import kelly_risk_mult
+        self.assertEqual(kelly_risk_mult(None, None), 1.0)
+        self.assertEqual(kelly_risk_mult(45.0, 2.0), 1.0)  # below 55% min
+
+    def test_confidence_risk_mult_ramps(self):
+        from services.risk_math import confidence_risk_mult
+        # At threshold = neutral
+        self.assertEqual(confidence_risk_mult(75, 75), 1.0)
+        # At 100 = max mult (default 1.75)
+        self.assertAlmostEqual(confidence_risk_mult(100, 75), 1.75, places=2)
+        # Below threshold = neutral (no negative ramp)
+        self.assertEqual(confidence_risk_mult(50, 75), 1.0)
+
+
+# ============================================================================
+# CATEGORY K: risk_manager state isolation
+# ----------------------------------------------------------------------------
+# The new reset_for_tests() helper lets us round-trip BP reservation +
+# circuit breakers without leaking state between tests.
+# ============================================================================
+
+class TestRiskManagerState(unittest.TestCase):
+
+    def setUp(self):
+        from services import risk_manager as rm
+        rm.reset_for_tests()
+
+    def test_bp_reservation_round_trip(self):
+        from services.risk_manager import reserve_bp, release_bp, get_in_flight_bp
+        self.assertEqual(get_in_flight_bp(), 0.0)
+        reserve_bp(1000)
+        self.assertEqual(get_in_flight_bp(), 1000.0)
+        reserve_bp(500)
+        self.assertEqual(get_in_flight_bp(), 1500.0)
+        release_bp(1200)
+        self.assertEqual(get_in_flight_bp(), 300.0)
+
+    def test_bp_breaker_lifecycle(self):
+        from services.risk_manager import (trip_bp_breaker, clear_bp_breaker,
+                                            bp_breaker_active)
+        self.assertFalse(bp_breaker_active())
+        trip_bp_breaker(minutes=30)
+        self.assertTrue(bp_breaker_active())
+        clear_bp_breaker()
+        self.assertFalse(bp_breaker_active())
+
+    def test_sl_failure_count_rolling(self):
+        from services.risk_manager import record_sl_resubmit_failure, sl_resubmit_failures_1h
+        self.assertEqual(sl_resubmit_failures_1h(), 0)
+        record_sl_resubmit_failure()
+        record_sl_resubmit_failure()
+        record_sl_resubmit_failure()
+        self.assertEqual(sl_resubmit_failures_1h(), 3)
+
+
+# ============================================================================
+# CATEGORY L: Adaptive risk + VIX-options bucket
+# ----------------------------------------------------------------------------
+# Both functions defer to fundamentals + closed-trades aggregation, so a
+# clean DB returns 1.0 (neutral). The tests pin that the multiplier doesn't
+# spuriously drop in a clean state — a regression here would silently halve
+# risk on a cold-start instance.
+# ============================================================================
+
+class TestAdaptiveRisk(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+
+    def test_neutral_when_no_data(self):
+        """No VIX, no closed trades → neutral 1.0."""
+        from services.risk_manager import adaptive_risk_multiplier, vix_options_bucket_multiplier
+        # Without VIX data and no closed trades the function returns 1.0
+        # (or 0.5 only if the win-rate calc sees ≥10 closed trades, which
+        # we don't have in a clean test DB).
+        self.assertEqual(adaptive_risk_multiplier(), 1.0)
+        self.assertEqual(vix_options_bucket_multiplier(), 1.0)
+
+
+# ============================================================================
+# CATEGORY M: Run-mode partitioning
+# ----------------------------------------------------------------------------
+# Smoke-tests that the run-mode env var resolves correctly.
+# ============================================================================
+
+class TestRunMode(unittest.TestCase):
+
+    def test_default_is_api(self):
+        os.environ.pop("RUN_MODE", None)
+        mode = (os.getenv("RUN_MODE") or "api").strip().lower()
+        self.assertEqual(mode, "api")
+
+    def test_manager_mode(self):
+        os.environ["RUN_MODE"] = "manager"
+        try:
+            mode = (os.getenv("RUN_MODE") or "api").strip().lower()
+            self.assertEqual(mode, "manager")
+        finally:
+            os.environ.pop("RUN_MODE", None)
+
+    def test_unknown_falls_back_to_api(self):
+        # The lifespan code falls back to api on unknown — mirror that here.
+        os.environ["RUN_MODE"] = "garbage"
+        try:
+            mode = (os.getenv("RUN_MODE") or "api").strip().lower()
+            if mode not in ("api", "manager"):
+                mode = "api"
+            self.assertEqual(mode, "api")
+        finally:
+            os.environ.pop("RUN_MODE", None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
