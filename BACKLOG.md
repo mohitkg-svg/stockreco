@@ -110,6 +110,21 @@ rollout). Revisit ~4 weeks after live trading is stable.
   `auto_trader`, `routers/trading`. Better to add models for *new* code first
   and migrate existing call sites incrementally.
 
+### Full AutoTraderService class encapsulation
+- **Status**: Substantially reduced in scope after the 2026-04-25
+  decomposition. Most of the module state (BP reservations, circuit
+  breakers, strategy/calibration caches, chandelier caches, price
+  cache, replace-stop cache) now lives in the extracted modules
+  (`risk_manager.py`, `execution_engine.py`, `position_manager.py`).
+- **Remaining state in auto_trader.py**: `_entry_lock` (single
+  threading.Lock), `_target_touch_counts` (per-trade debounce dict),
+  `_post_mortem_pool` (ThreadPoolExecutor), plus ~6 constants.
+- A class wrapper around two pieces of state is pure ceremony — the
+  testability benefit is already delivered by `auto_trader_state.py`
+  (read-view) and `reset_for_tests()` helpers in each decomposed module.
+- **Do this only if** we add multi-tenancy or cross-test isolation
+  requirements. Not worth the refactor cost otherwise.
+
 ### Async I/O migration (httpx.AsyncClient + await endpoints)
 - **Status**: **Formally deferred** after re-evaluation on 2026-04-25.
 - **Surface area**: 10+ routers, 15+ services, every yfinance / httpx /
