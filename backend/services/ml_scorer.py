@@ -101,14 +101,18 @@ def predict_winrate(ticker: str, signal: Dict[str, Any], as_of: Optional[datetim
 # Map P(win) → confidence multiplier. Envelope is intentionally tight (0.88..1.12)
 # because (a) the model has been trained on synthetic backtest labels, not live
 # trades, and (b) we want it to *tilt* the existing signal stack, not dominate it.
+# Envelope values live in services.config (ML_MULT_*).
 def winrate_to_multiplier(p: Optional[float]) -> float:
+    from services.config import (
+        ML_MULT_HIGH, ML_MULT_LIFT, ML_MULT_NEUTRAL, ML_MULT_DAMP, ML_MULT_LOW,
+    )
     if p is None:
-        return 1.0
-    if p >= 0.70: return 1.12
-    if p >= 0.60: return 1.06
-    if p >= 0.45: return 1.0
-    if p >= 0.35: return 0.94
-    return 0.88
+        return ML_MULT_NEUTRAL
+    if p >= 0.70: return ML_MULT_HIGH
+    if p >= 0.60: return ML_MULT_LIFT
+    if p >= 0.45: return ML_MULT_NEUTRAL
+    if p >= 0.35: return ML_MULT_DAMP
+    return ML_MULT_LOW
 
 
 def log_prediction(ticker: str, signal: Dict[str, Any], p: Optional[float],

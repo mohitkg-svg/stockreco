@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from routers._auth import require_api_key
+from services.config import CHAT_MODEL as _MODEL, CHAT_MAX_TOKENS as _MAX_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +24,6 @@ router = APIRouter(
     tags=["chat"],
     dependencies=[Depends(require_api_key)],
 )
-
-_MODEL = "claude-opus-4-7"
-_MAX_TOKENS = 8000
 
 
 class ChatMessage(BaseModel):

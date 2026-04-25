@@ -60,15 +60,67 @@ _root_logger.setLevel(logging.INFO)
 _LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s | %(message)s"
 _formatter = logging.Formatter(_LOG_FMT)
 
+
+# ---- Structured JSON formatter for stdout (Cloud Logging-friendly) ----
+# Cloud Logging auto-parses JSON lines and exposes each field as a queryable
+# attribute (severity, logger, message, etc). This makes "show me all
+# autotrade events for AAPL in the last hour" a one-line filter instead of
+# regex-grepping a flat string. Falls back to plain-text if json import fails
+# (it shouldn't — stdlib).
+class _JsonFormatter(logging.Formatter):
+    # Cloud Logging maps these keys to its severity column.
+    _SEV_MAP = {
+        "DEBUG": "DEBUG", "INFO": "INFO", "WARNING": "WARNING",
+        "ERROR": "ERROR", "CRITICAL": "CRITICAL",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        payload = {
+            "ts": _dt.fromtimestamp(record.created, tz=_tz.utc).isoformat(),
+            "severity": self._SEV_MAP.get(record.levelname, "DEFAULT"),
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        # Pick up any structured extras (logger.info("...", extra={"ticker": ...}))
+        for k, v in record.__dict__.items():
+            if k in payload or k.startswith("_"):
+                continue
+            if k in ("name", "msg", "args", "levelname", "levelno", "pathname",
+                     "filename", "module", "exc_info", "exc_text", "stack_info",
+                     "lineno", "funcName", "created", "msecs", "relativeCreated",
+                     "thread", "threadName", "processName", "process", "message",
+                     "taskName"):
+                continue
+            try:
+                _json.dumps(v)  # serializability check
+                payload[k] = v
+            except Exception:
+                payload[k] = repr(v)
+        try:
+            return _json.dumps(payload, default=str)
+        except Exception:
+            return super().format(record)
+
+
+# JSON to stdout in production (Cloud Run picks up structured fields);
+# plaintext locally so dev tail-f stays readable.
+_use_json_logs = os.getenv("LOG_JSON", "1") == "1"
+_stdout_formatter = _JsonFormatter() if _use_json_logs else _formatter
+
 if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler)
            for h in _root_logger.handlers):
     _stream_h = logging.StreamHandler()
-    _stream_h.setFormatter(_formatter)
+    _stream_h.setFormatter(_stdout_formatter)
     _root_logger.addHandler(_stream_h)
 
 if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == LOG_FILE
            for h in _root_logger.handlers):
     _file_h = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5)
+    # On-disk file stays plaintext for human inspection (tail / less / grep -i).
     _file_h.setFormatter(_formatter)
     _root_logger.addHandler(_file_h)
 

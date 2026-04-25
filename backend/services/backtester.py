@@ -277,6 +277,20 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
     if len(d) < 60:
         return {"results": [], "best": None}
 
+    # Sanity-filter malformed bars before simulating. Yahoo / Alpaca occasionally
+    # emit zero-volume halt prints, or High<Low artifacts from corporate-action
+    # adjustments. Both produce nonsense fills. Drop them quietly.
+    if "High" in d.columns and "Low" in d.columns:
+        bad_hl = d["High"] < d["Low"]
+        if bad_hl.any():
+            d = d[~bad_hl].copy()
+    if "Volume" in d.columns:
+        bad_vol = d["Volume"].fillna(0) <= 0
+        if bad_vol.any():
+            d = d[~bad_vol].copy()
+    if len(d) < 60:
+        return {"results": [], "best": None}
+
     atr_col = next((c for c in d.columns if c.startswith("ATR_")), None)
 
     def _evaluate(frame: pd.DataFrame):

@@ -83,3 +83,60 @@ Listed in **descending order of expected win-rate lift per dollar of cost**.
 - **Debit spreads** for defined-risk exposure
 - **Portfolio-heat-aware risk-per-trade**
 - **Push notifications** on T1/T2/T3 hits
+
+## Architecture / refactor backlog
+
+Items raised in the 2026-04-25 external code review. Right idea, deferred
+because the timing is wrong (don't refactor right before / during real-money
+rollout). Revisit ~4 weeks after live trading is stable.
+
+### Encapsulate auto_trader globals into a class
+- **What**: Replace module-level `_entry_lock`, `_bp_exhausted_until`, the
+  caches, etc. with an `AutoTraderService` class. State becomes explicit;
+  makes future testing tractable.
+- **Why defer**: ~1k LOC of churn for zero functional benefit. No test suite
+  exists, single FastAPI process, Cloud Run cold-starts (no hot-reload concern).
+  Risk of regression > value of the refactor right now.
+
+### Decompose auto_trader.py (3,179 LOC) into focused modules
+- **Proposed split**:
+  - `risk_manager.py` — budget, sector caps, multiplier stack, sizing
+  - `execution_engine.py` — paper_trader interactions, order submission
+  - `position_manager.py` — `manage_open_positions` state machine
+  - `auto_trader.py` (slim) — orchestration only
+- **Why defer**: Refactoring the highest-stakes file in the system right
+  before going live with real money is the worst possible timing. Plan for
+  4–6 weeks post-live once behavior is stable and well-monitored.
+
+### Pydantic models for internal data shapes
+- **What**: Replace `Dict[str, Any]` with `SignalData`, `TradeContext`, etc.
+  Catches `KeyError` at construction time instead of randomly during a trade.
+- **Why defer**: Mass refactor affecting most of `signal_generator`,
+  `auto_trader`, `routers/trading`. Better to add models for *new* code first
+  and migrate existing call sites incrementally.
+
+### Async I/O migration (httpx.AsyncClient + await endpoints)
+- **What**: Move broker / data-fetch calls to async; use `await` in routers.
+- **Why defer**: ThreadPoolExecutor at 4 workers handles single-user scale
+  fine. Migration is large surface area, high regression risk, marginal
+  benefit until traffic is much higher. Revisit if we ever hit thread
+  exhaustion symptoms.
+
+### Priority-queue scanner (vs flat 5min watchlist scan)
+- **Proposal**: scan tickers with open positions every 1m, high-conf signals
+  every 5m, general watchlist every 15m.
+- **Why reject**: open positions are already managed every **20 seconds** via
+  `_scheduled_manage`, not via the watchlist scanner. The proposal solves a
+  problem we don't have. Watchlist 5m + universe-pool 4×/day is right-sized.
+
+## Already accepted from this review (done in commit 2026-04-25)
+
+- ✅ Centralize cross-cutting magic numbers in `services/config.py`
+  (`RISK_*`, `ML_MULT_*`, `CHAT_*`). Feature-local thresholds intentionally
+  left co-located with their logic.
+- ✅ Backtester: skip bars where `High < Low` or `Volume == 0` before
+  simulating fills.
+- ✅ Structured JSON logging to stdout (env-gated via `LOG_JSON=1`, default
+  on for Cloud Run). Cloud Logging now parses each line as a structured
+  record with `severity`, `logger`, `message`, and any `extra` fields.
+  On-disk rotating file stays plaintext for human grep.

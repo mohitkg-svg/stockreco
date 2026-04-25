@@ -153,8 +153,14 @@ _target_touch_counts: Dict[int, int] = {}
 # ±0.3×ATR are normal market-order behaviour. ±0.3-1.0×ATR shifts targets
 # proportionally so distances stay intact. >1.0×ATR is a runaway gap-up
 # fill — flatten immediately rather than auto-trailing into a chop-out.
-_SLIPPAGE_SHIFT_ATR = 0.3
-_SLIPPAGE_REJECT_ATR = 1.0
+from services.config import (
+    RISK_SLIPPAGE_SHIFT_ATR as _SLIPPAGE_SHIFT_ATR,
+    RISK_SLIPPAGE_REJECT_ATR as _SLIPPAGE_REJECT_ATR,
+    RISK_MAX_CONFIDENCE_MULT as _MAX_CONFIDENCE_RISK_MULT,
+    RISK_KELLY_MAX_MULT as _KELLY_MAX_MULT,
+    RISK_KELLY_MIN_WIN_RATE as _KELLY_MIN_WIN_RATE,
+    RISK_PORTFOLIO_HEAT_CAP_PCT as _PORTFOLIO_HEAT_CAP_PCT,
+)
 # Below this T1-from-entry distance (in ATR), the break-even trail-on-T1
 # rule is suppressed — T1 is too tight to be a meaningful profit lock and
 # moving the stop there just chops us out on a normal pullback. We let the
@@ -163,14 +169,10 @@ _SLIPPAGE_REJECT_ATR = 1.0
 _T1_BE_MIN_ATR = 0.5
 
 # Profit-maximization tuning (strategy upgrade).
-# Confidence-scaled risk: a signal well above threshold gets a larger
-# position. Risk multiplier ramps linearly from 1.0x at the threshold to
-# _MAX_CONFIDENCE_RISK_MULT at 100% confidence.
-_MAX_CONFIDENCE_RISK_MULT = 1.75
-# Backtest-win-rate-aware scaling: if this ticker's strategy has a >=55%
-# historical hit rate, multiply the risk budget up to _KELLY_MAX_MULT.
-_KELLY_MAX_MULT = 1.35
-_KELLY_MIN_WIN_RATE = 55.0
+# Confidence-scaled risk: a signal well above threshold gets a larger position.
+# Kelly-criterion scaling: if this ticker's strategy has a >=55% historical
+# hit rate, multiply the risk budget up to _KELLY_MAX_MULT.
+# Both knobs live in services/config.py (RISK_*).
 # T2 partial profit-taking. At T1 we already trimmed 1/3 of the original
 # position (runner = 2/3). This fraction is applied to that REMAINING qty.
 # 0.33 of 2/3 original = 22% of original, leaving a 45% runner for T3+.
@@ -185,8 +187,7 @@ _STALE_TRADE_TF_MULT = 8
 # auto-trades cannot exceed this fraction of equity at the moment a new
 # entry is evaluated. A 2%-per-trade risk budget with 15 concurrent slots
 # otherwise allowed 30% portfolio heat — one correlated drawdown could wipe
-# out a third of the account before anything stopped out.
-_PORTFOLIO_HEAT_CAP_PCT = 0.10
+# out a third of the account before anything stopped out. (See config.py.)
 # Gap-open reject: if live price has drifted more than this % from the
 # signal's original entry, the signal was computed on stale data and the
 # geometry is no longer trustworthy (targets/stop were set relative to the
@@ -1236,7 +1237,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # A single reversal then hits the account ~5× harder than intended.
         # The 2.0× ceiling preserves 60% of the multiplier upside while
         # hard-capping the downside.
-        _MULT_CEILING = 2.0
+        from services.config import RISK_MULT_CEILING as _MULT_CEILING
         raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult
         clamped_stack = min(raw_stack, _MULT_CEILING)
         effective_risk_budget = risk_budget * clamped_stack

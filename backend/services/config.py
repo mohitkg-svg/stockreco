@@ -38,3 +38,35 @@ STOP_ATR_MULT_BY_TF = {
 # ---- Multi-timeframe S/R weights -------------------------------------------
 # When clustering swings across timeframes, higher-TF levels carry more weight.
 MTF_WEIGHTS = {"1mo": 4, "1d": 3, "4h": 2, "1h": 1}
+
+# ---- Risk envelope (auto_trader) -------------------------------------------
+# Confidence-risk multiplier ramps from 1.0 at threshold to this at 100% conf.
+RISK_MAX_CONFIDENCE_MULT = 1.75
+# Kelly-criterion multiplier cap. Above this, calibration drift dominates.
+RISK_KELLY_MAX_MULT = 1.35
+# Below this historical win rate, don't trust the bucket — force kelly_mult=1.0.
+RISK_KELLY_MIN_WIN_RATE = 55.0
+# Hard ceiling on the COMPOUND risk multiplier
+# (conf × kelly × cal × strategy × VIX). Critical-audit fix #1: stack was
+# producing 4-5× risk in rare edge cases.
+RISK_MULT_CEILING = 2.0
+# Unrealized drawdown threshold: above this fraction of equity, halve sizing.
+RISK_PORTFOLIO_HEAT_CAP_PCT = 0.10
+# Slippage tolerances vs ATR — shift entry by this much, reject if worse.
+RISK_SLIPPAGE_SHIFT_ATR = 0.3
+RISK_SLIPPAGE_REJECT_ATR = 1.0
+
+# ---- ML scorer envelope (ml_scorer) ----------------------------------------
+# P(win) → confidence-multiplier mapping. Tight envelope because v1 trains
+# on synthetic backtest labels, not live trades.
+ML_MULT_HIGH = 1.12      # P(win) >= 0.70
+ML_MULT_LIFT = 1.06      # P(win) >= 0.60
+ML_MULT_NEUTRAL = 1.00   # 0.45 ≤ P < 0.60
+ML_MULT_DAMP = 0.94      # 0.35 ≤ P < 0.45
+ML_MULT_LOW = 0.88       # P(win) < 0.35
+
+# ---- LLM chat (routers/chat) -----------------------------------------------
+# Centralized so model upgrades happen in one place. Downgrade to
+# claude-haiku-4-5 to cut chat token cost ~5× at the expense of nuance.
+CHAT_MODEL = "claude-opus-4-7"
+CHAT_MAX_TOKENS = 8000
