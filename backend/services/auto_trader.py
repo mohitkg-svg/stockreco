@@ -51,94 +51,32 @@ from concurrent.futures import ThreadPoolExecutor
 # manage loop does NOT take this lock — exits are independent of caps.
 _entry_lock = threading.Lock()
 
-# Buying-power circuit breaker. Set to a future UTC datetime when Alpaca
-# rejects an order for insufficient buying power — consider_signal then
-# short-circuits until we're past this timestamp. Prevents the retry storm
-# where every 15-min scan resubmits the same doomed orders for every
-# qualifying ticker.
-_bp_exhausted_until: Optional[datetime] = None
-# Broker-down circuit breaker. Set when Alpaca returns a 5xx (broker API
-# outage). Pauses entry/exit submission so we don't DDoS a broken broker.
-_broker_down_until: Optional[datetime] = None
-
-# Counter of SL-resubmit failures in the last rolling hour — surfaced via
-# /api/health and alerts.count_unacked(). Reset every 60 minutes.
-_sl_resubmit_failures: List[float] = []   # unix-ts of each failure
-_sl_resubmit_lock = threading.Lock()
-
-
-def record_sl_resubmit_failure() -> None:
-    import time as _t
-    now = _t.time()
-    with _sl_resubmit_lock:
-        # Drop entries older than 1h
-        cutoff = now - 3600
-        _sl_resubmit_failures[:] = [t for t in _sl_resubmit_failures if t > cutoff]
-        _sl_resubmit_failures.append(now)
-
-
-def sl_resubmit_failures_1h() -> int:
-    import time as _t
-    now = _t.time()
-    with _sl_resubmit_lock:
-        cutoff = now - 3600
-        return sum(1 for t in _sl_resubmit_failures if t > cutoff)
-
-
-def bp_breaker_active() -> bool:
-    return bool(_bp_exhausted_until and datetime.utcnow() < _bp_exhausted_until)
-
-
-def broker_down() -> bool:
-    return bool(_broker_down_until and datetime.utcnow() < _broker_down_until)
+# BP reservation, circuit breakers, and SL-resubmit tracking now live in
+# services.risk_manager. The aliases below preserve the public API used
+# by other modules (routers/trading.py, main.py /api/health endpoint).
+from services.risk_manager import (
+    bp_breaker_active, broker_down,
+    record_sl_resubmit_failure, sl_resubmit_failures_1h,
+    trip_bp_breaker as _trip_bp_breaker,
+    trip_broker_breaker as _trip_broker_breaker,
+    clear_bp_breaker as _clear_bp_breaker,
+    clear_broker_breaker as _clear_broker_breaker,
+    bp_exhausted_until as _bp_exhausted_until_getter,
+    broker_down_until as _broker_down_until_getter,
+)
 
 # Postmortem fix M1: local in-flight buying-power reservation. Alpaca's
 # reported `buying_power` lags submitted bracket orders (pending TPs reserve
 # BP that doesn't immediately show up as drawn). Without local bookkeeping,
 # a watchlist scan can submit 30 orders against the same stale BP figure
-# before the first 422 trips the circuit breaker. We add `qty * entry` to
-# this counter at submit time and decay it on the next account refresh
-# (the next manage tick or next consider_signal call) by re-reading
-# Alpaca's BP — anything the broker has now drawn down is implicitly
-# reflected, so we reset to zero when the gap closes.
-_in_flight_bp_reserved: float = 0.0
-_in_flight_bp_lock = threading.Lock()
-
-
-def _reserve_bp(amount: float) -> None:
-    global _in_flight_bp_reserved
-    with _in_flight_bp_lock:
-        _in_flight_bp_reserved = max(0.0, _in_flight_bp_reserved + float(amount))
-
-
-def _release_bp(amount: float) -> None:
-    global _in_flight_bp_reserved
-    with _in_flight_bp_lock:
-        _in_flight_bp_reserved = max(0.0, _in_flight_bp_reserved - float(amount))
-
-
-def _get_in_flight_bp() -> float:
-    with _in_flight_bp_lock:
-        return _in_flight_bp_reserved
-
-
-def _decay_in_flight_bp_if_stale() -> None:
-    """Reset the in-flight reservation periodically — Alpaca's reported BP
-    eventually reflects the submitted orders, at which point our local
-    counter is double-counting. We zero it after _BP_RESERVATION_TTL_SEC.
-    """
-    global _in_flight_bp_reserved, _in_flight_bp_last_reset
-    import time as _t
-    now = _t.time()
-    with _in_flight_bp_lock:
-        if now - _in_flight_bp_last_reset > _BP_RESERVATION_TTL_SEC:
-            _in_flight_bp_reserved = 0.0
-            _in_flight_bp_last_reset = now
-
-
-_BP_RESERVATION_TTL_SEC = 60.0  # Alpaca usually reflects submitted BP within 30-60s
-import time as _t_mod
-_in_flight_bp_last_reset: float = _t_mod.time()
+# before the first 422 trips the circuit breaker. BP reservation state +
+# helpers live in services.risk_manager. Aliases preserve existing call sites.
+from services.risk_manager import (
+    reserve_bp as _reserve_bp,
+    release_bp as _release_bp,
+    get_in_flight_bp as _get_in_flight_bp,
+    decay_in_flight_bp_if_stale as _decay_in_flight_bp_if_stale,
+)
 
 # Per-trade consecutive-touch counters for the next price target. Required
 # to suppress single-bar wick triggers — postmortems showed MRVL's T1 hit
@@ -575,9 +513,7 @@ def compute_confidence_calibration(min_bucket_n: int = 5) -> Dict[str, Any]:
     return summary
 
 
-# In-process cache so we don't hit the DB for every signal eval.
-_calibration_cache: Dict[str, tuple] = {}   # bucket -> (mult, expiry_ts)
-_CALIBRATION_CACHE_TTL = 3600  # 1h; nightly job writes fresh values anyway
+# Calibration cache moved to services.risk_manager.
 
 
 def strategy_scorecard(days: int = 60, min_trades: int = 5) -> Dict[str, Dict[str, Any]]:
@@ -631,58 +567,11 @@ def strategy_scorecard(days: int = 60, min_trades: int = 5) -> Dict[str, Dict[st
     return out
 
 
-# In-process cache for strategy multipliers — 1h TTL.
-_strategy_mult_cache: Dict[str, tuple] = {}
-_STRATEGY_CACHE_TTL = 3600
-
-
-def strategy_multiplier(strategy_name: Optional[str]) -> float:
-    """Return the empirical risk multiplier for a strategy. Defaults to 1.0."""
-    if not strategy_name:
-        return 1.0
-    import time as _t
-    now = _t.time()
-    cached = _strategy_mult_cache.get(strategy_name)
-    if cached and now < cached[1]:
-        return cached[0]
-    try:
-        card = strategy_scorecard(days=60, min_trades=5)
-        entry = card.get(strategy_name)
-        m = float(entry["multiplier"]) if entry else 1.0
-    except Exception:
-        m = 1.0
-    _strategy_mult_cache[strategy_name] = (m, now + _STRATEGY_CACHE_TTL)
-    return m
-
-
-def calibration_multiplier(confidence: float) -> float:
-    """Return the empirical risk-budget multiplier for a signal's confidence
-    bucket. Defaults to 1.0 when we don't have enough samples yet. Called
-    from consider_signal to shrink mis-calibrated risk."""
-    import time as _t
-    try:
-        bucket = f"{int(float(confidence) // 10) * 10}-{int(float(confidence) // 10) * 10 + 9}"
-    except Exception:
-        return 1.0
-    now = _t.time()
-    cached = _calibration_cache.get(bucket)
-    if cached and now < cached[1]:
-        return cached[0]
-    try:
-        from database import ConfidenceCalibration as _CC
-        db = SessionLocal()
-        try:
-            row = db.query(_CC).filter(_CC.bucket == bucket).first()
-            if row:
-                m = float(row.multiplier)
-                _calibration_cache[bucket] = (m, now + _CALIBRATION_CACHE_TTL)
-                return m
-        finally:
-            db.close()
-    except Exception:
-        pass
-    _calibration_cache[bucket] = (1.0, now + _CALIBRATION_CACHE_TTL)
-    return 1.0
+# Empirical multipliers + their caches moved to services.risk_manager
+from services.risk_manager import (
+    strategy_multiplier,
+    calibration_multiplier,
+)
 
 
 def update_config(**kwargs) -> Dict[str, Any]:
@@ -832,13 +721,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     tickers) serialize so a 3rd same-sector trade can't slip past the cap.
     """
     # Short-circuit if the buying-power breaker tripped recently.
-    # `global` declared here for both vars so the later error-handler can
-    # assign without Python raising SyntaxError about "used prior to global".
-    global _bp_exhausted_until, _broker_down_until  # noqa: E501
-    if _bp_exhausted_until and datetime.utcnow() < _bp_exhausted_until:
+    if bp_breaker_active():
         return None
     # Broker-down (Alpaca 5xx) breaker
-    if _broker_down_until and datetime.utcnow() < _broker_down_until:
+    if broker_down():
         return None
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_signal({signal.get('ticker')}): entry lock busy >30s, skipping")
@@ -1344,14 +1230,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             db.commit()
             logger.warning(f"AutoTrader submit failed for {ticker}: {res['error']}")
             err_lower = str(res.get("error", "")).lower()
-            # `_bp_exhausted_until` and `_broker_down_until` are already in the
-            # function's global scope via the declaration at the top of
-            # consider_signal — no second `global` needed here.
             if "insufficient buying power" in err_lower or "insufficient_buying_power" in err_lower:
-                from datetime import timedelta as _td2
-                _bp_exhausted_until = datetime.utcnow() + _td2(minutes=30)
+                _trip_bp_breaker(minutes=30)
                 logger.warning(
-                    f"AutoTrader: buying-power exhausted, pausing new entries until {_bp_exhausted_until.isoformat()}Z"
+                    f"AutoTrader: buying-power exhausted, pausing new entries 30m"
                 )
                 metrics.inc("autotrade_event", event="bp_exhausted")
                 _raise_alert("warning", "bp_breaker", f"Buying power exhausted on {ticker}; new entries paused 30m", ticker=ticker)
@@ -1359,8 +1241,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 # Broker 5xx — pause all entry/exit submits for 10 min so we don't
                 # DDoS Alpaca during an outage. Auto-recovers after the timer
                 # expires; manage loop still runs its reconciliation logic.
-                from datetime import timedelta as _td3
-                _broker_down_until = datetime.utcnow() + _td3(minutes=10)
+                _trip_broker_breaker(minutes=10)
                 logger.error(f"AutoTrader: Alpaca 5xx detected, broker-down circuit breaker tripped for 10m")
                 metrics.inc("autotrade_event", event="broker_down")
                 _raise_alert("error", "broker_down", f"Alpaca 5xx on {ticker} submit: {res['error'][:200]}", ticker=ticker)
