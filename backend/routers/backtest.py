@@ -7,6 +7,7 @@ from models import (
 )
 from services.data_fetcher import fetch_ohlcv
 from services.backtester import run_multi_strategy
+from services.portfolio_backtest import run_portfolio_backtest
 from routers._auth import require_api_key
 import logging
 
@@ -57,4 +58,30 @@ def backtest_ticker(ticker: str, db: Session = Depends(get_db)):
         best_direction=best["direction"] if best else None,
         best_confidence=best["confidence"] if best else None,
         results=results,
+    )
+
+
+@router.post("/portfolio/run")
+def backtest_portfolio(
+    starting_equity: float = 100_000.0,
+    risk_per_trade_pct: float = 0.02,
+    max_concurrent: int = 15,
+    max_per_sector: int = 5,
+    max_portfolio_heat_pct: float = 0.10,
+    daily_loss_limit_pct: float = 0.03,
+    max_tickers: int = 50,
+    lookback_days: int = 365,
+):
+    """Portfolio-level walk-forward backtest that honours the live-trader's
+    caps (concurrent positions, per-sector, beta-weighted heat, daily loss).
+    Returns composite equity curve, drawdown, sharpe, cap-rejection count."""
+    return run_portfolio_backtest(
+        starting_equity=starting_equity,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_concurrent=max_concurrent,
+        max_per_sector=max_per_sector,
+        max_portfolio_heat_pct=max_portfolio_heat_pct,
+        daily_loss_limit_pct=daily_loss_limit_pct,
+        max_tickers=max_tickers,
+        lookback_days=lookback_days,
     )

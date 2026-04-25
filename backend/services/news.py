@@ -59,37 +59,17 @@ _FINANCIAL_LEXICON_BOOSTS: Dict[str, float] = {
     "bearish": -2.5,
 }
 
-# Lazy-initialized VADER instance (import cost + lexicon-mutation happens once).
-_vader = None
-
-
-def _get_vader():
-    global _vader
-    if _vader is not None:
-        return _vader
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    v = SentimentIntensityAnalyzer()
-    # Inject finance boosts into the built-in lexicon.
-    v.lexicon.update(_FINANCIAL_LEXICON_BOOSTS)
-    _vader = v
-    return v
+# Sentiment scoring routes through the pluggable backend. Default VADER;
+# opt-in FinBERT via SENTIMENT_BACKEND=finbert (requires transformers + torch).
+from services.sentiment import score_text as _backend_score_text
 
 
 def score_text(text: str) -> Dict[str, Any]:
-    """Return {score, label, severity} for a news headline/summary."""
-    if not text or not text.strip():
-        return {"score": 0.0, "label": "neutral", "severity": 0}
-    v = _get_vader()
-    s = v.polarity_scores(text)
-    compound = float(s.get("compound", 0.0))
-    if compound >= _POSITIVE_THRESHOLD:
-        label = "positive"
-    elif compound <= _NEGATIVE_THRESHOLD:
-        label = "negative"
-    else:
-        label = "neutral"
-    severity = int(round(abs(compound) * 100))
-    return {"score": round(compound, 4), "label": label, "severity": severity}
+    """Back-compat shim — delegates to services.sentiment."""
+    out = _backend_score_text(text)
+    # Older callers may not expect the 'backend' key; trim to the original
+    # shape so news-event persistence doesn't break.
+    return {"score": out["score"], "label": out["label"], "severity": out["severity"]}
 
 
 def _alpaca_headers() -> Optional[Dict[str, str]]:
