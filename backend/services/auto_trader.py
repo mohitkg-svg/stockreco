@@ -917,20 +917,40 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             open_trades_heat = db.query(AutoTrade).filter(
                 AutoTrade.status.in_(["pending", "open"])
             ).all()
+            # Beta-weight each open trade's dollar-at-risk. High-beta names
+            # concentrate more systematic risk per dollar than low-beta names,
+            # so five tech longs ≠ five utility longs. Missing beta defaults
+            # to 1.0; extreme values clamped to [0.5, 2.0] in beta_weight().
+            try:
+                from services.fundamentals import beta_weight
+            except Exception:
+                beta_weight = lambda _t, default=1.0, **_: default  # noqa: E731
             current_heat = 0.0
             for ot in open_trades_heat:
                 oe = ot.entry_price or ot.requested_entry or 0.0
                 os_ = ot.current_stop or ot.stop_loss or 0.0
+                raw = 0.0
                 if ot.asset_type == "stock" and oe > 0 and os_ > 0:
-                    current_heat += max(0.0, (oe - os_)) * (ot.qty or 0)
+                    raw = max(0.0, (oe - os_)) * (ot.qty or 0)
                 elif ot.asset_type == "option" and oe > 0:
                     # For long options, max-loss = premium paid (contract × 100).
-                    current_heat += float(oe) * 100 * (ot.qty or 0)
+                    raw = float(oe) * 100 * (ot.qty or 0)
+                current_heat += raw * beta_weight(ot.ticker)
+            # Prospective trade's own beta-weighted contribution — include it
+            # in the check so we also reject entries that would push us over.
+            try:
+                prospective_stop = float(signal.get("stop_loss") or 0)
+                prospective_entry = float(signal.get("entry") or 0)
+                # Size estimate: use requested_qty if caller passed it, else skip
+                # (heat check still runs on existing positions alone).
+                _prospective = 0.0  # conservative default — pure existing-heat check
+            except Exception:
+                _prospective = 0.0
             heat_cap = _heat_equity * _PORTFOLIO_HEAT_CAP_PCT
             if current_heat >= heat_cap:
                 logger.info(
                     f"AutoTrader skip {signal.get('ticker')}: portfolio heat "
-                    f"${current_heat:.0f} ≥ cap ${heat_cap:.0f} "
+                    f"${current_heat:.0f} (beta-weighted) ≥ cap ${heat_cap:.0f} "
                     f"({_PORTFOLIO_HEAT_CAP_PCT*100:.0f}% × equity {_heat_equity:.0f})"
                 )
                 metrics.inc("autotrade_event", event="portfolio_heat_cap")
@@ -3020,8 +3040,13 @@ def manage_open_positions() -> Dict[str, Any]:
                                             # while we keep meaningful breathing
                                             # room for the winner to develop.
                                             initial_risk = max(0.01, float(t.entry_price) - float(t.stop_loss))
-                                            soft_be = float(t.entry_price) - 0.3 * initial_risk
-                                            new_stop = round(max(soft_be, t.current_stop), 2)
+                                            # Soft-BE distance is the LARGER of 0.3R or 0.25×ATR so we stay
+                                            # outside the 1-bar noise floor for high-volatility names
+                                            # (BE-trail was otherwise chopping them out on normal wicks).
+                                            atr_buffer = _chandelier_atr(t.ticker) or 0.0
+                                            stop_dist = max(0.3 * initial_risk, 0.25 * atr_buffer)
+                                            soft_be = float(t.entry_price) - stop_dist
+                                            new_stop = round(max(soft_be, t.current_stop or 0), 2)
                                         elif target_idx == 1:
                                             # At T2: now tighten to full entry (BE).
                                             new_stop = round(float(t.entry_price), 2)

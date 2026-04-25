@@ -503,6 +503,45 @@ class TestFundamentalsMultiplier(unittest.TestCase):
                 self.assertLessEqual(m, 1.08)
 
 
+class TestBetaWeight(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+        self.db = SessionLocal()
+
+    def tearDown(self):
+        self.db.close()
+
+    def _store(self, ticker: str, beta):
+        from database import Fundamentals
+        row = Fundamentals(ticker=ticker.upper(), beta=beta, data_hash="x")
+        self.db.add(row); self.db.commit()
+
+    def test_neutral_when_missing(self):
+        """No row or null beta → default 1.0 (market-weighted)."""
+        from services.fundamentals import beta_weight
+        self.assertEqual(beta_weight("UNKNOWN"), 1.0)
+        self._store("NULLB", None)
+        self.assertEqual(beta_weight("NULLB"), 1.0)
+
+    def test_passthrough_for_typical_range(self):
+        from services.fundamentals import beta_weight
+        self._store("LOW", 0.7)
+        self._store("MID", 1.0)
+        self._store("HIGH", 1.8)
+        self.assertEqual(beta_weight("LOW"), 0.7)
+        self.assertEqual(beta_weight("MID"), 1.0)
+        self.assertEqual(beta_weight("HIGH"), 1.8)
+
+    def test_clamps_extreme_values(self):
+        """Meme stocks can report beta 3-5; noisy data, clamped to [0.5, 2.0]."""
+        from services.fundamentals import beta_weight
+        self._store("CRAZY", 5.0)
+        self._store("DEFENSIVE", 0.1)
+        self.assertEqual(beta_weight("CRAZY"), 2.0)
+        self.assertEqual(beta_weight("DEFENSIVE"), 0.5)
+
+
 class TestFundamentalsHashing(unittest.TestCase):
 
     def test_same_inputs_produce_same_hash(self):

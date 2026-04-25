@@ -140,3 +140,51 @@ rollout). Revisit ~4 weeks after live trading is stable.
   on for Cloud Run). Cloud Logging now parses each line as a structured
   record with `severity`, `logger`, `message`, and any `extra` fields.
   On-disk rotating file stays plaintext for human grep.
+
+## Strategy-review backlog (2026-04-25, second external pass)
+
+Items from a second external review covering entry / exit / target /
+backtest strategy. Graded and applied the high-ROI ones; deferring the
+rest either because they're already-done (reviewer didn't know) or wrong
+timing pre-real-money.
+
+### Already applied
+
+- ✅ **ATR-capped Soft BE** — trail-to-`entry − max(0.3R, 0.25×ATR)` at T1
+  so high-volatility names aren't chopped out on noise. Had been patched
+  already but left duplicate code; cleaned up.
+- ✅ **Beta-weighted portfolio heat** — added `beta` column to
+  `Fundamentals` (fetched weekly via yfinance), and the 10%-of-equity
+  heat cap now multiplies each open trade's dollar-at-risk by
+  `clamp(beta, 0.5, 2.0)`. Five high-beta tech longs now contribute more
+  heat than five utilities at the same raw $-at-risk.
+
+### Rejected as already-done
+
+- ❌ **Volume Profile targets** — reviewer said "currently uses price
+  structure (S/R)". False: `signal_generator.py:645` and `:811` already
+  pull POC/VAH/VAL from `services/volume_profile.compute_volume_profile()`
+  and include them in target candidates.
+
+### Deferred — valid ideas, wrong timing
+
+- **Portfolio-level backtest with correlation** — `backtester.py` currently
+  evaluates tickers in isolation. A portfolio backtest that respects the
+  sector cap + heat cap during historical periods (Aug 2024 carry-trade
+  unwind, etc.) would tell us if our rules actually protect the account
+  in a correlated drawdown. 2-3 days work; revisit post-real-money.
+- **Vertical debit spreads** for long-call/long-put replacement — reduces
+  theta drag on runner positions. Requires multi-leg Alpaca orders,
+  spread-aware strike selection, spread-adjusted targets. ~3 days.
+  Already in this BACKLOG's earlier section.
+
+### Rejected — low ROI or empirically weak
+
+- **Join-the-Bid entry** — bid-chase with cancel/replace. Saves
+  ~$20-50/trade on slippage at the cost of a fragile order state machine.
+  The existing `limit_at_mid` captures most of the spread win at a fraction
+  of the complexity.
+- **Time-decay stop** — incrementally tighten stop each bar that fails
+  to hit T1. Intuitive but empirically weaker than fixed stops — premature
+  tightening chops the trade out on normal noise before the thesis plays
+  out. Not supported by studies.

@@ -425,6 +425,10 @@ class Fundamentals(Base):
     free_cash_flow = Column(Float, nullable=True)
     dividend_yield = Column(Float, nullable=True)
 
+    # Risk — 5y beta vs SPY. Used to beta-weight portfolio heat: 5 trades in
+    # high-beta tech aren't equivalent to 5 trades in utilities.
+    beta = Column(Float, nullable=True)
+
     # Composite — see services.fundamentals.compute_quality_score
     quality_score = Column(Float, nullable=True, index=True)
 
@@ -551,6 +555,7 @@ def create_tables():
     _ensure_column("auto_trader_config", "trade_calls", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "aggressive_options_mode", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "ml_scoring_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("fundamentals", "beta", "FLOAT")
     _ensure_column("auto_trader_config", "entry_order_type", "VARCHAR DEFAULT 'market'")
     _ensure_column("auto_trader_config", "use_universe_scanner", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "universe_top_n", "INTEGER DEFAULT 30")

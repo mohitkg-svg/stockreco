@@ -56,6 +56,7 @@ _HASH_FIELDS = (
     "return_on_equity", "return_on_assets",
     "debt_to_equity", "current_ratio",
     "free_cash_flow", "dividend_yield",
+    "beta",
 )
 
 
@@ -100,6 +101,7 @@ def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
         "current_ratio": _safe(info.get("currentRatio")),
         "free_cash_flow": _safe(info.get("freeCashflow")),
         "dividend_yield": _safe(info.get("dividendYield")),
+        "beta": _safe(info.get("beta")),
     }
 
 
@@ -283,12 +285,31 @@ def get_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
             "return_on_equity": r.return_on_equity, "return_on_assets": r.return_on_assets,
             "debt_to_equity": r.debt_to_equity, "current_ratio": r.current_ratio,
             "free_cash_flow": r.free_cash_flow, "dividend_yield": r.dividend_yield,
+            "beta": r.beta,
             "quality_score": r.quality_score, "data_hash": r.data_hash,
             "last_checked_at": r.last_checked_at.isoformat() if r.last_checked_at else None,
             "last_changed_at": r.last_changed_at.isoformat() if r.last_changed_at else None,
         }
     finally:
         db.close()
+
+
+def beta_weight(ticker: str, default: float = 1.0,
+                floor: float = 0.5, ceil: float = 2.0) -> float:
+    """Return the ticker's 5y beta clamped to [floor, ceil]. Used to
+    beta-weight portfolio heat — 5 high-beta tech names concentrate more
+    systematic risk than 5 utilities at the same raw $-at-risk.
+
+    Missing beta → `default` (1.0 = treat as market-weighted).
+    Clamp prevents a single meme stock with beta 4 from dominating the
+    heat calc (probably noisy data anyway)."""
+    r = get_fundamentals(ticker)
+    if r is None:
+        return default
+    b = r.get("beta")
+    if b is None or not math.isfinite(float(b)):
+        return default
+    return max(floor, min(ceil, float(b)))
 
 
 def quality_multiplier(ticker: str, direction: str) -> float:
