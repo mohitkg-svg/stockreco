@@ -30,7 +30,7 @@ def _load_dotenv(path: str) -> None:
 
 _load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -652,6 +652,27 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 logger.info(f"CORS allowed origins: {_cors_origins}")
+
+
+# Rate-limit middleware (r38) — token bucket per X-API-Key (or client IP
+# when unauth'd). Disabled when APP_RATE_LIMIT_PER_MIN=0. Applies to /api/*
+# only; /metrics and /ws/* skip the bucket.
+@app.middleware("http")
+async def _rate_limit_middleware(request, call_next):
+    path = request.url.path or ""
+    if path.startswith("/api/"):
+        try:
+            from routers._auth import rate_limit as _rl
+            x_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+            _rl(request, x_api_key=x_key)
+        except HTTPException as exc:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers or {},
+            )
+    return await call_next(request)
 
 # Mount /metrics endpoint (no-op if prometheus_client isn't installed).
 metrics.register_metrics_endpoint(app)

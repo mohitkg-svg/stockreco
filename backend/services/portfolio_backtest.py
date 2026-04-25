@@ -89,6 +89,26 @@ class PortfolioStats:
     max_pair_corr: Optional[float] = None
     stress_window: Optional[str] = None
     stress_window_label: Optional[str] = None
+    # Per-trade expectancy: WR × avg_win + (1-WR) × avg_loss. Single number
+    # answering "what's my expected $ per trade after costs?" — positive
+    # is necessary but not sufficient (a +$1 expectancy with $1000 max loss
+    # is still ruinous). Reported in dollars per trade at the actual
+    # backtest sizing, not normalized.
+    expectancy: Optional[float] = None
+    # Monte Carlo bootstrap of trade returns. Resamples closed-trade pnl
+    # values WITH replacement (`n_samples` paths × `len(closed_trades)`
+    # picks each), tracking the equity-curve drawdown for each path.
+    # Reports the empirical p5 / p50 / p95 max-drawdown — a much more
+    # honest answer to "how bad could this strategy get?" than a single
+    # historical realization. P95 (95th percentile worst drawdown) is
+    # the headline number for risk-of-ruin calibration.
+    mc_max_drawdown_p5_pct: Optional[float] = None
+    mc_max_drawdown_p50_pct: Optional[float] = None
+    mc_max_drawdown_p95_pct: Optional[float] = None
+    mc_ending_equity_p5: Optional[float] = None
+    mc_ending_equity_p50: Optional[float] = None
+    mc_ending_equity_p95: Optional[float] = None
+    mc_paths: Optional[int] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -421,6 +441,49 @@ def run_portfolio_backtest(
     gross_losses = sum(-t.pnl for t in closed_trades if t.pnl < 0)
     profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else (None if gross_wins == 0 else float("inf"))
 
+    # Expectancy: avg $/trade. Positive is necessary but not sufficient.
+    expectancy = None
+    if total > 0:
+        avg_win_pl = (gross_wins / wins) if wins > 0 else 0.0
+        avg_loss_pl = (-gross_losses / losses) if losses > 0 else 0.0
+        expectancy = round(win_rate * avg_win_pl + (1 - win_rate) * avg_loss_pl, 2)
+
+    # Monte Carlo bootstrap. Resample the closed-trade pnl array WITH
+    # replacement to build N synthetic equity paths. Tracks the empirical
+    # max-drawdown distribution + ending-equity distribution. The p95
+    # max-drawdown is the headline risk-of-ruin number — "if I get
+    # unlucky, how bad could it get?" — and is much more honest than a
+    # single historical realization.
+    mc_dd_p5 = mc_dd_p50 = mc_dd_p95 = None
+    mc_eq_p5 = mc_eq_p50 = mc_eq_p95 = None
+    mc_paths = None
+    if total >= 20:
+        try:
+            import numpy as _np
+            pnl_arr = _np.array([t.pnl for t in closed_trades], dtype=float)
+            n_paths = 1000
+            rng = _np.random.default_rng(seed=42)  # deterministic for reproducibility
+            max_dds = _np.zeros(n_paths)
+            end_eqs = _np.zeros(n_paths)
+            for k in range(n_paths):
+                sample = rng.choice(pnl_arr, size=total, replace=True)
+                eq_path = starting_equity + _np.cumsum(sample)
+                running_peak = _np.maximum.accumulate(eq_path)
+                # Avoid div-by-zero at zero peak (won't happen for positive
+                # starting_equity, but defensive).
+                dd = _np.where(running_peak > 0, (running_peak - eq_path) / running_peak, 0.0)
+                max_dds[k] = float(dd.max())
+                end_eqs[k] = float(eq_path[-1])
+            mc_dd_p5 = float(round(_np.percentile(max_dds, 5) * 100, 2))
+            mc_dd_p50 = float(round(_np.percentile(max_dds, 50) * 100, 2))
+            mc_dd_p95 = float(round(_np.percentile(max_dds, 95) * 100, 2))
+            mc_eq_p5 = float(round(_np.percentile(end_eqs, 5), 2))
+            mc_eq_p50 = float(round(_np.percentile(end_eqs, 50), 2))
+            mc_eq_p95 = float(round(_np.percentile(end_eqs, 95), 2))
+            mc_paths = n_paths
+        except Exception as e:
+            logger.debug(f"portfolio_bt: Monte Carlo skipped ({e})")
+
     # By-regime breakdown
     by_regime: Dict[str, Dict[str, Any]] = {}
     for t in closed_trades:
@@ -482,6 +545,14 @@ def run_portfolio_backtest(
         max_pair_corr=max_pair_corr,
         stress_window=stress_window,
         stress_window_label=sw_label,
+        expectancy=expectancy,
+        mc_max_drawdown_p5_pct=mc_dd_p5,
+        mc_max_drawdown_p50_pct=mc_dd_p50,
+        mc_max_drawdown_p95_pct=mc_dd_p95,
+        mc_ending_equity_p5=mc_eq_p5,
+        mc_ending_equity_p50=mc_eq_p50,
+        mc_ending_equity_p95=mc_eq_p95,
+        mc_paths=mc_paths,
     )
     return {
         "stats": stats.as_dict(),

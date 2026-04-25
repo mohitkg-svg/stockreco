@@ -222,6 +222,65 @@ class TestTrimFractionForADX(unittest.TestCase):
         self.assertEqual(self.fn("AAPL", "T2", default_frac=0.33), 0.15)
 
 
+class TestRateLimiter(unittest.TestCase):
+    """Token-bucket rate limiter on /api/* (r38). Disabled when
+    APP_RATE_LIMIT_PER_MIN=0. Burst should pass; sustained over-rate trips."""
+
+    def setUp(self):
+        # Reset bucket state + force a known config
+        from routers import _auth as a
+        a._RATE_BUCKETS.clear()
+        os.environ["APP_RATE_LIMIT_PER_MIN"] = "60"
+        os.environ["APP_RATE_LIMIT_BURST"] = "5"
+
+    def tearDown(self):
+        os.environ.pop("APP_RATE_LIMIT_PER_MIN", None)
+        os.environ.pop("APP_RATE_LIMIT_BURST", None)
+        from routers import _auth as a
+        a._RATE_BUCKETS.clear()
+
+    def _fake_request(self, ip="1.2.3.4"):
+        # Tiny stub matching what _auth.rate_limit reads off Request
+        class _Client:
+            def __init__(self, host): self.host = host
+        class _Req:
+            def __init__(self, host): self.client = _Client(host)
+        return _Req(ip)
+
+    def test_burst_allows_then_blocks(self):
+        from routers._auth import rate_limit
+        from fastapi import HTTPException
+        req = self._fake_request("9.9.9.9")
+        # 5 burst tokens — first 5 calls pass, 6th raises 429.
+        for _ in range(5):
+            self.assertIsNone(rate_limit(req, x_api_key=None))
+        with self.assertRaises(HTTPException) as ctx:
+            rate_limit(req, x_api_key=None)
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertIn("Retry-After", ctx.exception.headers or {})
+
+    def test_disabled_via_env(self):
+        os.environ["APP_RATE_LIMIT_PER_MIN"] = "0"
+        from routers._auth import rate_limit
+        req = self._fake_request("1.1.1.1")
+        # Should pass an arbitrary count without raising
+        for _ in range(50):
+            self.assertIsNone(rate_limit(req, x_api_key=None))
+
+    def test_separate_keys_have_separate_buckets(self):
+        from routers._auth import rate_limit
+        from fastapi import HTTPException
+        req = self._fake_request("2.2.2.2")
+        # Drain key A
+        for _ in range(5):
+            rate_limit(req, x_api_key="key-A")
+        # 6th on A trips
+        with self.assertRaises(HTTPException):
+            rate_limit(req, x_api_key="key-A")
+        # But key B is fresh
+        self.assertIsNone(rate_limit(req, x_api_key="key-B"))
+
+
 class TestPartialExitBacktest(unittest.TestCase):
     """Verify the partial-exit simulation path mirrors the live trim ladder
     (33% at T1, 33% at T2, runner at target) and produces a different

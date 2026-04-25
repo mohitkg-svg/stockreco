@@ -369,7 +369,7 @@ Every gate short-circuits on failure. Order matters — cheap checks first.
 
 ```
 risk_budget = equity × max_risk_per_trade_pct
-           × adaptive_risk_mult       # 0.5×–1.0× based on VIX, recent WR, SPY chop ADX (r34, r37)
+           × adaptive_risk_mult       # 0.5×–1.0× based on VIX, recent WR, SPY chop ADX, strategy drawdown ≥10% (r34, r37, r38)
            × confidence_multiplier    # 1.0 at threshold → 1.75 at 100%
            × kelly_multiplier         # 1.0 below 55% WR → 1.20 at 100% WR (tightened r33 pre-live)
            × calibration_multiplier   # per-confidence-bucket empirical
@@ -749,7 +749,7 @@ auth is a no-op (local dev).
 ## 11. Safety & Risk Controls
 
 ### Entry-side gates (~28 total — expanded since r19)
-Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, **liquidity gate** (median 20-day $-volume ≥ $10M, r34), earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), **regime-tightened concurrent cap** (cap÷3 in VIX>25 or SPY<200EMA; cap×2/3 in VIX>20, r34), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55% OR **SPY daily ADX_14 < 20** [chop, r37]), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), **AI judge entry-veto** (r36, off/shadow by default; when active, Claude can skip after every other gate has passed), ticker blacklist.
+Confidence threshold, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, **liquidity gate** (median 20-day $-volume ≥ $10M, r34), earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), **regime-tightened concurrent cap** (cap÷3 in VIX>25 or SPY<200EMA; cap×2/3 in VIX>20, r34), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **adaptive risk size** (×0.5 when VIX > 25 OR recent WR < 55% OR **SPY daily ADX_14 < 20** [chop, r37] OR **30d strategy drawdown ≥ 10% of equity** [r38]), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap), **AI judge entry-veto** (r36, off/shadow by default; when active, Claude can skip after every other gate has passed), ticker blacklist.
 
 ### Multiplier stack (~10 factors, hard-capped at 2.0×)
 Confidence-headroom × Kelly × calibration × per-strategy × VIX × analyst-rating × fundamentals-quality × short-interest × Stocktwits × WSB × institutional × insider × ML-scorer (shadow) × **AI judge (r36, shadow by default, 0.6×–1.4× envelope)**. Compound is clamped to `RISK_MULT_CEILING = 2.0` (Critical-audit fix #1) so a winning streak across all factors can't compound to runaway risk. Heat-aware throttle (r35: 0.85× / 0.60× / 0.40× as live heat crosses 50% / 70% / 85% of cap) applies AFTER the ceiling.
@@ -781,10 +781,11 @@ SL-invariant check (resubmit on broker drop), slippage reject, reverse-thesis cl
 - Persistent kill switch — survives deploys; unkill does NOT re-enable trading (two-step re-arm).
 - Idempotency hash deduping retries within 12h, bucket-aware on confidence.
 - Post-mortem auto-generated on every losing stop (skipped for `closed_reverse`).
-- Synthetic-data regression suite (125 tests) gates every deploy via `deploy.sh`.
+- Synthetic-data regression suite (128 tests) gates every deploy via `deploy.sh`.
 
 ### Auth & access
 - Shared-secret `APP_API_KEY` gating all `/api/*` and `/ws/quotes`.
+- **API rate limiter (r38)**: token bucket per X-API-Key (or client IP) on `/api/*`. Defaults `APP_RATE_LIMIT_PER_MIN=300` + `APP_RATE_LIMIT_BURST=60`. Returns 429 with `Retry-After` header on exhaustion. Disabled with `APP_RATE_LIMIT_PER_MIN=0`.
 - Frontend login screen with localStorage cache.
 - 401-global-event flips UI back to login.
 - Manager service is `--ingress internal`, not reachable from public internet at all.
@@ -909,6 +910,32 @@ building. `SKIP_TESTS=1` to override.
 ---
 
 ## 14. Changelog (current → past)
+
+### Revision 38 — External review pass 5: Monte Carlo, expectancy, drawdown trigger, API rate limit
+- **Monte Carlo bootstrap** in `portfolio_backtest`: 1000 paths × N
+  closed-trade resamples (with replacement, deterministic seed=42).
+  Reports p5 / p50 / p95 of max-drawdown and ending-equity. Headline
+  number is **p95 max-drawdown** — "if I get unlucky, how bad could it
+  get?" — much more honest than a single historical realization.
+- **Expectancy metric**: WR × avg_win + (1-WR) × avg_loss in dollars
+  per trade. Positive is necessary but not sufficient. Surfaced in the
+  portfolio-backtest stats payload.
+- **Strategy-drawdown trigger** in `adaptive_risk_multiplier`: when the
+  bot's own 30-day cumulative-realized-PnL curve has drawn down ≥ 10%
+  of equity from its trailing peak, halve risk. Joins the existing
+  VIX > 25, recent-WR < 55%, SPY-ADX < 20 triggers (all 0.5×, lowest
+  wins). Strategy-PnL (vs whole-account equity) isolates the bot's
+  behavior from manual trades or external deposits.
+- **API rate limiter** (`routers/_auth.rate_limit`): token bucket per
+  X-API-Key (or client IP for unauth'd probes). Mounted as middleware
+  on `/api/*`. Defaults 300 req/min refill + 60 burst — generous enough
+  that interactive use never hits them, but a leaked key + runaway
+  script trips at burst exhaustion. Disabled with
+  `APP_RATE_LIMIT_PER_MIN=0`.
+- **Bollinger Bands** confirmed already present in `indicators.py`
+  (`BBU_20`, `BBM_20`, `BBL_20`); reviewer suggestion was a false
+  alarm. No code change.
+- 3 new rate-limiter tests; 128 regression tests total.
 
 ### Revision 37 — Backtest/live alignment + extreme-trend runner + persisted debounce + chop sizing
 - **Ghost-Alpha fix**: `services/backtester._simulate` now mirrors the live

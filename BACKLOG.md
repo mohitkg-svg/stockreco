@@ -326,6 +326,62 @@ to ATR fallback, OCC consolidation, runner sizing, and restart safety.
   trend-following entries via false breakouts; half-size during these
   periods recovers the EV the chop chops out.
 
+## External review backlog (2026-04-25, fifth pass — strategy/backtest robustness)
+
+Long review covering analysis strategy, execution, backtesting realism,
+performance, and security. Triaged by ROI vs scope; deferred items have
+explicit revisit conditions.
+
+### ✅ Applied (r38, 2026-04-25)
+
+- ✅ **Monte Carlo bootstrap** in `portfolio_backtest`: 1000 paths × N
+  resampled trade pnls, deterministic seed=42. p5 / p50 / p95 of
+  max-drawdown and ending-equity now in stats. Headline is p95 max-
+  drawdown for risk-of-ruin calibration.
+- ✅ **Expectancy** (avg $/trade after costs) in stats — fills the
+  "positive expectancy is necessary but not sufficient" reviewer point.
+- ✅ **Strategy-drawdown trigger** in `adaptive_risk_multiplier`: 30-day
+  cumulative realized-PnL drawdown ≥ 10% of equity → 0.5× sizing. Joins
+  VIX/WR/ADX triggers (lowest wins).
+- ✅ **API rate limiter** middleware: token-bucket per X-API-Key (or IP).
+  300/min refill + 60 burst defaults. Returns 429 with Retry-After.
+- ✅ **Bollinger Bands** confirmed already in `indicators.py`. No-op.
+
+### ⏸️ Deferred — Tier E (multi-week or trigger-gated)
+
+- **vectorbt / PyBroker backtester rewrite** — reviewer's biggest
+  recommendation. Multi-week port of `_simulate` to a vectorized
+  engine. Current backtester now mirrors live partial exits + has
+  Monte Carlo + walk-forward already; the marginal value of a rewrite
+  is execution speed, not correctness. Revisit when single-strategy
+  backtest > 10s per ticker on the watchlist (currently ~1s).
+- **LSTM / Transformer ML hybrid** — not gated on engineering, gated
+  on data: shadow-mode log of LightGBM scorer needs ≥ 200 closed
+  trades before *any* ML graduation, and a sequence model needs
+  meaningfully more. Revisit when LightGBM has been live-blended at
+  10% weight for 90+ days with measurable lift.
+- **Full pairwise correlation matrix** — Tier C. Revisit at 20+
+  concurrent positions (cap is 15).
+- **Async I/O migration** — formally deferred with concrete latency /
+  CPU / concurrent-user triggers; none have fired.
+- **Debit spreads** — multi-leg Alpaca order machinery + spread-aware
+  strikes. ~3 days work. Revisit ~4 weeks post-real-money once naked
+  long-call/long-put behavior is well-understood live.
+- **JWT/OAuth** — overkill for a single-user app behind X-API-Key +
+  Cloud Run + IP rate limit. Revisit if multi-user.
+- **Trivy / Snyk dependency scanning** — out of scope for this
+  pre-live phase; Cloud Run base image and pinned requirements get
+  GitHub Dependabot alerts already.
+- **SHAP / LIME interpretability** — gated by ML graduation milestone.
+- **Optuna hyperparameter tuning** — gated by ML graduation milestone.
+- **CI/CD performance threshold gate** (e.g., fail deploy if Sharpe <
+  1.0) — running portfolio backtest in deploy.sh adds 60+s to every
+  deploy and is brittle to data-availability flakes. Revisit if we
+  observe a regression that this would have caught.
+- **Earnings call transcript NLP** — sized to 1-2 weeks for ingestion +
+  embedding pipeline. High signal but hard to validate lift before
+  live data accumulates.
+
 ### Closed via r36 (independent of this review pass)
 
 - ✅ **AI judge layer** — `services/ai_judge.py` wraps three Claude

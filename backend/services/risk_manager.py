@@ -208,6 +208,50 @@ def adaptive_risk_multiplier() -> float:
     except Exception:
         recent_wr = None
 
+    # Strategy-drawdown trigger (r38, external review pass 5): build a
+    # 30-day cumulative-realized-PnL curve from closed AutoTrades; if the
+    # current cum-PnL is ≥ 10% of starting equity below the trailing peak,
+    # halve risk. This is the "stop the bleeding" reflex — without it, a
+    # losing run keeps deploying the same size into the same broken setup.
+    # Strategy-PnL (vs whole-account equity) isolates the bot's behavior
+    # from manual trading or external deposits/withdrawals.
+    drawdown_pct = None
+    try:
+        from database import SessionLocal as _SL, AutoTrade as _AT
+        from datetime import datetime as _dt, timedelta as _td
+        from services import paper_trader as _pt
+        _acct = _pt.get_account()
+        equity = float(_acct["equity"]) if _acct else 0.0
+        if equity > 0:
+            _db = _SL()
+            try:
+                since = _dt.utcnow() - _td(days=30)
+                rows = (
+                    _db.query(_AT)
+                    .filter(_AT.status.like("closed%"),
+                            _AT.closed_at >= since,
+                            _AT.realized_pl.isnot(None))
+                    .order_by(_AT.closed_at.asc())
+                    .all()
+                )
+                if len(rows) >= 5:
+                    cum = 0.0
+                    peak = 0.0
+                    for r in rows:
+                        cum += float(r.realized_pl or 0.0)
+                        if cum > peak:
+                            peak = cum
+                    # Drawdown is peak-to-trough as a % of starting equity.
+                    # peak - cum is the realized $ given back from the high
+                    # water mark; we normalize against equity to get a %.
+                    drawdown_dollars = peak - cum
+                    if drawdown_dollars > 0:
+                        drawdown_pct = (drawdown_dollars / equity) * 100
+            finally:
+                _db.close()
+    except Exception:
+        drawdown_pct = None
+
     mult = 1.0
     if vix_level is not None and vix_level > 25:
         mult = min(mult, 0.5)
@@ -216,6 +260,8 @@ def adaptive_risk_multiplier() -> float:
     if recent_wr is not None and recent_wr < 55.0:
         mult = min(mult, 0.5)
     if spy_adx is not None and spy_adx < 20.0:
+        mult = min(mult, 0.5)
+    if drawdown_pct is not None and drawdown_pct >= 10.0:
         mult = min(mult, 0.5)
     return mult
 
