@@ -593,23 +593,70 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
     // indicators, or price lines).
   }, [ticker, timeframe, hideIndicators, theme]);
 
-  // ----- Live tick: extend the most recent bar with the latest WS price -----
+  // ----- Live tick: extend OR ROLL the most recent bar based on wall-clock -----
+  // Bug fix: previously this effect always mutated the most recent candle's
+  // high/low/close with the latest tick. That meant once the 5-min (or any
+  // intraday) bar's wall-clock window had passed, the chart kept extending
+  // the SAME candle forever — until the next backend refetch overwrote
+  // it. The fix detects when the live-tick time has crossed into a new
+  // bar bucket and APPENDS a new candle in that case (lightweight-charts'
+  // .update() accepts a strictly-newer time and creates a new bar).
   useEffect(() => {
     if (!liveQuote || !chartRef.current || !seriesRef.current.candle || !lastCandleRef.current) return;
     const px = liveQuote.last || (liveQuote.bid && liveQuote.ask ? (liveQuote.bid + liveQuote.ask) / 2 : null);
     if (!px) return;
+
+    // Bar duration in seconds for the current timeframe
+    const _BAR_SECS = {
+      '5m': 300, '15m': 900, '30m': 1800, '1h': 3600,
+      '4h': 14400, '1d': 86400, '1mo': 30 * 86400,
+    };
+    const dur = _BAR_SECS[timeframe];
     const bar = lastCandleRef.current;
-    bar.high = Math.max(bar.high, px);
-    bar.low = Math.min(bar.low, px);
-    bar.close = px;
-    try {
-      seriesRef.current.candle.update(bar);
-    } catch (e) {
-      // Only happens during the brief gap between cleanup and next setData — log
-      // for diagnosis instead of swallowing entirely.
-      if (chartRef.current) console.debug('chart live-update skipped:', e?.message || e);
+
+    // If we don't know the duration (unexpected tf), fall back to the
+    // legacy behavior — extending the last bar — rather than refusing to update.
+    if (!dur) {
+      bar.high = Math.max(bar.high, px);
+      bar.low = Math.min(bar.low, px);
+      bar.close = px;
+      try { seriesRef.current.candle.update(bar); } catch (_) {}
+      return;
     }
-  }, [liveQuote?.last, liveQuote?.bid, liveQuote?.ask]);
+
+    const tickSec = Math.floor((liveQuote.ts || Date.now() / 1000));
+    const lastBucket = Math.floor(bar.time / dur) * dur;
+    const tickBucket = Math.floor(tickSec / dur) * dur;
+
+    if (tickBucket <= lastBucket) {
+      // Same bucket — extend the existing bar.
+      bar.high = Math.max(bar.high, px);
+      bar.low = Math.min(bar.low, px);
+      bar.close = px;
+      try {
+        seriesRef.current.candle.update(bar);
+      } catch (e) {
+        if (chartRef.current) console.debug('chart live-update skipped:', e?.message || e);
+      }
+    } else {
+      // Crossed into a new bucket — open a new bar at tickBucket.
+      // Open at previous close (typical for tick-rolled candles when the
+      // first print of the new bar is the tick we just received).
+      const newBar = {
+        time: tickBucket,
+        open: bar.close,
+        high: Math.max(bar.close, px),
+        low: Math.min(bar.close, px),
+        close: px,
+      };
+      try {
+        seriesRef.current.candle.update(newBar);
+        lastCandleRef.current = newBar;
+      } catch (e) {
+        if (chartRef.current) console.debug('chart bar-roll skipped:', e?.message || e);
+      }
+    }
+  }, [liveQuote?.last, liveQuote?.bid, liveQuote?.ask, liveQuote?.ts, timeframe]);
 
   return (
     <div className="relative w-full">
