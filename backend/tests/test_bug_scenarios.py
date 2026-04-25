@@ -519,5 +519,137 @@ class TestFundamentalsHashing(unittest.TestCase):
         self.assertNotEqual(_hash_payload(a), _hash_payload(b))
 
 
+# ============================================================================
+# CATEGORY I: Trade-rationale endpoint
+# ----------------------------------------------------------------------------
+# Combines: origin classification (watchlist/scanner), signal reasoning,
+# backtest evidence, fundamentals, analyst rating, macro context.
+# These tests pin the shape and the origin-classification branches so a
+# casual refactor doesn't silently lose a section.
+# ============================================================================
+
+class TestTradeRationale(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+        self.db = SessionLocal()
+
+    def tearDown(self):
+        self.db.close()
+
+    def _trade(self, **over) -> AutoTrade:
+        t = _make_trade(**over)
+        self.db.add(t); self.db.commit()
+        return t
+
+    def _call(self, trade_id: int):
+        # FastAPI route function — call directly to avoid TestClient overhead.
+        from routers.trading import auto_trade_rationale
+        return auto_trade_rationale(trade_id)
+
+    def test_404_on_unknown_trade(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(999_999)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_origin_watchlist_only(self):
+        from database import WatchlistStock
+        t = self._trade(ticker="AAPL")
+        self.db.add(WatchlistStock(ticker="AAPL")); self.db.commit()
+        r = self._call(t.id)
+        self.assertEqual(r["origin"], "watchlist")
+        self.assertIsNone(r["scanner"])
+
+    def test_origin_scanner_only(self):
+        from database import CandidatePool
+        t = self._trade(ticker="ON")
+        self.db.add(CandidatePool(ticker="ON", score=80.5, rvol=1.5,
+                                   rs_20d=0.3, rs_60d=0.4, adx=32,
+                                   pct_from_52w_high=-0.01,
+                                   reason="strong trend, near 52wH"))
+        self.db.commit()
+        r = self._call(t.id)
+        self.assertEqual(r["origin"], "scanner")
+        self.assertIsNotNone(r["scanner"])
+        self.assertEqual(r["scanner"]["score"], 80.5)
+        self.assertIn("strong trend", r["scanner"]["reason"])
+
+    def test_origin_both(self):
+        from database import WatchlistStock, CandidatePool
+        t = self._trade(ticker="NVDA")
+        self.db.add(WatchlistStock(ticker="NVDA"))
+        self.db.add(CandidatePool(ticker="NVDA", score=95))
+        self.db.commit()
+        r = self._call(t.id)
+        self.assertEqual(r["origin"], "watchlist+pool")
+        self.assertIsNotNone(r["scanner"])
+
+    def test_signal_reasoning_split_into_lines(self):
+        # Insert signal with multi-line reasoning, link to trade
+        sig = _make_signal(ticker="AAPL", signal_type="BUY", confidence=80,
+                           reasoning="✅ Above SMA200\n✅ RSI bullish\n✅ MACD crossover")
+        self.db.add(sig); self.db.commit()
+        t = self._trade(ticker="AAPL", signal_id=sig.id)
+        r = self._call(t.id)
+        self.assertIsNotNone(r["signal"])
+        self.assertEqual(len(r["signal"]["reasoning_lines"]), 3)
+        self.assertTrue(any("SMA200" in ln for ln in r["signal"]["reasoning_lines"]))
+
+    def test_backtest_section_when_best_strategy_present(self):
+        from database import BestStrategyPerTicker
+        t = self._trade(ticker="MSFT")
+        self.db.add(BestStrategyPerTicker(
+            ticker="MSFT", strategy="Composite (multi-factor)", direction="BUY",
+            confidence=72, oos_trades=8, win_rate=0.625, avg_pl=2.3,
+        ))
+        self.db.commit()
+        r = self._call(t.id)
+        self.assertIsNotNone(r["backtest"])
+        self.assertEqual(r["backtest"]["winning_strategy"], "Composite (multi-factor)")
+        self.assertAlmostEqual(r["backtest"]["win_rate"], 0.625)
+
+    def test_fundamentals_and_analyst_present_when_available(self):
+        from database import Fundamentals, AnalystRating
+        t = self._trade(ticker="GOOGL", entry_price=180.0)
+        self.db.add(Fundamentals(ticker="GOOGL", quality_score=71, sector="Tech",
+                                  pe_ratio=31.3, peg_ratio=2.32,
+                                  revenue_growth_yoy=0.18, profit_margin=0.33))
+        self.db.add(AnalystRating(ticker="GOOGL", mean=1.9, key="buy",
+                                   analyst_count=42, target_mean=200.0))
+        self.db.commit()
+        r = self._call(t.id)
+        self.assertEqual(r["fundamentals"]["quality_score"], 71)
+        self.assertIsNotNone(r["analyst"])
+        self.assertAlmostEqual(r["analyst"]["target_premium_vs_entry"], (200 - 180) / 180, places=4)
+
+    def test_macro_context_within_48h_only(self):
+        from database import MacroEvent
+        opened = datetime.utcnow()
+        t = self._trade(ticker="AAPL", opened_at=opened, filled_at=opened)
+        # Within ±48h: should appear
+        self.db.add(MacroEvent(
+            event_key="CPI", event_name="Consumer Price Index",
+            country="US", importance="high",
+            release_time_utc=opened - timedelta(hours=12),
+        ))
+        # Way outside the window: should be excluded
+        self.db.add(MacroEvent(
+            event_key="OLD", event_name="Old Event", country="US", importance="high",
+            release_time_utc=opened - timedelta(days=20),
+        ))
+        # Low importance: should be excluded even if in window
+        self.db.add(MacroEvent(
+            event_key="LOW", event_name="Low Event", country="US", importance="low",
+            release_time_utc=opened + timedelta(hours=2),
+        ))
+        self.db.commit()
+        r = self._call(t.id)
+        keys = [ev["event_key"] for ev in r["macro_context"]]
+        self.assertIn("CPI", keys)
+        self.assertNotIn("OLD", keys)
+        self.assertNotIn("LOW", keys)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

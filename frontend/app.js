@@ -1181,6 +1181,150 @@ function NewsPanel({ ticker }) {
 }
 
 // ---------- Trade-vs-News Context (inline explainer on a closed auto-trade) ----------
+function TradeRationale({ tradeId }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    if (!tradeId) return;
+    setLoading(true); setErr(null);
+    api.get(`/api/trading/auto/rationale/${tradeId}`)
+      .then(d => setData(d))
+      .catch(e => setErr(typeof e === 'string' ? e : (e.detail || 'failed to load')))
+      .finally(() => setLoading(false));
+  }, [tradeId]);
+
+  if (loading) return <div className="text-xs app-text-muted py-1">loading rationale…</div>;
+  if (err) return <div className="text-xs text-red-400">Error: {err}</div>;
+  if (!data) return null;
+
+  const fmtPct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+  const fmtNum = (v, d = 2) => v == null ? '—' : Number(v).toFixed(d);
+  const originLabel = {
+    'watchlist': '🎯 Watchlist',
+    'scanner': '🔭 Scanner-discovered',
+    'watchlist+pool': '🎯 Watchlist + Scanner',
+    'unknown': '? Unknown origin',
+  }[data.origin] || data.origin;
+
+  const Section = ({ title, children, accent = 'blue' }) => (
+    <div className={`mt-2 p-2 rounded-md bg-${accent}-500/5 border border-${accent}-500/20`}>
+      <div className="text-[10px] uppercase tracking-wider app-text-muted mb-1 font-semibold">{title}</div>
+      {children}
+    </div>
+  );
+
+  return (
+    <div className="text-xs space-y-1">
+      {/* Origin */}
+      <div className="flex items-center gap-2 mb-1">
+        <span className="font-bold">{originLabel}</span>
+        {data.signal?.timeframe && <span className="pill text-[10px]">{data.signal.timeframe}</span>}
+        {data.signal?.signal_type && <span className={`pill text-[10px] ${data.signal.signal_type === 'BUY' ? 'pill-success' : 'pill-danger'}`}>{data.signal.signal_type}</span>}
+      </div>
+
+      {/* Scanner snapshot */}
+      {data.scanner && (
+        <Section title="Why scanner picked it" accent="indigo">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 font-mono text-[11px]">
+            <div>score: <span className="font-bold">{fmtNum(data.scanner.score, 1)}</span></div>
+            <div>RVOL: {fmtNum(data.scanner.rvol)}</div>
+            <div>RS 20d: {fmtPct(data.scanner.rs_20d)}</div>
+            <div>RS 60d: {fmtPct(data.scanner.rs_60d)}</div>
+            <div>ADX: {fmtNum(data.scanner.adx, 1)}</div>
+            <div>52w-hi: {fmtPct(data.scanner.pct_from_52w_high)}</div>
+            <div className="col-span-2">price: ${fmtNum(data.scanner.price)}</div>
+          </div>
+          {data.scanner.reason && <div className="mt-1 italic app-text-secondary">{data.scanner.reason}</div>}
+        </Section>
+      )}
+
+      {/* Signal reasoning */}
+      {data.signal && (
+        <Section title={`Signal — confidence ${fmtNum(data.signal.confidence, 0)}%${data.signal.strategy ? ' · ' + data.signal.strategy : ''}`} accent="emerald">
+          {data.signal.reasoning_lines?.length > 0 ? (
+            <ul className="space-y-0.5 leading-snug">
+              {data.signal.reasoning_lines.map((ln, i) => (
+                <li key={i} className="font-mono text-[11px]">{ln}</li>
+              ))}
+            </ul>
+          ) : (
+            <div className="italic app-text-muted">no reasoning recorded</div>
+          )}
+        </Section>
+      )}
+
+      {/* Backtest */}
+      {data.backtest && (
+        <Section title="Best strategy on this ticker (walk-forward)" accent="blue">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 font-mono text-[11px]">
+            <div className="col-span-2">{data.backtest.winning_strategy} <span className="app-text-muted">({data.backtest.winning_direction})</span></div>
+            <div>conf: {fmtNum(data.backtest.confidence, 0)}</div>
+            <div>OOS trades: {data.backtest.oos_trades ?? '—'}</div>
+            <div>win rate: {fmtPct(data.backtest.win_rate)}</div>
+            <div>avg P/L: {fmtNum(data.backtest.avg_pl, 1)}</div>
+          </div>
+        </Section>
+      )}
+
+      {/* Fundamentals */}
+      {data.fundamentals && (
+        <Section title={`Fundamentals — quality score ${fmtNum(data.fundamentals.quality_score, 0)}`} accent="purple">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 font-mono text-[11px]">
+            <div>PE: {fmtNum(data.fundamentals.pe_ratio, 1)}</div>
+            <div>PEG: {fmtNum(data.fundamentals.peg_ratio)}</div>
+            <div>rev YoY: {fmtPct(data.fundamentals.revenue_growth_yoy)}</div>
+            <div>EPS YoY: {fmtPct(data.fundamentals.earnings_growth_yoy)}</div>
+            <div>profit M: {fmtPct(data.fundamentals.profit_margin)}</div>
+            <div>ROE: {fmtPct(data.fundamentals.return_on_equity)}</div>
+            <div>D/E: {fmtNum(data.fundamentals.debt_to_equity, 1)}</div>
+            <div>current: {fmtNum(data.fundamentals.current_ratio, 1)}</div>
+          </div>
+          {data.fundamentals.sector && (
+            <div className="mt-1 text-[10px] app-text-muted">{data.fundamentals.sector} · {data.fundamentals.industry}</div>
+          )}
+        </Section>
+      )}
+
+      {/* Analyst */}
+      {data.analyst && (
+        <Section title={`Wall Street — ${data.analyst.key || 'n/a'} (${data.analyst.analyst_count || 0} analysts)`} accent="amber">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 font-mono text-[11px]">
+            <div>mean: {fmtNum(data.analyst.mean)}</div>
+            <div>target: ${fmtNum(data.analyst.target_mean)}</div>
+            <div>vs entry: {fmtPct(data.analyst.target_premium_vs_entry)}</div>
+            <div>range: ${fmtNum(data.analyst.target_low)} – ${fmtNum(data.analyst.target_high)}</div>
+          </div>
+        </Section>
+      )}
+
+      {/* Macro */}
+      {data.macro_context?.length > 0 && (
+        <Section title="Macro context (±48h)" accent="rose">
+          <div className="space-y-0.5 font-mono text-[11px]">
+            {data.macro_context.map((ev, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className={`pill text-[9px] ${ev.importance === 'high' ? 'pill-danger' : 'pill-warn'}`}>{ev.importance}</span>
+                <span className="font-bold">{ev.event_key}</span>
+                <span className="app-text-muted">@ {ev.release_time_utc?.slice(0,16).replace('T',' ')}</span>
+                <span className={ev.minutes_relative_to_open >= 0 ? 'text-blue-400' : 'app-text-secondary'}>
+                  ({ev.minutes_relative_to_open >= 0 ? '+' : ''}{ev.minutes_relative_to_open}m vs open)
+                </span>
+                {ev.actual != null && <span>actual {ev.actual}</span>}
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
+
+      {!data.signal && !data.scanner && !data.backtest && !data.fundamentals && !data.analyst && !data.macro_context?.length && (
+        <div className="italic app-text-muted text-[11px]">No detailed rationale recorded for this trade. (Older trades pre-date this feature.)</div>
+      )}
+    </div>
+  );
+}
+
 function TradeNewsContext({ tradeId }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1895,6 +2039,7 @@ function AutoTraderPanel({ reloadToken }) {
   const [showCfg, setShowCfg] = useState(false);
   const [expanded, setExpanded] = useState(null); // trade.id whose post-mortem is open
   const [newsExpanded, setNewsExpanded] = useState(null); // trade.id whose news context is open
+  const [rationaleExpanded, setRationaleExpanded] = useState(null); // trade.id whose rationale is open
 
   // Perf: puts-watch iterates the full watchlist, synthesises a bear thesis
   // per ticker, and fetches option chains — it was gating the whole panel's
@@ -2172,6 +2317,7 @@ function AutoTraderPanel({ reloadToken }) {
               const isPmOpen = expanded === t.id;
               const isClosed = !!t.closed_at;
               const isNewsOpen = newsExpanded === t.id;
+              const isRatOpen = rationaleExpanded === t.id;
               const statusPill =
                 t.status === 'open' ? { cls: 'pill-success', label: 'live' } :
                 t.status === 'pending' ? { cls: 'pill-warn', label: 'pending' } :
@@ -2230,29 +2376,38 @@ function AutoTraderPanel({ reloadToken }) {
                     </div>
                   </div>
 
-                  {/* Actions row (only when relevant) */}
-                  {(losingStop || isClosed) && (
-                    <div className="mt-2 pt-2 border-t app-border-soft flex gap-2">
-                      {losingStop && (
-                        <button
-                          onClick={() => setExpanded(isPmOpen ? null : t.id)}
-                          className="text-[10px] px-2 py-1 rounded-md bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/30 font-semibold"
-                        >
-                          🔍 {isPmOpen ? 'Hide post-mortem' : 'Why did this lose?'}
-                        </button>
-                      )}
-                      {isClosed && (
-                        <button
-                          onClick={() => setNewsExpanded(isNewsOpen ? null : t.id)}
-                          className="text-[10px] px-2 py-1 rounded-md bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border border-blue-500/30 font-semibold"
-                        >
-                          📰 {isNewsOpen ? 'Hide news' : 'News during trade'}
-                        </button>
-                      )}
-                    </div>
-                  )}
+                  {/* Actions row — rationale always available; post-mortem + news as before */}
+                  <div className="mt-2 pt-2 border-t app-border-soft flex gap-2 flex-wrap">
+                    <button
+                      onClick={() => setRationaleExpanded(isRatOpen ? null : t.id)}
+                      className="text-[10px] px-2 py-1 rounded-md bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/30 font-semibold"
+                    >
+                      📊 {isRatOpen ? 'Hide rationale' : 'Why this trade?'}
+                    </button>
+                    {losingStop && (
+                      <button
+                        onClick={() => setExpanded(isPmOpen ? null : t.id)}
+                        className="text-[10px] px-2 py-1 rounded-md bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/30 font-semibold"
+                      >
+                        🔍 {isPmOpen ? 'Hide post-mortem' : 'Why did this lose?'}
+                      </button>
+                    )}
+                    {isClosed && (
+                      <button
+                        onClick={() => setNewsExpanded(isNewsOpen ? null : t.id)}
+                        className="text-[10px] px-2 py-1 rounded-md bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border border-blue-500/30 font-semibold"
+                      >
+                        📰 {isNewsOpen ? 'Hide news' : 'News during trade'}
+                      </button>
+                    )}
+                  </div>
 
                   {/* Expanded sections */}
+                  {isRatOpen && (
+                    <div className="mt-2 p-2 rounded-lg bg-emerald-500/5 border border-emerald-500/20">
+                      <TradeRationale tradeId={t.id} />
+                    </div>
+                  )}
                   {isPmOpen && (
                     <div className="mt-2 p-2 rounded-lg bg-red-500/5 border border-red-500/20">
                       <PostMortem trade={t} onRegen={async () => {

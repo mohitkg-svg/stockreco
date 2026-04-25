@@ -270,6 +270,171 @@ def auto_regen_postmortem(trade_id: int):
     return res
 
 
+@router.get("/auto/rationale/{trade_id}")
+def auto_trade_rationale(trade_id: int):
+    """Aggregated 'why was this trade made?' view.
+
+    Pulls together:
+      • Origin — was the ticker on the watchlist or surfaced by the scanner?
+        (and the scanner score breakdown if so)
+      • Signal — the originating Signal row's reasoning bullets, confidence,
+        timeframe, strategy
+      • Backtest — best_strategy_per_ticker row (winning strategy + OOS metrics)
+      • Fundamentals — composite quality_score + headline ratios
+      • Analyst rating — consensus + price target premium
+      • Macro context — high-importance events within ±48h of opened_at
+
+    Frontend renders this in a single expander on the trade card.
+    """
+    from database import (
+        SessionLocal, AutoTrade, Signal, WatchlistStock, CandidatePool,
+        BestStrategyPerTicker, Fundamentals, AnalystRating, MacroEvent,
+    )
+    from datetime import timedelta
+
+    db = SessionLocal()
+    try:
+        t = db.query(AutoTrade).filter(AutoTrade.id == trade_id).first()
+        if not t:
+            raise HTTPException(status_code=404, detail=f"trade {trade_id} not found")
+
+        ticker = t.ticker
+        # --- Origin ---
+        wl = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
+        cand = db.query(CandidatePool).filter(CandidatePool.ticker == ticker).first()
+        if wl and cand:
+            origin = "watchlist+pool"
+        elif wl:
+            origin = "watchlist"
+        elif cand:
+            origin = "scanner"
+        else:
+            origin = "unknown"
+        scanner = None
+        if cand:
+            scanner = {
+                "score": cand.score, "rvol": cand.rvol,
+                "rs_20d": cand.rs_20d, "rs_60d": cand.rs_60d,
+                "adx": cand.adx, "pct_from_52w_high": cand.pct_from_52w_high,
+                "reason": cand.reason, "price": cand.price,
+                "generated_at": cand.generated_at.isoformat() if cand.generated_at else None,
+            }
+
+        # --- Signal ---
+        signal = None
+        if t.signal_id:
+            sig = db.query(Signal).filter(Signal.id == t.signal_id).first()
+            if sig:
+                # reasoning is stored as a newline-separated string; split into bullets
+                reasoning_lines: list = []
+                if sig.reasoning:
+                    reasoning_lines = [ln for ln in sig.reasoning.split("\n") if ln.strip()]
+                signal = {
+                    "signal_type": sig.signal_type,
+                    "confidence": sig.confidence,
+                    "timeframe": sig.timeframe,
+                    "strategy": getattr(sig, "strategy", None),
+                    "entry": sig.entry, "stop_loss": sig.stop_loss,
+                    "target1": sig.target1, "target2": sig.target2, "target3": sig.target3,
+                    "reasoning_lines": reasoning_lines,
+                    "generated_at": sig.generated_at.isoformat() if sig.generated_at else None,
+                }
+
+        # --- Backtest evidence ---
+        bs = db.query(BestStrategyPerTicker).filter(BestStrategyPerTicker.ticker == ticker).first()
+        backtest = None
+        if bs:
+            backtest = {
+                "winning_strategy": bs.strategy,
+                "winning_direction": bs.direction,
+                "confidence": bs.confidence,
+                "oos_trades": bs.oos_trades,
+                "win_rate": bs.win_rate,
+                "avg_pl": bs.avg_pl,
+                "updated_at": bs.updated_at.isoformat() if bs.updated_at else None,
+            }
+
+        # --- Fundamentals ---
+        f = db.query(Fundamentals).filter(Fundamentals.ticker == ticker).first()
+        fundamentals = None
+        if f:
+            fundamentals = {
+                "quality_score": f.quality_score,
+                "sector": f.sector, "industry": f.industry,
+                "pe_ratio": f.pe_ratio, "peg_ratio": f.peg_ratio,
+                "revenue_growth_yoy": f.revenue_growth_yoy,
+                "earnings_growth_yoy": f.earnings_growth_yoy,
+                "profit_margin": f.profit_margin,
+                "return_on_equity": f.return_on_equity,
+                "debt_to_equity": f.debt_to_equity,
+                "current_ratio": f.current_ratio,
+                "last_changed_at": f.last_changed_at.isoformat() if f.last_changed_at else None,
+            }
+
+        # --- Analyst rating ---
+        ar = db.query(AnalystRating).filter(AnalystRating.ticker == ticker).first()
+        analyst = None
+        if ar:
+            target_premium = None
+            cur_px = t.entry_price or t.requested_entry
+            if ar.target_mean and cur_px:
+                target_premium = (ar.target_mean - cur_px) / cur_px
+            analyst = {
+                "mean": ar.mean, "key": ar.key, "analyst_count": ar.analyst_count,
+                "target_mean": ar.target_mean,
+                "target_high": ar.target_high, "target_low": ar.target_low,
+                "target_premium_vs_entry": target_premium,
+                "updated_at": ar.updated_at.isoformat() if ar.updated_at else None,
+            }
+
+        # --- Macro context (events within ±48h of opened_at) ---
+        macro_events: list = []
+        if t.opened_at:
+            window_start = t.opened_at - timedelta(hours=48)
+            window_end = t.opened_at + timedelta(hours=48)
+            evs = (
+                db.query(MacroEvent)
+                .filter(
+                    MacroEvent.release_time_utc >= window_start,
+                    MacroEvent.release_time_utc <= window_end,
+                    MacroEvent.importance.in_(["high", "medium"]),
+                )
+                .order_by(MacroEvent.release_time_utc.asc()).all()
+            )
+            for ev in evs:
+                macro_events.append({
+                    "event_key": ev.event_key,
+                    "event_name": ev.event_name,
+                    "importance": ev.importance,
+                    "release_time_utc": ev.release_time_utc.isoformat() if ev.release_time_utc else None,
+                    "consensus": ev.consensus,
+                    "actual": ev.actual,
+                    "surprise_pct": ev.surprise_pct,
+                    "minutes_relative_to_open": (
+                        int((ev.release_time_utc - t.opened_at).total_seconds() / 60)
+                        if (ev.release_time_utc and t.opened_at) else None
+                    ),
+                })
+
+        return {
+            "trade_id": t.id, "ticker": ticker, "asset_type": t.asset_type,
+            "side": t.side, "qty": t.qty,
+            "entry_price": t.entry_price, "stop_loss": t.stop_loss,
+            "target1": t.target1, "target2": t.target2, "target3": t.target3,
+            "status": t.status, "note": t.note,
+            "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+            "origin": origin,
+            "scanner": scanner,
+            "signal": signal,
+            "backtest": backtest,
+            "fundamentals": fundamentals,
+            "analyst": analyst,
+            "macro_context": macro_events,
+        }
+    finally:
+        db.close()
+
+
 # -------- Kill switch --------
 
 @router.post("/kill")
