@@ -20,6 +20,20 @@ set -euo pipefail
 REGION="${1:-us-central1}"
 SERVICE="stockrecs"
 
+# ---- Pre-deploy regression tests --------------------------------------------
+# Cheap (<3s) regression suite that catches the bug families surfaced in
+# production losses. Skip with SKIP_TESTS=1 if you really need to.
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+  echo "── Running pre-deploy regression tests ──"
+  if (cd backend && DATABASE_URL="sqlite:///$(mktemp)" APP_API_KEY=test \
+       python3 -m unittest tests.test_bug_scenarios tests.test_smoke 2>&1 | tail -8); then
+    echo "✅ tests passed; proceeding with deploy"
+  else
+    echo "❌ pre-deploy tests FAILED — aborting. Set SKIP_TESTS=1 to override."
+    exit 1
+  fi
+fi
+
 # Pick up env vars from backend/.env if present (without overwriting shell vars).
 if [ -f backend/.env ]; then
   set -a
