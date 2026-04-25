@@ -111,11 +111,24 @@ rollout). Revisit ~4 weeks after live trading is stable.
   and migrate existing call sites incrementally.
 
 ### Async I/O migration (httpx.AsyncClient + await endpoints)
-- **What**: Move broker / data-fetch calls to async; use `await` in routers.
-- **Why defer**: ThreadPoolExecutor at 4 workers handles single-user scale
-  fine. Migration is large surface area, high regression risk, marginal
-  benefit until traffic is much higher. Revisit if we ever hit thread
-  exhaustion symptoms.
+- **Status**: **Formally deferred** after re-evaluation on 2026-04-25.
+- **Surface area**: 10+ routers, 15+ services, every yfinance / httpx /
+  Alpaca SDK call. Estimated ~3 full days of code + ~1 day of regression
+  hunting. Many call sites would need conditional sync/async variants
+  during the migration window.
+- **Benefit at current traffic**: negligible. Single-user app on Cloud Run
+  with min-instances=1. ThreadPoolExecutor at 4 workers + scheduler-driven
+  background jobs handle the load with ~20% CPU headroom during peak scans.
+  No thread-exhaustion symptoms observed in logs.
+- **Concrete trigger to revisit**: any of these would tip the trade-off:
+  - `/api/health` reports sustained 95p latency > 2s
+  - Cloud Run `container_instance_count` trending above 2 during market hours
+  - Concurrent-user count > 5
+  - Scheduler job misfires due to thread pool saturation
+- **Doing it wrong costs more than doing it late.** Half-migrated async code
+  (some awaited, some not) is the single most common source of "works in
+  tests, deadlocks in prod" failures in Python web apps. Not worth the
+  risk days before real-money trading.
 
 ### Priority-queue scanner (vs flat 5min watchlist scan)
 - **Proposal**: scan tickers with open positions every 1m, high-conf signals

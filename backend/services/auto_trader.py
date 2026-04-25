@@ -250,29 +250,9 @@ def _post_mortem_async(trade_id: int) -> None:
         logger.warning(f"could not schedule post_mortem #{trade_id}: {e}")
 
 
-def _signal_idempotency_key(signal: Dict[str, Any]) -> str:
-    """
-    Deterministic dedupe hash for a signal: ticker + direction + rounded
-    entry/stop/T1 + confidence-bucket + UTC date. Postmortem fix H2: yesterday's
-    stale signal that happens to round to the same prices as today's fresh
-    high-conviction setup was deduping the new entry. Including the day-stamp
-    forces a fresh key each session; including the confidence bucket
-    distinguishes a 60-conf chop signal from a 90-conf trend signal even when
-    levels rounded identically.
-    """
-    conf_bucket = int(float(signal.get("confidence") or 0) // 10)
-    day_stamp = datetime.utcnow().strftime("%Y%m%d")
-    parts = "|".join([
-        str(signal.get("ticker", "")).upper(),
-        str(signal.get("signal_type", "")),
-        f"{round(float(signal.get('entry') or 0), 2):.2f}",
-        f"{round(float(signal.get('stop_loss') or 0), 2):.2f}",
-        f"{round(float(signal.get('target1') or 0), 2):.2f}",
-        str(signal.get("timeframe", "")),
-        f"c{conf_bucket}",
-        day_stamp,
-    ])
-    return hashlib.sha1(parts.encode()).hexdigest()[:16]
+# Idempotency-key math lives in services.risk_math. We keep a local alias
+# so existing call sites don't have to change.
+from services.risk_math import signal_idempotency_key as _signal_idempotency_key  # noqa: F401
 
 from database import SessionLocal, AutoTrade, AutoTraderConfig, Signal, WatchlistStock
 from services import paper_trader, live_quotes
