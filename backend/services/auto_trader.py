@@ -1854,86 +1854,14 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
 
 # ---------- Manage: trail stops, reconcile ---------------------------------
 
-def _get_legs(parent_id: str) -> List[Any]:
-    """Return child orders (TP + SL) of a bracket parent."""
-    c = paper_trader._get_client()
-    if not c:
-        return []
-    try:
-        parent = c.get_order_by_id(parent_id)
-        return list(parent.legs or [])
-    except Exception as e:
-        logger.warning(f"could not fetch legs of {parent_id}: {e}")
-        return []
-
-
-def _identify_legs(parent_id: str) -> Dict[str, Optional[str]]:
-    """Return {'stop_id': ..., 'tp_id': ...} for a bracket parent."""
-    out: Dict[str, Optional[str]] = {"stop_id": None, "tp_id": None}
-    for leg in _get_legs(parent_id):
-        otype = str(getattr(leg, "order_type", "")).lower()
-        if "stop" in otype:
-            out["stop_id"] = str(leg.id)
-        elif "limit" in otype:
-            out["tp_id"] = str(leg.id)
-    return out
-
-
-# Last successfully-requested stop price per broker order id. Stops the
-# manage loop from calling Alpaca with an identical stop price twice in
-# consecutive ticks (race produces "order already replaced" / 42210000).
-_replace_stop_cache: Dict[str, float] = {}
-
-
-def _replace_stop(stop_order_id: str, new_stop: float) -> bool:
-    """Move the SL child order to a new stop price.
-
-    Returns True only if the broker acknowledged the replacement. Callers
-    MUST guard their DB mutation behind this return value (current pattern:
-    `if new_stop > t.current_stop and _replace_stop(...): t.current_stop = ...`)
-    so the database can never carry a tighter stop than the broker actually
-    holds. A False return is logged loudly because every failure means the
-    next manage tick will re-attempt — silent drift is a money bug.
-    """
-    rounded = round(float(new_stop), 2)
-    # Idempotency: if we already sent this exact stop price for this order
-    # (and Alpaca accepted it), skip the round-trip. Avoids the "order
-    # already replaced" race when two manage ticks compute the same target.
-    last = _replace_stop_cache.get(stop_order_id)
-    if last is not None and abs(last - rounded) < 0.005:
-        return True
-    c = paper_trader._get_client()
-    if not c:
-        logger.warning(f"replace_stop {stop_order_id}: no broker client — keeping old stop")
-        return False
-    try:
-        from alpaca.trading.requests import ReplaceOrderRequest
-        c.replace_order_by_id(
-            stop_order_id,
-            order_data=ReplaceOrderRequest(stop_price=rounded),
-        )
-        _replace_stop_cache[stop_order_id] = rounded
-        return True
-    except Exception as e:
-        err_lower = str(e).lower()
-        # Alpaca briefly reports "order already replaced" when our previous
-        # replace is still settling. Our intent is accepted — record it and
-        # treat as success so the DB advances; next tick will re-sync if
-        # the broker ends up on a different price.
-        if "already replaced" in err_lower:
-            _replace_stop_cache[stop_order_id] = rounded
-            logger.debug(
-                f"replace_stop {stop_order_id}: already-replaced (racing prior tick), "
-                f"caching intent {rounded}"
-            )
-            return True
-        # Loud — DB will not advance, broker keeps prior stop. Manage loop
-        # will retry every 60s until success.
-        logger.error(
-            f"replace_stop FAILED {stop_order_id} → {new_stop}: {e} "
-            f"(broker stop unchanged, will retry next manage tick)"
-        )
-        return False
+# Broker-interaction helpers moved to services.execution_engine.
+# Back-compat aliases below — existing call sites don't change.
+from services.execution_engine import (
+    get_legs as _get_legs,
+    identify_legs as _identify_legs,
+    replace_stop as _replace_stop,
+    _replace_stop_cache,  # re-exported for any introspection use
+)
 
 
 from services.config import PRICE_FALLBACK_TTL_SEC as _PRICE_FALLBACK_TTL
@@ -2489,57 +2417,12 @@ def _force_close_trade(
     summary: Dict[str, Any],
     status_override: Optional[str] = None,
 ) -> None:
-    """Cancel any working broker orders and exit the position at market.
-
-    `status_override` lets callers tag the reason (e.g. "closed_slippage" for
-    runaway-fill rejects). Default is "closed_reverse" — see C1 fix.
-    """
-    if t.asset_type == "stock":
-        # Cancel parent bracket (which also cancels its TP/SL legs in Alpaca),
-        # then market-close the position.
-        try:
-            if t.parent_order_id:
-                paper_trader.cancel_order(t.parent_order_id)
-        except Exception as e:
-            logger.warning(f"reverse-close cancel parent failed: {e}")
-        res = paper_trader.close_position(t.ticker)
-        if "error" in res:
-            logger.warning(f"reverse-close {t.ticker} failed: {res['error']}")
-            return
-        # Realised P/L from current price snapshot
-        px = _current_price(t.ticker)
-        if px and t.entry_price:
-            t.realized_pl = (px - t.entry_price) * t.qty
-    else:
-        # Option: market sell-to-close
-        sell = paper_trader.submit_simple_option_order(
-            occ_symbol=t.symbol, qty=int(t.qty), side="sell",
-            order_type="market", time_in_force="day",
-        )
-        if "error" in sell:
-            logger.warning(f"reverse-close option {t.symbol} failed: {sell['error']}")
-            return
-        pos = paper_trader.get_option_position(t.symbol)
-        if pos and pos.get("current_price") is not None and t.entry_price:
-            t.realized_pl = (pos["current_price"] - t.entry_price) * t.qty * 100
-
-    # Distinct status for reverse-closes — postmortem fix C1: a reverse-close
-    # is fundamentally different from "stop hit" or "target hit"; conflating
-    # them mis-attributes win/loss stats AND triggers post-mortems on trades
-    # that were never given a chance to test their stop. closed_reverse is
-    # never post-mortem'd because the close was caused by an exogenous
-    # opposing signal, not a stop failure.
-    t.status = status_override or "closed_reverse"
-    t.closed_at = datetime.utcnow()
-    t.note = (t.note or "") + f" | {t.status.upper()}: {reason}"
-    # Clean up state-machine bookkeeping (postmortem fix H1).
-    _target_touch_counts.pop(t.id, None)
-    db.commit()
-    summary["closed"] += 1
-    metrics.inc("autotrade_event", event=t.status)
-    logger.warning(
-        f"AutoTrader {t.status.upper()} {t.ticker} ({t.asset_type}) — {reason} "
-        f"PL≈${(t.realized_pl or 0):.2f}"
+    """Thin wrapper — delegates to execution_engine, passes the
+    target-touch-count cleanup as a callback."""
+    from services.execution_engine import force_close_trade as _ee_force_close
+    _ee_force_close(
+        t, db, reason, summary, status_override=status_override,
+        on_close=lambda closed_t: _target_touch_counts.pop(closed_t.id, None),
     )
 
 
