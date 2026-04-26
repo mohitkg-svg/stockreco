@@ -94,3 +94,32 @@ def age_out_trades(req: AgeOutTradesRequest):
         "skipped": [t for t in touched if "skipped" in t],
         "days_offset": req.days_offset,
     }
+
+
+@router.post("/sync-positions")
+def sync_positions():
+    """Reconcile the Alpaca account against the `auto_trades` table.
+    Alpaca is the source of truth for actual capital deployment.
+
+    See `services.auto_trader.sync_positions_from_alpaca` for full
+    semantics. Two reconciliation paths (idempotent — safe to re-run):
+
+      1. **Adopt** — Alpaca position with no DB row → insert a new
+         row with `status="adopted"`. Suppresses the `unexpected_position`
+         alert and counts toward portfolio capital/heat math, but the
+         manage loop SKIPS adopted rows (operator handles externally).
+
+      2. **Close-external** — open DB row with no Alpaca position →
+         flip `status="closed_external"` with note. The position closed
+         via a path the bot didn't observe (manual flatten, missed leg
+         fill, etc.). Pending rows are not touched (may be in flight).
+
+    Returns `{adopted: [...], closed_external: [...]}`.
+
+    Use case: option assignment converts a put into 100 short shares,
+    or you placed a manual trade via the Alpaca dashboard, or a broker
+    bracket leg filled via a path the manage loop missed. Run sync to
+    bring the DB in line with reality.
+    """
+    from services.auto_trader import sync_positions_from_alpaca
+    return sync_positions_from_alpaca()

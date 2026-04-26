@@ -407,10 +407,18 @@ def realized_pnl_today() -> float:
 
 
 def count_open_auto_trades() -> int:
+    """Count rows that consume a concurrent-position slot.
+
+    Includes `adopted` (r41 sync) — those represent operator-accepted
+    external positions that consume capital and contribute to the
+    portfolio's correlation profile, even though the bot doesn't trail/
+    exit them. Excluding them would let the bot enter a new trade on
+    top of an already-correlated external position past the cap.
+    """
     db = SessionLocal()
     try:
         return db.query(AutoTrade).filter(
-            AutoTrade.status.in_(["pending", "open"])
+            AutoTrade.status.in_(["pending", "open", "adopted"])
         ).count()
     finally:
         db.close()
@@ -464,7 +472,7 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
     try:
         from datetime import datetime as _dt_kill
         open_rows = db2.query(AutoTrade).filter(
-            AutoTrade.status.in_(["pending", "open"])
+            AutoTrade.status.in_(["pending", "open", "adopted"])
         ).all()
         for row in open_rows:
             row.status = "closed_kill"
@@ -532,9 +540,12 @@ def detect_unexpected_positions() -> Dict[str, Any]:
 
     db = SessionLocal()
     try:
+        # Include `adopted` (r41 sync) — those represent operator-accepted
+        # external positions that the bot doesn't manage but DOES know
+        # about, so they shouldn't refire the alert.
         open_tickers = {
             r.ticker for r in db.query(AutoTrade).filter(
-                AutoTrade.status.in_(["pending", "open"]),
+                AutoTrade.status.in_(["pending", "open", "adopted"]),
                 AutoTrade.asset_type == "stock",
             ).all()
         }
@@ -555,11 +566,143 @@ def detect_unexpected_positions() -> Dict[str, Any]:
             _raise_alert(
                 "critical", "unexpected_position",
                 f"Alpaca reports unexpected stock position {sym} qty={qty} avg=${pos.get('avg_entry_price')} — "
-                f"possible option assignment or external manual trade. Investigate.",
+                f"possible option assignment or external manual trade. Reconcile via "
+                f"POST /api/admin/sync-positions to adopt or close the row.",
                 ticker=sym,
             )
 
     return {"unexpected": unexpected, "count": len(unexpected)}
+
+
+def sync_positions_from_alpaca() -> Dict[str, Any]:
+    """Reconcile the Alpaca account against the `auto_trades` table.
+
+    **Alpaca is the source of truth** for actual capital deployment;
+    `auto_trades` is the bot's record of what IT opened. Divergence
+    happens for legitimate reasons:
+      * Option assignment converts a held option into shares.
+      * The operator places a manual trade via the Alpaca dashboard.
+      * A bracket leg fills via a path the manage loop didn't observe.
+      * A position was closed externally without the bot knowing.
+
+    Two reconciliation paths (idempotent — safe to re-run any time):
+
+      1. **Adopt**: an Alpaca stock position with no matching open
+         AutoTrade row → insert a row with `status="adopted"`. These
+         rows count toward portfolio capital + heat math but are
+         skipped by the manage loop (no auto-trail, no auto-exit —
+         the operator handles them externally). They DO suppress
+         future `unexpected_position` alerts.
+
+      2. **Close-external**: an open AutoTrade row with no matching
+         Alpaca position → mark `status="closed_external"` with note.
+         The position closed via some path the bot didn't see (manual
+         flatten, bracket leg fill we missed, broker-side reconciliation).
+
+    Pending rows are not reconciled either way — they may be in flight
+    at the broker. Multi-leg option symbols (>6 chars) are skipped on
+    the adopt side; option positions are managed via the OCC-symbol-
+    keyed AutoTrade rows.
+
+    Returns `{adopted: [...], closed_external: [...]}` for operator review.
+    """
+    if not paper_trader.is_enabled():
+        return {"adopted": [], "closed_external": [], "note": "broker disabled"}
+    try:
+        alpaca_positions = paper_trader.get_positions() or []
+    except Exception as e:
+        logger.warning(f"sync_positions_from_alpaca: Alpaca fetch failed: {e}")
+        return {"adopted": [], "closed_external": [], "error": str(e)}
+
+    # Build the Alpaca-side stock map: ticker → position dict.
+    alpaca_stocks: Dict[str, Dict[str, Any]] = {}
+    for pos in alpaca_positions:
+        sym = (pos.get("symbol") or "").upper()
+        qty = float(pos.get("qty") or 0)
+        if not sym or qty == 0 or len(sym) > 6:
+            continue
+        alpaca_stocks[sym] = pos
+
+    adopted: List[Dict[str, Any]] = []
+    closed_external: List[Dict[str, Any]] = []
+
+    db = SessionLocal()
+    try:
+        # Snapshot: every stock row in pending / open / adopted state.
+        open_rows = db.query(AutoTrade).filter(
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
+            AutoTrade.asset_type == "stock",
+        ).all()
+        db_tickers = {r.ticker: r for r in open_rows}
+
+        # 1) ADOPT: Alpaca position has no DB row → create adopted row
+        for sym, pos in alpaca_stocks.items():
+            if sym in db_tickers:
+                continue
+            qty = float(pos.get("qty") or 0)
+            avg_entry = float(pos.get("avg_entry_price") or 0)
+            if avg_entry <= 0:
+                continue
+            row = AutoTrade(
+                ticker=sym,
+                symbol=sym,
+                asset_type="stock",
+                side="buy" if qty > 0 else "sell",
+                qty=abs(qty),
+                original_qty=abs(qty),
+                requested_entry=avg_entry,
+                entry_price=avg_entry,
+                # Placeholder stop/target — bot won't manage these (status=adopted
+                # is excluded from the manage loop). Set to 5% below entry just
+                # so heat math has a number to work with; reflects "no specific
+                # stop, just bound the worst case" semantics.
+                stop_loss=round(avg_entry * 0.95, 2),
+                current_stop=round(avg_entry * 0.95, 2),
+                target1=round(avg_entry * 1.05, 2),
+                level_index=0,
+                status="adopted",
+                opened_at=datetime.utcnow(),
+                filled_at=datetime.utcnow(),
+                note=(
+                    f"ADOPTED from Alpaca {datetime.utcnow().isoformat()}: "
+                    f"external position (qty={qty}, avg_entry=${avg_entry:.2f}). "
+                    f"Bot will NOT trail/exit this position — operator manages externally."
+                ),
+            )
+            db.add(row)
+            adopted.append({
+                "ticker": sym, "qty": qty, "avg_entry": avg_entry,
+            })
+
+        # 2) CLOSE-EXTERNAL: open DB row has no Alpaca position → mark closed
+        # Skip pending — those may be in flight at the broker.
+        for r in open_rows:
+            if r.status == "pending":
+                continue
+            if r.status == "adopted" and r.ticker in alpaca_stocks:
+                continue
+            if r.status == "open" and r.ticker in alpaca_stocks:
+                continue
+            # adopted-but-no-longer-on-alpaca → closed externally
+            # open-but-no-longer-on-alpaca → closed externally
+            if r.ticker not in alpaca_stocks:
+                r.status = "closed_external"
+                r.closed_at = datetime.utcnow()
+                r.note = (r.note or "") + (
+                    f" | RECONCILED {datetime.utcnow().isoformat()}: "
+                    f"Alpaca no longer reports a position for {r.ticker}; "
+                    f"closed externally"
+                )
+                closed_external.append({"trade_id": r.id, "ticker": r.ticker})
+
+        db.commit()
+    finally:
+        db.close()
+
+    logger.warning(
+        f"sync_positions_from_alpaca: adopted={len(adopted)} closed_external={len(closed_external)}"
+    )
+    return {"adopted": adopted, "closed_external": closed_external}
 
 
 def compute_confidence_calibration(min_bucket_n: int = 5) -> Dict[str, Any]:
@@ -765,8 +908,9 @@ def _build_ai_context(ticker: str, db: Session) -> Dict[str, Any]:
         sector = (ctx.get("fundamentals") or {}).get("sector")
         if sector:
             from services.fundamentals import get_fundamentals as _gf
+            # Include adopted — AI should see externally-held sector exposure too.
             open_others = db.query(AutoTrade).filter(
-                AutoTrade.status.in_(["pending", "open"])
+                AutoTrade.status.in_(["pending", "open", "adopted"])
             ).all()
             same = []
             for ot in open_others:
@@ -802,9 +946,14 @@ def _build_ai_context(ticker: str, db: Session) -> Dict[str, Any]:
 # ---------- Budget bookkeeping --------------------------------------------
 
 def _open_allocations(db: Session) -> Dict[str, float]:
-    """Sum notional of currently-open auto trades, by asset_type."""
+    """Sum notional of currently-open auto trades, by asset_type.
+
+    Includes `adopted` rows (r41 sync) — they consume capital just
+    like normal open positions, even though the bot doesn't manage them.
+    Excluding them would over-state available stock/option budget.
+    """
     open_trades = db.query(AutoTrade).filter(
-        AutoTrade.status.in_(["pending", "open"])
+        AutoTrade.status.in_(["pending", "open", "adopted"])
     ).all()
     out = {"stock": 0.0, "option": 0.0}
     for t in open_trades:
@@ -845,7 +994,7 @@ def status_snapshot() -> Dict[str, Any]:
             "option_remaining": max(0.0, option_budget - alloc["option"]),
             "config": get_config_dict(),
             "open_trades": db.query(AutoTrade).filter(
-                AutoTrade.status.in_(["pending", "open"])
+                AutoTrade.status.in_(["pending", "open", "adopted"])
             ).count(),
         }
     finally:
@@ -1101,8 +1250,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         except Exception:
             _heat_equity = 0.0
         if _heat_equity > 0:
+            # Include adopted — adopted positions count toward portfolio heat.
             open_trades_heat = db.query(AutoTrade).filter(
-                AutoTrade.status.in_(["pending", "open"])
+                AutoTrade.status.in_(["pending", "open", "adopted"])
             ).all()
             # Beta-weight each open trade's dollar-at-risk. High-beta names
             # concentrate more systematic risk per dollar than low-beta names,
@@ -1358,10 +1508,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if ws and getattr(ws, "auto_trade_enabled", True) is False:
             return None
 
-        # One open auto-trade per ticker.
+        # One open auto-trade per ticker. Include `adopted` so the bot
+        # doesn't enter a new trade on top of an externally-held position
+        # in the same name.
         existing = db.query(AutoTrade).filter(
             AutoTrade.ticker == ticker,
-            AutoTrade.status.in_(["pending", "open"]),
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
         ).first()
         if existing:
             return None
@@ -1386,9 +1538,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         except Exception:
             sector = ""
         if sector and getattr(cfg, "max_per_sector", 3):
+            # Include adopted — sector concentration is real regardless
+            # of whether the bot is managing the position.
             same_sector_open = db.query(AutoTrade).filter(
                 AutoTrade.sector == sector,
-                AutoTrade.status.in_(["pending", "open"]),
+                AutoTrade.status.in_(["pending", "open", "adopted"]),
             ).count()
             if same_sector_open >= cfg.max_per_sector:
                 logger.info(
@@ -1408,7 +1562,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 if _sector_equity > 0:
                     sector_rows = db.query(AutoTrade).filter(
                         AutoTrade.sector == sector,
-                        AutoTrade.status.in_(["pending", "open"]),
+                        AutoTrade.status.in_(["pending", "open", "adopted"]),
                     ).all()
                     sector_heat = 0.0
                     for sr in sector_rows:
@@ -1780,9 +1934,10 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             return None
 
         # Don't double-trade an underlying we already have a long stock auto-trade on
+        # (including adopted — externally-held position counts).
         existing = db.query(AutoTrade).filter(
             AutoTrade.ticker == ticker,
-            AutoTrade.status.in_(["pending", "open"]),
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
         ).first()
         if existing:
             return None
@@ -2090,12 +2245,12 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         existing_stock = db.query(AutoTrade).filter(
             AutoTrade.ticker == ticker,
             AutoTrade.asset_type == "stock",
-            AutoTrade.status.in_(["pending", "open"]),
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
         ).first()
         existing_option = db.query(AutoTrade).filter(
             AutoTrade.ticker == ticker,
             AutoTrade.asset_type == "option",
-            AutoTrade.status.in_(["pending", "open"]),
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
         ).first()
         if existing_option:
             return None  # one option play at a time per ticker
