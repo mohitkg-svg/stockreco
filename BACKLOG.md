@@ -69,7 +69,6 @@ has gone stale should either move to ✅ done or be re-categorized as
 | Latency simulation in backtest | Paper bot doesn't suffer execution latency |
 | Tax modeling | Out of scope |
 | Priority-queue scanner | Open positions managed every 20s already; wrong problem |
-| PDT *enforcement* (vs the counter we built) | Paper account isn't PDT-restricted; revisit when going live with margin < $25k |
 | "Rip out and rebuild" the rule engine to be ML-only | Rule engine is the deterministic floor; ML is a layer on top, not a replacement |
 
 ### Pre-live decisions still in operator's hands (not engineering work)
@@ -409,6 +408,27 @@ to ATR fallback, OCC consolidation, runner sizing, and restart safety.
   applies 0.5× when SPY daily ADX_14 < 20. Range-bound markets chew up
   trend-following entries via false breakouts; half-size during these
   periods recovers the EV the chop chops out.
+
+## External review backlog (2026-04-25, sixth pass — execution + concurrency)
+
+Three small but real findings: lock contention, missing PDT enforcement,
+broken option premium-vs-underlying compare.
+
+### ✅ Applied (r41, commit `c313b02`, 2026-04-25)
+
+- ✅ **Lock contention**: `_confirm_1m_bar` moved BEFORE `_entry_lock`
+  acquisition in `consider_signal`. Slow OHLCV fetch can no longer
+  hold the global entry lock.
+- ✅ **PDT day-trade hard gate**: new `cfg.pdt_enforce` flag (default
+  False on paper). When True, blocks new entries at ≥3 day-trades in
+  trailing 5 business days — preventing the 4th from triggering a
+  90-day PDT lock on margin <$25k. **Must flip to True before going
+  live with margin <$25k** (LIVE_CHECKLIST.md cutover step).
+- ✅ **Option underlying-vs-premium bug**: `_manage_option_trade` was
+  comparing current underlying ($500) against `t.requested_entry`
+  (option premium $2.00). New `auto_trades.underlying_entry_price`
+  column stores the underlying at entry; manage-loop uses it for
+  the spread-artifact "underlying against thesis" check.
 
 ## External review backlog (2026-04-25, fifth pass — strategy/backtest robustness)
 

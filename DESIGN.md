@@ -219,10 +219,11 @@ best strategy, score) is blended in when available.
 | `enabled` | `false` | Global auto-trade switch |
 | `killed` | `false` | Persistent kill flag — survives restarts |
 | `dry_run` | `false` | Record trades without broker submission |
+| `pdt_enforce` | **`false`** (r41) | Hard gate at ≥3 day-trades in trailing 5 business days. Defaulted `false` for paper; **must flip `true` before going live with margin < $25k**. |
 | `confidence_threshold` | 75 | Minimum signal confidence to open a trade |
-| `max_pct_of_equity` | **1.0** | Total deployable capital ceiling |
-| `stock_pct_of_equity` | **0.50** | Stock bucket (≈ $49k on $98k equity) |
-| `option_pct_of_equity` | **0.50** | Options bucket |
+| `max_pct_of_equity` | **0.50** | Total deployable capital ceiling |
+| `stock_pct_of_equity` | **0.40** | Stock bucket (≈ $39k on $98k equity) |
+| `option_pct_of_equity` | **0.05** (r39) | Options bucket — capped at 5% pre-live until ≥100 closed option trades show positive expectancy |
 | `max_risk_per_trade_pct` | 0.02 | Stop-loss dollar risk cap per entry |
 | `daily_loss_limit_pct` | 0.03 | Halt entries after this realized loss |
 | `max_concurrent_positions` | **15** | Hard cap across portfolio |
@@ -252,6 +253,7 @@ Per-entry lifecycle. Status values: `pending`, `open`, `closed_target`,
 - `realized_pl` — accumulates partial-fill gains (T1 + T2 trims)
 - `original_qty` — fixed denominator for partial trims (prevents exponential decay across cascades)
 - `target_touch_count` — persisted 2-tick debounce counter (r37; survives instance restarts)
+- `underlying_entry_price` — for OPTIONS only (r41); the underlying's price at trade open. `requested_entry` for options is the option PREMIUM, not the underlying — the premium-stop spread-artifact guard previously compared underlying price ($500) against premium ($2) and always evaluated "against us". Now compared against this column. NULL for stocks; NULL on rows from before r41 migration (manage code falls back to no-skip in that case).
 - `parent_order_id`, `stop_order_id`, `tp_order_id` — broker refs
 - `idempotency_key` — SHA1 of ticker|side|rounded levels|tf|conf bucket|UTC day
 - `sector` — captured at entry for correlation cap
@@ -342,6 +344,7 @@ Every gate short-circuits on failure. Order matters — cheap checks first.
 | # | Gate | Reason |
 |---|---|---|
 | 0 | **Hard freeze** (30d WR < 35% with ≥ 5 trades) | r40: stop the bleeding when streak indicates broken edge |
+| 0b | **PDT gate** when `cfg.pdt_enforce=true`: ≥ 3 day-trades in 5 business days | r41: prevents 4th day-trade triggering 90-day PDT lock on margin <$25k |
 | 1 | Buying-power circuit breaker not tripped | Prevents retry storms on 422 |
 | 2 | `enabled=true`, `killed=false`, broker connected | Global switches |
 | 3 | Signal is BUY, confidence ≥ threshold (and **raw evidence ≥ 30**, r40) | Direction + quality floor + evidence-weight floor |
@@ -772,6 +775,7 @@ auth is a no-op (local dev).
     (`stop_too_tight_atr_error`, `gap_open_gate_error`,
     `liquidity_gate_error`, `earnings_gate_error`,
     `macro_blackout_gate_error`), `closed_kill`, `post_mortem_dropped`
+  - r41: `pdt_limit` (PDT hard-gate trip when `cfg.pdt_enforce=true`)
   - `killed`, `unkilled`
 - **Operator alert categories** (`services/alerts.py`, persisted to
   `alerts` table, 5-min dedup):
@@ -910,6 +914,13 @@ All browsers get 401 on next request and prompt for the new key.
 
 ## 13. Operational Playbook
 
+> **Going live with real money?** Read [`LIVE_CHECKLIST.md`](./LIVE_CHECKLIST.md)
+> first. It has pre-flight gates, the conservative first-month config
+> profile, the cutover sequence (deploy with `enabled=false` →
+> 24h dry_run smoke → 3-trade manual approval → autonomous), daily
+> ops rhythm, and emergency procedures. The settings here are paper
+> defaults; live should HALVE most of them for the first month.
+
 ### Deploying
 
 ```bash
@@ -1001,15 +1012,15 @@ Local off-cloud archive: `pg_dump "$DATABASE_URL" --no-owner --no-acl
    and `AI_CONFIDENCE_MULT_MODE` independently — each on its own
    review cycle.
 
-### PDT day-trade monitoring
+### PDT day-trade monitoring (r39 counter, r41 hard gate)
 - `GET /api/trading/auto/pdt` — count of same-day open+close trades in
   trailing 5 business days.
-- On Alpaca paper: informational. The bot's recent paper-trading run
-  showed 6/5 day-trades, all losses — strong vote for theta-stop +
-  stale-trade + ADX trim safeguards already in place.
-- On Alpaca live with margin < $25k: 4+ day trades in 5 days blocks
-  new opens for 90 days. **Pre-entry hard-gate not yet wired** — when
-  going live with margin, gate `consider_signal` on this counter.
+- **Hard gate** (r41): set `cfg.pdt_enforce=true` to block new entries
+  at ≥3 day-trades in 5 business days (one-trade safety margin under
+  the FINRA threshold of 4). Honored skips fire `autotrade_skip{reason=pdt_limit}`.
+- Defaults `cfg.pdt_enforce=false` for paper-account behavior. **Must
+  flip to `true` before going live with margin < $25k** — otherwise
+  the 4th day-trade triggers a 90-day Pattern Day Trader lock.
 
 ### Strategy-drawdown response (r38)
 - `adaptive_risk_multiplier` halves risk when 30d realized-PnL DD ≥ 10%
