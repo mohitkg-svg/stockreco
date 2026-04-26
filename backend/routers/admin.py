@@ -96,6 +96,35 @@ def age_out_trades(req: AgeOutTradesRequest):
     }
 
 
+@router.post("/promote-adopted/{ticker}")
+def promote_adopted(ticker: str):
+    """Promote an `adopted` AutoTrade row to `open` with bot-computed
+    stop/target levels, submitting a real broker stop-loss order so the
+    manage loop will trail / partial-exit / stop-out the position like
+    any other auto-trade.
+
+    Levels are anchored to CURRENT live price (not the original adoption
+    entry price — that's a sunk cost; new trail bracket needs to make
+    sense around today's price). Computed from 1.5×ATR (with 2%-of-price
+    fallback) for stop distance, and 1.5R / 2.5R / 4R for T1 / T2 / T3.
+
+    Use case: after `POST /api/admin/sync-positions` adopts an external
+    position, this endpoint hands it off to the bot's management loop
+    instead of leaving it for manual operator handling.
+
+    Failure modes (returns `{ok: False, reason}`):
+      * No adopted row for ticker
+      * Alpaca no longer reports a position (row marked `closed_external`
+        as a side effect — sync would have done the same)
+      * Live price fetch failed (refused rather than using a stale anchor)
+      * Broker SL submit failed
+
+    Idempotent on success: a second call returns "no adopted stock row".
+    """
+    from services.auto_trader import promote_adopted_to_managed
+    return promote_adopted_to_managed(ticker)
+
+
 @router.post("/sync-positions")
 def sync_positions():
     """Reconcile the Alpaca account against the `auto_trades` table.

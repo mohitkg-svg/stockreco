@@ -705,6 +705,206 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
     return {"adopted": adopted, "closed_external": closed_external}
 
 
+def _compute_managed_levels(ticker: str, direction: str, current_price: float) -> Dict[str, Any]:
+    """Derive stop / T1 / T2 / T3 for a position we already hold.
+
+    Different problem than `signal_generator.generate_signal` (which decides
+    *whether* to enter): we already hold the position, we just need
+    reasonable exit levels anchored to CURRENT price.
+
+    Approach: 1.5 × ATR stop distance (matches the live entry-side
+    `STOP_ATR_MULT_BY_TF["1d"] = 2.0` minus a tightening for "we've
+    already deployed capital, accept slightly tighter risk envelope").
+    Targets at 1.5R / 2.5R / 4R from current — same R-multiple ladder
+    the live signal_generator uses for stocks. Falls back to 2% / 3% / 5%
+    / 8% percentage moves if ATR can't be computed.
+
+    Args:
+        ticker: symbol (uppercase)
+        direction: "BUY" (long position) or "SELL" (short)
+        current_price: live price to anchor levels on
+
+    Returns:
+        `{stop_loss, target1, target2, target3, atr, rationale}` —
+        rationale string explains how levels were chosen for audit.
+    """
+    atr = None
+    try:
+        atr = _chandelier_atr(ticker)
+    except Exception:
+        atr = None
+
+    if atr and atr > 0:
+        risk = 1.5 * atr
+        rationale = f"ATR-based: 1.5×ATR({atr:.2f})={risk:.2f} stop distance"
+    else:
+        risk = current_price * 0.02
+        rationale = f"ATR unavailable; 2%-of-price={risk:.2f} stop distance"
+
+    if direction == "BUY":
+        stop = round(current_price - risk, 2)
+        t1 = round(current_price + 1.5 * risk, 2)
+        t2 = round(current_price + 2.5 * risk, 2)
+        t3 = round(current_price + 4.0 * risk, 2)
+    else:
+        stop = round(current_price + risk, 2)
+        t1 = round(current_price - 1.5 * risk, 2)
+        t2 = round(current_price - 2.5 * risk, 2)
+        t3 = round(current_price - 4.0 * risk, 2)
+
+    return {
+        "stop_loss": stop,
+        "target1": t1,
+        "target2": t2,
+        "target3": t3,
+        "atr": atr,
+        "rationale": rationale,
+    }
+
+
+def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
+    """Promote an `adopted` AutoTrade row to `open` with bot-computed
+    targets, submitting a real broker stop-loss order so the manage loop
+    will trail / exit it like any other trade.
+
+    Workflow:
+      1. Find the adopted row for the ticker (idempotent — if already
+         `open`, returns early with a note).
+      2. Verify Alpaca still reports a position for it (positions can
+         disappear between sync and promote; if missing, mark
+         `closed_external` instead).
+      3. Compute fresh stop/T1/T2/T3 from CURRENT price + ATR (not the
+         original adoption entry — that's a sunk anchor; new trail
+         needs to bracket today's price).
+      4. Submit a real broker stop-loss order via `paper_trader._get_client()`.
+      5. Update the row: `status="open"`, `current_stop`, `target1/2/3`,
+         `stop_order_id`, append `note`.
+      6. The manage loop's next tick will pick the row up and run the
+         normal trailing/partial-exit/exit state machine on it.
+
+    The `entry_price` field is preserved at the original adoption value
+    so realized PnL is computed against the actual cost basis. The
+    `requested_entry` is also preserved for audit.
+
+    Returns: `{ok, trade_id, ticker, current_price, levels, stop_order_id}`
+    on success, or `{ok: False, reason}` on failure.
+    """
+    if not paper_trader.is_enabled():
+        return {"ok": False, "reason": "broker disabled"}
+
+    ticker = ticker.strip().upper()
+    if not ticker:
+        return {"ok": False, "reason": "ticker required"}
+
+    db = SessionLocal()
+    try:
+        row = db.query(AutoTrade).filter(
+            AutoTrade.ticker == ticker,
+            AutoTrade.status == "adopted",
+            AutoTrade.asset_type == "stock",
+        ).order_by(AutoTrade.opened_at.desc()).first()
+        if row is None:
+            return {"ok": False, "reason": f"no adopted stock row for {ticker}"}
+
+        # Verify Alpaca still has the position
+        try:
+            alpaca_positions = paper_trader.get_positions() or []
+        except Exception as e:
+            return {"ok": False, "reason": f"alpaca fetch failed: {e}"}
+        alpaca_pos = next(
+            (p for p in alpaca_positions
+             if (p.get("symbol") or "").upper() == ticker
+             and float(p.get("qty") or 0) != 0),
+            None,
+        )
+        if not alpaca_pos:
+            row.status = "closed_external"
+            row.closed_at = datetime.utcnow()
+            row.note = (row.note or "") + (
+                f" | RECONCILED at promote: Alpaca no longer reports a position for {ticker}"
+            )
+            db.commit()
+            return {"ok": False, "reason": "no Alpaca position; row marked closed_external"}
+
+        live_qty = abs(float(alpaca_pos.get("qty") or 0))
+        if live_qty != float(row.qty or 0):
+            # Alpaca qty drifted from the adoption snapshot — sync the row
+            # first so the SL we submit matches the actual position size.
+            row.qty = live_qty
+            row.note = (row.note or "") + (
+                f" | qty resync at promote: row→{live_qty} from Alpaca"
+            )
+
+        # Direction: long stock = SELL stop. (Bot only adopts long stocks today.)
+        is_long = float(alpaca_pos.get("qty") or 0) > 0
+        direction = "BUY" if is_long else "SELL"
+
+        # Live price anchor — fetch fresh. A stale anchor would skew the
+        # whole stop/target ladder, so we refuse the promote rather than
+        # accept a degraded number. (`fetch_current_price` returns
+        # `(price, change_pct)` or None.)
+        current_price = None
+        try:
+            pi = fetch_current_price(ticker)
+            if pi:
+                current_price = float(pi[0])
+        except Exception:
+            current_price = None
+        if current_price is None or current_price <= 0:
+            return {"ok": False, "reason": "could not fetch live price for level computation"}
+
+        levels = _compute_managed_levels(ticker, direction, current_price)
+        new_stop = float(levels["stop_loss"])
+
+        # Submit the broker stop-loss leg
+        try:
+            from alpaca.trading.requests import StopOrderRequest
+            from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+            c = paper_trader._get_client()
+            sell_side = _OS.SELL if is_long else _OS.BUY
+            stop_res = c.submit_order(order_data=StopOrderRequest(
+                symbol=ticker, qty=int(live_qty), side=sell_side,
+                time_in_force=_TIF.GTC, stop_price=round(new_stop, 2),
+            ))
+            stop_order_id = getattr(stop_res, "id", None)
+        except Exception as e:
+            logger.error(f"promote_adopted: SL submit failed for {ticker}: {e}")
+            return {"ok": False, "reason": f"broker SL submit failed: {e}"}
+
+        # Promote: status open, real levels, note the transition
+        row.status = "open"
+        row.stop_loss = new_stop
+        row.current_stop = new_stop
+        row.target1 = float(levels["target1"])
+        row.target2 = float(levels["target2"])
+        row.target3 = float(levels["target3"])
+        row.stop_order_id = str(stop_order_id) if stop_order_id else None
+        row.note = (row.note or "") + (
+            f" | PROMOTED-TO-MANAGED {datetime.utcnow().isoformat()}: "
+            f"current=${current_price:.2f}, levels {levels['rationale']}; "
+            f"stop=${new_stop:.2f}, T1=${levels['target1']:.2f}, "
+            f"T2=${levels['target2']:.2f}, T3=${levels['target3']:.2f}, "
+            f"stop_order_id={stop_order_id}"
+        )
+        db.commit()
+        logger.warning(
+            f"promote_adopted_to_managed: {ticker} #{row.id} promoted to open. "
+            f"qty={live_qty}, current=${current_price:.2f}, "
+            f"stop=${new_stop:.2f}, targets=({levels['target1']}, {levels['target2']}, {levels['target3']})"
+        )
+        return {
+            "ok": True,
+            "trade_id": row.id,
+            "ticker": ticker,
+            "qty": live_qty,
+            "current_price": current_price,
+            "levels": levels,
+            "stop_order_id": str(stop_order_id) if stop_order_id else None,
+        }
+    finally:
+        db.close()
+
+
 def compute_confidence_calibration(min_bucket_n: int = 5) -> Dict[str, Any]:
     """F1: Bucket closed auto-trades by signal-confidence and compute realized
     win-rate + avg PnL per bucket. Exposes whether our confidence score has

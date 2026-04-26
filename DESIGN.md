@@ -744,6 +744,7 @@ Header also carries: live-stream indicator, theme toggle pill, log-out.
 ### Admin (r40+)
 - `POST /api/admin/age-out-trades` — backdate `closed_at` on listed `AutoTrade` rows by N days (≥31). One-off operational cleanup for removing specific historical trades from 30-day analytics windows when those trades are known to be from now-fixed bugs and not representative of forward behavior. Audit-trail preserving: trades not deleted, only `closed_at` shifts; `note` is appended.
 - `POST /api/admin/sync-positions` — reconcile Alpaca account against `auto_trades` table. Alpaca is source of truth. Two paths: (1) **adopt** Alpaca positions with no DB row → insert `status="adopted"` (suppresses alerts, counts capital, manage loop skips); (2) **close-external** open DB rows with no matching Alpaca position → mark `status="closed_external"`. Idempotent; pending rows untouched. Use after option assignments / manual dashboard trades / missed bracket fills.
+- `POST /api/admin/promote-adopted/{ticker}` — promote an adopted row to `status="open"` with bot-computed stop/T1/T2/T3 levels (1.5×ATR risk distance, 1.5R/2.5R/4R targets, anchored to current price), submit a real broker stop-loss order, and hand the position off to the manage loop's normal trailing/partial-exit logic. Side-effect: marks the row `closed_external` if Alpaca no longer reports the position.
 
 ### Health & WS
 - `GET /api/health` — subsystem heartbeat (open, no auth)
@@ -1052,6 +1053,27 @@ OCC-symbol-keyed AutoTrade rows.
 When you eventually close an `adopted` position via Alpaca, the next
 `sync-positions` call will mark it `closed_external` automatically.
 
+**Promote-to-managed**: when you'd rather have the bot manage an
+adopted position (trail it, take partials at T1/T2, exit at T3 or
+stop), call `POST /api/admin/promote-adopted/{ticker}`. This:
+
+  1. Computes fresh stop/T1/T2/T3 from CURRENT live price (not
+     the adoption-time entry — that's a sunk anchor; new bracket
+     needs to make sense around today's price). Levels: 1.5×ATR
+     stop distance with 2%-of-price fallback; targets at 1.5R /
+     2.5R / 4R from current.
+  2. Submits a real broker stop-loss order to Alpaca via
+     `paper_trader._get_client()`.
+  3. Flips status `adopted → open`, populates `current_stop` /
+     `target1/2/3` / `stop_order_id`, appends a PROMOTED-TO-MANAGED
+     audit note.
+  4. The next manage-loop tick picks the row up; the normal
+     trailing / partial-exit / stop-out / chandelier-trail state
+     machine runs on it.
+
+The `entry_price` field is preserved at the original adoption value
+so realized PnL is computed against the actual cost basis.
+
 ### Strategy-drawdown response (r38)
 - `adaptive_risk_multiplier` halves risk when 30d realized-PnL DD ≥ 10%
   of equity.
@@ -1064,6 +1086,26 @@ When you eventually close an `adopted` position via Alpaca, the next
 ---
 
 ## 14. Changelog (current → past)
+
+### Revision 41-promote — Promote adopted positions to bot-managed
+
+Extends r41-sync. After adopting an external position via
+`/api/admin/sync-positions`, operators can now hand it off to the
+bot's management loop via `POST /api/admin/promote-adopted/{ticker}`:
+
+- New `_compute_managed_levels(ticker, direction, current_price)` helper
+  returns stop/T1/T2/T3 anchored to current price (not adoption entry):
+  1.5×ATR stop distance, 1.5R/2.5R/4R targets. Falls back to 2%-of-price
+  if ATR unavailable.
+- New `promote_adopted_to_managed(ticker)` function: locates the
+  adopted row, verifies Alpaca still has the position (else marks
+  `closed_external`), computes levels, submits broker SL, flips
+  status `adopted → open` with audit note. The manage loop then trails
+  / partials / exits the position like any other auto-trade.
+- New endpoint: `POST /api/admin/promote-adopted/{ticker}`.
+- Failure modes return `{ok: False, reason}`: missing adopted row,
+  Alpaca position gone, live price unavailable, broker SL submit
+  failed. Idempotent on success.
 
 ### Revision 41-sync — Position reconciliation with Alpaca as source of truth
 
