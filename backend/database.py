@@ -222,6 +222,13 @@ class AutoTraderConfig(Base):
     # day-trades have already happened in the trailing 5 business days
     # (preventing a 4th which would trigger a 90-day PDT lock).
     pdt_enforce = Column(Boolean, default=False)
+    # r41-promote-auto: when True, the periodic reconcile job calls
+    # sync_positions_from_alpaca + promote_adopted_to_managed in
+    # sequence — every external position the bot finds is auto-adopted
+    # AND auto-promoted to bot management with bot-computed levels.
+    # When False (default), the periodic job only alerts via
+    # detect_unexpected_positions; reconciliation is operator-driven.
+    auto_promote_adopted = Column(Boolean, default=False)
     # Max concurrent open positions across the whole portfolio. Complements
     # max_per_sector (which only bounds correlated exposure).
     max_concurrent_positions = Column(Integer, default=10)
@@ -761,6 +768,7 @@ def create_tables():
     _ensure_column("auto_trader_config", "killed_at", "TIMESTAMP")
     _ensure_column("auto_trader_config", "killed_reason", "VARCHAR")
     _ensure_column("auto_trader_config", "pdt_enforce", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "auto_promote_adopted", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "max_concurrent_positions", "INTEGER DEFAULT 10")
     # Legacy default (FALSE) preserved for existing rows; new rows get TRUE via ORM default
     _ensure_column("auto_trader_config", "flatten_by_eod", "BOOLEAN DEFAULT FALSE")

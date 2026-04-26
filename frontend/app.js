@@ -2344,6 +2344,32 @@ function AutoTraderPanel({ reloadToken }) {
               </span>
             </label>
           </div>
+          {/* Position reconciliation + PDT enforcement */}
+          <div className="mt-3 pt-3 border-t app-border-soft space-y-2">
+            <div className="text-[11px] uppercase tracking-wide app-text-muted font-semibold mb-1">Reconciliation &amp; safety</div>
+            <label className="flex items-start gap-2 cursor-pointer text-sm">
+              <input type="checkbox" checked={!!cfg.auto_promote_adopted}
+                     onChange={e => updateCfg({ auto_promote_adopted: e.target.checked })}
+                     className="accent-blue-500 mt-0.5" />
+              <div>
+                <div className="font-semibold">🔁 Auto-promote external positions</div>
+                <div className="text-[11px] app-text-muted leading-relaxed">
+                  Hourly reconcile job sees an Alpaca position the bot didn't open (option assignment, manual dashboard trade, missed bracket fill) → automatically adopts it AND promotes to bot-managed: computes stop/T1/T2/T3 from current price + 1.5×ATR, submits a real broker stop-loss, the manage loop trails / partial-exits / stops it like any other auto-trade. When OFF (default), the job only alerts; you reconcile manually via <code>POST /api/admin/sync-positions</code> + <code>/api/admin/promote-adopted/{`{ticker}`}</code>.
+                </div>
+              </div>
+            </label>
+            <label className="flex items-start gap-2 cursor-pointer text-sm">
+              <input type="checkbox" checked={!!cfg.pdt_enforce}
+                     onChange={e => updateCfg({ pdt_enforce: e.target.checked })}
+                     className="accent-rose-500 mt-0.5" />
+              <div>
+                <div className="font-semibold">🛡 PDT enforcement (live margin &lt; $25k)</div>
+                <div className="text-[11px] app-text-muted leading-relaxed">
+                  Hard-blocks new entries when ≥3 day-trades have occurred in the trailing 5 business days. Prevents the 4th from triggering a 90-day Pattern Day Trader lock. <strong>Must enable before going live with margin &lt; $25k.</strong> Defaulted off because Alpaca paper isn't PDT-restricted.
+                </div>
+              </div>
+            </label>
+          </div>
           <div className="mt-3 text-[11px] app-text-muted leading-relaxed">
             Strategy: long stock on BUY ≥ threshold with bracket stop. Soft-BE at T1 · BE at T2 · recompute + chandelier past T3. Puts use a synthesized bear thesis; exits on T1/T2 hit, 50% premium decay, or underlying broke stop.
           </div>

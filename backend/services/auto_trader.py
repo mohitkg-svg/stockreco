@@ -358,6 +358,8 @@ def get_config_dict() -> Dict[str, Any]:
             "daily_loss_limit_pct": float(getattr(cfg, "daily_loss_limit_pct", 0.03) or 0.03),
             "flatten_by_eod": bool(getattr(cfg, "flatten_by_eod", False)),
             "ml_scoring_enabled": bool(getattr(cfg, "ml_scoring_enabled", False)),
+            "pdt_enforce": bool(getattr(cfg, "pdt_enforce", False)),
+            "auto_promote_adopted": bool(getattr(cfg, "auto_promote_adopted", False)),
         }
     finally:
         db.close()
@@ -703,6 +705,63 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
         f"sync_positions_from_alpaca: adopted={len(adopted)} closed_external={len(closed_external)}"
     )
     return {"adopted": adopted, "closed_external": closed_external}
+
+
+def auto_reconcile_positions() -> Dict[str, Any]:
+    """Periodic Alpaca-DB reconciler — replaces `detect_unexpected_positions`
+    on the scheduler.
+
+    Behavior depends on `cfg.auto_promote_adopted`:
+
+      * False (default, paper-safe): runs `detect_unexpected_positions`
+        only — alerts on Alpaca positions with no DB row, takes no
+        action. Same as the original r34 behavior. Operator runs
+        `/api/admin/sync-positions` manually to resolve.
+
+      * True (opt-in via UI / config): runs `sync_positions_from_alpaca`
+        + `promote_adopted_to_managed` for each freshly-adopted ticker.
+        Every external position is automatically: adopted (DB row) →
+        promoted (status=open, broker SL submitted, bot-computed
+        targets) → managed by the manage loop. No operator action
+        required.
+
+    Promotion failures don't abort the reconcile — the row stays
+    adopted (no SL submitted, bot won't trail). Operator is alerted
+    via the existing `force_close_failed`-style channel for failed
+    SL submits.
+
+    Returns a summary dict keyed on the path taken so logs surface
+    which mode the job ran in.
+    """
+    db = SessionLocal()
+    try:
+        cfg = get_config(db)
+        flag = bool(getattr(cfg, "auto_promote_adopted", False))
+    finally:
+        db.close()
+
+    if not flag:
+        return {"mode": "detect_only", **detect_unexpected_positions()}
+
+    sync_result = sync_positions_from_alpaca()
+    adopted = sync_result.get("adopted", [])
+    promotions = []
+    for entry in adopted:
+        ticker = entry.get("ticker")
+        if not ticker:
+            continue
+        try:
+            r = promote_adopted_to_managed(ticker)
+            promotions.append({"ticker": ticker, **r})
+        except Exception as e:
+            logger.error(f"auto_reconcile_positions: promote {ticker} failed: {e}")
+            promotions.append({"ticker": ticker, "ok": False, "reason": str(e)})
+    return {
+        "mode": "auto_promote",
+        "adopted": adopted,
+        "promotions": promotions,
+        "closed_external": sync_result.get("closed_external", []),
+    }
 
 
 def _compute_managed_levels(ticker: str, direction: str, current_price: float) -> Dict[str, Any]:

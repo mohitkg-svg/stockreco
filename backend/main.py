@@ -363,13 +363,18 @@ async def lifespan(app: FastAPI):
             _scheduled_manage, "interval", seconds=20, id="auto_trader_manage",
             max_instances=1, coalesce=True, misfire_grace_time=10,
         )
+        # r41-promote-auto: dispatch via auto_reconcile_positions which
+        # consults `cfg.auto_promote_adopted`. When False (default), runs
+        # detect_unexpected_positions (alerts only — current behavior).
+        # When True, runs sync + promote in one shot so external positions
+        # are automatically managed by the bot.
         scheduler.add_job(
-            auto_trader.detect_unexpected_positions, "interval", minutes=60,
-            id="unexpected_positions_audit",
+            auto_trader.auto_reconcile_positions, "interval", minutes=60,
+            id="positions_reconcile",
             max_instances=1, coalesce=True, misfire_grace_time=120,
         )
         try:
-            auto_trader.detect_unexpected_positions()
+            auto_trader.auto_reconcile_positions()
         except Exception as _e:
             logger.warning(f"boot reconciliation failed: {_e}")
         scheduler.start()

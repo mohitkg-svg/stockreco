@@ -50,6 +50,8 @@ class AutoTraderConfigRequest(BaseModel):
     chandelier_atr_mult: Optional[float] = Field(None, ge=0, le=10)
     dry_run: Optional[bool] = None
     ml_scoring_enabled: Optional[bool] = None
+    pdt_enforce: Optional[bool] = None
+    auto_promote_adopted: Optional[bool] = None
 
 
 class KillSwitchRequest(BaseModel):

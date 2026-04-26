@@ -1087,6 +1087,32 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 41-promote-auto — Auto-promote external positions on the periodic reconcile
+
+Extends r41-promote. Adds `cfg.auto_promote_adopted` config flag
+(default False, surfaced in the Auto-Trader Config drawer UI). When
+True, the periodic 60-min reconcile job runs sync + promote in one
+shot — every external position the bot finds is automatically adopted,
+levels computed, broker SL submitted, status flipped to `open`, and
+the manage loop trails/exits it like any other auto-trade.
+
+When False (default, paper-safe), the job runs `detect_unexpected_positions`
+only — alerts but takes no action; operator reconciles manually.
+
+- New `auto_reconcile_positions()` dispatcher: consults the flag and
+  routes to detect-only or sync+promote.
+- Replaced the scheduled `detect_unexpected_positions` job with
+  `auto_reconcile_positions`. Boot-time reconciliation also routed
+  through the dispatcher.
+- New `cfg.auto_promote_adopted` Boolean column + migration. Surfaced
+  in `get_config_dict`, accepted by `AutoTraderConfigRequest`,
+  exposed as a UI toggle in the "Reconciliation & safety" section
+  of the Auto-Trader Config drawer (alongside `pdt_enforce`).
+
+Promotion failures inside the loop don't abort the whole reconcile —
+the row stays `adopted` (no SL, bot won't trail). Operator sees the
+failure in the alert log and can promote-or-close manually.
+
 ### Revision 41-promote — Promote adopted positions to bot-managed
 
 Extends r41-sync. After adopting an external position via
