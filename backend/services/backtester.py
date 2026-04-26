@@ -104,7 +104,6 @@ def _simulate(
     in_trade = False
     entry_price = 0.0
     entry_date = None
-    entry_idx = 0
     stop = 0.0
     target = 0.0
     gap_target: Optional[float] = None  # nearest unfilled gap-fill, computed at entry
@@ -160,7 +159,7 @@ def _simulate(
         if not in_trade and bool(entries.iloc[i - 1]):
             entry_price = _apply_costs(float(row["Open"]), "entry", direction)
             entry_date = d.index[i]
-            entry_idx = i
+            # r39 audit cleanup: removed unused `entry_idx = i`.
             # Compute gap-fill levels from history visible at entry (no look-ahead)
             hist = d.iloc[:i + 1]
             try:
@@ -198,6 +197,11 @@ def _simulate(
             hit_t1 = False
             hit_t2 = False
             partial_pl_dollars = 0.0     # accumulated $-PnL per dollar of original exposure
+            # r39 audit fix #25: snapshot portfolio at trade open. Each
+            # partial leg's portfolio update applies `contrib × portfolio_at_open`
+            # rather than `contrib × current_portfolio` — so a multi-leg
+            # winner doesn't inflate geometrically across legs.
+            portfolio_at_trade_open = portfolio
             in_trade = True
 
         elif in_trade:
@@ -284,7 +288,8 @@ def _simulate(
                         return
                     contrib = _pnl_per_unit(px, frac_remaining)
                     partial_pl_dollars += contrib
-                    portfolio += portfolio * contrib
+                    # r39 audit fix #25: use snapshot, not current portfolio
+                    portfolio += portfolio_at_trade_open * contrib
                     trades.append({
                         "entry_date": str(entry_date.date()),
                         "exit_date": str(d.index[i].date()),
@@ -315,13 +320,20 @@ def _simulate(
                     elif direction == "SELL" and hi >= stop:
                         _flush(stop, "stop")
                 # 4) T1 partial — bank 33%
+                # r39 audit fix #25: previously each partial leg used
+                # `portfolio += portfolio * contrib` (compounding off
+                # current portfolio). When T1+T2+target hit in the same
+                # bar, T2's contrib applied to a portfolio inflated by
+                # T1 — geometric-vs-arithmetic mismatch overstating gains.
+                # Now: each leg's contrib applies to `portfolio_at_trade_open`
+                # so all three legs compose linearly off the same base.
                 if not bar_remainder_exit and not hit_t1:
                     t1_hit = (direction == "BUY" and hi >= t1_px) or \
                              (direction == "SELL" and lo <= t1_px)
                     if t1_hit:
                         contrib = _pnl_per_unit(t1_px, 0.33)
                         partial_pl_dollars += contrib
-                        portfolio += portfolio * contrib
+                        portfolio += portfolio_at_trade_open * contrib
                         frac_remaining -= 0.33
                         hit_t1 = True
                         # Tighten stop to soft-BE.
@@ -333,7 +345,7 @@ def _simulate(
                     if t2_hit:
                         contrib = _pnl_per_unit(t2_px, 0.33)
                         partial_pl_dollars += contrib
-                        portfolio += portfolio * contrib
+                        portfolio += portfolio_at_trade_open * contrib
                         frac_remaining -= 0.33
                         hit_t2 = True
                         # Tighten stop to entry (full BE).

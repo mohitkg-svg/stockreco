@@ -79,14 +79,26 @@ def confidence_mult_mode() -> VetoMode:
 
 _client = None
 _client_init_attempted = False
+_client_init_last_attempt = 0.0   # r39: monotonic ts of last init attempt for 10-min retry
 
 
 def _get_client():
-    """Return a cached Anthropic client, or None if no API key is set."""
-    global _client, _client_init_attempted
-    if _client_init_attempted:
+    """Return a cached Anthropic client, or None if no API key is set.
+
+    r39 audit cleanup: previously a single failed init permanently
+    disabled AI calls until process restart (`_client_init_attempted=True`
+    on first failure). Now we retry once every 10 minutes — a transient
+    network blip on the first call doesn't permanently disable the AI
+    judge layer for the life of the process.
+    """
+    global _client, _client_init_attempted, _client_init_last_attempt
+    now = time.time()
+    if _client is not None:
         return _client
+    if _client_init_attempted and (now - _client_init_last_attempt) < 600:
+        return None
     _client_init_attempted = True
+    _client_init_last_attempt = now
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         logger.info("ai_judge: ANTHROPIC_API_KEY not set; all AI calls will abstain")
@@ -96,7 +108,7 @@ def _get_client():
         _client = anthropic.Anthropic(api_key=api_key)
         return _client
     except Exception as e:
-        logger.warning(f"ai_judge: Anthropic client init failed: {e}; abstaining")
+        logger.warning(f"ai_judge: Anthropic client init failed: {e}; will retry in 10m")
         return None
 
 

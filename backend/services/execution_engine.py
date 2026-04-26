@@ -117,6 +117,16 @@ def force_close_trade(
     # Deferred imports to avoid circulars during module load.
     from services.auto_trader import _current_price
 
+    # r39 audit critical-5: previously, broker-call failure here returned
+    # early WITHOUT updating status, raising an alert, or resubmitting an
+    # SL leg. For stocks the existing bracket was canceled BEFORE the
+    # close attempt, so a failure left the position naked-long with no
+    # downside protection. The DB row stayed `open` and the manage loop
+    # silently re-tried each tick — log spam, no escalation.
+    # New behavior: raise a critical alert, attempt a fresh SL resubmit
+    # to keep the position covered, mark the row `error` if everything
+    # fails. The position is still naked until the operator intervenes,
+    # but at least the operator is loudly informed.
     if t.asset_type == "stock":
         try:
             if t.parent_order_id:
@@ -125,7 +135,33 @@ def force_close_trade(
             logger.warning(f"reverse-close cancel parent failed: {e}")
         res = paper_trader.close_position(t.ticker)
         if "error" in res:
-            logger.warning(f"reverse-close {t.ticker} failed: {res['error']}")
+            from services.alerts import alert as _raise_alert
+            _raise_alert(
+                "error", "force_close_failed",
+                f"close_position {t.ticker} failed: {res['error']}; position naked-long, "
+                f"trade #{t.id} marked error pending operator intervention",
+                ticker=t.ticker, trade_id=t.id,
+            )
+            # Try to put a fresh stop back on the open position so we're
+            # not unprotected while the operator sees the alert.
+            try:
+                if t.current_stop and t.qty:
+                    from alpaca.trading.requests import StopOrderRequest
+                    from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+                    c = paper_trader._get_client()
+                    c.submit_order(order_data=StopOrderRequest(
+                        symbol=t.ticker, qty=int(t.qty), side=_OS.SELL,
+                        time_in_force=_TIF.GTC, stop_price=float(t.current_stop),
+                    ))
+                    logger.warning(
+                        f"force_close_failed: resubmitted stop for {t.ticker} "
+                        f"@ {t.current_stop} after close failure"
+                    )
+            except Exception as _se:
+                logger.error(f"force_close_failed: SL resubmit also failed: {_se}")
+            t.status = "error"
+            t.note = (t.note or "") + f" | FORCE_CLOSE_FAILED: {res['error']}"
+            db.commit()
             return
         px = _current_price(t.ticker)
         if px and t.entry_price:
@@ -136,7 +172,16 @@ def force_close_trade(
             order_type="market", time_in_force="day",
         )
         if "error" in sell:
-            logger.warning(f"reverse-close option {t.symbol} failed: {sell['error']}")
+            from services.alerts import alert as _raise_alert
+            _raise_alert(
+                "error", "force_close_failed",
+                f"option close {t.symbol} failed: {sell['error']}; position open, "
+                f"trade #{t.id} marked error pending operator intervention",
+                ticker=t.ticker, trade_id=t.id,
+            )
+            t.status = "error"
+            t.note = (t.note or "") + f" | FORCE_CLOSE_FAILED: {sell['error']}"
+            db.commit()
             return
         pos = paper_trader.get_option_position(t.symbol)
         if pos and pos.get("current_price") is not None and t.entry_price:

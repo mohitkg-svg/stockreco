@@ -89,16 +89,24 @@ def chandelier_adx(ticker: str) -> Optional[float]:
 def adaptive_chandelier_mult(base_mult: float, ticker: str) -> float:
     """Adjust the configured chandelier multiplier based on trend strength:
       • ADX > 30  (strong trend)     → base × 1.33 (give winners room)
-      • ADX < 20  (chop)             → base × 0.83 (cut bleed)
+      • ADX < 20  (chop)             → base × 1.25 (give chop room — r39 audit)
       • 20 ≤ ADX ≤ 30 (transitional) → base (config value unchanged)
-    Returns base if ADX cannot be read."""
+    Returns base if ADX cannot be read.
+
+    r39 audit fix: previously chop was 0.83× (TIGHTER stop), labelled
+    "cut bleed". But chop has wider absolute noise; tightening the trail
+    in chop produces more whipsaws, not fewer. Six consecutive
+    paper-trade losses (April 2026) all matched the chop-whipsaw pattern.
+    Inverted to 1.25× — give chop room. The structural stop (signal-side)
+    still bounds total loss; the chandelier just stops fighting the chop.
+    """
     adx = chandelier_adx(ticker)
     if adx is None:
         return base_mult
     if adx > 30:
         return base_mult * 1.33
     if adx < 20:
-        return base_mult * 0.83
+        return base_mult * 1.25
     return base_mult
 
 

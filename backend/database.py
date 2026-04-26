@@ -94,7 +94,12 @@ class AutoTraderConfig(Base):
     confidence_threshold = Column(Float, default=75.0)
     max_pct_of_equity = Column(Float, default=0.50)   # total cap
     stock_pct_of_equity = Column(Float, default=0.40) # of equity, not of cap
-    option_pct_of_equity = Column(Float, default=0.10)
+    # r39 audit fix #11: defaulted to 0.10 (10% of equity) but recent paper
+    # losses (CNTA -$2440, VTWO -$6500 = 90% of dollar losses) all came from
+    # naked options. Cut to 5% pre-live until ≥ 100 closed option trades
+    # establish positive expectancy. Operator can raise via /api/trading/
+    # auto/config once data exists.
+    option_pct_of_equity = Column(Float, default=0.05)
     max_risk_per_trade_pct = Column(Float, default=0.02)  # 2% of equity
     trade_options = Column(Boolean, default=False)    # Master toggle — enables PUT auto-buy for bearish theses
     trade_calls = Column(Boolean, default=False)      # Enables CALL auto-buy for sub-threshold bullish setups

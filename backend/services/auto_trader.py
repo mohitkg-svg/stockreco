@@ -238,11 +238,31 @@ def _confirm_1m_bar(ticker: str, direction: str = "BUY") -> bool:
 # are infrequent, and we don't want to fan out a hundred analyses if many
 # trades close at once.
 _post_mortem_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="post-mortem")
+# r39 audit cleanup: bound the pending queue so a manage-loop tick that
+# closes 10+ trades simultaneously (e.g. SPY 5% gap-down stops out the
+# whole book) doesn't queue 10 LLM jobs. We track in-flight + queued
+# count manually since ThreadPoolExecutor's queue isn't size-bounded.
+_POST_MORTEM_MAX_PENDING = 5
+_post_mortem_pending: int = 0
+_post_mortem_lock = threading.Lock()
 
 
 def _post_mortem_async(trade_id: int) -> None:
     """Re-fetch the trade by id in a fresh session and run the analysis off-loop."""
+    global _post_mortem_pending
+    with _post_mortem_lock:
+        if _post_mortem_pending >= _POST_MORTEM_MAX_PENDING:
+            logger.info(
+                f"post_mortem queue full ({_post_mortem_pending}/{_POST_MORTEM_MAX_PENDING}); "
+                f"dropping #{trade_id} — operator can regenerate via "
+                f"POST /api/trading/auto/postmortem/{trade_id}"
+            )
+            metrics.inc("autotrade_event", event="post_mortem_dropped")
+            return
+        _post_mortem_pending += 1
+
     def _job():
+        global _post_mortem_pending
         from database import SessionLocal as _SL, AutoTrade as _AT
         s = _SL()
         try:
@@ -253,10 +273,14 @@ def _post_mortem_async(trade_id: int) -> None:
             logger.warning(f"async post_mortem #{trade_id} failed: {e}")
         finally:
             s.close()
+            with _post_mortem_lock:
+                _post_mortem_pending -= 1
     try:
         _post_mortem_pool.submit(_job)
     except Exception as e:
         logger.warning(f"could not schedule post_mortem #{trade_id}: {e}")
+        with _post_mortem_lock:
+            _post_mortem_pending -= 1
 
 
 # Idempotency-key math lives in services.risk_math. We keep a local alias
@@ -428,14 +452,43 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
         except Exception as e:
             logger.error(f"kill(): close_all_positions failed: {e}")
 
+    # r39 audit fix #23: previously kill() flattened the broker but did NOT
+    # update DB AutoTrade.status for open rows. Combined with the manage
+    # loop's (now-fixed) `if True:` bug at line 2647, this meant phantom
+    # `open` / `pending` rows persisted indefinitely in the dashboard
+    # and counted toward `count_open_auto_trades()`, blocking the
+    # concurrent cap. Now: flip every open/pending row to
+    # `closed_kill` so the dashboard and counters reflect reality.
+    db2 = SessionLocal()
+    db_closed = 0
+    try:
+        from datetime import datetime as _dt_kill
+        open_rows = db2.query(AutoTrade).filter(
+            AutoTrade.status.in_(["pending", "open"])
+        ).all()
+        for row in open_rows:
+            row.status = "closed_kill"
+            row.closed_at = _dt_kill.utcnow()
+            row.note = (row.note or "") + f" | KILLED: {reason or 'unspecified'}"
+            row.target_touch_count = 0
+            _target_touch_counts.pop(row.id, None)
+            db_closed += 1
+        db2.commit()
+    except Exception as e:
+        logger.error(f"kill(): DB status update failed: {e}")
+    finally:
+        db2.close()
+
     logger.critical(
-        f"AUTO-TRADER KILLED reason={reason!r} flattened={len(flattened)} cancelled={cancelled}"
+        f"AUTO-TRADER KILLED reason={reason!r} flattened={len(flattened)} "
+        f"cancelled={cancelled} db_rows_closed={db_closed}"
     )
     metrics.inc("autotrade_event", event="killed")
     return {
         "killed": True,
         "flattened": flattened,
         "cancelled": cancelled,
+        "db_rows_closed": db_closed,
         "reason": reason,
     }
 
@@ -917,6 +970,16 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # bound — silently swallowed by a bare except) can use it. Bug
         # introduced in r34, surfaced by ruff in r39.
         ticker = (signal.get("ticker") or "").strip().upper()
+        # r39 audit fix #8: hard freeze on losing streak (WR < 35%, n ≥ 5).
+        # Different from `adaptive_risk_multiplier` shrinking — this is the
+        # full stop. Operator must intervene (kill the streak's contributing
+        # trades from the lookback or wait for them to age past 30d).
+        from services.risk_manager import should_freeze_trading as _freeze
+        _freeze_reason = _freeze()
+        if _freeze_reason:
+            logger.warning(f"AutoTrader skip {ticker}: trading frozen — {_freeze_reason}")
+            metrics.inc("autotrade_skip", reason="trading_frozen")
+            return None
         cfg = get_config(db)
         if not cfg.enabled:
             metrics.inc("autotrade_skip", reason="disabled")
@@ -1000,16 +1063,13 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     # For long options, max-loss = premium paid (contract × 100).
                     raw = float(oe) * 100 * (ot.qty or 0)
                 current_heat += raw * beta_weight(ot.ticker)
-            # Prospective trade's own beta-weighted contribution — include it
-            # in the check so we also reject entries that would push us over.
-            try:
-                prospective_stop = float(signal.get("stop_loss") or 0)
-                prospective_entry = float(signal.get("entry") or 0)
-                # Size estimate: use requested_qty if caller passed it, else skip
-                # (heat check still runs on existing positions alone).
-                _prospective = 0.0  # conservative default — pure existing-heat check
-            except Exception:
-                _prospective = 0.0
+            # r39 audit cleanup: removed dead `prospective_stop` /
+            # `prospective_entry` computations — they were computed but
+            # never used in the cap math (the comment said "conservative
+            # default — pure existing-heat check"). The heat-aware risk
+            # multiplier (r35) now handles the prospective contribution
+            # softly via sizing throttle as we approach the cap, which
+            # makes more sense than pure binary include/exclude.
             heat_cap = _heat_equity * _PORTFOLIO_HEAT_CAP_PCT
             if current_heat >= heat_cap:
                 logger.info(
@@ -1116,8 +1176,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     )
                     metrics.inc("autotrade_event", event="stop_too_tight_atr")
                     return None
-        except Exception:
-            pass
+        except Exception as _e:
+            # r39 audit fix #15: don't silently swallow gate errors. If the
+            # ATR-stop check itself crashes, we want to know — silent passes
+            # are exactly what hid the original liquidity-gate bug.
+            logger.warning(f"stop_too_tight_atr gate {ticker}: {_e}")
+            metrics.inc("autotrade_event", event="stop_too_tight_atr_error")
 
         # Gap-open reject: if live price has drifted past _STALE_GAP_PCT from
         # the signal's entry, the targets/stop were computed for a different
@@ -1135,8 +1199,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     )
                     metrics.inc("autotrade_event", event="gap_open_reject")
                     return None
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"gap-open gate {ticker}: {_e}")
+            metrics.inc("autotrade_event", event="gap_open_gate_error")
 
         # Liquidity gate: require ≥ $10M median daily $-volume over the last
         # 20 trading days. Sub-threshold names produce wide spreads + slippage
@@ -1158,8 +1223,30 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     )
                     metrics.inc("autotrade_event", event="illiquid_skip")
                     return None
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"liquidity gate {ticker}: {_e}")
+            metrics.inc("autotrade_event", event="liquidity_gate_error")
+
+        # r39 audit fix #19: ticker-level ADX gate. SPY-ADX is checked in
+        # adaptive_risk_multiplier (market regime), but the TICKER's own ADX
+        # was never checked. CNTA / AMKR were trading on tickers with
+        # sub-20 ADX while SPY was trending — the bot saw "trend regime"
+        # via SPY but bought into ticker-level chop. Reject when the
+        # ticker's ADX < 18; allows mean-reversion strategies to bypass
+        # via signal["strategy"] containing "MEANREV" or "MEAN_REVERSION".
+        try:
+            _t_adx = signal.get("adx")
+            _strat_name = (signal.get("strategy") or "").upper()
+            _is_mean_rev = "MEANREV" in _strat_name or "MEAN_REVERSION" in _strat_name
+            if _t_adx is not None and _t_adx < 18 and not _is_mean_rev:
+                logger.info(
+                    f"AutoTrader skip {ticker}: ticker ADX {_t_adx:.1f} < 18 "
+                    f"(chop) and strategy {_strat_name!r} is not mean-reversion"
+                )
+                metrics.inc("autotrade_skip", reason="ticker_chop")
+                return None
+        except Exception as _e:
+            logger.warning(f"ticker-ADX gate {ticker}: {_e}")
 
         # Earnings-calendar gate: reject entries on tickers with a scheduled
         # earnings release within 48h. The rule-based signal generator has no
@@ -1177,8 +1264,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 )
                 metrics.inc("autotrade_event", event="earnings_skip")
                 return None
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"earnings gate {ticker}: {_e}")
+            metrics.inc("autotrade_event", event="earnings_gate_error")
         # Trailing-only exit: park the bracket TP far away so it never fires.
         # Real exit comes from the trailing stop in manage_open_positions().
         risk_per_share = entry - stop
@@ -1201,8 +1289,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 logger.info(f"AutoTrader skip {ticker}: macro blackout — {why}")
                 metrics.inc("autotrade_event", event="macro_blackout_stock")
                 return None
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning(f"macro blackout gate {ticker}: {_e}")
+            metrics.inc("autotrade_event", event="macro_blackout_gate_error")
 
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
@@ -1398,10 +1487,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.debug(f"ai_judge confidence_multiplier wrapper failed: {_e}")
 
         from services.config import RISK_MULT_CEILING as _MULT_CEILING
-        raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult
+        # r39 audit fix #13: removed dead duplicate `raw_stack` and
+        # `effective_risk_budget` assignments — first lines were silently
+        # overwritten by the second (without ai_mult / heat_mult).
         raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult * ai_mult
         clamped_stack = min(raw_stack, _MULT_CEILING)
-        effective_risk_budget = risk_budget * clamped_stack
         # Heat-aware throttle: applies AFTER the multiplier-stack ceiling so
         # the heat-throttle still pulls things smaller even when other
         # factors maxed out the 2× cap. This is a downward-only adjustment
@@ -1743,14 +1833,20 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         else:
             per_contract_dollar_cap_frac = (0.02 if aggressive else 0.01)  # original
         per_contract_dollar_cap = equity * per_contract_dollar_cap_frac
-        risk_per_contract = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
-        if risk_per_contract <= 0:
+        # r39 audit fix #9: previously `risk_per_contract = effective_max_loss`,
+        # which assumes the underlying-stop fires before premium collapses — too
+        # optimistic. For naked options, the realistic worst case is full premium
+        # loss (option goes to zero on a fast adverse move while the underlying-
+        # stop hasn't fired yet — exactly the CNTA -$2440 / VTWO -$6500 pattern).
+        # Floor at 50% of premium so sizing is bounded by realistic worst case.
+        _eml = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
+        if _eml <= 0:
             return None
         notional_per_contract = _prem * 100
-        # Adaptive risk: halve the cap under high VIX (>25) or when recent
-        # win-rate is below 55%. Catches regime changes the static cap misses.
+        risk_per_contract = max(_eml, notional_per_contract * 0.5)
+        # r39 audit fix #13: previously this block had two `risk_budget = ...`
+        # lines; the first ignored heat-mult and was silently overwritten.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
         from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
         risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
@@ -2051,14 +2147,20 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         else:
             per_contract_dollar_cap_frac = (0.02 if aggressive else 0.01)  # original
         per_contract_dollar_cap = equity * per_contract_dollar_cap_frac
-        risk_per_contract = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
-        if risk_per_contract <= 0:
+        # r39 audit fix #9: previously `risk_per_contract = effective_max_loss`,
+        # which assumes the underlying-stop fires before premium collapses — too
+        # optimistic. For naked options, the realistic worst case is full premium
+        # loss (option goes to zero on a fast adverse move while the underlying-
+        # stop hasn't fired yet — exactly the CNTA -$2440 / VTWO -$6500 pattern).
+        # Floor at 50% of premium so sizing is bounded by realistic worst case.
+        _eml = float(top.get("effective_max_loss") or top.get("max_loss_per_contract") or 0)
+        if _eml <= 0:
             return None
         notional_per_contract = _prem * 100
-        # Adaptive risk: halve the cap under high VIX (>25) or when recent
-        # win-rate is below 55%. Catches regime changes the static cap misses.
+        risk_per_contract = max(_eml, notional_per_contract * 0.5)
+        # r39 audit fix #13: previously this block had two `risk_budget = ...`
+        # lines; the first ignored heat-mult and was silently overwritten.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
         from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
         risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
@@ -2066,7 +2168,17 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_cash = int(cash / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_bp = int(buying_power / notional_per_contract) if notional_per_contract > 0 else 0
-        qty = min(max_qty_by_risk, max_qty_by_remaining, max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp)
+        # r39 audit critical-3: cheap-options gamma cap was computed but
+        # NEVER USED in the call_play qty calculation (compare put_play
+        # which DOES include max_qty_by_dollar_cap in min()). The CNTA
+        # -$2440 case was a $0.30 CALL with 122 contracts — exactly what
+        # this cap was supposed to prevent. Now wired in.
+        max_qty_by_dollar_cap = int(per_contract_dollar_cap / notional_per_contract) if notional_per_contract > 0 else 0
+        qty = min(
+            max_qty_by_risk, max_qty_by_remaining,
+            max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp,
+            max_qty_by_dollar_cap,
+        )
         if qty < 1:
             return None
 
@@ -2121,6 +2233,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             asset_type="option",
             side="buy",
             qty=qty,
+            original_qty=qty,   # r39 audit critical-2: stock+put paths set this; calls were missing it, causing T1 trim to fall back to current qty (exponential decay risk)
             requested_entry=float(top["premium"]),
             # For calls: underlying stop sits BELOW price. The option
             # manage loop (`_manage_option_trade`) already supports puts;
@@ -2204,7 +2317,29 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
 
     # 1) Pending → open
     if t.status == "pending":
-        if "filled" in pstatus:
+        # r39 audit fix #22: previously `"filled" in pstatus` matched both
+        # "filled" AND "partially_filled". For options without a bracket SL
+        # there's no SL-leg-vs-actual-qty mismatch, but `t.qty` was left at
+        # the requested qty rather than the actually-filled qty — inflating
+        # portfolio heat and trim sizes. Now: special-case partially_filled
+        # to update `t.qty` from `filled_qty` before promoting to open
+        # (matching the stock side's behavior).
+        if pstatus == "partially_filled":
+            try:
+                filled_qty = int(getattr(parent, "filled_qty", 0) or 0)
+                if filled_qty > 0:
+                    t.qty = float(filled_qty)
+                    t.note = (t.note or "") + (
+                        f" | OPTION PARTIAL FILL: using {filled_qty} of original qty"
+                    )
+            except Exception as _e:
+                logger.debug(f"option partial-fill qty update {t.symbol}: {_e}")
+            t.entry_price = float(parent.filled_avg_price) if parent.filled_avg_price else t.requested_entry
+            t.status = "open"
+            t.filled_at = datetime.utcnow()
+            db.commit()
+            logger.info(f"AutoTrader PUT {t.ticker} {t.symbol} partially filled qty={t.qty} @ {t.entry_price}")
+        elif pstatus == "filled":
             t.entry_price = float(parent.filled_avg_price) if parent.filled_avg_price else t.requested_entry
             t.status = "open"
             t.filled_at = datetime.utcnow()
@@ -2388,10 +2523,25 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
     #      reading is almost certainly a stale/wide quote. Don't exit on
     #      premium alone; let the underlying-stop in step 4 handle real losses.
     if not exit_reason and cur_premium is not None and t.entry_price:
-        if cur_premium <= t.entry_price * 0.5:
-            from datetime import datetime as _dt_pm, timedelta as _td_pm
-            opened = t.filled_at or t.opened_at
-            held_secs = (_dt_pm.utcnow() - opened).total_seconds() if opened else 99999
+        # r39 audit fix #12: previously a flat 50% decay threshold across all
+        # hold times. A 6-min 50% decay is much more likely to be a quote-cross
+        # than a 6-hour 50% decay. Scale by elapsed time:
+        #   < 30 min held  → require 75% decay (strong evidence past spread)
+        #   < 24h held     → require 50% decay (original threshold)
+        #   ≥ 48h held     → require 40% decay (theta is real by now)
+        from datetime import datetime as _dt_pm
+        opened = t.filled_at or t.opened_at
+        held_secs = (_dt_pm.utcnow() - opened).total_seconds() if opened else 99999
+        if held_secs < 1800:        # < 30 min
+            decay_threshold_pct = 0.25   # require ≥ 75% decay
+        elif held_secs < 86400:     # < 24h
+            decay_threshold_pct = 0.50
+        elif held_secs >= 172800:   # ≥ 48h
+            decay_threshold_pct = 0.60   # require ≥ 40% decay
+        else:                       # 24-48h transitional
+            decay_threshold_pct = 0.55
+        decay_trigger_price = t.entry_price * decay_threshold_pct
+        if cur_premium <= decay_trigger_price:
             spread_artifact_window = held_secs < 300  # 5 min
             # Check underlying direction against thesis
             underlying_against_us = False
@@ -2408,7 +2558,12 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                 )
                 metrics.inc("autotrade_event", event="premium_stop_spread_skip")
             else:
-                exit_reason = f"premium decayed to ${cur_premium:.2f} (≥50% of entry ${t.entry_price:.2f})"
+                pct_lost = (1 - cur_premium / t.entry_price) * 100
+                exit_reason = (
+                    f"premium decayed to ${cur_premium:.2f} ({pct_lost:.0f}% loss vs entry "
+                    f"${t.entry_price:.2f}; held {held_secs/60:.0f}m, "
+                    f"threshold {(1-decay_threshold_pct)*100:.0f}%)"
+                )
                 final_status = "closed_stop"
 
     # 5b) Theta stop — if the underlying has barely moved after 48h of holding,
@@ -2622,104 +2777,117 @@ def manage_open_positions() -> Dict[str, Any]:
                             t.note = (t.note or "") + f" | PARTIAL FILL: using {int(filled_qty)} of original qty"
                             db.commit()
                     if t.status == "pending" and pstatus == "filled":
-                        if True:
-                            legs = _identify_legs(t.parent_order_id)
-                            t.entry_price = float(parent.filled_avg_price) if parent.filled_avg_price else t.requested_entry
-                            t.stop_order_id = legs.get("stop_id")
-                            t.tp_order_id = legs.get("tp_id")
-                            t.status = "open"
-                            t.filled_at = datetime.utcnow()
-                            db.commit()
-                            logger.info(f"AutoTrader {t.ticker} filled @ {t.entry_price}")
+                        # r39 audit critical-1: previously this block was wrapped
+                        # in `if True:` with an `elif "canceled"...:` chained
+                        # underneath — making the cancel/reject/expired branch
+                        # UNREACHABLE since the elif chained off the `if True:`,
+                        # not the outer condition. Effect: pending parent orders
+                        # that got canceled/rejected/expired stayed in `pending`
+                        # forever, blocking the concurrent-position cap.
+                        # Cancel/reject/expired now handled in a separate `if`
+                        # block below.
+                        legs = _identify_legs(t.parent_order_id)
+                        t.entry_price = float(parent.filled_avg_price) if parent.filled_avg_price else t.requested_entry
+                        t.stop_order_id = legs.get("stop_id")
+                        t.tp_order_id = legs.get("tp_id")
+                        t.status = "open"
+                        t.filled_at = datetime.utcnow()
+                        db.commit()
+                        logger.info(f"AutoTrader {t.ticker} filled @ {t.entry_price}")
 
-                            # ----- Slippage check (postmortem fix #1) -----
-                            # If the actual fill drifted materially from the
-                            # requested entry, the pre-computed targets are
-                            # stale relative to "true" risk. Postmortems showed
-                            # MU gapped through T1 on the open and the trail
-                            # locked us into a chop-out at BE before the move
-                            # had any room.
-                            try:
-                                req_entry = float(t.requested_entry or 0)
-                                if req_entry > 0 and t.asset_type == "stock":
-                                    slip = float(t.entry_price) - req_entry
-                                    atr = _chandelier_atr(t.ticker)
-                                    if atr and atr > 0:
-                                        atr_units = abs(slip) / atr
-                                        if atr_units > _SLIPPAGE_REJECT_ATR:
-                                            # Runaway gap fill — flatten now.
-                                            logger.warning(
-                                                f"AutoTrader {t.ticker} slippage {slip:+.2f} "
-                                                f"= {atr_units:.2f}×ATR > {_SLIPPAGE_REJECT_ATR}; "
-                                                f"force-closing"
-                                            )
-                                            _force_close_trade(
-                                                t, db,
-                                                f"slippage {atr_units:.2f}×ATR exceeds reject threshold",
-                                                summary,
-                                                status_override="closed_slippage",
-                                            )
-                                            continue
-                                        elif atr_units > _SLIPPAGE_SHIFT_ATR:
-                                            # Shift targets + stop so distance-
-                                            # from-entry is preserved — but
-                                            # CAP the stop so we never tighten
-                                            # below the original risk-per-share
-                                            # (postmortem fix C2). On positive
-                                            # slippage, naively shifting the
-                                            # stop UP shrinks the cushion and
-                                            # puts us inside the chop range
-                                            # the original stop was sized to
-                                            # absorb.
-                                            old_t = (t.target1, t.target2, t.target3, t.stop_loss)
-                                            if t.target1: t.target1 = round(float(t.target1) + slip, 2)
-                                            if t.target2: t.target2 = round(float(t.target2) + slip, 2)
-                                            if t.target3: t.target3 = round(float(t.target3) + slip, 2)
-                                            if t.stop_loss:
-                                                # Original risk-per-share from the SIGNAL.
-                                                orig_risk = max(0.0, req_entry - float(t.stop_loss))
-                                                shifted_stop = float(t.stop_loss) + slip
-                                                # Long stops sit BELOW entry; the
-                                                # furthest-down (loosest) of the
-                                                # two preserves the cushion.
-                                                # min() = lower price = looser
-                                                # for a long stop.
-                                                if orig_risk > 0:
-                                                    cap_stop = float(t.entry_price) - orig_risk
-                                                    new_stop = min(shifted_stop, cap_stop)
-                                                else:
-                                                    new_stop = shifted_stop
-                                                t.stop_loss = round(new_stop, 2)
-                                                if t.stop_order_id and t.stop_loss > 0:
-                                                    if _replace_stop(t.stop_order_id, t.stop_loss):
-                                                        t.current_stop = t.stop_loss
-                                            t.note = (t.note or "") + (
-                                                f" | slippage {slip:+.2f} ({atr_units:.2f}×ATR) "
-                                                f"shifted T1-3+stop from {old_t} to "
-                                                f"({t.target1},{t.target2},{t.target3},{t.stop_loss})"
-                                            )
-                                            _record_target_history(
-                                                t,
-                                                f"slippage shift {slip:+.2f} ({atr_units:.2f}×ATR)",
-                                                [t.target1 or 0, t.target2 or 0, t.target3 or 0],
-                                            )
-                                            db.commit()
-                                            logger.info(
-                                                f"AutoTrader {t.ticker} slippage-shift {slip:+.2f} "
-                                                f"({atr_units:.2f}×ATR); new T1-3 = "
-                                                f"{t.target1}/{t.target2}/{t.target3}"
-                                            )
-                            except Exception as e:
-                                logger.warning(f"slippage check {t.ticker} failed: {e}")
-                        elif "canceled" in pstatus or "rejected" in pstatus or "expired" in pstatus:
-                            t.status = "closed_manual"
-                            t.closed_at = datetime.utcnow()
-                            t.note = (t.note or "") + f" | parent {pstatus}"
-                            t.target_touch_count = 0
-                            _target_touch_counts.pop(t.id, None)
-                            db.commit()
-                            summary["closed"] += 1
-                            metrics.inc("autotrade_event", event="closed_manual")
+                        # ----- Slippage check (postmortem fix #1) -----
+                        # If the actual fill drifted materially from the
+                        # requested entry, the pre-computed targets are
+                        # stale relative to "true" risk. Postmortems showed
+                        # MU gapped through T1 on the open and the trail
+                        # locked us into a chop-out at BE before the move
+                        # had any room.
+                        try:
+                            req_entry = float(t.requested_entry or 0)
+                            if req_entry > 0 and t.asset_type == "stock":
+                                slip = float(t.entry_price) - req_entry
+                                atr = _chandelier_atr(t.ticker)
+                                if atr and atr > 0:
+                                    atr_units = abs(slip) / atr
+                                    if atr_units > _SLIPPAGE_REJECT_ATR:
+                                        # Runaway gap fill — flatten now.
+                                        logger.warning(
+                                            f"AutoTrader {t.ticker} slippage {slip:+.2f} "
+                                            f"= {atr_units:.2f}×ATR > {_SLIPPAGE_REJECT_ATR}; "
+                                            f"force-closing"
+                                        )
+                                        _force_close_trade(
+                                            t, db,
+                                            f"slippage {atr_units:.2f}×ATR exceeds reject threshold",
+                                            summary,
+                                            status_override="closed_slippage",
+                                        )
+                                        continue
+                                    elif atr_units > _SLIPPAGE_SHIFT_ATR:
+                                        # Shift targets + stop so distance-
+                                        # from-entry is preserved — but
+                                        # CAP the stop so we never tighten
+                                        # below the original risk-per-share
+                                        # (postmortem fix C2). On positive
+                                        # slippage, naively shifting the
+                                        # stop UP shrinks the cushion and
+                                        # puts us inside the chop range
+                                        # the original stop was sized to
+                                        # absorb.
+                                        old_t = (t.target1, t.target2, t.target3, t.stop_loss)
+                                        if t.target1: t.target1 = round(float(t.target1) + slip, 2)
+                                        if t.target2: t.target2 = round(float(t.target2) + slip, 2)
+                                        if t.target3: t.target3 = round(float(t.target3) + slip, 2)
+                                        if t.stop_loss:
+                                            # Original risk-per-share from the SIGNAL.
+                                            orig_risk = max(0.0, req_entry - float(t.stop_loss))
+                                            shifted_stop = float(t.stop_loss) + slip
+                                            # Long stops sit BELOW entry; the
+                                            # furthest-down (loosest) of the
+                                            # two preserves the cushion.
+                                            # min() = lower price = looser
+                                            # for a long stop.
+                                            if orig_risk > 0:
+                                                cap_stop = float(t.entry_price) - orig_risk
+                                                new_stop = min(shifted_stop, cap_stop)
+                                            else:
+                                                new_stop = shifted_stop
+                                            t.stop_loss = round(new_stop, 2)
+                                            if t.stop_order_id and t.stop_loss > 0:
+                                                if _replace_stop(t.stop_order_id, t.stop_loss):
+                                                    t.current_stop = t.stop_loss
+                                        t.note = (t.note or "") + (
+                                            f" | slippage {slip:+.2f} ({atr_units:.2f}×ATR) "
+                                            f"shifted T1-3+stop from {old_t} to "
+                                            f"({t.target1},{t.target2},{t.target3},{t.stop_loss})"
+                                        )
+                                        _record_target_history(
+                                            t,
+                                            f"slippage shift {slip:+.2f} ({atr_units:.2f}×ATR)",
+                                            [t.target1 or 0, t.target2 or 0, t.target3 or 0],
+                                        )
+                                        db.commit()
+                                        logger.info(
+                                            f"AutoTrader {t.ticker} slippage-shift {slip:+.2f} "
+                                            f"({atr_units:.2f}×ATR); new T1-3 = "
+                                            f"{t.target1}/{t.target2}/{t.target3}"
+                                        )
+                        except Exception as e:
+                            logger.warning(f"slippage check {t.ticker} failed: {e}")
+                    # r39 audit critical-1: cancel/reject/expired branch is now
+                    # a separate `if`, not an unreachable `elif` chained off
+                    # the (also-removed) `if True:`.
+                    elif t.status == "pending" and any(
+                        s in pstatus for s in ("canceled", "rejected", "expired")
+                    ):
+                        t.status = "closed_manual"
+                        t.closed_at = datetime.utcnow()
+                        t.note = (t.note or "") + f" | parent {pstatus}"
+                        t.target_touch_count = 0
+                        _target_touch_counts.pop(t.id, None)
+                        db.commit()
+                        summary["closed"] += 1
+                        metrics.inc("autotrade_event", event="closed_manual")
                         continue
 
                     # B1: SL leg invariant — confirm the broker still holds
@@ -2769,6 +2937,25 @@ def manage_open_positions() -> Dict[str, Any]:
                                             f"{t.ticker} SL resubmit FAILED: {_re} — POSITION IS NAKED",
                                             ticker=t.ticker, trade_id=t.id,
                                         )
+                                        # r39 audit cleanup: escalate if rolling 1h
+                                        # failure count crosses threshold. 3+ SL
+                                        # resubmit failures in 1h means the broker
+                                        # API is mis-behaving and the bot should be
+                                        # killed by the operator. Per-occurrence
+                                        # alerts are already firing above; this is
+                                        # the additional one that says "this is a
+                                        # pattern, not a one-off".
+                                        try:
+                                            _fail_count = sl_resubmit_failures_1h()
+                                            if _fail_count >= 3:
+                                                _raise_alert(
+                                                    "critical", "sl_resubmit_storm",
+                                                    f"{_fail_count} SL resubmit failures in last 1h — "
+                                                    f"broker API may be impaired; consider killing "
+                                                    f"the auto-trader (POST /api/trading/kill)",
+                                                )
+                                        except Exception:
+                                            pass
                         except Exception as _e:
                             logger.warning(f"SL invariant check {t.ticker}: {_e}")
 
@@ -2785,12 +2972,16 @@ def manage_open_positions() -> Dict[str, Any]:
                             age_min = (datetime.utcnow() - t.filled_at).total_seconds() / 60.0
                             max_age_min = _STALE_TRADE_TF_MULT * tf_minutes
                             if age_min > max_age_min:
-                                # Only close if the trade is not meaningfully
-                                # winning (price below 0.3×R above entry).
+                                # r39 audit fix #18: previously closed if price
+                                # was less than +0.3R above entry — meaning a
+                                # trade at +0.4R at hour 7 that pulled back to
+                                # +0.2R at hour 8 got stale-recycled. The
+                                # "winning a little" zone shouldn't qualify as
+                                # stale. Now only close stale trades that are
+                                # FLAT or LOSING (price at or below entry).
                                 px_probe = _current_price(t.ticker)
                                 entry_px = float(t.entry_price)
-                                rps = max(0.01, entry_px - float(t.stop_loss or entry_px))
-                                if px_probe is not None and (px_probe - entry_px) < 0.3 * rps:
+                                if px_probe is not None and px_probe <= entry_px:
                                     _force_close_trade(
                                         t, db,
                                         f"stale trade: open {age_min/60:.1f}h without T1 "

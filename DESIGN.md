@@ -992,6 +992,98 @@ Local off-cloud archive: `pg_dump "$DATABASE_URL" --no-owner --no-acl
 
 ## 14. Changelog (current → past)
 
+### Revision 40 — Comprehensive audit fixes: 5 critical + 14 high/medium + 6 low
+
+Two parallel deep-audit agents flagged ~30 issues; this revision lands all
+of them. The four agents-flagged-and-verified critical bugs were silently
+broken in production (most had been since r34).
+
+**Critical bugs fixed (silent failures):**
+- **`if True:` unreachable elif** (`auto_trader.py:2647`) — pending
+  parent orders that got canceled/rejected/expired stayed in `pending`
+  forever, blocking the concurrent-position cap. Removed the placeholder
+  wrapper; cancel/reject/expired now handled in a separate `if`.
+- **`consider_call_play` missing `original_qty`** — call paths re-introduced
+  the exponential-decay class of bug `original_qty` was added to prevent.
+- **Cheap-options gamma cap dead in CALLs** — `per_contract_dollar_cap`
+  was computed but not included in `qty = min(...)`. Directly causal in
+  the CNTA -$2440 paper loss. Now wired.
+- **AI news-trim didn't resize broker SL leg** — would have caused
+  Alpaca rejection or short-flip when stop fires. Now resizes via
+  `replace_order_by_id`.
+- **`force_close_trade` silent failure** — broker-call failure left
+  position naked-long with no alert. Now raises `force_close_failed`
+  alert + attempts SL resubmit + marks DB row `error`.
+
+**High-severity strategy / sizing fixes:**
+- **Chandelier ADX<20 inverted** (`position_manager.py:89`): was 0.83×
+  (tighter stop in chop, causing whipsaws); now 1.25× (give chop room).
+- **Confidence raw-evidence floor** (`signal_generator.py`): require
+  raw winning-side score ≥ 30 before signal goes actionable. Was a tilt-
+  vote (60/40 looked the same as 30/20).
+- **Hard freeze regime** (`risk_manager.should_freeze_trading`):
+  trailing-30d WR < 35% with ≥ 5 trades → no entries at all. Wired
+  into `consider_signal` short-circuit.
+- **Option `risk_per_contract` floor at 50% of premium** — was using
+  `effective_max_loss` only (assumed underlying-stop fires before
+  premium collapses). Floor at full-premium ÷ 2 for realistic worst-case
+  sizing.
+- **Wired the documented 5%-of-strike option spread filter** that was
+  missing from `options_analyzer.py` despite being in the docstring.
+- **Cap `option_pct_of_equity` default at 5%** (was 10%) until ≥ 100
+  closed option trades establish positive expectancy.
+- **Time-scaled premium-decay threshold** — was flat 50% across hold
+  times; now 25% (< 30min) → 40% (< 24h) → 50-60% (24h+).
+- **Compound regime triggers** in `adaptive_risk_multiplier` — was
+  `min()` (all triggers clamped to same 0.5× floor); now multiply with
+  hard floor at 0.25×.
+
+**Medium fixes:**
+- Removed dead duplicate `raw_stack` / `risk_budget` / `effective_risk_budget`
+  assignments (3 sites). Bug-class that's slipped past us repeatedly.
+- Replaced bare `except: pass` in entry gates with logged warning +
+  `*_gate_error` metric (4 sites). Same pattern that hid the original
+  liquidity-gate bug.
+- **Hard-zero breakout/breakdown bonus in chop** — was scoring +8 to
+  the FADE direction (causing oscillating BUY/SELL signals on noise);
+  now annotation-only with no score.
+- **Cap `_regime_mult` to [0.7, 1.4]** — 14 multiplicative confidence
+  factors compound on correlated names (high RVOL ↔ strong sector ↔
+  positive analyst ratings); clamp prevents systematic inflation.
+- **Weakened stale-trade gate** — was closing winners-by-a-little; now
+  only closes flat or losing trades.
+- **Ticker-ADX entry gate** — reject when ticker's ADX < 18 unless
+  the strategy is mean-reversion. Catches CNTA/AMKR-class chop entries.
+- **T1 R:R floor 1.0 → 1.3** — eliminates marginal entries with zero
+  EV after costs + partial fills.
+- **Options `partially_filled` special-case** — was matching `"filled"
+  in pstatus` and leaving `t.qty` at requested qty (inflating heat
+  calculations). Now updates qty from `filled_qty` first.
+- **`kill()` updates DB statuses** — was flattening broker but leaving
+  open/pending DB rows. Now flips them to `closed_kill` + clears
+  touch counts.
+- **BP decay only on real broker drop** — was zeroing on any broker BP
+  decrease (including external causes); now requires drop ≥ 90% of
+  reservation before zeroing, partial drops decrement proportionally.
+- **Backtester PnL no longer compounds across multi-leg bars** — was
+  geometric-vs-arithmetic mismatch; now snapshots portfolio at trade
+  open and applies each leg's contribution against the snapshot.
+- **AI news force_close passes touch-count cleanup** callback.
+
+**Low cleanup:**
+- AI client retry every 10 minutes (was permanently disabled on first
+  init failure).
+- `_post_mortem_pool` bounded at 5 pending — drops oldest with metric
+  rather than queuing unbounded if many trades close at once.
+- `sl_resubmit_failures_1h()` ≥ 3 → `sl_resubmit_storm` critical alert
+  (was a rolling counter no one was watching).
+- `portfolio_backtest`: pull `current_heat` recompute outside the
+  per-ticker loop, incremental update on entry. ~10× speedup for
+  50-ticker × 250-day.
+- Removed dead vars (`entry_idx`, `prospective_stop`, `prospective_entry`).
+
+128/128 regression tests pass; ruff clean.
+
 ### Revision 39 — Partial-item cleanup: Sortino/Calmar/turnover, alerts, PDT, ruff CI gate (caught real bug)
 - **Sortino, Calmar, turnover** added to `portfolio_backtest` stats.
   Sortino = downside-vol-only Sharpe; Calmar = annualized return /

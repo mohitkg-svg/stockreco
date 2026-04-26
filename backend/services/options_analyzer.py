@@ -262,6 +262,16 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             oi = int(o.get("openInterest") or 0)
             if vol < MIN_VOLUME or oi < MIN_OI:
                 continue
+            # r39 audit fix #10: bid-ask spread filter. Module docstring at
+            # line 19 promised "Bid-ask spread < 5% of strike" but the
+            # check was never coded. Wide-spread contracts on illiquid
+            # chains routinely have 10%+ spreads — entering at ask and
+            # exiting at bid eats most of any profit. Reject.
+            bid = float(o.get("bid") or 0)
+            ask = float(o.get("ask") or 0)
+            if bid > 0 and ask > bid and strike > 0:
+                if (ask - bid) / strike > 0.05:
+                    continue
             iv = float(o.get("impliedVolatility") or 0)
 
             # IV-vs-RV gate — skip over-priced premium. Contracts where IV

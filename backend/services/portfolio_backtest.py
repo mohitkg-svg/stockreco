@@ -343,6 +343,18 @@ def run_portfolio_backtest(
 
         # Scan for new signals, respect caps
         if not daily_loss_hit and len(open_trades) < max_concurrent:
+            # r39 audit cleanup: pre-compute current_heat ONCE per day
+            # outside the per-ticker loop. Previously this was an
+            # `O(N_tickers × N_open_positions)` recompute inside the inner
+            # loop — for a 50-ticker × 250-day backtest with up to 15 open
+            # positions that's ~187k extra iterations. The heat number is
+            # the same for every candidate on the same day; recompute only
+            # when a new entry actually opens (incremental update below).
+            current_heat = sum(
+                abs(t.entry_price - t.stop_price) * t.shares * max(0.5, min(2.0, t.beta))
+                for t in open_trades
+            )
+            heat_cap = equity * max_portfolio_heat_pct
             for ticker in tickers:
                 if len(open_trades) >= max_concurrent:
                     break
@@ -378,11 +390,7 @@ def run_portfolio_backtest(
                 shares = max(1, int((equity * risk_per_trade_pct) / risk_per_share))
                 raw_heat = risk_per_share * shares
                 weighted_heat = raw_heat * max(0.5, min(2.0, beta))
-                current_heat = sum(
-                    abs(t.entry_price - t.stop_price) * t.shares * max(0.5, min(2.0, t.beta))
-                    for t in open_trades
-                )
-                if (current_heat + weighted_heat) > equity * max_portfolio_heat_pct:
+                if (current_heat + weighted_heat) > heat_cap:
                     rejections += 1
                     continue
                 # Regime tagging at entry — ADX_14 from this bar, VIX
@@ -407,6 +415,9 @@ def run_portfolio_backtest(
                     target_price=target, beta=beta, shares=shares,
                     entry_adx=entry_adx, entry_vix=entry_vix,
                 ))
+                # Incrementally update the precomputed current_heat so the
+                # next ticker in this same day's loop sees the updated value.
+                current_heat += weighted_heat
                 # Track peak per-sector concentration
                 per_sector_exposure_max[sector] = max(
                     per_sector_exposure_max.get(sector, 0),

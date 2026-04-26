@@ -285,25 +285,31 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
             f"({vol_avg:.0f}) at a breakout/breakdown level — weak conviction, fakeout risk"
         )
 
-    # Breakout check — regime-aware. In chop, fade the breakout instead of confirming it.
-    breakout_score = 15 if not regime_chop else 6
+    # Breakout check — regime-aware. r39 audit fix #16: previously gave +8 to
+    # the FADE direction in chop (bear at resistance, bull at support). But
+    # this means at a chop S/R level, BOTH a failed-breakout fade AND a
+    # mean-reversion bias score positive simultaneously — leading to
+    # frequent oscillating signals. Now: in chop, log the structural
+    # observation as ANNOTATION ONLY (no score). The mean-reversion bias is
+    # captured elsewhere via RSI/MACD; the breakout/breakdown level just
+    # adds noise here. In trend, only the trend-direction score remains.
+    breakout_score = 15
     if nearest_res and price >= nearest_res * 0.995:
         if regime_chop:
-            # Failed breakout setup: expect rejection
-            bear_score += 8
+            # Annotation only — no score. Mean-reversion bias comes from
+            # RSI/MACD, not from S/R proximity in chop.
             reasons.append(
                 f"🚫 Price at resistance ${nearest_res:.2f} but ADX {adx:.1f} <20 — chop regime, "
-                "breakout unlikely to follow through; expect rejection"
+                "structural note (no score)"
             )
         else:
             bull_score += breakout_score
             reasons.append(f"🚀 Price breaking out above resistance at ${nearest_res:.2f}")
     if nearest_sup and price <= nearest_sup * 1.005:
         if regime_chop:
-            bull_score += 8
             reasons.append(
                 f"🚫 Price at support ${nearest_sup:.2f} but ADX {adx:.1f} <20 — chop regime, "
-                "breakdown likely fails; expect bounce"
+                "structural note (no score)"
             )
         else:
             bear_score += breakout_score
@@ -476,6 +482,21 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
 
     confidence_bull = (bull_score / total) * 100
     confidence_bear = (bear_score / total) * 100
+
+    # r39 audit fix: confidence is normalized to a percentage, so a weak
+    # setup (bull=30, bear=20) produces conf=60 — same as a strong setup
+    # (bull=60, bear=40). The 55% threshold is satisfied just by directional
+    # disagreement, not by actual evidence weight. Add a raw-evidence floor:
+    # the winning side must independently score ≥30 raw points before we
+    # consider the signal actionable. Threshold chosen so that ≥3 strong
+    # confluence factors must align (RSI/MACD/EMA cross/structure each score
+    # ~10 raw on a clean move).
+    _MIN_RAW_EVIDENCE = 30
+    if max(bull_score, bear_score) < _MIN_RAW_EVIDENCE:
+        return _neutral_signal(
+            ticker, timeframe,
+            f"Insufficient evidence (max raw score {max(bull_score, bear_score)} < {_MIN_RAW_EVIDENCE})"
+        )
 
     atr = ind.get("atr") or price * 0.02
 
@@ -651,6 +672,17 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
+        # r39 audit fix #14: clamp _regime_mult to [0.7, 1.4] before
+        # applying. There are 14+ multiplicative confidence factors stacked
+        # (regime, RVOL, RS, sector, breadth, best-strategy, earnings,
+        # analyst, fundamentals, SI, sentiment, insider, WSB, institutional,
+        # ML); each in [0.85, 1.12]. The compound easily reaches 2-3× on
+        # momentum names because the factors are correlated (a momentum name
+        # has high RVOL AND strong sector AND positive analyst rating). The
+        # clamp prevents the stack from systematically inflating already-
+        # crowded trades. Full bucketing into orthogonal groups is BACKLOG
+        # Tier E; this is the safer first step.
+        _regime_mult = max(0.7, min(1.4, _regime_mult))
         confidence = min(round(confidence_bull * _regime_mult), 95)
         entry = round(price, 2)
 
@@ -708,7 +740,13 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         # the trade would be mathematically unprofitable after fees/slippage
         # (live auto_trader's MIN_RR=2.0 would reject it anyway, but the
         # signal would still display misleading targets in the UI).
-        t1_floor = entry + max(risk * 1.0, atr * 0.5)
+        # r39 audit fix #20: previously `risk * 1.0` — a 1:1 R:R floor.
+        # After 6bps round-trip costs + the 33% partial-fill at T1 (which
+        # banks at 1× and lets only 67% of the position run to T2/T3), a
+        # 1:1 trade has zero positive expectancy at our 50-55% live WR.
+        # Bump to 1.3 so even the worst trade in the universe must offer
+        # ~30% net edge to make it through. Eliminates marginal entries.
+        t1_floor = entry + max(risk * 1.3, atr * 0.5)
         above = [lvl for lvl in above if lvl >= t1_floor]
         # Enforce min spacing between targets so they're not bunched on one tight cluster
         spread = max(risk * 0.75, atr * 0.5)
@@ -874,6 +912,8 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
+        # r39 audit fix #14: same clamp on bear side.
+        _regime_mult = max(0.7, min(1.4, _regime_mult))
         confidence = min(round(confidence_bear * _regime_mult), 95)
         entry = round(price, 2)
 
@@ -921,7 +961,8 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         below = sorted(set(round(v, 2) for v in below), reverse=True)
         # Audit fix H3 (short mirror): drop any candidate closer than 1R to
         # entry so T1 always offers ≥ 1:1 reward-to-risk.
-        t1_ceiling = entry - max(risk * 1.0, atr * 0.5)
+        # r39 audit fix #20: bump T1 floor to 1.3R on bear side too
+        t1_ceiling = entry - max(risk * 1.3, atr * 0.5)
         below = [lvl for lvl in below if lvl <= t1_ceiling]
         spread = max(risk * 0.75, atr * 0.5)
         picked = []

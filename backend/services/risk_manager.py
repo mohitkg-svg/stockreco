@@ -72,8 +72,15 @@ def get_in_flight_bp() -> float:
 
 
 def decay_in_flight_bp_if_stale() -> None:
-    """Re-read Alpaca's BP every 60s. If the broker's number has dropped
-    (i.e. they've drawn down the reserved amount), reset our counter."""
+    """Re-read Alpaca's BP every 60s. Decay reservation only when the broker
+    BP has dropped by AT LEAST our last reservation amount — meaning our
+    submitted bracket was likely the cause of the drop.
+
+    r39 audit fix #24: previously zeroed the reservation any time broker
+    BP dropped, including external causes (deposits, withdrawals, manual
+    orders outside the bot, account-wide bracket releases). That re-
+    introduced the same stale-BP bug the reservation was added to prevent.
+    """
     global _in_flight_bp_reserved, _in_flight_bp_last_seen_broker_bp, _in_flight_bp_last_check_ts
     now = time.time()
     if now - _in_flight_bp_last_check_ts < 60:
@@ -88,9 +95,17 @@ def decay_in_flight_bp_if_stale() -> None:
         with _in_flight_bp_lock:
             prev = _in_flight_bp_last_seen_broker_bp
             _in_flight_bp_last_seen_broker_bp = cur_bp
-            # If broker BP dropped, the reservation is implicitly satisfied.
-            if prev is not None and cur_bp < prev:
-                _in_flight_bp_reserved = 0.0
+            # Decay only when the drop is at least our reserved amount —
+            # confidence the broker drained OUR submission, not an external
+            # cause. Decay by the delta, not all the way to zero, so a
+            # small partial-fill draws down a proportional reservation.
+            if prev is not None and cur_bp < prev and _in_flight_bp_reserved > 0:
+                drop = prev - cur_bp
+                if drop >= _in_flight_bp_reserved * 0.9:   # broker drop ~= our reservation
+                    _in_flight_bp_reserved = 0.0
+                else:
+                    # Partial drain — proportional decrement, never below zero.
+                    _in_flight_bp_reserved = max(0.0, _in_flight_bp_reserved - drop)
     except Exception as e:
         logger.debug(f"decay_in_flight_bp: {e}")
 
@@ -252,20 +267,23 @@ def adaptive_risk_multiplier() -> float:
     except Exception:
         drawdown_pct = None
 
+    # r39 audit fix #17: previously each adverse regime independently
+    # clamped via min() — VIX>25 AND WR<55% AND chop AND drawdown all gave
+    # 0.5×, not 0.0625× as compound risk would imply. When multiple
+    # regimes are simultaneously adverse, that's strictly worse than any
+    # single one, so we COMPOUND the factors with a hard floor at 0.25×
+    # (the lowest size we'd want to deploy on any signal).
     mult = 1.0
     if vix_level is not None and vix_level > 25:
-        mult = min(mult, 0.5)
+        mult *= 0.5
     elif vix_level is not None and vix_level > 20:
-        mult = min(mult, 0.75)
+        mult *= 0.75
     if recent_wr is not None and recent_wr < 55.0:
-        mult = min(mult, 0.5)
+        mult *= 0.5
     if spy_adx is not None and spy_adx < 20.0:
-        mult = min(mult, 0.5)
+        mult *= 0.5
     if drawdown_pct is not None and drawdown_pct >= 10.0:
-        mult = min(mult, 0.5)
-        # Raise an explicit operator alert. Dedup is handled inside
-        # `alerts.alert` (5-min window per category+message), so this is
-        # safe to call from a hot path.
+        mult *= 0.5
         try:
             from services.alerts import alert as _raise
             _raise(
@@ -274,7 +292,56 @@ def adaptive_risk_multiplier() -> float:
             )
         except Exception:
             pass
-    return mult
+    # Floor at 0.25× — anything smaller is too small to recover trading
+    # costs even on a winner. Below this we should freeze (see
+    # should_freeze_trading), not just shrink.
+    return max(mult, 0.25)
+
+
+def should_freeze_trading() -> Optional[str]:
+    """r39 audit fix #8: hard freeze trigger on a clear losing streak.
+
+    Returns a reason string when trading should be paused entirely, or
+    None when normal sizing applies.
+
+    Trigger: trailing-30d realized win-rate < 35% with ≥ 5 closed trades.
+    The number 5 is small enough to react fast; below 35% WR we're no
+    longer in "size down to find your edge", we're in "stop and figure
+    out what's wrong". `adaptive_risk_multiplier` already shrinks size on
+    < 55% WR; this is the next step beyond that — the engineering kill
+    switch the strategy needs but the operator hasn't manually tripped.
+
+    Caller in `consider_signal` short-circuits with
+    `autotrade_skip{reason=trading_frozen}` when this returns non-None.
+    """
+    try:
+        from database import SessionLocal, AutoTrade
+        from datetime import datetime, timedelta
+        db = SessionLocal()
+        try:
+            since = datetime.utcnow() - timedelta(days=30)
+            closed = db.query(AutoTrade).filter(
+                AutoTrade.status.like("closed%"),
+                AutoTrade.closed_at >= since,
+                AutoTrade.realized_pl.isnot(None),
+            ).all()
+            n = len(closed)
+            if n < 5:
+                return None
+            wins = sum(1 for t in closed if (t.realized_pl or 0) > 0)
+            wr_pct = (wins / n) * 100
+            if wr_pct < 35.0:
+                return (
+                    f"trailing-30d WR {wr_pct:.0f}% < 35% on {n} trades — "
+                    f"trading frozen until streak ends or operator overrides "
+                    f"(extend lookback / wait for closed trades to age out)"
+                )
+            return None
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"should_freeze_trading: {e}")
+        return None
 
 
 # ---------- Health monitors (operator alerts) ------------------------------

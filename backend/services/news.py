@@ -297,11 +297,16 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
                 if action == "close":
                     try:
                         from services.execution_engine import force_close_trade
+                        # r39 audit fix #21: pass touch-count cleanup callback
+                        # so closed-trade state doesn't leak in the in-memory
+                        # cache. Mirrors auto_trader._force_close_trade pattern.
+                        from services.auto_trader import _touch_clear as _tc
                         force_close_trade(
                             t, db,
                             reason=f"AI news_exit: {res.get('reason', '')}",
                             summary={},
                             status_override="closed_news_ai",
+                            on_close=lambda closed_t: _tc(closed_t, db),
                         )
                     except Exception as e:
                         logger.warning(f"news: AI-driven close failed for {ticker} #{t.id}: {e}")
@@ -327,6 +332,24 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
                                 logger.info(
                                     f"AI news_exit TRIM {ticker} #{t.id}: -{half} shares"
                                 )
+                                # r39 audit critical-4: must resize the broker SL leg
+                                # to remaining qty. Otherwise when the stop fires,
+                                # Alpaca rejects (only have half the shares) — or,
+                                # depending on broker semantics, the position flips
+                                # short. This is the same fix the F3/T2 trims
+                                # already perform; news-driven trim was missing it.
+                                if t.stop_order_id and t.qty > 0:
+                                    try:
+                                        from alpaca.trading.requests import ReplaceOrderRequest
+                                        c.replace_order_by_id(
+                                            t.stop_order_id,
+                                            order_data=ReplaceOrderRequest(qty=int(t.qty)),
+                                        )
+                                    except Exception as _re:
+                                        logger.warning(
+                                            f"news: AI-trim SL-resize failed for "
+                                            f"{ticker} #{t.id}: {_re}"
+                                        )
                         elif t.asset_type == "option":
                             half = max(1, int((t.qty or 0) // 2))
                             res2 = paper_trader.submit_simple_option_order(
