@@ -931,10 +931,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     invoked separately at the end of every per-ticker analysis loop via
     `consider_put_play(ticker)`.
 
+    Structure (logical sections marked inline as section dividers):
+      § PRE-FLIGHT      — circuit breakers, kill flag, freeze regime, signal validation
+      § ENTRY GATES     — ~25 rule-based reject conditions (geometry, liquidity, regime, etc.)
+      § AI ENTRY VETO   — Claude review, off/shadow/active mode-gated
+      § BUDGET + SIZING — multiplier stack, heat-aware throttle, qty calculation
+      § ORDER SUBMIT    — bracket submission, AutoTrade row insert, broadcast events
+
+    A future revision will extract these sections into named helpers
+    (BACKLOG → "Decompose consider_signal into Gates/Sizing/Submission").
+    Doing it inline now is too risky given the recent r40 audit; the
+    section dividers provide structural guidance until the extraction
+    can be done with regression-test coverage of each block.
+
     Thread-safety: holds the process-wide `_entry_lock` for the duration of
     the budget/cap/idempotency checks. Two concurrent calls (same or different
     tickers) serialize so a 3rd same-sector trade can't slip past the cap.
     """
+    # ════════════════════════════════════════════════════════════════════
+    # § PRE-FLIGHT — circuit breakers, kill flag, freeze, signal validation
+    # ════════════════════════════════════════════════════════════════════
     # Validate the signal shape at the boundary. Failed validation is a
     # malformed signal — log + skip cleanly rather than letting `signal.get`
     # downstream silently coerce missing fields to 0. We don't pass the
@@ -998,6 +1014,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if confidence < cfg.confidence_threshold:
             metrics.inc("autotrade_skip", reason="below_confidence_threshold")
             return None
+
+        # ════════════════════════════════════════════════════════════════════
+        # § ENTRY GATES — rule-based reject conditions (~25 gates)
+        # ════════════════════════════════════════════════════════════════════
 
         # C1: Daily loss limit — halt new entries once realized PnL today is
         # worse than -(daily_loss_limit_pct * equity). Existing trades keep
@@ -1371,6 +1391,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             except Exception:
                 pass
 
+        # ════════════════════════════════════════════════════════════════════
+        # § AI ENTRY VETO — Claude semantic review (off/shadow/active gated)
+        # ════════════════════════════════════════════════════════════════════
         # AI entry-veto layer (shadow by default; flip via AI_ENTRY_VETO_MODE
         # env var to "active" only after reviewing ≥200 shadow decisions).
         # Failure / abstain / off → proceed (rule-engine wins). Honored skips
@@ -1401,6 +1424,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             # Hard guarantee: AI judge failure NEVER blocks a trade.
             logger.debug(f"ai_judge entry_veto wrapper failed: {_e}")
 
+        # ════════════════════════════════════════════════════════════════════
+        # § BUDGET + SIZING — multiplier stack, heat-aware throttle, qty calc
+        # ════════════════════════════════════════════════════════════════════
         # Check budget
         acct = paper_trader.get_account()
         if not acct:
@@ -1503,7 +1529,6 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if raw_stack > _MULT_CEILING:
             logger.info(
                 f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
-                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} strat={strat_mult:.2f} vix={vix_mult:.2f})"
                 f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} "
                 f"strat={strat_mult:.2f} vix={vix_mult:.2f} ai={ai_mult:.2f})"
             )
@@ -1559,6 +1584,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.info(f"AutoTrader DRY-RUN {ticker} qty={qty} entry≈{entry} (no broker submit)")
             return None
 
+        # ════════════════════════════════════════════════════════════════════
+        # § ORDER SUBMIT — bracket submission, AutoTrade row, broadcast
+        # ════════════════════════════════════════════════════════════════════
         # Ground-up Tier 1: entry order type. market (default) vs limit_at_mid.
         # limit_at_mid captures half the bid-ask spread for liquid names.
         # Quote the live mid from the stock stream; fall back to market if

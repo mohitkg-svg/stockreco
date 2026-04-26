@@ -37,6 +37,7 @@ has gone stale should either move to ✅ done or be re-categorized as
 | Full pairwise correlation matrix | Concurrent positions routinely > 20 (cap is 15) |
 | Debit spreads (multi-leg, defined-risk) | ~4 weeks post-real-money once naked option behavior is well-understood live |
 | AutoTraderService class encapsulation | Multi-tenancy or cross-test isolation requirements |
+| Decompose `consider_signal` into Gates / Sizing / Submission helpers | After paper-trade volume builds enough that each section has dedicated unit-test coverage; safe to refactor when regressions would be caught by green-vs-broken tests, not by reading 300 lines of orchestration. r40 added section dividers (§ PRE-FLIGHT / § ENTRY GATES / § AI VETO / § BUDGET + SIZING / § ORDER SUBMIT) as the visual scaffolding; full extraction is the next step but high-risk to do directly after the audit pass that just caught silent broken code in this exact function. |
 
 ### ⏸️ Deferred — cost / budget gated
 
