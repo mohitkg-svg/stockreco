@@ -242,9 +242,12 @@ best strategy, score) is blended in when available.
 | `ticker_blacklist` | "" | Comma-separated symbols never to trade (e.g. "GOOGL"). |
 
 ### 4.4 `AutoTrade`
-Per-entry lifecycle. Status values: `pending`, `open`, `closed_target`,
-`closed_stop`, `closed_reverse`, `closed_stale`, `closed_slippage`,
-`closed_manual`, `error`. Key fields:
+Per-entry lifecycle. Status values: `pending`, `open`, **`adopted`** (r41 sync —
+externally-held position; counts toward capital/heat math but bot doesn't
+trail/exit), `closed_target`, `closed_stop`, `closed_reverse`,
+`closed_stale`, `closed_slippage`, `closed_manual`, `closed_news_ai`,
+`closed_kill`, **`closed_external`** (r41 sync — DB row for a position
+that closed via a path the bot didn't observe), `error`. Key fields:
 
 - `entry_price` / `requested_entry` — fill vs signal
 - `stop_loss` (original) / `current_stop` (mutated by trailing)
@@ -738,8 +741,9 @@ Header also carries: live-stream indicator, theme toggle pill, log-out.
 - `GET /api/ai-judge/summary` — aggregate: count, honored count, avg latency, by call_site × mode
 - `GET /api/ai-judge/modes` — current mode for each call site + whether `ANTHROPIC_API_KEY` is set
 
-### Admin (r40)
+### Admin (r40+)
 - `POST /api/admin/age-out-trades` — backdate `closed_at` on listed `AutoTrade` rows by N days (≥31). One-off operational cleanup for removing specific historical trades from 30-day analytics windows when those trades are known to be from now-fixed bugs and not representative of forward behavior. Audit-trail preserving: trades not deleted, only `closed_at` shifts; `note` is appended.
+- `POST /api/admin/sync-positions` — reconcile Alpaca account against `auto_trades` table. Alpaca is source of truth. Two paths: (1) **adopt** Alpaca positions with no DB row → insert `status="adopted"` (suppresses alerts, counts capital, manage loop skips); (2) **close-external** open DB rows with no matching Alpaca position → mark `status="closed_external"`. Idempotent; pending rows untouched. Use after option assignments / manual dashboard trades / missed bracket fills.
 
 ### Health & WS
 - `GET /api/health` — subsystem heartbeat (open, no auth)
@@ -1022,6 +1026,32 @@ Local off-cloud archive: `pg_dump "$DATABASE_URL" --no-owner --no-acl
   flip to `true` before going live with margin < $25k** — otherwise
   the 4th day-trade triggers a 90-day Pattern Day Trader lock.
 
+### Position reconciliation — Alpaca as source of truth (r41 sync)
+
+The DB's `auto_trades` table is the bot's record of what IT opened.
+Alpaca's positions are the actual capital deployment. Divergence is
+inevitable (option assignment, manual dashboard trades, missed bracket
+fills) and produces hourly `unexpected_position` critical alerts.
+
+**Reconcile via**: `POST /api/admin/sync-positions`. Two paths:
+
+  1. **Adopt** — Alpaca position with no DB row → insert
+     `status="adopted"`. The bot now knows about it (suppresses the
+     alert, counts toward capital/heat/sector concentration math) but
+     does NOT trail/exit it (operator handles externally).
+
+  2. **Close-external** — open DB row with no Alpaca position → mark
+     `status="closed_external"`. The position closed via a path the
+     bot didn't observe.
+
+Idempotent; safe to re-run any time. Pending DB rows are untouched
+(may be in flight at the broker). Multi-leg option symbols (>6 chars)
+are skipped on the adopt side; option positions are handled via the
+OCC-symbol-keyed AutoTrade rows.
+
+When you eventually close an `adopted` position via Alpaca, the next
+`sync-positions` call will mark it `closed_external` automatically.
+
 ### Strategy-drawdown response (r38)
 - `adaptive_risk_multiplier` halves risk when 30d realized-PnL DD ≥ 10%
   of equity.
@@ -1034,6 +1064,31 @@ Local off-cloud archive: `pg_dump "$DATABASE_URL" --no-owner --no-acl
 ---
 
 ## 14. Changelog (current → past)
+
+### Revision 41-sync — Position reconciliation with Alpaca as source of truth
+
+External-review-driven extension of r41. The repeating
+`unexpected_position` critical alert (firing hourly when a real Alpaca
+position has no matching DB row — option assignment, manual dashboard
+trade, etc.) had no clean resolution path other than "ack and live with
+it" or "close the position you wanted to keep".
+
+- **New `sync_positions_from_alpaca()` function** (`services/auto_trader.py`)
+  — idempotent reconciler. Two paths:
+  - **Adopt** Alpaca-but-not-DB → insert `status="adopted"` (suppresses
+    alerts, counts capital/heat/sector, manage loop skips)
+  - **Close-external** DB-but-not-Alpaca (open status only; pending
+    untouched) → mark `status="closed_external"`
+- **Two new AutoTrade statuses**: `adopted` and `closed_external`.
+- **Capital/heat/sector filters** updated to include `adopted`:
+  `count_open_auto_trades`, `_open_allocations`, `status_snapshot`,
+  portfolio-heat tracking, one-per-ticker check, sector concentration
+  count + dollar-heat cap, AI judge same-sector context, `kill()`.
+  Manage loop iteration intentionally LEFT to filter only
+  `["pending", "open"]` — bot doesn't trail/exit adopted positions.
+- **New endpoint**: `POST /api/admin/sync-positions`.
+- **AAPL 35-share adoption** confirmed working in production (paper);
+  the 4-hour repeating critical alert is now suppressed.
 
 ### Revision 41 — External-review small fixes: lock contention, PDT gate, option-vs-premium bug
 - **(A) Lock contention**: `_confirm_1m_bar` now runs BEFORE the
