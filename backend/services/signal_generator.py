@@ -1,3 +1,55 @@
+"""Composite signal synthesis — the central rule-based engine.
+
+Takes a single ticker's OHLCV frame at a single timeframe, runs ~20
+analysis modules over it (indicators, S/R, patterns, supply/demand
+zones, Fibonacci, gap detection, multi-timeframe alignment, RVOL,
+volume profile, sentiment, fundamentals, analyst consensus, ML scorer),
+and produces a single `signal` dict consumed by:
+
+  * `routers/analysis.py` — surfaces to the UI
+  * `services/auto_trader.consider_signal()` — the auto-trader's entry
+    decision, gated on ~25 rule-based filters before submitting a
+    bracket order
+
+Public surface:
+  * `generate_signal(ticker, timeframe, df)` → signal dict (see schema below)
+  * `_apply_backtest_to_signal(signal, df, timeframe)` — blends per-ticker
+    backtest "best-strategy" score into the confidence multiplier
+  * `get_timeframe_alignment(signals)` — summary helper for the
+    multi-TF alignment grid in the UI
+
+Signal dict schema (all keys present on every return; some may be None):
+  * `ticker`: uppercase symbol
+  * `timeframe`: one of "5m" / "15m" / "30m" / "1h" / "4h" / "1d" / "1mo"
+  * `signal_type`: "BUY" / "SELL" / "NEUTRAL"
+  * `confidence`: int 0-95 (capped to leave headroom for "perfect" trades)
+  * `entry`, `stop_loss`, `target1`, `target2`, `target3`: float prices,
+    None on NEUTRAL signals
+  * `reasoning`: newline-joined list of human-readable signal contributors
+  * `patterns`: JSON-stringified list of detected pattern names
+  * `strategy`: free-text label of dominant strategy (e.g.
+    "Composite (multi-factor)", "MEANREV", "BREAKOUT")
+  * `adx`: current ADX_14 value, surfaced for downstream regime gating
+  * Auto-trader path enriches with `backtest_*` keys via
+    `_apply_backtest_to_signal` before passing to consider_signal.
+
+Behavior worth knowing (audit-rationale cross-references):
+  * **Raw-evidence floor** (r40 #7): rejects signals where the winning
+    side scored < 30 raw points — prevents tilt-vote-only signals
+    (60/40 split with weak conviction) from clearing the threshold.
+  * **Regime-aware scoring**: in chop (ADX < 20), breakout/breakdown
+    bonuses are zeroed (r40 #16) so structural noise doesn't stack.
+  * **Per-signal `_regime_mult` clamped to [0.7, 1.4]** (r40 #14) before
+    being applied — prevents the 14+ multiplicative confidence factors
+    from systematically inflating already-correlated names.
+  * **T1 R:R floor 1.3** (r40 #20) — rejects entries with insufficient
+    edge after costs.
+
+NOT in this module:
+  * Auto-trade entry submission (`services/auto_trader.consider_signal`)
+  * Position management / trailing stops (`services/position_manager`)
+  * Backtester / portfolio backtester (`services/backtester*`)
+"""
 import json
 from typing import Dict, Any, List, Optional
 from services.indicators import extract_latest
@@ -114,9 +166,48 @@ def _calibrate_short_stop(
 
 
 def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Generate a trading signal for the given ticker/timeframe.
-    Returns dict with signal_type, confidence, entry, stop_loss, targets, reasoning, patterns.
+    """Compose a directional signal from ~20 analysis inputs.
+
+    Args:
+        ticker: uppercase symbol; passed through into the signal dict.
+        timeframe: one of "5m" / "15m" / "30m" / "1h" / "4h" / "1d" / "1mo".
+            Affects stop-multiplier (`STOP_ATR_MULT_BY_TF`), MTF weighting,
+            and which support/resistance series are computed.
+        df: OHLCV frame (must have `Open / High / Low / Close / Volume`),
+            indexed by timestamp. Indicators are computed inline if not
+            already present. Must have ≥ 30 bars or returns NEUTRAL with
+            "Insufficient data".
+
+    Returns:
+        Signal dict per the module-docstring schema. Always returns a
+        valid dict — `_neutral_signal()` is the fail-open fallback for
+        every error / data-quality / weak-evidence path.
+
+    Generation flow (high level):
+        1. Indicator extraction + S/R + patterns + zones + Fib + gaps + RVOL
+        2. Bull/bear evidence accumulation (~50 weighted contributors)
+        3. Raw-evidence floor (r40): reject if max(bull, bear) < 30
+        4. Direction selection: bull > bear AND confidence ≥ 55%, or vice versa
+        5. Regime-aware adjustments (chop kills breakout bonuses, r40)
+        6. Multi-timeframe alignment bonus
+        7. Target ladder generation (T1/T2/T3) honoring R:R ≥ 1.3 (r40)
+        8. ML scorer blend (when not in shadow mode)
+        9. `_regime_mult` clamp to [0.7, 1.4] before final confidence
+        10. Final cap at 95 (leaves headroom for "perfect" setup recognition)
+
+    Side effects: NONE. Pure function over the input frame.
+
+    Failure modes — every one returns a NEUTRAL signal with a `reason`:
+        * Empty / short frame → "Insufficient data"
+        * Indicators didn't compute → "No indicator data"
+        * No clear direction → "No clear signal conditions"
+        * Mixed signals → "Mixed signals — no clear directional bias"
+        * Below evidence floor (r40) → "Insufficient evidence (max raw score X < 30)"
+        * Bull and bear scores tied → "Mixed signals"
+
+    Performance: O(N × number-of-strategy-checks) per call, dominated by
+    the indicator + zone computations. Typically ~30-80ms on a 500-bar
+    daily frame.
     """
     if df.empty or len(df) < 30:
         return _neutral_signal(ticker, timeframe, "Insufficient data")
@@ -997,6 +1088,20 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
 
 
 def _neutral_signal(ticker: str, timeframe: str, reason: str) -> Dict[str, Any]:
+    """Build the canonical NEUTRAL fallback signal.
+
+    Every error / weak-evidence / data-quality path in `generate_signal`
+    returns this shape. The `signal_type="NEUTRAL"` and `entry=None`
+    fields combine to make the auto-trader's `consider_signal` treat
+    these as non-actionable (rejected at gate 3 — non_buy_signal).
+
+    The fixed `confidence=50` is deliberate: it represents "no opinion"
+    and ensures these rows don't accidentally pass the
+    `confidence ≥ threshold` gate even on misconfigured deployments.
+
+    `reason` flows through to the UI (signal "reasoning" pane) so
+    operators can see why a particular ticker was passed over.
+    """
     return {
         "ticker": ticker,
         "timeframe": timeframe,

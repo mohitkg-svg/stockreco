@@ -1,3 +1,44 @@
+"""FastAPI app entrypoint + dual-service runtime composition.
+
+The same Python image runs in two distinct Cloud Run services
+differentiated by the `RUN_MODE` env var:
+
+  * `RUN_MODE=api` (default): HTTP traffic, scanner schedules, signal
+    generation, alt-data refresh jobs. Min 1 / max 3 instances.
+    Frontend SPA is served from `/`. Scheduler runs scan + alt-data jobs.
+
+  * `RUN_MODE=manager`: internal-ingress only. Runs the 20-second
+    `manage_open_positions` loop + 60-minute broker reconciliation +
+    boot-time reconciliation. Min/max=1 instance — doubling would
+    dual-fire the manage loop.
+
+Both services share the same Cloud SQL Postgres database; coordination
+is via `auto_trades` rows (api inserts pending/open; manager updates).
+Process-local state (BP reservations, circuit breakers, in-memory
+caches) is per-service by design.
+
+Module-level surface (in dependency order):
+  * `.env` loader (no python-dotenv dependency)
+  * Logging setup (rotating file + structured JSON to stdout)
+  * `lifespan` async context manager — registers all scheduler jobs
+    based on `RUN_MODE` and starts the live-quotes WebSocket
+  * Global `app = FastAPI(...)` with router includes + CORS + rate
+    limiter middleware
+  * `/api/health` handler (subsystem heartbeat for liveness probes)
+
+Critical invariants:
+  * `_load_dotenv()` must run BEFORE any service import — service
+    modules read `os.getenv` at import time.
+  * `RUN_MODE=manager` returns early in lifespan after registering its
+    minimal job set; api-mode falls through to register everything else.
+  * Cloud Run liveness probe targets `/api/health`; manager's probe
+    trips when `last_manage_at` exceeds 120s during RTH.
+
+NOT in this module:
+  * Service-level logic (lives in `services/*`)
+  * Router endpoint implementations (`routers/*`)
+  * Database setup (`database.py`)
+"""
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -68,6 +109,17 @@ _formatter = logging.Formatter(_LOG_FMT)
 # regex-grepping a flat string. Falls back to plain-text if json import fails
 # (it shouldn't — stdlib).
 class _JsonFormatter(logging.Formatter):
+    """Structured JSON log formatter for Cloud Logging consumption.
+
+    Each line is one JSON object with `severity / message / logger /
+    timestamp` plus any extra fields attached to the LogRecord. Cloud
+    Logging auto-parses these and indexes them as queryable fields,
+    making `severity=ERROR` filters and ad-hoc `jsonPayload.event=...`
+    searches possible without grep-on-text.
+
+    Toggled via `LOG_JSON=1` (default in Cloud Run); set `LOG_JSON=0`
+    for local dev where plaintext is easier to read.
+    """
     # Cloud Logging maps these keys to its severity column.
     _SEV_MAP = {
         "DEBUG": "DEBUG", "INFO": "INFO", "WARNING": "WARNING",
@@ -142,6 +194,15 @@ logger.info(f"Logging to {LOG_FILE} (rotating 5MB × 5)")
 # lines. Keep the FIRST occurrence of each distinct message, then suppress
 # repeats for 60s. Genuinely new errors still surface promptly.
 class _RateLimitFilter(logging.Filter):
+    """Per-message-template log dedup filter.
+
+    Keyed on `(logger_name, level, msg_template)` so args-varying lines
+    (e.g. ticker-substituted error strings) still dedupe. First
+    occurrence passes through; subsequent identical messages are
+    suppressed for `interval_sec`. Set on the noisy Alpaca SDK loggers
+    in particular — without this a 5-minute API outage produces
+    thousands of identical log lines and floods Cloud Logging quota.
+    """
     def __init__(self, interval_sec: float = 60.0):
         super().__init__()
         self.interval = interval_sec
@@ -675,6 +736,15 @@ logger.info(f"CORS allowed origins: {_cors_origins}")
 # only; /metrics and /ws/* skip the bucket.
 @app.middleware("http")
 async def _rate_limit_middleware(request, call_next):
+    """ASGI middleware applying the per-X-API-Key token-bucket limiter
+    on every `/api/*` request. Defers to `routers._auth.rate_limit`
+    for the actual bucket logic; this middleware only handles request
+    routing + 429 response synthesis.
+
+    Skips `/metrics`, `/ws/*`, and the SPA static routes so prometheus
+    scrapes and live quote streams don't share buckets with HTTP API
+    callers. Disabled entirely when `APP_RATE_LIMIT_PER_MIN=0`.
+    """
     path = request.url.path or ""
     if path.startswith("/api/"):
         try:

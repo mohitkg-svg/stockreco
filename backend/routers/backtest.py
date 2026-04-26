@@ -1,3 +1,23 @@
+"""Backtest router — single-ticker + portfolio-level historical replay.
+
+Endpoints under `/api/backtest/*`:
+  * `POST /api/backtest/{ticker}` — multi-strategy walk-forward replay
+    on the ticker's 2y daily history. Returns per-strategy stats so
+    the UI can rank "which strategy works best on this stock".
+  * `POST /api/backtest/portfolio/run?stress_window=<key>` — composite
+    portfolio backtest with cap enforcement (sector / heat / daily
+    loss). Optionally replay over a canned historical drawdown
+    window (Aug 2024 carry, Mar 2020 COVID, etc.) instead of the
+    trailing lookback.
+  * `GET /api/backtest/portfolio/stress-windows` — list canned windows.
+
+Heavy lifting in `services.backtester` (per-ticker) and
+`services.portfolio_backtest` (portfolio). This router gates the calls
+on auth + watchlist membership and shapes the response for the SPA.
+
+Compute-heavy: 2y multi-strategy + walk-forward folds + yfinance
+fetch ≈ 1-3s per ticker; portfolio backtest ≈ 30-60s for 50 tickers.
+"""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db, WatchlistStock

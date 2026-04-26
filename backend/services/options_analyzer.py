@@ -82,6 +82,14 @@ PREMIUM_STOP_PCT = 0.50   # exit when contract has lost 50% of its premium
 
 
 def _mid_price(o: dict) -> Optional[float]:
+    """Best-effort fair price for a contract: prefer (bid+ask)/2 when
+    both quotes are non-zero (true mid), fall back to last-traded price.
+
+    Returns None when none are available — caller should treat this as
+    "skip this contract, can't price it". The fallback order matters:
+    `last` can be hours stale on illiquid chains, so we only use it
+    when the live two-sided quote is missing entirely.
+    """
     bid = o.get("bid") or 0
     ask = o.get("ask") or 0
     last = o.get("lastPrice") or 0

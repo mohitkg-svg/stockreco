@@ -1,3 +1,31 @@
+"""Technical-indicator computation — single source of truth for the
+column-name vocabulary the rest of the codebase reads.
+
+Backed by the `ta` library (vectorized, deterministic). Indicators are
+computed on demand by `compute_indicators()` and cached only via the
+caller's frame (no module-level state).
+
+Column-name vocabulary appended by `compute_indicators()`:
+
+  Moving averages: SMA_20, SMA_50, SMA_200, EMA_9, EMA_21, EMA_50
+  Momentum: RSI_14, STOCHk_14, STOCHd_14
+  Trend: MACD_12_26, MACDs_12_26, MACDh_12_26 (line / signal / histogram)
+  ADX (when ≥ 14 bars): ADX_14, DMP_14, DMN_14
+  Volatility: BBU_20, BBM_20, BBL_20 (Bollinger upper/mid/lower),
+              ATR_14 (when ≥ 14 bars)
+  Volume: OBV, VOL_SMA20
+  VWAP: session-anchored on intraday TFs, rolling-20 on daily+
+
+Consumers (grep these names):
+  * `services/strategies.py` — every strategy reads several of these
+  * `services/signal_generator.py` — synthesis pipeline
+  * `services/backtester.py` — falls back to ATR_* before its own ATR proxy
+  * `routers/analysis.py` — chart overlay + indicator pane
+
+`extract_latest(df)` flattens the most recent row into a Python dict
+for the analysis pane / API response. Subset-of-columns helpers
+(`get_rsi_series`, `get_macd_series`) feed the chart frontend.
+"""
 import pandas as pd
 import numpy as np
 import ta
@@ -9,7 +37,25 @@ from typing import Dict, Any, List
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add all technical indicators to the dataframe. Returns enriched df."""
+    """Append the full technical-indicator column set to a copy of `df`.
+
+    Returns the enriched DataFrame. Original `df` is not mutated.
+
+    Returns `df` unchanged when `df.empty` or `len(df) < 20` (most
+    indicators need ≥ 14 lookback bars; SMA_50 / SMA_200 will be NaN
+    until enough rows accumulate, but the column will still exist).
+
+    Column names appended: see module docstring for the full list. Any
+    rename of these column names is a breaking change — every strategy,
+    the signal generator, the backtester ATR fallback, and the chart
+    frontend grep these literal strings.
+
+    VWAP semantics: session-anchored (resets daily) when the index
+    spacing is sub-daily; falls back to a rolling 20-bar VWAP for daily+
+    bars where session anchoring is meaningless. Bare `except: NaN`
+    around the VWAP block ensures a malformed index doesn't take down
+    the whole indicator computation.
+    """
     if df.empty or len(df) < 20:
         return df
 
@@ -81,7 +127,16 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_latest(df: pd.DataFrame) -> Dict[str, Any]:
-    """Extract the latest indicator values as a flat dict."""
+    """Flatten the most recent row into a dict for analysis / API output.
+
+    Returns lowercased indicator keys (close, rsi, macd, atr, adx, ...)
+    along with derived booleans (rsi_oversold, macd_bullish, sma_cross).
+    Empty frame → empty dict (caller must None-guard).
+
+    Used by:
+      * `signal_generator.generate_signal` — primary input for evidence accumulation
+      * `routers/analysis.py` — populates the analysis-pane indicator widgets
+    """
     if df.empty:
         return {}
 
@@ -154,7 +209,18 @@ def extract_latest(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def get_chart_indicator_series(df: pd.DataFrame) -> dict:
-    """Return time-series data for charting each indicator."""
+    """Build the chart overlay payload for the SPA's price pane.
+
+    Returns `{name: [{time, value}, ...]}` where `name` is the
+    user-facing label (e.g. "SMA20") and each point's `time` is a
+    Unix-second timestamp. NaN values become `None` so the chart
+    library can render gaps. Missing columns (e.g. SMA_200 on a
+    short backtest window) silently produce an empty series rather
+    than raising — the caller doesn't need a column-presence check.
+
+    Lightweight-charts on the frontend expects this exact shape;
+    changing it requires a coordinated frontend update.
+    """
     if df.empty:
         return {}
 
@@ -179,6 +245,8 @@ def get_chart_indicator_series(df: pd.DataFrame) -> dict:
 
 
 def get_rsi_series(df: pd.DataFrame) -> list:
+    """RSI_14 chart series — separate pane below price, frontend pairs
+    this with overbought/oversold reference lines at 70 / 30."""
     if "RSI_14" not in df.columns:
         return []
     ts = [int(t.timestamp()) for t in df.index]
@@ -187,6 +255,8 @@ def get_rsi_series(df: pd.DataFrame) -> list:
 
 
 def get_macd_series(df: pd.DataFrame) -> dict:
+    """MACD chart series — returns `{MACD, Signal, Histogram}` lists
+    for the three components, paired into a separate pane below RSI."""
     ts = [int(t.timestamp()) for t in df.index]
     result = {}
     for col, name in [("MACD_12_26", "MACD"), ("MACDs_12_26", "Signal"), ("MACDh_12_26", "Histogram")]:

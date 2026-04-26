@@ -15,6 +15,11 @@ from typing import Dict, Callable, List
 
 
 def _trend_following(d: pd.DataFrame) -> Dict:
+    """Long when price is above SMA50 AND momentum (RSI) is in the
+    healthy 50–70 zone AND MACD histogram just flipped positive.
+    Mirror conditions for shorts. The MACD-histogram-cross gate ensures
+    we only enter on the FIRST bar of momentum confirmation, not every
+    bar a trend persists."""
     long = (
         (d["Close"] > d["SMA_50"])
         & (d["RSI_14"] > 50) & (d["RSI_14"] < 70)
@@ -34,6 +39,9 @@ def _trend_following(d: pd.DataFrame) -> Dict:
 
 
 def _golden_cross(d: pd.DataFrame) -> Dict:
+    """Major-trend-reversal signal: SMA50 crosses above SMA200 (golden
+    cross) → long; below (death cross) → short. Slow-moving — fires
+    a few times per year per ticker — but historically high R:R."""
     long = (d["SMA_50"] > d["SMA_200"]) & (d["SMA_50"].shift(1) <= d["SMA_200"].shift(1))
     short = (d["SMA_50"] < d["SMA_200"]) & (d["SMA_50"].shift(1) >= d["SMA_200"].shift(1))
     return {
@@ -45,7 +53,10 @@ def _golden_cross(d: pd.DataFrame) -> Dict:
 
 
 def _rsi_mean_reversion(d: pd.DataFrame) -> Dict:
-    # Enter long when RSI crosses back up through 30 (oversold bounce)
+    """Oversold-bounce long: RSI crosses UP through 30 while price is
+    above the SMA200 (i.e., dip in an uptrend). Mirror for shorts: RSI
+    crosses DOWN through 70 in a downtrend. The SMA200 trend-direction
+    filter prevents catching falling-knife mean-reversion attempts."""
     long = (d["RSI_14"] > 30) & (d["RSI_14"].shift(1) <= 30) & (d["Close"] > d["SMA_200"])
     short = (d["RSI_14"] < 70) & (d["RSI_14"].shift(1) >= 70) & (d["Close"] < d["SMA_200"])
     return {
@@ -57,6 +68,9 @@ def _rsi_mean_reversion(d: pd.DataFrame) -> Dict:
 
 
 def _macd_crossover(d: pd.DataFrame) -> Dict:
+    """MACD line crosses signal line — classic momentum-rotation
+    trigger. No trend-direction filter (works in both directions),
+    making it noisier than `_trend_following` but faster to react."""
     long = (d["MACD_12_26"] > d["MACDs_12_26"]) & (d["MACD_12_26"].shift(1) <= d["MACDs_12_26"].shift(1))
     short = (d["MACD_12_26"] < d["MACDs_12_26"]) & (d["MACD_12_26"].shift(1) >= d["MACDs_12_26"].shift(1))
     return {
@@ -68,6 +82,10 @@ def _macd_crossover(d: pd.DataFrame) -> Dict:
 
 
 def _bollinger_breakout(d: pd.DataFrame) -> Dict:
+    """Volatility-expansion breakout: close pierces the Bollinger upper
+    (long) or lower (short) band on at least 1.2× the 20-bar average
+    volume. Volume filter rejects the no-conviction breakouts that
+    typically reverse within a few bars."""
     vol_ok = d["Volume"] > 1.2 * d["VOL_SMA20"]
     long = (d["Close"] > d["BBU_20"]) & (d["Close"].shift(1) <= d["BBU_20"].shift(1)) & vol_ok
     short = (d["Close"] < d["BBL_20"]) & (d["Close"].shift(1) >= d["BBL_20"].shift(1)) & vol_ok
@@ -80,10 +98,13 @@ def _bollinger_breakout(d: pd.DataFrame) -> Dict:
 
 
 def _donchian_breakout(d: pd.DataFrame) -> Dict:
-    # Audit fix C4: without a crossover guard this fires on EVERY bar that sits
-    # above the 20-bar high, producing dozens of duplicate entries across a
-    # single trend leg. Gate on the prior bar sitting at-or-below the level so
-    # we only trigger on the *first* breakout bar, not every confirmation bar.
+    """Long on the FIRST close above the trailing 20-bar high (mirror
+    for shorts). The crossover guard (`shift(1) <= ...`) ensures one
+    entry per breakout, not one per confirmation bar — without it the
+    same trend leg fires dozens of duplicate signals.
+
+    Audit-fix lineage: C4. Inspired by the classic Turtle Trading rule.
+    """
     high_20 = d["High"].rolling(20).max().shift(1)
     low_20 = d["Low"].rolling(20).min().shift(1)
     long = (d["Close"] > high_20) & (d["Close"].shift(1) <= high_20.shift(1))
@@ -97,7 +118,10 @@ def _donchian_breakout(d: pd.DataFrame) -> Dict:
 
 
 def _ema_pullback(d: pd.DataFrame) -> Dict:
-    # In uptrend (SMA50 > SMA200), buy pullback to EMA21
+    """Trend-continuation pullback: in an uptrend (SMA50 > SMA200),
+    buy bars whose Low touched the EMA21 but closed back above it.
+    The "touched and recovered" pattern is the classic
+    healthy-pullback-in-trend signature. Mirror logic for shorts."""
     uptrend = d["SMA_50"] > d["SMA_200"]
     downtrend = d["SMA_50"] < d["SMA_200"]
     touched_ema_below = (d["Low"] <= d["EMA_21"]) & (d["Close"] > d["EMA_21"])

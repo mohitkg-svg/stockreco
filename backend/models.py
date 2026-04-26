@@ -1,3 +1,25 @@
+"""Pydantic schemas — request/response shapes for the FastAPI surface
+plus a few internal-flow validation models.
+
+Two distinct categories live here:
+
+  1. **API-facing schemas** — request bodies (`AddTickerRequest`,
+     `ChatRequest`, etc.) and response shapes (`SignalResponse`,
+     `ChartDataResponse`, `BacktestResponse`, `MultiStrategyBacktestResponse`,
+     `OverviewItem`). These define the JSON contract with the SPA.
+     Field names here are public — renaming them is a breaking change
+     for every frontend consumer.
+
+  2. **Internal-flow validation** — `SignalPayload` (r36) wraps the
+     dict produced by `services.signal_generator.generate_signal` and
+     consumed by `services.auto_trader.consider_signal`. Used as a
+     parsing layer at the boundary; consumers still receive the dict.
+
+Type aliases at the top (`SignalType`, `Timeframe`, `Direction`, `SRType`)
+are the single source of truth for the string vocabulary that crosses
+the API. Importing them keeps backend + frontend honest about which
+literal values are valid where.
+"""
 from pydantic import BaseModel
 from typing import Optional, List, Literal
 from datetime import datetime

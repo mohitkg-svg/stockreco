@@ -1,3 +1,22 @@
+"""Analysis router — runs the signal-generation pipeline on demand.
+
+Endpoints under `/api/analysis/*`:
+  * `POST /api/analysis/{ticker}` — full multi-timeframe analysis
+    (indicators + S/R + patterns + zones + Fib + MTF alignment) and
+    persistence of every emitted signal to the `signals` table
+  * `GET /api/analysis/overview` — dashboard summary across watchlist
+  * `GET /api/analysis/chart/{ticker}` — OHLCV + indicator overlay +
+    S/R levels for the chart pane
+  * `GET /api/analysis/recent-signals` — recent signal feed
+
+The heavy lifting is delegated to `services.signal_generator` and
+`services.indicators`. This router is mostly orchestration: fetch
+OHLCV, run signal generation per timeframe, insert into DB, build
+the response shape.
+
+Background-task dispatch (auto-trader entry submission) happens
+post-response so the HTTP response isn't blocked on broker round-trips.
+"""
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import desc

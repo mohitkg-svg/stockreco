@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PortfolioTrade:
+    """One simulated trade within a portfolio-level backtest run.
+
+    Tracks entry context (ticker, sector, beta, ADX/VIX regime tags)
+    plus exit outcome. Sector + beta are used for the cap enforcement
+    (max_per_sector, beta-weighted heat) that distinguishes this from
+    the per-ticker `services.backtester._simulate` engine.
+
+    `regime_label()` derives a human-readable bucket (trending / chop /
+    high_vix / normal) used in the by-regime stats breakdown.
+    """
     ticker: str
     sector: Optional[str]
     direction: str           # BUY | SELL
@@ -58,6 +68,20 @@ class PortfolioTrade:
 
 @dataclass
 class PortfolioStats:
+    """Aggregate stats for a portfolio backtest run.
+
+    Combines headline metrics (equity, win rate, profit factor, Sharpe,
+    Sortino, Calmar, expectancy) with composite-portfolio-only stats
+    (max drawdown duration, cap rejection count, by-regime breakdown,
+    per-sector concentration peak, realized pair-correlation diagnostic).
+
+    r38 added Monte Carlo bootstrap percentiles (p5/p50/p95 of max
+    drawdown and ending equity). r39 added Sortino/Calmar/turnover.
+    Stress-window metadata (key + label) is set when the run targeted
+    a canned historical drawdown range.
+
+    Serialization: `as_dict()` → JSON-friendly dict for the API response.
+    """
     starting_equity: float
     ending_equity: float
     total_trades: int

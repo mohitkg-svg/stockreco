@@ -1,3 +1,38 @@
+"""Database setup, ORM models, and lightweight migrations.
+
+DATABASE_URL selection (in order):
+  1. `DATABASE_URL` env var (production: Cloud SQL Postgres via unix
+     socket; staging: Neon / managed Postgres).
+  2. Fallback to `sqlite:///./stockapp.db` for local dev / tests.
+
+Postgres path: connection-pool tuning is sized for Cloud SQL db-f1-micro
+(~25 total connection slots, 3-5 superuser-reserved). Pool size 8 +
+overflow 7 = 15 — leaves room for scheduler jobs to initialize
+simultaneously without tripping "remaining connection slots reserved".
+
+SQLite path: WAL journal mode + 30s busy_timeout is set via a SQLAlchemy
+`connect`-event PRAGMA hook. Required because `manage_open_positions`
+holds a session through 1-5s Alpaca REST round-trips while
+`consider_signal` from the scan thread may be trying to INSERT — 5s
+default busy_timeout wasn't enough.
+
+Migration strategy:
+  * `create_tables()` (called from `main.py:lifespan`) runs `metadata.create_all`
+    + a small set of additive `_ensure_column` calls. SQLAlchemy
+    creates new tables from the model classes; column additions to
+    existing tables are handled idempotently by `_ensure_column`.
+  * Singleton `AutoTraderConfig` row (id=1) is seeded on first call.
+  * For anything more complex than "add a nullable column" use the
+    versioned migration runner that tracks applied versions in a
+    `schema_migrations` table — defined elsewhere; not yet needed
+    in production.
+
+Public surface:
+  * `engine`, `SessionLocal`, `Base` — standard SQLAlchemy trinity.
+  * `get_db()` — FastAPI dependency yielding a session.
+  * Each ORM class is a thin row representation; query patterns live
+    in the consuming services.
+"""
 import os
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
@@ -58,6 +93,13 @@ Base = declarative_base()
 
 
 class WatchlistStock(Base):
+    """User-curated watchlist row. The set of tickers the scanner runs
+    against (in addition to the universe-scanner CandidatePool).
+
+    Each row is a single ticker; per-ticker `auto_trade_enabled` lets
+    the operator block specific symbols without removing them from the
+    watchlist (e.g., during earnings, after a bad post-mortem).
+    """
     __tablename__ = "watchlist"
     ticker = Column(String, primary_key=True, index=True)
     name = Column(String, nullable=True)
@@ -68,6 +110,26 @@ class WatchlistStock(Base):
 
 
 class Signal(Base):
+    """One row per emitted signal. Persists every analysis-pipeline
+    output — BUY / SELL / NEUTRAL alike — so we have full historical
+    record for backtesting (forward-tested signal-vs-realized
+    correlation), low-signal-volume alerting (r39), and the analysis-
+    pane "recent signals" widget.
+
+    Auto-trader reads from this when deciding whether to open a position;
+    every actionable signal also gets the strategy / confidence /
+    reasoning fields populated by `services.signal_generator`.
+
+    Schema notes:
+      * `signal_type`: literal "BUY", "SELL", or "NEUTRAL"
+      * `entry/stop_loss/target1/2/3`: prices; NULL for NEUTRAL
+      * `strategy`: free-text label of dominant signal-generator branch
+      * `reasoning`: newline-joined human-readable contributors
+      * `patterns`: JSON-stringified list of detected pattern names
+      * `is_new`: UI flag that flips false after first user view
+      * Backtest fields (`backtest_score` etc.) are populated by
+        `_apply_backtest_to_signal` when the auto-trader path is invoked.
+    """
     __tablename__ = "signals"
     id = Column(Integer, primary_key=True, autoincrement=True)
     ticker = Column(String, index=True, nullable=False)

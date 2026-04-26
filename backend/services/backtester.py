@@ -1,3 +1,42 @@
+"""Per-ticker historical backtest engine.
+
+Runs every strategy from `services.strategies.all_strategies()` against
+a single ticker's OHLCV history (typically 2y of daily bars), simulating
+trades with realistic costs (commission + slippage) and the same exit
+state machine the live engine uses (partial trims at T1/T2, runner at
+target, soft-BE / BE stop tightening).
+
+Two consumers:
+  * `routers/backtest.py` — exposes per-strategy stats to the UI for
+    "which strategy works best for this ticker?".
+  * `services/signal_generator.py` (via `_apply_backtest_to_signal`) —
+    blends a backtest "best-strategy" score into the live signal's
+    confidence multiplier.
+
+Surface:
+  * `run_backtest(df, signal_type, timeframe)` — single signal_type's stats
+  * `run_multi_strategy(df, timeframe)` — all strategies, with walk-forward
+    folds + composite confidence
+  * `score_strategy(stats)` — collapse a stats dict into a 0-100 number
+
+Realism additions (since r37):
+  * Partial-exit ladder (T1=50% of distance to target, T2=85%) matching
+    the live engine. Toggle via `partial_exits=False` for legacy single-
+    exit comparison.
+  * Per-side cost haircut via `BT_COMMISSION_BPS` + `BT_SLIPPAGE_BPS`.
+  * Gap-aware exits (open price used as fill when a bar gaps through
+    stop or target).
+  * Gap-fill targeting (unfilled bear/bull gaps act as secondary targets).
+  * Sharpe annualization sourced per timeframe (r34) — `_BARS_PER_YEAR`.
+  * Liquidity gate (r39) at `run_multi_strategy` entry — skips backtests
+    on tickers with median 20-bar $-volume < $10M.
+
+NOT in this module (deliberate scope split):
+  * Multi-asset / cross-ticker correlation simulation lives in
+    `services/portfolio_backtest.py`.
+  * Live trade execution / partial-fill bookkeeping lives in
+    `services/auto_trader.py` + `services/execution_engine.py`.
+"""
 import logging
 import pandas as pd
 import numpy as np
@@ -47,6 +86,13 @@ _BARS_PER_YEAR = {
 
 
 def _annualization_factor(timeframe: Optional[str]) -> float:
+    """Return `sqrt(bars_per_year)` for Sharpe annualization.
+
+    Equity curve in `_simulate` is per-bar (one entry per OHLCV row),
+    so per-bar pct_change → bar-frequency stdev. Multiplying by the
+    daily `sqrt(252)` blindly inflated intraday Sharpe by 8.8× on 5m.
+    Falls back to `sqrt(252)` if the timeframe isn't in `_BARS_PER_YEAR`.
+    """
     n = _BARS_PER_YEAR.get(timeframe, 252)
     return float(n ** 0.5)
 
@@ -73,25 +119,45 @@ def _simulate(
     timeframe: Optional[str] = None,
     partial_exits: bool = True,
 ) -> Dict[str, Any]:
-    """Simulate trades given an entry signal series. direction = 'BUY' or 'SELL'.
+    """Simulate trades given an entry signal series.
 
-    Gap-aware: if an unfilled bear-gap sits above the entry (long) or an unfilled
-    bull-gap sits below (short), we treat the gap-fill midpoint as a *secondary*
-    target and exit at whichever fires first (gap-fill or ATR-target).
+    Args:
+        d: OHLCV frame with `Open / High / Low / Close / Volume` columns,
+           indexed by timestamp. Indicators may be present but aren't
+           required by `_simulate` itself (caller supplies `atr`).
+        entries: boolean Series aligned to `d.index`. `entries.iloc[i-1] = True`
+           triggers a market-open entry on bar `i`.
+        direction: 'BUY' (longs) or 'SELL' (shorts).
+        atr: ATR series aligned to `d.index`. Used to compute stop and target
+           distances per bar (with a fallback chain when the value is missing).
+        timeframe: optional, used for `STOP_ATR_MULT_BY_TF` lookup and
+           Sharpe annualization. Falls back to `DEFAULT_STOP_ATR_MULT=1.5`.
+        partial_exits: when True (default, r37), simulates the LIVE
+           auto_trader state machine — 33% banked at T1 (50% of distance
+           to target), another 33% at T2 (85%), runner exits at the full
+           ATR target. Stop tightens to soft-BE at T1, full BE at T2.
+           Closes the "Ghost Alpha" backtest-vs-live divergence. Set False
+           for legacy all-in/all-out behavior.
 
-    `partial_exits=True` (default, r37): match the LIVE auto_trader's
-    state machine — bank 33% at T1 (1×R), bank another 33% of original at
-    T2 (2×R), runner exits at the full ATR target. Stop tightens to
-    soft-BE (entry − 0.3R) at T1, then full BE at T2. Without this the
-    backtest's all-in/all-out fills systematically diverge from live (the
-    "Ghost Alpha" gap — backtest claims more upside than live captures
-    AND more drawdown than live actually takes).
+    Returns:
+        `{trades, equity_curve, stats}` — trade list with entry/exit/PnL,
+        per-bar equity values, and aggregate stats from `_build_stats`.
 
-    `partial_exits=False`: legacy single-exit behavior, kept for sanity
-    comparison and any tests that depend on the old shape.
+    Behavior worth knowing:
+        * Gap-aware: a bar that opens past the stop or target fills at the
+          OPEN price, not the level (realistic worst-case slippage on gaps).
+        * Conservative bias: when a bar's range covers BOTH stop and target,
+          the stop is taken (we can't know intra-bar print order).
+        * Unfilled bear/bull gaps act as secondary targets — exit at
+          whichever fires first.
+        * Costs (`COMMISSION_BPS + SLIPPAGE_BPS`) are applied to entry AND
+          exit price in the direction that hurts the trader.
+        * `partial_pl_dollars` accumulates each leg's contribution; portfolio
+          updates use a snapshot taken at trade open (r39 fix #25 — prevents
+          geometric inflation when T1+T2+target hit in the same bar).
 
-    Audit fix C2: stop multiplier sources from STOP_ATR_MULT_BY_TF (same table
-    the live signal generator uses) so backtest stats reflect live risk.
+    `entry_idx`/`hist` lookups use `df.iloc[:i+1]` to enforce no look-ahead
+    on the gap-target computation (the only place future bars could leak in).
     """
     from services.gap_detector import gap_targets_above as _gta, gap_targets_below as _gtb
 
@@ -370,6 +436,27 @@ def _simulate(
 
 
 def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float, timeframe: Optional[str] = None) -> Dict[str, Any]:
+    """Aggregate per-trade outcomes into the stats dict consumed by the UI
+    and `score_strategy`. Defines the response shape — downstream callers
+    grep for these keys.
+
+    Returned shape:
+        {
+          stats: {
+            total_trades, win_rate, profit_factor, total_return_pct,
+            max_drawdown_pct, sharpe_ratio, avg_win_pct, avg_loss_pct
+          },
+          equity_curve: [{time, value}, ...],   # downsampled to ~300 points
+          trades: [{entry_date, exit_date, ...}, ...],   # last 50
+        }
+
+    Empty-trade case returns `_empty_stats()` (all zeros) so downstream
+    consumers don't need to None-guard each field.
+
+    Sharpe uses the timeframe-aware `_annualization_factor` (r34 fix —
+    intraday Sharpes were 8.8× inflated by blind `sqrt(252)`).
+    Profit factor caps at 99.9 to avoid `inf` JSON-serialization issues.
+    """
     if not trades:
         return {
             "stats": _empty_stats(),

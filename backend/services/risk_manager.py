@@ -55,18 +55,32 @@ _sl_resubmit_lock = threading.Lock()
 
 
 def reserve_bp(amount: float) -> None:
+    """Add `amount` (in dollars) to the in-flight BP reservation counter.
+
+    Called at order-submit time before Alpaca acknowledges the bracket.
+    Prevents a watchlist scan from sizing 30 orders against the same
+    stale buying-power figure before the first 422 trips the BP breaker.
+    Saturates at 0 to defend against a hypothetical caller passing
+    negative amounts. Lock-protected; safe to call from any thread.
+    """
     global _in_flight_bp_reserved
     with _in_flight_bp_lock:
         _in_flight_bp_reserved = max(0.0, _in_flight_bp_reserved + float(amount))
 
 
 def release_bp(amount: float) -> None:
+    """Subtract `amount` from the in-flight BP reservation counter.
+
+    Called when an order is canceled or fails to submit. Saturates at
+    0 (never goes negative). Lock-protected.
+    """
     global _in_flight_bp_reserved
     with _in_flight_bp_lock:
         _in_flight_bp_reserved = max(0.0, _in_flight_bp_reserved - float(amount))
 
 
 def get_in_flight_bp() -> float:
+    """Read the current in-flight BP reservation. Lock-protected."""
     with _in_flight_bp_lock:
         return _in_flight_bp_reserved
 
@@ -111,40 +125,62 @@ def decay_in_flight_bp_if_stale() -> None:
 
 
 def trip_bp_breaker(minutes: int = 30) -> None:
+    """Trip the buying-power circuit breaker for `minutes`. Called from
+    `consider_signal` after an Alpaca 422 (insufficient BP) — pauses
+    new entries so a tight scan loop doesn't generate retry storms
+    against the broker. Default 30 min absorbs typical end-of-day BP
+    constraints without manual intervention.
+    """
     global _bp_exhausted_until
     from datetime import timedelta
     _bp_exhausted_until = datetime.utcnow() + timedelta(minutes=minutes)
 
 
 def trip_broker_breaker(minutes: int = 5) -> None:
+    """Trip the broker-down circuit breaker for `minutes`. Called from
+    `consider_signal` after an Alpaca 5xx — pauses new entries until
+    the broker stabilizes. Shorter window than BP breaker because 5xx
+    recoveries are typically minutes, not tens of minutes.
+    """
     global _broker_down_until
     from datetime import timedelta
     _broker_down_until = datetime.utcnow() + timedelta(minutes=minutes)
 
 
 def clear_bp_breaker() -> None:
+    """Manually clear the BP circuit breaker (admin / recovery action).
+    Doesn't re-arm the auto-trader — just removes this one gate."""
     global _bp_exhausted_until
     _bp_exhausted_until = None
 
 
 def clear_broker_breaker() -> None:
+    """Manually clear the broker-down circuit breaker (admin action)."""
     global _broker_down_until
     _broker_down_until = None
 
 
 def bp_breaker_active() -> bool:
+    """True iff the BP circuit breaker is currently tripped (within its
+    timer window). Read by `consider_signal` as gate #1."""
     return bool(_bp_exhausted_until and datetime.utcnow() < _bp_exhausted_until)
 
 
 def broker_down() -> bool:
+    """True iff the broker-down circuit breaker is tripped. Read as
+    gate #2 in `consider_signal` (and surfaced on `/api/health`)."""
     return bool(_broker_down_until and datetime.utcnow() < _broker_down_until)
 
 
 def bp_exhausted_until() -> Optional[datetime]:
+    """Expiry time of the BP breaker, or None if not tripped. Surfaced
+    on the operator dashboard for visibility into when the breaker
+    will auto-clear."""
     return _bp_exhausted_until
 
 
 def broker_down_until() -> Optional[datetime]:
+    """Expiry time of the broker-down breaker, or None if not tripped."""
     return _broker_down_until
 
 
