@@ -154,6 +154,12 @@ class AutoTraderConfig(Base):
     killed = Column(Boolean, default=False)
     killed_at = Column(DateTime, nullable=True)
     killed_reason = Column(String, nullable=True)
+    # r41 review fix B: PDT enforcement. False (default) = informational
+    # only (paper-account behavior). Flip to True when going live with a
+    # margin account < $25k — the gate then blocks new entries when 3+
+    # day-trades have already happened in the trailing 5 business days
+    # (preventing a 4th which would trigger a 90-day PDT lock).
+    pdt_enforce = Column(Boolean, default=False)
     # Max concurrent open positions across the whole portfolio. Complements
     # max_per_sector (which only bounds correlated exposure).
     max_concurrent_positions = Column(Integer, default=10)
@@ -218,6 +224,17 @@ class AutoTrade(Base):
     # the very first tick (no debounce state to consult), occasionally
     # chopping out winners on a 1-bar wick.
     target_touch_count = Column(Integer, default=0)
+    # r41 review fix C: For OPTIONS, `requested_entry` is the option
+    # PREMIUM (e.g. $2.00), not the underlying price. The premium-stop
+    # spread-artifact guard previously compared current underlying
+    # ($500) against premium ($2.00) and always evaluated to "against
+    # us" — making the spread-artifact window fire premium-stops
+    # incorrectly on every option trade in the first 5 minutes.
+    # `underlying_entry_price` stores the underlying's price at the
+    # moment of option entry so the comparison is meaningful.
+    # Stocks: this column is None (use entry_price as before).
+    # Options: set from thesis["entry"] in consider_call/put_play.
+    underlying_entry_price = Column(Float, nullable=True)
 
 
 class CandidatePool(Base):
@@ -681,6 +698,7 @@ def create_tables():
     _ensure_column("auto_trader_config", "killed", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "killed_at", "TIMESTAMP")
     _ensure_column("auto_trader_config", "killed_reason", "VARCHAR")
+    _ensure_column("auto_trader_config", "pdt_enforce", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "max_concurrent_positions", "INTEGER DEFAULT 10")
     # Legacy default (FALSE) preserved for existing rows; new rows get TRUE via ORM default
     _ensure_column("auto_trader_config", "flatten_by_eod", "BOOLEAN DEFAULT FALSE")
@@ -696,6 +714,7 @@ def create_tables():
     _ensure_column("auto_trader_config", "ticker_blacklist", "VARCHAR DEFAULT ''")
     _ensure_column("auto_trades", "original_qty", "DOUBLE PRECISION")
     _ensure_column("auto_trades", "target_touch_count", "INTEGER DEFAULT 0")
+    _ensure_column("auto_trades", "underlying_entry_price", "DOUBLE PRECISION")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:

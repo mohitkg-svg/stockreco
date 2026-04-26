@@ -974,18 +974,38 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     if broker_down():
         metrics.inc("autotrade_skip", reason="broker_down")
         return None
+    # Bind canonical ticker upfront for pre-lock gates and confirm 1m bar.
+    ticker = (signal.get("ticker") or "").strip().upper()
+    if not ticker:
+        return None
+
+    # Basic filters before heavy I/O or locking.
+    if signal.get("signal_type") != "BUY":
+        metrics.inc("autotrade_skip", reason="non_buy_signal")
+        return None
+
+    # Profit-audit #6: 1-min bar entry confirmation.
+    # Move I/O (fetch OHLCV) outside the global entry lock to prevent
+    # blocking parallel scans when the data API is slow.
+    if not _confirm_1m_bar(ticker, direction="BUY"):
+        logger.info(
+            f"AutoTrader skip {ticker}: 1-min bar disagrees with BUY direction "
+            f"(pre-lock confirmation check)"
+        )
+        metrics.inc("autotrade_event", event="one_min_disagree")
+        return None
+
     if not _entry_lock.acquire(timeout=30.0):
-        logger.warning(f"consider_signal({signal.get('ticker')}): entry lock busy >30s, skipping")
+        logger.warning(f"consider_signal({ticker}): entry lock busy >30s, skipping")
         metrics.inc("autotrade_event", event="entry_lock_timeout")
         metrics.inc("autotrade_skip", reason="entry_lock_timeout")
         return None
+
     db = SessionLocal()
     try:
-        # Bind canonical ticker upfront so EVERY downstream gate (including
-        # the liquidity gate that previously referenced ticker before it was
-        # bound — silently swallowed by a bare except) can use it. Bug
-        # introduced in r34, surfaced by ruff in r39.
-        ticker = (signal.get("ticker") or "").strip().upper()
+        # `ticker` already bound pre-lock above (r41 review fix A —
+        # _confirm_1m_bar moved before lock acquisition to prevent slow
+        # data-API calls from stalling parallel scanner threads).
         # r39 audit fix #8: hard freeze on losing streak (WR < 35%, n ≥ 5).
         # Different from `adaptive_risk_multiplier` shrinking — this is the
         # full stop. Operator must intervene (kill the streak's contributing
@@ -1004,6 +1024,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if getattr(cfg, "killed", False):
             metrics.inc("autotrade_skip", reason="killed")
             return None
+        # r41 review fix B: PDT day-trade hard gate. Only fires when
+        # cfg.pdt_enforce is True (default False so paper account is
+        # unaffected). On live margin < $25k, this prevents the 4th
+        # day-trade in 5 business days from firing — which would
+        # otherwise trigger a 90-day PDT lock. Threshold of 3 (not 4)
+        # gives us a one-trade safety margin.
+        if getattr(cfg, "pdt_enforce", False):
+            try:
+                from services.risk_manager import pdt_day_trade_count as _pdt
+                _pdt_data = _pdt(window_business_days=5)
+                if _pdt_data.get("count", 0) >= 3:
+                    logger.warning(
+                        f"AutoTrader skip {ticker}: PDT gate — "
+                        f"{_pdt_data['count']} day-trades in last 5 business days "
+                        f"(threshold 3, ≥ 4 would trigger PDT lock)"
+                    )
+                    metrics.inc("autotrade_skip", reason="pdt_limit")
+                    return None
+            except Exception as _pe:
+                logger.warning(f"PDT gate check failed (falling open): {_pe}")
         if not paper_trader.is_enabled():
             metrics.inc("autotrade_skip", reason="broker_not_enabled")
             return None
@@ -1529,6 +1569,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if raw_stack > _MULT_CEILING:
             logger.info(
                 f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
+                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} strat={strat_mult:.2f} vix={vix_mult:.2f})"
                 f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} "
                 f"strat={strat_mult:.2f} vix={vix_mult:.2f} ai={ai_mult:.2f})"
             )
@@ -1552,16 +1593,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if qty < 1:
             return None
 
-        # Profit-audit #6: 1-min bar entry confirmation. Require the last
-        # closed 1-min bar to agree with BUY direction. Skips on missing
-        # data (fail-open) so we don't reject good signals on API flakes.
-        if not _confirm_1m_bar(ticker, direction="BUY"):
-            logger.info(
-                f"AutoTrader skip {ticker}: 1-min bar disagrees with BUY direction "
-                f"(waiting for green-bar confirmation)"
-            )
-            metrics.inc("autotrade_event", event="one_min_disagree")
-            return None
+        # r41 review fix A: 1-min bar confirmation moved BEFORE the entry
+        # lock at the top of consider_signal so a slow OHLCV fetch can't
+        # stall parallel scans waiting on the lock. The post-lock duplicate
+        # that used to live here was removed.
 
         logger.info(
             f"AutoTrader opening {ticker} qty={qty} entry≈{entry} stop={stop} "
@@ -1952,6 +1987,11 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             qty=qty,
             original_qty=qty,   # critical-audit fix #11: freeze entry qty
             requested_entry=float(top["premium"]),       # premium per share
+            # r41 review fix C: store underlying price at entry so the
+            # premium-stop spread-artifact guard can do a meaningful
+            # underlying-vs-thesis comparison (the old code compared
+            # underlying $500 to premium $2 — always "against us").
+            underlying_entry_price=float(thesis.get("entry") or 0) or None,
             # NOTE: for option trades the broker has no SL leg. We track the
             # UNDERLYING stop level here (initialised to the bear-thesis stop) so
             # the state-machine trail in _manage_option_trade can mutate it.
@@ -2263,6 +2303,9 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             qty=qty,
             original_qty=qty,   # r39 audit critical-2: stock+put paths set this; calls were missing it, causing T1 trim to fall back to current qty (exponential decay risk)
             requested_entry=float(top["premium"]),
+            # r41 review fix C: store underlying price at entry (see PUT path
+            # above for rationale).
+            underlying_entry_price=float(thesis.get("entry") or 0) or None,
             # For calls: underlying stop sits BELOW price. The option
             # manage loop (`_manage_option_trade`) already supports puts;
             # we reuse it for calls by parsing direction from the OCC
@@ -2572,13 +2615,25 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
         if cur_premium <= decay_trigger_price:
             spread_artifact_window = held_secs < 300  # 5 min
             # Check underlying direction against thesis
+            # r41 review fix C: previously compared underlying price `px`
+            # ($500-ish) against `t.requested_entry` ($2.00 — option
+            # PREMIUM, not underlying entry). The check was effectively
+            # `500 > 2.0 * 1.001 = True` for every put, meaning every
+            # option in the 5-min window incorrectly evaluated to
+            # "underlying against us". Now uses `underlying_entry_price`
+            # which is set at trade-open from `thesis["entry"]`.
             underlying_against_us = False
-            if px is not None and getattr(t, "requested_entry", None):
+            _u_entry = getattr(t, "underlying_entry_price", None)
+            if px is not None and _u_entry and _u_entry > 0:
                 # For CALL: against = price < entry; for PUT: against = price > entry
                 if is_put:
-                    underlying_against_us = px > float(t.requested_entry) * 1.001
+                    underlying_against_us = px > float(_u_entry) * 1.001
                 else:
-                    underlying_against_us = px < float(t.requested_entry) * 0.999
+                    underlying_against_us = px < float(_u_entry) * 0.999
+            # If `underlying_entry_price` is missing (rows from before r41
+            # migration), fall back to NOT skipping the premium-stop —
+            # safer to fire on a real decay than skip on a stale guard.
+
             if spread_artifact_window and not underlying_against_us:
                 logger.info(
                     f"AutoTrader skip premium-stop {t.ticker} {t.symbol}: held {held_secs:.0f}s, "

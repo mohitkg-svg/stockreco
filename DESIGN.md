@@ -1024,6 +1024,28 @@ Local off-cloud archive: `pg_dump "$DATABASE_URL" --no-owner --no-acl
 
 ## 14. Changelog (current → past)
 
+### Revision 41 — External-review small fixes: lock contention, PDT gate, option-vs-premium bug
+- **(A) Lock contention**: `_confirm_1m_bar` now runs BEFORE the
+  `_entry_lock` acquisition in `consider_signal`. Previously a slow
+  Yahoo/Alpaca OHLCV fetch could hold the global lock for several
+  seconds, blocking all other tickers. Removed the now-duplicate
+  post-lock check.
+- **(B) PDT day-trade hard gate**: new `cfg.pdt_enforce` flag (default
+  False = informational only on paper). When True, blocks new entries
+  at 3+ day-trades in the trailing 5 business days — preventing the
+  4th which would trigger a 90-day Pattern Day Trader lock on margin
+  accounts < $25k. Flip to True when going live with margin.
+- **(C) Option underlying-vs-premium check**: `_manage_option_trade`
+  was comparing current underlying price (~$500) against
+  `t.requested_entry` which is the option PREMIUM (~$2.00) — every
+  put always evaluated "underlying against us" and the spread-artifact
+  window was effectively disabled for options. New
+  `auto_trades.underlying_entry_price` column populated from
+  `thesis["entry"]` in both option-entry paths; `_manage_option_trade`
+  uses it for the underlying-direction check. Falls back to no-skip
+  for pre-migration rows (safer to fire on real decay than skip on a
+  stale guard).
+
 ### Revision 40 — Comprehensive audit fixes: 5 critical + 14 high/medium + 6 low
 
 Two parallel deep-audit agents flagged ~30 issues; this revision lands all

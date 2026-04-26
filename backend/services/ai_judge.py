@@ -92,9 +92,7 @@ def _get_client():
     judge layer for the life of the process.
     """
     global _client, _client_init_attempted, _client_init_last_attempt
-    # Use monotonic, not wall-clock — wall-clock can jump on NTP sync,
-    # making "10 minutes since last attempt" calculations wrong.
-    now = time.monotonic()
+    now = time.time()
     if _client is not None:
         return _client
     if _client_init_attempted and (now - _client_init_last_attempt) < 600:
