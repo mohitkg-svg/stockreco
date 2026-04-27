@@ -458,6 +458,55 @@
             transition: left .2s ease, background .2s ease;
         }
         html[data-theme="light"] .theme-toggle::after { left: 25px; }
+
+        /* r49: undoable-toast progress fill */
+        @keyframes r49ToastProgress {
+            from { width: 100%; }
+            to { width: 0%; }
+        }
+
+        /* r49: density tokens. Compact mode reduces vertical rhythm + scales
+           cards down for power users who want max info density. */
+        html[data-density="compact"] .surface,
+        html[data-density="compact"] .surface-soft { padding: 0.75rem !important; }
+        html[data-density="compact"] .rounded-2xl { border-radius: 0.75rem; }
+        html[data-density="compact"] h1, html[data-density="compact"] h2, html[data-density="compact"] h3 {
+            line-height: 1.2;
+        }
+        html[data-density="compact"] [data-r49-card] { padding: 0.5rem 0.625rem !important; }
+        html[data-density="compact"] [data-r49-stat] { padding: 0.5rem !important; }
+        html[data-density="compact"] [data-r49-stat] [data-r49-stat-label] { font-size: 9px; }
+        html[data-density="compact"] [data-r49-stat] [data-r49-stat-value] { font-size: 14px; }
+        html[data-density="compact"] [data-r49-spacer] { gap: 0.5rem !important; margin-top: 0.5rem !important; margin-bottom: 0.5rem !important; }
+
+        /* r49: focus ring for accessibility */
+        :focus-visible {
+            outline: 2px solid var(--accent-strong, #60a5fa);
+            outline-offset: 2px;
+            border-radius: 4px;
+        }
+
+        /* r49: skip-link */
+        .r49-skip-link {
+            position: absolute;
+            top: -40px;
+            left: 8px;
+            background: var(--accent);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-weight: 600;
+            z-index: 100;
+            transition: top 0.2s;
+        }
+        .r49-skip-link:focus { top: 8px; }
+
+        /* r49: pulse / flash animation for "this just changed" */
+        @keyframes r49Flash {
+            0% { background-color: rgba(59, 130, 246, 0.45); }
+            100% { background-color: transparent; }
+        }
+        .r49-flash { animation: r49Flash 1.2s ease-out; }
     </style>
 </head>
 <body>

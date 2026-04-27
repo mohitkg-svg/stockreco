@@ -33,6 +33,435 @@ function parseServerDate(s) {
   return isNaN(d.getTime()) ? null : d;
 }
 
+// ============================================================================
+// r49 UX OVERHAUL — core utilities
+// ============================================================================
+
+// r49: localStorage with safe JSON + try/catch (Safari Private Mode).
+const ls = {
+  get(key, fallback = null) {
+    try {
+      const v = localStorage.getItem(key);
+      if (v === null) return fallback;
+      try { return JSON.parse(v); } catch (_) { return v; }
+    } catch (_) { return fallback; }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value));
+    } catch (_) {}
+  },
+};
+
+// r49: persistent state hook backed by localStorage. Survives reload.
+function usePersistentState(key, initial) {
+  const [v, setV] = useState(() => {
+    const stored = ls.get(key, undefined);
+    return stored !== undefined ? stored : (typeof initial === 'function' ? initial() : initial);
+  });
+  useEffect(() => { ls.set(key, v); }, [key, v]);
+  return [v, setV];
+}
+
+// r49: density mode. 'compact' = tight grids, smaller cards, scannable.
+function useDensity() {
+  const [density, setDensity] = usePersistentState('uiDensity', 'regular');
+  useEffect(() => {
+    document.documentElement.setAttribute('data-density', density);
+  }, [density]);
+  return [density, setDensity];
+}
+
+// r49: friendly-error mapper. Convert raw fetch / SQL / broker errors
+// into ops-readable strings. Falls back to passthrough.
+function friendlyError(e) {
+  if (!e) return '';
+  const raw = String(e?.detail || e?.message || e);
+  const lower = raw.toLowerCase();
+  if (/insufficient/.test(lower) && /buying power/.test(lower)) return 'Buying power exhausted. New entries paused.';
+  if (/pattern day trader/.test(lower) || /pdt/.test(lower)) return 'PDT violation — bot locked out 24h.';
+  if (/wash trade/.test(lower)) return 'Wash-trade rejection (same-day reverse).';
+  if (/sub.?penny/.test(lower)) return 'Sub-penny rejection — limit price below tick size.';
+  if (/not tradable|halt/.test(lower)) return 'Asset not tradable (halted or delisted).';
+  if (/connection|timeout|refused|unreachable/.test(lower)) return 'Network error. Retry.';
+  if (/forbidden|401|unauthorized/.test(lower)) return 'Auth expired — log in again.';
+  if (/database is locked/.test(lower)) return 'Database busy — retrying automatically.';
+  if (lower.length > 220) return raw.slice(0, 220) + '…';
+  return raw;
+}
+
+// ============================================================================
+// r49: undoable toast system (replaces native confirm/alert for destructive ops)
+// ============================================================================
+const _undoActions = new Map(); // id → { action, label, expires }
+const _toastListeners = new Set();
+let _toastSeq = 1;
+
+function toast(opts) {
+  const id = _toastSeq++;
+  const t = {
+    id,
+    msg: opts.msg || '',
+    kind: opts.kind || 'info',  // 'info' | 'success' | 'warn' | 'error'
+    duration: opts.duration ?? 4000,
+    actionLabel: opts.actionLabel || null,
+    onAction: opts.onAction || null,
+    createdAt: Date.now(),
+  };
+  _toastListeners.forEach(fn => fn({ type: 'add', toast: t }));
+  if (t.duration > 0) {
+    setTimeout(() => _toastListeners.forEach(fn => fn({ type: 'remove', id })), t.duration);
+  }
+  return id;
+}
+
+// r49: undoable destructive action. Stages the operation; if not undone in
+// `delayMs`, executes. Returns a cancel function.
+function stageAction({ label, delayMs = 4000, onConfirm, onUndo, kind = 'warn' }) {
+  let cancelled = false;
+  const id = _toastSeq++;
+  const undo = () => {
+    if (cancelled) return;
+    cancelled = true;
+    _toastListeners.forEach(fn => fn({ type: 'remove', id }));
+    if (onUndo) try { onUndo(); } catch (_) {}
+  };
+  _toastListeners.forEach(fn => fn({
+    type: 'add',
+    toast: {
+      id,
+      msg: label,
+      kind,
+      duration: delayMs,
+      actionLabel: 'Undo',
+      onAction: undo,
+      createdAt: Date.now(),
+      progress: true,
+      progressMs: delayMs,
+    },
+  }));
+  setTimeout(() => {
+    if (cancelled) return;
+    cancelled = true;
+    _toastListeners.forEach(fn => fn({ type: 'remove', id }));
+    try { onConfirm(); } catch (e) { toast({ msg: 'Action failed: ' + friendlyError(e), kind: 'error' }); }
+  }, delayMs);
+  return undo;
+}
+
+function ToastHost() {
+  const [items, setItems] = useState([]);
+  useEffect(() => {
+    const onEvent = (ev) => {
+      if (ev.type === 'add') setItems(arr => [...arr, ev.toast]);
+      else if (ev.type === 'remove') setItems(arr => arr.filter(t => t.id !== ev.id));
+    };
+    _toastListeners.add(onEvent);
+    return () => _toastListeners.delete(onEvent);
+  }, []);
+  if (items.length === 0) return null;
+  const colorMap = {
+    success: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200',
+    warn: 'border-amber-500/50 bg-amber-500/15 text-amber-100',
+    error: 'border-red-500/50 bg-red-500/15 text-red-100',
+    info: 'border-blue-500/40 bg-blue-500/10 text-blue-200',
+  };
+  return (
+    <div className="fixed bottom-4 right-4 z-[60] space-y-2 max-w-sm">
+      {items.map(t => (
+        <div
+          key={t.id}
+          role={t.kind === 'error' || t.kind === 'warn' ? 'alert' : 'status'}
+          className={`relative rounded-lg border px-3 py-2.5 shadow-xl text-xs ${colorMap[t.kind] || colorMap.info}`}
+        >
+          <div className="flex items-start gap-3">
+            <div className="flex-1 leading-relaxed">{t.msg}</div>
+            {t.actionLabel && (
+              <button
+                onClick={() => { try { t.onAction?.(); } catch (_) {} }}
+                className="font-bold underline whitespace-nowrap focus:outline-none focus:ring-2 focus:ring-white/40 rounded px-1"
+              >
+                {t.actionLabel}
+              </button>
+            )}
+          </div>
+          {t.progress && (
+            <div className="absolute left-0 right-0 bottom-0 h-0.5 bg-white/30 rounded-b-lg overflow-hidden">
+              <div
+                className="h-full bg-white"
+                style={{
+                  animation: `r49ToastProgress ${t.progressMs}ms linear forwards`,
+                }}
+              />
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================================
+// r49: SWR-style shared query layer with single-flight + visibility gating
+// ============================================================================
+const _swrCache = new Map(); // key → { data, ts, promise }
+const _swrSubs = new Map();  // key → Set<setter>
+
+function _swrNotify(key) {
+  const subs = _swrSubs.get(key);
+  if (!subs) return;
+  const v = _swrCache.get(key);
+  subs.forEach(s => s(v));
+}
+
+async function _swrFetch(key, fetcher) {
+  const existing = _swrCache.get(key);
+  if (existing?.promise) return existing.promise;  // single-flight
+  const p = (async () => {
+    try {
+      const data = await fetcher();
+      _swrCache.set(key, { data, ts: Date.now(), promise: null });
+      _swrNotify(key);
+      return data;
+    } catch (e) {
+      _swrCache.set(key, { data: existing?.data, ts: existing?.ts, promise: null, error: e });
+      _swrNotify(key);
+      throw e;
+    }
+  })();
+  _swrCache.set(key, { ...(existing || {}), promise: p });
+  return p;
+}
+
+function useSWR(key, fetcher, { intervalMs = 30000, enabled = true } = {}) {
+  const [state, setState] = useState(() => _swrCache.get(key) || { data: undefined, ts: 0 });
+  const fetcherRef = useRef(fetcher);
+  useEffect(() => { fetcherRef.current = fetcher; }, [fetcher]);
+  useEffect(() => {
+    if (!enabled || !key) return;
+    if (!_swrSubs.has(key)) _swrSubs.set(key, new Set());
+    _swrSubs.get(key).add(setState);
+    // Initial fetch if cache stale.
+    const cached = _swrCache.get(key);
+    if (!cached || (Date.now() - (cached.ts || 0)) > Math.max(1000, intervalMs / 2)) {
+      _swrFetch(key, () => fetcherRef.current()).catch(() => {});
+    }
+    const iv = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      _swrFetch(key, () => fetcherRef.current()).catch(() => {});
+    }, intervalMs);
+    const onVis = () => {
+      if (document.visibilityState === 'visible') {
+        _swrFetch(key, () => fetcherRef.current()).catch(() => {});
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener('visibilitychange', onVis);
+      _swrSubs.get(key)?.delete(setState);
+    };
+  }, [key, intervalMs, enabled]);
+  return {
+    data: state?.data,
+    error: state?.error,
+    loading: !state?.data && !state?.error,
+    refresh: () => _swrFetch(key, () => fetcherRef.current()),
+  };
+}
+
+function swrInvalidate(prefix) {
+  const keys = Array.from(_swrCache.keys()).filter(k => !prefix || k.startsWith(prefix));
+  keys.forEach(k => {
+    _swrCache.delete(k);
+    _swrNotify(k);
+  });
+}
+
+// ============================================================================
+// r49: keyboard shortcuts (palette, navigation, quick actions)
+// ============================================================================
+const _kbListeners = new Set();
+function _kbHandler(e) {
+  // Don't intercept while typing in inputs (unless ⌘/Ctrl+K explicitly).
+  const tag = (e.target?.tagName || '').toUpperCase();
+  const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable;
+  const cmd = e.metaKey || e.ctrlKey;
+  const k = (e.key || '').toLowerCase();
+  for (const fn of _kbListeners) {
+    try { fn({ key: k, cmd, shift: e.shiftKey, alt: e.altKey, isInput, raw: e }); } catch (_) {}
+  }
+}
+if (typeof window !== 'undefined' && !window.__r49KbInstalled) {
+  window.addEventListener('keydown', _kbHandler);
+  window.__r49KbInstalled = true;
+}
+
+function useKeyboard(callback, deps = []) {
+  useEffect(() => {
+    _kbListeners.add(callback);
+    return () => _kbListeners.delete(callback);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+}
+
+// ============================================================================
+// r49: notification persistence (alert inbox)
+// ============================================================================
+function pushNotification(n) {
+  try {
+    const arr = ls.get('notifInbox', []) || [];
+    arr.unshift({ ...n, id: _toastSeq++, ts: Date.now() });
+    while (arr.length > 100) arr.pop();
+    ls.set('notifInbox', arr);
+    window.dispatchEvent(new CustomEvent('app:notif'));
+  } catch (_) {}
+}
+function useNotifications() {
+  const [arr, setArr] = useState(() => ls.get('notifInbox', []) || []);
+  useEffect(() => {
+    const onChange = () => setArr(ls.get('notifInbox', []) || []);
+    window.addEventListener('app:notif', onChange);
+    return () => window.removeEventListener('app:notif', onChange);
+  }, []);
+  const unread = arr.filter(n => !n.read).length;
+  const markRead = useCallback(() => {
+    const now = ls.get('notifInbox', []) || [];
+    ls.set('notifInbox', now.map(n => ({ ...n, read: true })));
+    window.dispatchEvent(new CustomEvent('app:notif'));
+  }, []);
+  const clear = useCallback(() => {
+    ls.set('notifInbox', []);
+    window.dispatchEvent(new CustomEvent('app:notif'));
+  }, []);
+  return { items: arr, unread, markRead, clear };
+}
+
+// ============================================================================
+// r49: directional / colour-blind icons (▲/▼ paired with colour for redundancy)
+// ============================================================================
+function DirIcon({ dir, className = '' }) {
+  if (dir === 'up' || dir === 'BUY') return <span className={`inline-block ${className}`} aria-hidden="true">▲</span>;
+  if (dir === 'down' || dir === 'SELL') return <span className={`inline-block ${className}`} aria-hidden="true">▼</span>;
+  return <span className={`inline-block ${className}`} aria-hidden="true">●</span>;
+}
+
+// ============================================================================
+// r49: GLOBAL ERROR BOUNDARY
+// ============================================================================
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) {
+    try {
+      console.error('UI error:', error, info);
+      // Forward to backend frontend-error endpoint (added in r48).
+      fetch(`${API_BASE}/api/log/frontend-error`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          msg: String(error?.message || error),
+          stack: String(error?.stack || ''),
+          url: window.location.href,
+          componentStack: info?.componentStack || '',
+        }),
+      }).catch(() => {});
+    } catch (_) {}
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div role="alert" className="m-4 p-4 rounded-xl border border-red-500/50 bg-red-500/10 text-red-100">
+          <div className="font-bold mb-1">Something broke in the UI.</div>
+          <div className="text-xs opacity-80 mb-2">Error: {String(this.state.error.message || this.state.error)}</div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => this.setState({ error: null })}
+              className="px-3 py-1 rounded-md bg-white/10 hover:bg-white/20 text-xs font-semibold"
+            >Reset panel</button>
+            <button
+              onClick={() => window.location.reload()}
+              className="px-3 py-1 rounded-md bg-white/10 hover:bg-white/20 text-xs font-semibold"
+            >Reload app</button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ============================================================================
+// r49: small visual helpers
+// ============================================================================
+function Sparkline({ values = [], width = 120, height = 32, stroke = '#10b981', fill = 'rgba(16,185,129,0.18)' }) {
+  if (!values || values.length < 2) return <svg width={width} height={height} />;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const step = width / (values.length - 1);
+  const pts = values.map((v, i) => `${(i * step).toFixed(1)},${(height - ((v - min) / span) * height).toFixed(1)}`);
+  const d = 'M' + pts.join(' L');
+  const fillD = `${d} L${width},${height} L0,${height} Z`;
+  return (
+    <svg width={width} height={height} aria-hidden="true">
+      <path d={fillD} fill={fill} />
+      <path d={d} fill="none" stroke={stroke} strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+function ProgressBar({ pct, danger = false, warn = false }) {
+  const w = Math.max(0, Math.min(100, pct || 0));
+  const barColor = danger
+    ? 'bg-gradient-to-r from-red-500 to-rose-500'
+    : warn
+    ? 'bg-gradient-to-r from-amber-500 to-orange-500'
+    : 'bg-gradient-to-r from-blue-500 to-indigo-500';
+  return (
+    <div className="h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--surface-border)' }}>
+      <div className={`h-full transition-all ${barColor}`} style={{ width: `${w}%` }} />
+    </div>
+  );
+}
+
+// r49: R-multiple progress bar — entry left, stop also left, T1/T2/T3 to right.
+// Shows where current price is on the entry → T3 axis with stop sentinel.
+function RProgressBar({ entry, stop, target1, target2, target3, current, side = 'BUY' }) {
+  if (!entry || !stop || !current) return null;
+  const isLong = side === 'BUY';
+  // Range from stop → max(targets, current)
+  const lo = isLong ? stop : Math.max(target1 || 0, target2 || 0, target3 || 0, current);
+  const hi = isLong ? Math.max(target1 || 0, target2 || 0, target3 || 0, current) : stop;
+  if (lo >= hi) return null;
+  const span = hi - lo;
+  const pos = (v) => `${Math.max(0, Math.min(100, ((v - lo) / span) * 100))}%`;
+  const r = (current - entry) / Math.max(1e-9, Math.abs(entry - stop)) * (isLong ? 1 : -1);
+  const winning = r >= 0;
+  return (
+    <div className="relative h-3 rounded-full overflow-hidden border app-border-soft" style={{ background: 'rgba(148,163,184,0.08)' }}>
+      {/* entry → current shaded */}
+      <div
+        className={`absolute top-0 bottom-0 ${winning ? 'bg-emerald-500/30' : 'bg-red-500/30'}`}
+        style={{
+          left: isLong ? pos(entry) : pos(current),
+          right: isLong ? `calc(100% - ${pos(current)})` : `calc(100% - ${pos(entry)})`,
+        }}
+      />
+      {/* Stop tick */}
+      <div className="absolute top-0 bottom-0 w-0.5 bg-red-500" style={{ left: pos(stop) }} title={`Stop ${stop}`} />
+      {/* Entry tick */}
+      <div className="absolute top-0 bottom-0 w-0.5 bg-blue-400" style={{ left: pos(entry) }} title={`Entry ${entry}`} />
+      {[target1, target2, target3].filter(Boolean).map((t, i) => (
+        <div key={i} className="absolute top-0 bottom-0 w-0.5 bg-emerald-400/70" style={{ left: pos(t) }} title={`T${i + 1} ${t}`} />
+      ))}
+      {/* Current marker */}
+      <div className="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full bg-white border-2 border-blue-500 shadow-md"
+           style={{ left: `calc(${pos(current)} - 5px)` }} title={`Now ${current}`} />
+    </div>
+  );
+}
+
 // ---------- Theme ----------
 // Persist in localStorage; the index.html pre-paint script applies it before
 // the React tree mounts so there is never a flash of the wrong theme.
@@ -364,6 +793,637 @@ function SignalBadge({ type, confidence, isNew }) {
   );
 }
 
+// ============================================================================
+// r49: NEW WIDGETS — equity curve, command bar, freshness, daily-loss, sectors, alert inbox, quick-trade palette
+// ============================================================================
+
+// r49: data-feed freshness strip — shows live status of each upstream feed
+function FreshnessStrip({ liveConnected }) {
+  const { data: health } = useSWR('/api/health', () => api.get('/api/health'), { intervalMs: 15000 });
+  const items = useMemo(() => {
+    const arr = [];
+    arr.push({
+      label: 'Quotes',
+      ok: !!liveConnected,
+      hint: liveConnected ? 'WS connected' : 'WS disconnected',
+    });
+    if (health) {
+      arr.push({ label: 'Broker', ok: !health.broker_down, hint: health.broker_down ? 'Down' : 'OK' });
+      arr.push({ label: 'BP', ok: !health.bp_breaker_active, hint: health.bp_breaker_active ? 'Exhausted' : 'OK' });
+      arr.push({ label: 'PDT', ok: !health.pdt_locked, hint: health.pdt_locked ? 'Locked 24h' : 'OK' });
+      arr.push({ label: 'DB', ok: !health.db_down, hint: health.db_down ? 'Down' : 'OK' });
+      if (health.crisis_mode) arr.push({ label: 'Crisis', ok: false, hint: 'Crisis mode active' });
+    }
+    return arr;
+  }, [health, liveConnected]);
+  return (
+    <div className="flex items-center gap-2 flex-wrap text-[10px]" role="status" aria-label="Data feed health">
+      {items.map((it, i) => (
+        <span
+          key={i}
+          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border font-semibold uppercase tracking-wider ${
+            it.ok
+              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400'
+              : 'border-red-500/40 bg-red-500/10 text-red-400'
+          }`}
+          title={it.hint}
+        >
+          <span className={`w-1.5 h-1.5 rounded-full ${it.ok ? 'bg-emerald-400' : 'bg-red-400'}`} />
+          {it.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// r49: equity curve panel — area chart of equity over N days + drawdown shaded
+function EquityCurvePanel({ lookbackDays = 30 }) {
+  const { data, error, refresh } = useSWR(
+    `/api/trading/equity-curve?lookback_days=${lookbackDays}`,
+    () => api.get(`/api/trading/equity-curve?lookback_days=${lookbackDays}`),
+    { intervalMs: 60000 }
+  );
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef({});
+  useEffect(() => {
+    if (!containerRef.current || !window.LightweightCharts) return;
+    const chart = LightweightCharts.createChart(containerRef.current, {
+      width: containerRef.current.clientWidth,
+      height: 200,
+      ...chartThemeOptions(),
+    });
+    chartRef.current = chart;
+    seriesRef.current.equity = chart.addAreaSeries({
+      lineColor: '#3b82f6', topColor: 'rgba(59,130,246,0.4)', bottomColor: 'rgba(59,130,246,0.02)',
+      lineWidth: 2, priceLineVisible: false,
+    });
+    seriesRef.current.spy = chart.addLineSeries({
+      color: 'rgba(148,163,184,0.5)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+    });
+    const ro = new ResizeObserver(() => {
+      if (chartRef.current && containerRef.current)
+        chartRef.current.applyOptions({ width: containerRef.current.clientWidth });
+    });
+    ro.observe(containerRef.current);
+    return () => {
+      ro.disconnect();
+      try { chart.remove(); } catch (_) {}
+      chartRef.current = null;
+      seriesRef.current = {};
+    };
+  }, []);
+  useEffect(() => {
+    if (!data || !chartRef.current || !seriesRef.current.equity) return;
+    const points = (data.snapshots || []).map(s => {
+      const d = parseServerDate(s.ts);
+      if (!d) return null;
+      return { time: Math.floor(d.getTime() / 1000), value: s.equity };
+    }).filter(Boolean);
+    if (points.length) {
+      seriesRef.current.equity.setData(points);
+      // SPY-relative overlay: scale to a $100 baseline at start
+      if (data.spy_curve) {
+        const spy0 = data.spy_curve[0]?.spy_close;
+        const eq0 = points[0].value;
+        if (spy0 && eq0) {
+          const spyPts = data.spy_curve.map(p => {
+            const d = parseServerDate(p.ts);
+            if (!d) return null;
+            return { time: Math.floor(d.getTime() / 1000), value: eq0 * (p.spy_close / spy0) };
+          }).filter(Boolean);
+          seriesRef.current.spy.setData(spyPts);
+        }
+      }
+      chartRef.current.timeScale().fitContent();
+    }
+  }, [data]);
+  const stats = useMemo(() => {
+    if (!data?.snapshots?.length) return null;
+    const eq = data.snapshots.map(s => s.equity);
+    const start = eq[0], cur = eq[eq.length - 1];
+    const peak = Math.max(...eq);
+    const dd = ((cur - peak) / peak) * 100;
+    const ret = ((cur - start) / start) * 100;
+    return { start, cur, peak, dd, ret };
+  }, [data]);
+  return (
+    <div className="surface rounded-2xl p-4 shadow-xl">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-bold uppercase tracking-wider app-text-secondary">Equity Curve</h3>
+          <span className="text-[10px] app-text-muted">Last {lookbackDays}d · vs SPY</span>
+        </div>
+        {stats && (
+          <div className="flex items-center gap-3 text-xs font-mono">
+            <span className={stats.ret >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+              <DirIcon dir={stats.ret >= 0 ? 'up' : 'down'} /> {stats.ret >= 0 ? '+' : ''}{stats.ret.toFixed(2)}%
+            </span>
+            <span className="app-text-muted">DD <span className="text-red-400">{stats.dd.toFixed(2)}%</span></span>
+            <button onClick={refresh} className="app-text-muted hover:app-text-primary" aria-label="Refresh">↻</button>
+          </div>
+        )}
+      </div>
+      {error && <div role="alert" className="text-xs text-red-300 mb-2">{friendlyError(error)}</div>}
+      <div ref={containerRef} className="w-full" style={{ height: 200 }} />
+      {!data && !error && <div className="skel h-8 w-full mt-2" />}
+    </div>
+  );
+}
+
+// r49: daily loss + risk-budget progress
+function DailyLossProgress() {
+  const { data: status } = useSWR('/api/trading/auto/status', () => api.get('/api/trading/auto/status'), { intervalMs: 30000 });
+  const { data: health } = useSWR('/api/health', () => api.get('/api/health'), { intervalMs: 30000 });
+  if (!status) return null;
+  const cfg = status.config || {};
+  const equity = status.equity || 0;
+  const dailyLossLimitPct = cfg.daily_loss_limit_pct || 0.03;
+  const dailyLossLimitDollar = equity * dailyLossLimitPct;
+  // Pull today's P/L from auto-trader trades — naively use status fields if present
+  const todayLoss = Math.max(0, -(status.realized_today || 0));
+  const usedPct = dailyLossLimitDollar > 0 ? (todayLoss / dailyLossLimitDollar) * 100 : 0;
+  const sessionDd = (health?.session_dd_pct || 0) * 100;
+  return (
+    <div className="surface rounded-2xl p-4 shadow-xl" data-r49-card>
+      <div className="grid grid-cols-2 gap-3 text-xs">
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="app-text-secondary uppercase tracking-wider text-[10px] font-semibold">Daily Loss Used</span>
+            <span className="font-mono app-text-primary">${todayLoss.toFixed(0)} / ${dailyLossLimitDollar.toFixed(0)}</span>
+          </div>
+          <ProgressBar pct={usedPct} danger={usedPct >= 80} warn={usedPct >= 50} />
+          <div className="text-[10px] app-text-muted mt-1">{usedPct.toFixed(0)}% of {(dailyLossLimitPct * 100).toFixed(1)}% cap</div>
+        </div>
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <span className="app-text-secondary uppercase tracking-wider text-[10px] font-semibold">Session DD</span>
+            <span className="font-mono">{sessionDd.toFixed(2)}%</span>
+          </div>
+          <ProgressBar pct={Math.min(100, (sessionDd / 5) * 100)} danger={sessionDd >= 4} warn={sessionDd >= 2.5} />
+          <div className="text-[10px] app-text-muted mt-1">
+            {health?.crisis_mode ? <span className="text-red-400 font-semibold">⚠ CRISIS MODE</span> : 'Healthy'}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// r49: sector / correlation exposure widget
+function SectorExposureWidget({ positions = [] }) {
+  if (!positions || positions.length < 2) return null;
+  // Approximation — real backend has sector lookup via fundamentals; here we
+  // group by symbol prefix as a fallback if sector field missing.
+  const totals = {};
+  let total = 0;
+  positions.forEach(p => {
+    const notional = Math.abs((p.qty || 0) * (p.current_price || p.avg_entry_price || 0));
+    const sec = p.sector || p.industry || 'Unknown';
+    totals[sec] = (totals[sec] || 0) + notional;
+    total += notional;
+  });
+  const buckets = Object.entries(totals).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const colors = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#64748b'];
+  return (
+    <div className="surface rounded-2xl p-4 shadow-xl" data-r49-card>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-bold uppercase tracking-wider app-text-secondary">Sector Exposure</h3>
+        <span className="text-[10px] app-text-muted">{positions.length} positions · ${total.toFixed(0)}</span>
+      </div>
+      <div className="h-2 rounded-full overflow-hidden flex">
+        {buckets.map(([sec, val], i) => (
+          <div
+            key={sec}
+            style={{ width: `${(val / total) * 100}%`, background: colors[i % colors.length] }}
+            title={`${sec}: $${val.toFixed(0)} (${((val / total) * 100).toFixed(1)}%)`}
+          />
+        ))}
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-1 mt-3 text-[10px]">
+        {buckets.map(([sec, val], i) => (
+          <div key={sec} className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full" style={{ background: colors[i % colors.length] }} />
+            <span className="app-text-secondary truncate">{sec}</span>
+            <span className="ml-auto font-mono app-text-primary">{((val / total) * 100).toFixed(0)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// r49: command bar — sticky single-row exposure summary at top of trading view
+function CommandBar() {
+  const { data: status } = useSWR('/api/trading/auto/status', () => api.get('/api/trading/auto/status'), { intervalMs: 30000 });
+  const { data: health } = useSWR('/api/health', () => api.get('/api/health'), { intervalMs: 30000 });
+  const { data: account } = useSWR('/api/trading/account', () => api.get('/api/trading/account'), { intervalMs: 30000 });
+  if (!account && !status) {
+    return <div className="surface rounded-xl p-3 skel h-14" data-r49-card />;
+  }
+  const equity = account?.equity || status?.equity || 0;
+  const bp = account?.buying_power || 0;
+  const today = status?.realized_today || 0;
+  const dd = (health?.session_dd_pct || 0) * 100;
+  const heat = status?.current_heat_pct ?? null;
+  const heatCap = (status?.config?.max_pct_of_equity || 0.5) * 100;
+  const cells = [
+    { label: 'Equity', value: `$${equity.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, kind: '' },
+    { label: 'Today P/L', value: `${today >= 0 ? '+' : ''}$${today.toFixed(0)}`, kind: today >= 0 ? 'good' : 'bad', icon: today >= 0 ? 'up' : 'down' },
+    { label: 'DD', value: `${dd.toFixed(2)}%`, kind: dd >= 4 ? 'bad' : dd >= 2 ? 'warn' : '' },
+    { label: 'BP', value: `$${bp.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, kind: '' },
+    { label: 'Heat', value: heat != null ? `${heat.toFixed(1)}%/${heatCap.toFixed(0)}%` : '—', kind: heat != null && heat >= heatCap * 0.85 ? 'warn' : '' },
+    { label: 'Mode', value: health?.crisis_mode ? 'CRISIS' : (status?.enabled ? 'ARMED' : 'PAUSED'), kind: health?.crisis_mode ? 'bad' : (status?.enabled ? 'good' : 'warn') },
+  ];
+  const kindClass = { good: 'text-emerald-400', bad: 'text-red-400', warn: 'text-amber-400' };
+  return (
+    <div className="surface rounded-xl px-3 py-2 shadow-xl border app-border-soft" data-r49-card>
+      <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
+        {cells.map((c, i) => (
+          <div key={i} className="flex flex-col">
+            <div className="text-[9px] uppercase tracking-wider app-text-muted font-semibold">{c.label}</div>
+            <div className={`font-mono font-bold text-sm sm:text-base ${kindClass[c.kind] || 'app-text-primary'}`}>
+              {c.icon && <DirIcon dir={c.icon} className="text-xs mr-0.5" />}
+              {c.value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// r49: alert inbox — persistent notification surface; ⌘+K to open
+function AlertInbox() {
+  const { items, unread, markRead, clear } = useNotifications();
+  const [open, setOpen] = useState(false);
+  useKeyboard(({ key, cmd, isInput }) => {
+    if (cmd && key === 'i' && !isInput) {
+      setOpen(o => !o);
+      if (!open) markRead();
+    }
+    if (key === 'escape' && open) setOpen(false);
+  }, [open, markRead]);
+  return (
+    <>
+      <button
+        onClick={() => { setOpen(o => !o); if (!open) markRead(); }}
+        className="relative px-2.5 py-1 rounded-lg surface-soft border app-border-soft text-xs font-semibold app-text-secondary hover:app-text-primary"
+        aria-label={`Alerts inbox${unread ? ` (${unread} unread)` : ''}`}
+        title="⌘I — Alert inbox"
+      >
+        🔔
+        {unread > 0 && (
+          <span className="absolute -top-1 -right-1 bg-red-500 text-white text-[9px] font-bold rounded-full w-4 h-4 flex items-center justify-center">
+            {unread > 9 ? '9+' : unread}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div
+          role="dialog"
+          aria-label="Alert inbox"
+          className="fixed top-14 right-4 w-80 max-h-[70vh] overflow-y-auto z-50 surface rounded-xl border app-border shadow-2xl"
+        >
+          <div className="p-3 border-b app-border flex items-center justify-between">
+            <h3 className="text-sm font-bold">Notifications</h3>
+            <div className="flex gap-2">
+              <button onClick={clear} className="text-xs app-text-muted hover:app-text-primary">Clear</button>
+              <button onClick={() => setOpen(false)} className="text-xs app-text-muted hover:app-text-primary" aria-label="Close">✕</button>
+            </div>
+          </div>
+          {items.length === 0 ? (
+            <div className="p-4 text-xs app-text-muted text-center">No notifications.</div>
+          ) : (
+            <div className="divide-y app-border-soft">
+              {items.map(n => (
+                <div key={n.id} className="p-3 text-xs">
+                  <div className="flex items-start gap-2">
+                    <span className={`inline-block w-1.5 h-1.5 rounded-full mt-1.5 ${
+                      n.severity === 'critical' || n.severity === 'error' ? 'bg-red-400' :
+                      n.severity === 'warning' ? 'bg-amber-400' :
+                      n.severity === 'success' ? 'bg-emerald-400' : 'bg-blue-400'
+                    }`} />
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium leading-relaxed">{n.message || n.msg}</div>
+                      <div className="text-[10px] app-text-muted mt-1">
+                        {n.category} · {new Date(n.ts).toLocaleString()}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+// r49: quick-trade ticket palette — ⌘+K opens; ticker + side + qty + bracket
+function QuickTradePalette({ onClose }) {
+  const [ticker, setTicker] = useState('');
+  const [side, setSide] = useState('buy');
+  const [qty, setQty] = useState(10);
+  const [type, setType] = useState('market');
+  const [submitting, setSubmitting] = useState(false);
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => { inputRef.current?.focus(); }, []);
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Quick analysis preview when ticker entered
+  useEffect(() => {
+    if (!ticker || ticker.length < 1) { setAnalysis(null); return; }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      api.get(`/api/analysis/${ticker.toUpperCase()}`)
+        .then(d => { if (!cancelled) setAnalysis(d); })
+        .catch(() => { if (!cancelled) setAnalysis(null); });
+    }, 250);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [ticker]);
+
+  const submit = async () => {
+    if (!ticker || qty < 1) { setErr('Ticker + qty required'); return; }
+    setSubmitting(true); setErr(null); setResult(null);
+    try {
+      const sig = analysis?.primary_signal;
+      const payload = {
+        symbol: ticker.toUpperCase(),
+        qty: Number(qty),
+        side,
+        entry_type: type,
+        time_in_force: 'gtc',
+      };
+      if (sig?.target1) payload.take_profit = sig.target1;
+      if (sig?.stop_loss) payload.stop_loss = sig.stop_loss;
+      const res = await api.post('/api/trading/order', payload);
+      setResult(res);
+      pushNotification({ severity: 'info', category: 'order_submitted', message: `Quick-ticket ${side.toUpperCase()} ${qty} ${ticker.toUpperCase()} → ${res.id?.slice(0, 8)}` });
+      swrInvalidate('/api/trading');
+      setTimeout(onClose, 1500);
+    } catch (e) {
+      setErr(friendlyError(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[55] bg-black/60 flex items-start justify-center pt-24" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-label="Quick trade ticket"
+        className="surface rounded-2xl border app-border w-full max-w-lg shadow-2xl mx-4"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="p-4 border-b app-border flex items-center justify-between">
+          <div>
+            <h3 className="text-lg font-bold">Quick Ticket</h3>
+            <div className="text-[11px] app-text-muted">⌘K · Esc to close</div>
+          </div>
+          <button onClick={onClose} className="app-text-muted hover:app-text-primary" aria-label="Close">✕</button>
+        </div>
+        <div className="p-4 space-y-3">
+          <div>
+            <label className="text-[10px] uppercase tracking-wider app-text-muted block mb-1">Ticker</label>
+            <input
+              ref={inputRef}
+              value={ticker}
+              onChange={e => setTicker(e.target.value.toUpperCase())}
+              placeholder="e.g. AAPL"
+              className="w-full bg-transparent border app-border rounded-lg px-3 py-2 text-lg font-mono font-bold focus:border-blue-500"
+            />
+          </div>
+          {analysis?.current_price && (
+            <div className="text-xs surface-soft rounded-lg p-2">
+              <div className="flex items-baseline gap-2">
+                <span className="font-mono font-bold text-base">${analysis.current_price.toFixed(2)}</span>
+                {analysis.change_pct != null && (
+                  <span className={analysis.change_pct >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                    {analysis.change_pct >= 0 ? '+' : ''}{analysis.change_pct.toFixed(2)}%
+                  </span>
+                )}
+                {analysis.primary_signal && (
+                  <span className="ml-auto">
+                    <SignalBadge type={analysis.primary_signal.signal_type} confidence={analysis.primary_signal.confidence} />
+                  </span>
+                )}
+              </div>
+              {analysis.primary_signal?.entry && (
+                <div className="text-[10px] app-text-muted mt-1 font-mono">
+                  Bot: entry ${analysis.primary_signal.entry.toFixed(2)} ·
+                  stop ${analysis.primary_signal.stop_loss?.toFixed(2)} ·
+                  T1 ${analysis.primary_signal.target1?.toFixed(2)}
+                </div>
+              )}
+            </div>
+          )}
+          <div className="grid grid-cols-3 gap-2">
+            <div>
+              <label className="text-[10px] uppercase tracking-wider app-text-muted block mb-1">Side</label>
+              <div className="flex gap-1">
+                <button
+                  onClick={() => setSide('buy')}
+                  className={`flex-1 px-2 py-1.5 rounded text-xs font-bold ${side === 'buy' ? 'bg-emerald-600 text-white' : 'surface-soft app-text-secondary'}`}
+                >▲ BUY</button>
+                <button
+                  onClick={() => setSide('sell')}
+                  className={`flex-1 px-2 py-1.5 rounded text-xs font-bold ${side === 'sell' ? 'bg-red-600 text-white' : 'surface-soft app-text-secondary'}`}
+                >▼ SELL</button>
+              </div>
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-wider app-text-muted block mb-1">Qty</label>
+              <input
+                type="number" min="1" max="10000" value={qty} onChange={e => setQty(Number(e.target.value))}
+                className="w-full bg-transparent border app-border rounded px-2 py-1.5 text-sm font-mono"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-wider app-text-muted block mb-1">Type</label>
+              <select
+                value={type} onChange={e => setType(e.target.value)}
+                className="w-full bg-transparent border app-border rounded px-2 py-1.5 text-xs"
+              >
+                <option value="market">Market</option>
+                <option value="limit_at_mid">Limit @ mid</option>
+              </select>
+            </div>
+          </div>
+          {err && <div role="alert" className="text-xs text-red-300 bg-red-500/10 border border-red-500/40 rounded p-2">⚠ {err}</div>}
+          {result && <div role="status" className="text-xs text-emerald-300 bg-emerald-500/10 border border-emerald-500/40 rounded p-2">✅ Submitted #{result.id?.slice(0, 8)}</div>}
+          <button
+            onClick={submit}
+            disabled={submitting || !ticker || qty < 1}
+            className="w-full py-2.5 rounded-lg font-bold bg-gradient-to-b from-blue-500 to-blue-600 disabled:opacity-50 text-white"
+          >
+            {submitting ? 'Submitting…' : `Submit ${side.toUpperCase()} ${qty} ${ticker || '—'}`}
+          </button>
+          <div className="text-[10px] app-text-muted text-center">Bracket attached when bot has a current signal · ⏎ submit · Esc cancel</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// r49: skip-link for accessibility
+function SkipLink() {
+  return <a href="#r49-main" className="r49-skip-link">Skip to main content</a>;
+}
+
+// r49: my-position banner — only when holding the analyzed ticker
+function MyPositionBanner({ ticker, position, currentPrice, signal }) {
+  if (!position || !currentPrice) return null;
+  const entry = position.avg_entry_price;
+  const stop = position.current_stop || (signal && signal.stop_loss);
+  const t1 = position.target1 || (signal && signal.target1);
+  const t2 = position.target2 || (signal && signal.target2);
+  const t3 = position.target3 || (signal && signal.target3);
+  const side = (position.side || (position.qty < 0 ? 'sell' : 'buy')).toLowerCase();
+  const isLong = side === 'buy' || side === 'long';
+  const direction = isLong ? 'BUY' : 'SELL';
+  const r = stop && entry
+    ? (currentPrice - entry) / Math.max(1e-9, Math.abs(entry - stop)) * (isLong ? 1 : -1)
+    : null;
+  const distToStop = stop ? Math.abs(currentPrice - stop) : null;
+  const distToStopPct = distToStop && currentPrice ? (distToStop / currentPrice) * 100 : null;
+  const winning = (position.unrealized_pl ?? 0) >= 0;
+
+  // Time held
+  const opened = parseServerDate(position.opened_at) || parseServerDate(position.created_at);
+  const heldMin = opened ? Math.max(0, (Date.now() - opened.getTime()) / 60000) : null;
+  const heldFmt = heldMin == null ? '—' :
+    heldMin < 60 ? `${heldMin.toFixed(0)}m` :
+    heldMin < 1440 ? `${(heldMin / 60).toFixed(1)}h` :
+    `${(heldMin / 1440).toFixed(1)}d`;
+
+  const closeUndoable = () => {
+    stageAction({
+      label: `Closing ${ticker} (${position.qty} sh) — undo within 4s`,
+      delayMs: 4000,
+      kind: 'warn',
+      onConfirm: async () => {
+        try {
+          await api.post(`/api/trading/close/${ticker}`);
+          toast({ msg: `Closed ${ticker}`, kind: 'success', duration: 3000 });
+          swrInvalidate('/api/trading');
+          window.dispatchEvent(new CustomEvent('app:trade_closed'));
+        } catch (e) {
+          toast({ msg: `Close ${ticker} failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
+        }
+      },
+    });
+  };
+
+  const moveStopBE = async () => {
+    if (!entry) return;
+    try {
+      await api.post('/api/trading/order', {
+        symbol: ticker,
+        action: 'move_stop_be',
+        new_stop: entry,
+      });
+      toast({ msg: 'Move-stop request sent', kind: 'success', duration: 3000 });
+    } catch (e) {
+      toast({ msg: `Move stop failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
+    }
+  };
+
+  return (
+    <div
+      className={`surface rounded-2xl border-2 ${winning ? 'border-emerald-500/40' : 'border-red-500/40'} p-4 shadow-xl`}
+      role="region"
+      aria-label="Your open position in this ticker"
+    >
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <span className="text-xs uppercase tracking-wider app-text-muted">Your Position</span>
+            <span className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${isLong ? 'bg-emerald-500/20 text-emerald-300' : 'bg-red-500/20 text-red-300'}`}>
+              <DirIcon dir={direction} /> {direction}
+            </span>
+          </div>
+          <div className="font-mono text-sm">
+            <span className="font-bold">{Math.abs(position.qty)}</span>
+            <span className="app-text-muted"> @ ${entry?.toFixed(2)}</span>
+          </div>
+          <div className="text-xs app-text-muted">held {heldFmt}</div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={moveStopBE}
+            className="text-xs px-2.5 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/40 font-semibold"
+            disabled={!entry}
+            title="Set stop-loss to break-even"
+          >Move stop → BE</button>
+          <button
+            onClick={closeUndoable}
+            className="text-xs px-2.5 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 font-semibold"
+          >Close (undoable)</button>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
+        <div>
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Now</div>
+          <div className="font-mono font-bold text-base">${currentPrice.toFixed(2)}</div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Unrealized</div>
+          <div className={`font-mono font-bold text-base ${winning ? 'text-emerald-400' : 'text-red-400'}`}>
+            {winning ? '+' : ''}${(position.unrealized_pl ?? 0).toFixed(2)}
+            <span className="text-xs ml-1">({(position.unrealized_plpc ?? 0).toFixed(2)}%)</span>
+          </div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">R-multiple</div>
+          <div className={`font-mono font-bold text-base ${r >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+            {r != null ? `${r >= 0 ? '+' : ''}${r.toFixed(2)}R` : '—'}
+          </div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Dist to stop</div>
+          <div className="font-mono font-bold text-base text-amber-400">
+            {distToStop != null ? `$${distToStop.toFixed(2)} (${distToStopPct?.toFixed(1)}%)` : '—'}
+          </div>
+        </div>
+        <div>
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Stop / T1</div>
+          <div className="font-mono text-xs">
+            <span className="text-red-400">${stop?.toFixed(2) ?? '—'}</span>
+            <span className="app-text-muted"> / </span>
+            <span className="text-emerald-400">${t1?.toFixed(2) ?? '—'}</span>
+          </div>
+        </div>
+      </div>
+      {entry && stop && (
+        <div className="mt-3">
+          <RProgressBar
+            entry={entry} stop={stop} target1={t1} target2={t2} target3={t3}
+            current={currentPrice} side={direction}
+          />
+          <div className="flex items-center justify-between mt-1 text-[9px] app-text-muted font-mono">
+            <span>Stop ${stop.toFixed(2)}</span>
+            <span>Entry ${entry.toFixed(2)}</span>
+            <span>{t1 ? `T1 $${t1.toFixed(2)}` : ''}</span>
+            <span>{t2 ? `T2 $${t2.toFixed(2)}` : ''}</span>
+            <span>{t3 ? `T3 $${t3.toFixed(2)}` : ''}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------- Watchlist Panel ----------
 // r42 fix #1.26: WatchlistPanel re-renders on every quote tick because
 // `overview` is memoized at the parent. Wrap with React.memo so equal-
@@ -373,6 +1433,9 @@ const WatchlistPanel = React.memo(function WatchlistPanelImpl({ overview, select
   const [newTicker, setNewTicker] = useState('');
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState(null);
+  // r49: watchlist sort + filter persisted to localStorage
+  const [sortKey, setSortKey] = usePersistentState('watchlistSort', 'default');
+  const [filterText, setFilterText] = useState('');
 
   const handleAdd = async (e) => {
     e.preventDefault();
@@ -388,6 +1451,20 @@ const WatchlistPanel = React.memo(function WatchlistPanelImpl({ overview, select
       setAdding(false);
     }
   };
+
+  const sortedOverview = useMemo(() => {
+    const arr = filterText
+      ? overview.filter(it => it.ticker.toLowerCase().includes(filterText.toLowerCase()))
+      : [...overview];
+    const cmp = {
+      'default': (a, b) => 0,
+      'ticker': (a, b) => a.ticker.localeCompare(b.ticker),
+      'change': (a, b) => (b.change_pct ?? -Infinity) - (a.change_pct ?? -Infinity),
+      'conf': (a, b) => (b.confidence ?? -Infinity) - (a.confidence ?? -Infinity),
+      'price': (a, b) => (b.price ?? 0) - (a.price ?? 0),
+    }[sortKey] || ((a, b) => 0);
+    return arr.sort(cmp);
+  }, [overview, sortKey, filterText]);
 
   return (
     <div className="w-full surface border-r app-border flex flex-col h-full">
@@ -412,11 +1489,34 @@ const WatchlistPanel = React.memo(function WatchlistPanelImpl({ overview, select
           />
           <button type="submit" disabled={adding} className="bg-gradient-to-b from-blue-500 to-blue-600 hover:from-blue-400 hover:to-blue-500 disabled:opacity-50 px-3 py-1.5 rounded-lg text-sm font-semibold shadow-lg shadow-blue-500/20">+</button>
         </form>
+        {/* r49: filter + sort */}
+        <div className="flex gap-1 mt-2">
+          <input
+            type="text"
+            value={filterText}
+            onChange={e => setFilterText(e.target.value)}
+            placeholder="Filter…"
+            className="flex-1 bg-transparent border app-border-soft rounded px-2 py-1 text-xs"
+            aria-label="Filter watchlist"
+          />
+          <select
+            value={sortKey}
+            onChange={e => setSortKey(e.target.value)}
+            className="bg-transparent border app-border-soft rounded px-1 py-1 text-[10px]"
+            aria-label="Sort watchlist"
+          >
+            <option value="default">Sort: order</option>
+            <option value="ticker">A→Z</option>
+            <option value="change">% chg</option>
+            <option value="conf">Conf</option>
+            <option value="price">Price</option>
+          </select>
+        </div>
         {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
       </div>
       <div className="flex-1 overflow-y-auto scrollbar-thin">
-        {overview.length === 0 && <div className="p-4 text-sm text-gray-500 text-center">No stocks yet. Add one above.</div>}
-        {overview.map((item) => (
+        {sortedOverview.length === 0 && <div className="p-4 text-sm text-gray-500 text-center">{overview.length === 0 ? 'No stocks yet. Add one above.' : 'No matches.'}</div>}
+        {sortedOverview.map((item) => (
           <div
             key={item.ticker}
             onClick={() => onSelect(item.ticker)}
@@ -471,7 +1571,19 @@ const WatchlistPanel = React.memo(function WatchlistPanelImpl({ overview, select
 });
 
 // ---------- Stock Chart ----------
-function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideIndicators = false }) {
+function StockChart({
+  ticker, timeframe, liveQuote = null, theme = 'dark',
+  hideIndicators = false,
+  // r49: layered overlay toggles (default all on for parity with prior code)
+  showMAs = true, showBB = true, showSR = true, showZones = true, showFibs = true, showNews = true,
+  // r49: trade-level rendering — entry/SL/T1/T2/T3 lines on chart
+  signal = null,
+  // r49: open-position overlay — entry-line + R-progress shading
+  position = null,
+  // r49: news markers (array of {timestamp, severity, headline, sentiment_label})
+  newsEvents = [],
+  height = 460,
+}) {
   const lastCandleRef = useRef(null);  // {time, open, high, low, close} of the bar we keep mutating
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -491,7 +1603,7 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
     if (!containerRef.current) return;
     const chart = LightweightCharts.createChart(containerRef.current, {
       width: containerRef.current.clientWidth,
-      height: 460,
+      height: height,
       ...chartThemeOptions(),
       crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
@@ -524,7 +1636,99 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
       chartRef.current = null;
       seriesRef.current = { candle: null, volume: null, indicators: {} };
     };
-  }, [theme]);
+  }, [theme, height]);
+
+  // r49: live-tick last-bar update is handled by the existing
+  // bar-roll-aware effect further down (around line ~1850); my new
+  // trade-level / position / news-marker effects below extend the chart
+  // without duplicating that logic.
+
+  // r49: trade-level overlay — render entry/SL/T1/T2/T3 horizontal lines
+  // when a signal is provided. Lines persist across data-loads via separate
+  // refs so they don't get cleared by `clearPriceLines()` in the data effect.
+  const tradeLineRefs = useRef([]);
+  useEffect(() => {
+    const c = seriesRef.current?.candle;
+    if (!c) return;
+    // Clear existing trade lines
+    for (const ln of tradeLineRefs.current) {
+      try { c.removePriceLine(ln); } catch (_) {}
+    }
+    tradeLineRefs.current = [];
+    if (!signal || hideIndicators) return;
+    const addLine = (price, color, title, lineWidth = 2, style = LightweightCharts.LineStyle.Solid) => {
+      if (!price || !Number.isFinite(price)) return;
+      try {
+        const ln = c.createPriceLine({ price, color, lineWidth, lineStyle: style, axisLabelVisible: true, title });
+        tradeLineRefs.current.push(ln);
+      } catch (_) {}
+    };
+    if (signal.entry) addLine(signal.entry, '#3b82f6', `Entry $${signal.entry.toFixed(2)}`, 2, LightweightCharts.LineStyle.Solid);
+    if (signal.stop_loss) addLine(signal.stop_loss, '#ef4444', `Stop $${signal.stop_loss.toFixed(2)}`, 2, LightweightCharts.LineStyle.Dashed);
+    if (signal.target1) addLine(signal.target1, '#10b981', `T1 $${signal.target1.toFixed(2)}`, 2, LightweightCharts.LineStyle.Dashed);
+    if (signal.target2) addLine(signal.target2, '#10b981', `T2 $${signal.target2.toFixed(2)}`, 1, LightweightCharts.LineStyle.Dashed);
+    if (signal.target3) addLine(signal.target3, '#10b981', `T3 $${signal.target3.toFixed(2)}`, 1, LightweightCharts.LineStyle.Dotted);
+    return () => {
+      const cc = seriesRef.current?.candle;
+      if (cc) for (const ln of tradeLineRefs.current) { try { cc.removePriceLine(ln); } catch (_) {} }
+      tradeLineRefs.current = [];
+    };
+  }, [signal?.entry, signal?.stop_loss, signal?.target1, signal?.target2, signal?.target3, hideIndicators]);
+
+  // r49: open-position overlay — entry-line + current-stop line. Distinct
+  // styling from signal-levels so trader can tell "what bot wants" vs "what
+  // I actually have".
+  const positionLineRefs = useRef([]);
+  useEffect(() => {
+    const c = seriesRef.current?.candle;
+    if (!c) return;
+    for (const ln of positionLineRefs.current) { try { c.removePriceLine(ln); } catch (_) {} }
+    positionLineRefs.current = [];
+    if (!position) return;
+    const addLine = (price, color, title, lineWidth, style) => {
+      if (!price || !Number.isFinite(price)) return;
+      try {
+        const ln = c.createPriceLine({ price, color, lineWidth, lineStyle: style, axisLabelVisible: true, title });
+        positionLineRefs.current.push(ln);
+      } catch (_) {}
+    };
+    if (position.avg_entry_price) {
+      addLine(position.avg_entry_price, '#a855f7', `★ Entry ${position.avg_entry_price.toFixed(2)}`, 3, LightweightCharts.LineStyle.Solid);
+    }
+    if (position.current_stop && position.current_stop !== position.avg_entry_price) {
+      addLine(position.current_stop, '#fb923c', `★ Stop ${position.current_stop.toFixed(2)}`, 2, LightweightCharts.LineStyle.Dashed);
+    }
+    return () => {
+      const cc = seriesRef.current?.candle;
+      if (cc) for (const ln of positionLineRefs.current) { try { cc.removePriceLine(ln); } catch (_) {} }
+      positionLineRefs.current = [];
+    };
+  }, [position?.avg_entry_price, position?.current_stop]);
+
+  // r49: news markers — vertical pins at bar timestamps for sev≥35 events.
+  useEffect(() => {
+    const c = seriesRef.current?.candle;
+    if (!c || !showNews || !newsEvents || newsEvents.length === 0) return;
+    // lightweight-charts v4 supports series.setMarkers([{time, position, color, shape, text}])
+    try {
+      const markers = newsEvents.slice(0, 30).map(n => {
+        const d = parseServerDate(n.published_at || n.ts);
+        if (!d) return null;
+        const time = Math.floor(d.getTime() / 1000);
+        const positive = n.sentiment_label === 'positive';
+        const negative = n.sentiment_label === 'negative';
+        return {
+          time,
+          position: positive ? 'belowBar' : 'aboveBar',
+          color: positive ? '#10b981' : negative ? '#ef4444' : '#94a3b8',
+          shape: positive ? 'arrowUp' : negative ? 'arrowDown' : 'circle',
+          text: '',
+        };
+      }).filter(Boolean);
+      c.setMarkers(markers);
+    } catch (_) {}
+    return () => { try { c.setMarkers([]); } catch (_) {} };
+  }, [newsEvents, showNews]);
 
   useEffect(() => {
     if (!ticker || !chartRef.current) return;
@@ -594,12 +1798,23 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
         lastDataRef.current = data;
 
         if (!hideIndicators) {
+          // r49: layered MA / BB toggles. Indicator names from the backend
+          // include SMA_20 / SMA_50 / SMA_200 / EMA_21 / BBU_20 / BBL_20 / BBM_20.
+          // MAs (showMAs=true): SMA*, EMA* | BB (showBB=true): BBU/BBL/BBM
+          const isBB = (n) => /^BB[ULM]/.test(n);
+          const isMA = (n) => /^(SMA|EMA)/.test(n);
           data.indicators.forEach(ind => {
+            const name = ind.name || '';
+            if (isBB(name) && !showBB) return;
+            if (isMA(name) && !showMAs) return;
+            // Other indicators (RSI, MACD, ATR) are handled in separate panes;
+            // gate them under showMAs as the broad "indicator overlay" toggle.
+            if (!isBB(name) && !isMA(name) && !showMAs) return;
             const lineSeries = chartRef.current.addLineSeries({
               color: ind.color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
             });
             lineSeries.setData(ind.values.filter(v => v.value != null));
-            seriesRef.current.indicators[ind.name] = lineSeries;
+            seriesRef.current.indicators[name] = lineSeries;
           });
         }
 
@@ -619,7 +1834,7 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
           setLoading(false);
           return;
         }
-        data.support_resistance.forEach(lvl => {
+        if (showSR) data.support_resistance.forEach(lvl => {
           addPriceLine({
             price: lvl.price,
             color: lvl.type === 'support' ? '#10b981' : '#ef4444',
@@ -631,7 +1846,7 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
         });
 
         // Supply/Demand zones — drawn as two price lines per zone (high + low) forming a band
-        const zones = data.supply_demand_zones || {};
+        const zones = showZones ? (data.supply_demand_zones || {}) : {};
         (zones.demand || []).forEach(z => {
           addPriceLine({
             price: z.high, color: 'rgba(16,185,129,0.55)', lineWidth: 1,
@@ -656,7 +1871,7 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
         });
 
         // Fibonacci retracements + extensions
-        const fib = data.fibonacci;
+        const fib = showFibs ? data.fibonacci : null;
         if (fib) {
           const KEY = new Set([0.382, 0.5, 0.618]);
           const retColor = (r) => KEY.has(r) ? 'rgba(250,204,21,0.85)' : 'rgba(250,204,21,0.45)';
@@ -762,7 +1977,7 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
     // lightweight-charts instance on theme change — without re-running the
     // data effect, the new chart instance renders empty (no candles,
     // indicators, or price lines).
-  }, [ticker, timeframe, hideIndicators, theme]);
+  }, [ticker, timeframe, hideIndicators, theme, showMAs, showBB, showSR, showZones, showFibs]);
 
   // ----- Live tick: extend OR ROLL the most recent bar based on wall-clock -----
   // Bug fix: previously this effect always mutated the most recent candle's
@@ -859,7 +2074,7 @@ function TimeframeSelector({ value, onChange }) {
 }
 
 // ---------- Signal Card ----------
-function SignalCard({ signal, currentPrice }) {
+function SignalCard({ signal, currentPrice, primarySignal = null }) {
   if (!signal) return null;
   const isBuy = signal.signal_type === 'BUY';
   const borderColor = isBuy ? 'border-emerald-600/50' : signal.signal_type === 'SELL' ? 'border-red-600/50' : 'border-gray-600/50';
@@ -868,19 +2083,34 @@ function SignalCard({ signal, currentPrice }) {
     ? (Math.abs(signal.target1 - signal.entry) / Math.abs(signal.entry - signal.stop_loss)).toFixed(2)
     : null;
 
+  // r49: dedup primary-signal duplication. When `signal` is for the user's
+  // current TF AND primarySignal is for a different TF, we surface a single
+  // pill that says "↗ Primary: 1d 75 BUY" rather than rendering a second card.
+  const showPrimaryPill = primarySignal
+    && primarySignal.timeframe !== signal.timeframe
+    && primarySignal.signal_type !== 'NEUTRAL';
+
   return (
-    <div className={`surface border ${borderColor} rounded-2xl p-5 shadow-xl shadow-black/20`}>
-      <div className="flex items-center justify-between mb-3">
+    <div className={`surface border ${borderColor} rounded-2xl p-5 shadow-xl shadow-black/20`} data-r49-card>
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div className="flex items-center gap-2 flex-wrap">
-          <h3 className="text-lg font-bold">Primary Signal</h3>
+          <h3 className="text-lg font-bold">Signal · {signal.timeframe}</h3>
           <SignalBadge type={signal.signal_type} confidence={signal.confidence} />
-          <span className="text-xs text-gray-500 uppercase">{signal.timeframe}</span>
+          <DirIcon dir={signal.signal_type} className={isBuy ? 'text-emerald-400' : signal.signal_type === 'SELL' ? 'text-red-400' : 'app-text-muted'} />
           {signal.strategy && (
             <span className="text-[10px] px-2 py-0.5 rounded bg-indigo-900/40 border border-indigo-700 text-indigo-300 uppercase tracking-wider" title="Strategy used to derive this signal">
               {signal.strategy}
             </span>
           )}
         </div>
+        {showPrimaryPill && (
+          <span
+            className="text-[10px] px-2 py-0.5 rounded surface-soft border app-border-soft app-text-secondary"
+            title={`Strongest signal across all timeframes: ${primarySignal.timeframe} ${primarySignal.signal_type} (${primarySignal.confidence})`}
+          >
+            ↗ Primary: {primarySignal.timeframe} {primarySignal.signal_type} {Math.round(primarySignal.confidence)}
+          </span>
+        )}
       </div>
       {signal.entry != null && (
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3 text-sm">
@@ -963,7 +2193,7 @@ function ReasoningBlock({ reasoning }) {
   const warnCount = rows.filter(r => r.kind === 'warn').length;
 
   // Collapsed by default when there are >6 rows; full list one click away.
-  const VISIBLE = 6;
+  const VISIBLE = 12;  // r49: was 6 — most signals have 8-12 reasoning lines, truncating mid-list creates extra clicks per signal
   const shown = expanded ? rows : rows.slice(0, VISIBLE);
   const hiddenCount = Math.max(0, rows.length - VISIBLE);
 
@@ -1697,15 +2927,36 @@ function NewsAnalysisSummary() {
 // ---------- Analysis View ----------
 function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeChanged = null, theme = 'dark' }) {
   const [analysis, setAnalysis] = useState(null);
-  const [timeframe, setTimeframe] = useState('1d');
+  const [timeframe, setTimeframe] = usePersistentState('analysisTF', '1d');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [hideIndicators, setHideIndicators] = useState(() => {
-    try { return localStorage.getItem('hideIndicators') === '1'; } catch (_) { return false; }
+  // r49: layered overlay toggles (replaces single hideIndicators).
+  // Persisted; default-on for parity. "Clean preset" = all off.
+  const [overlay, setOverlay] = usePersistentState('chartOverlay', {
+    mas: true, bb: true, sr: true, zones: true, fibs: true, news: true,
   });
-  useEffect(() => {
-    try { localStorage.setItem('hideIndicators', hideIndicators ? '1' : '0'); } catch (_) {}
-  }, [hideIndicators]);
+  const [hideIndicators, setHideIndicators] = usePersistentState('hideIndicators', false);
+  // r49: compact mode (smaller chart + collapsed defaults)
+  const [compactMode, setCompactMode] = usePersistentState('analysisCompact', false);
+
+  // r49: load my open position for this ticker — drives chart overlay + banner.
+  const { data: myPositionsRaw } = useSWR(
+    '/api/trading/positions',
+    () => api.get('/api/trading/positions'),
+    { intervalMs: 30000 }
+  );
+  const myPosition = useMemo(() => {
+    if (!ticker || !myPositionsRaw) return null;
+    return (myPositionsRaw || []).find(p => p.symbol === ticker) || null;
+  }, [myPositionsRaw, ticker]);
+
+  // r49: load news for this ticker to feed chart markers.
+  const { data: newsData } = useSWR(
+    ticker ? `/api/news/recent?ticker=${ticker}&limit=20` : null,
+    () => ticker ? api.get(`/api/news/recent?ticker=${ticker}&limit=20`) : Promise.resolve({}),
+    { intervalMs: 60000, enabled: !!ticker }
+  );
+  const newsEvents = useMemo(() => (newsData?.events || []).filter(n => (n.severity || 0) >= 35), [newsData]);
 
   // Track the ticker owned by the most-recent fetch. Stops a slow response
   // for ticker A from clobbering the UI after the user clicked ticker B.
@@ -1788,41 +3039,100 @@ function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeCh
         </div>
       </div>
 
-      {error && <div className="m-3 sm:m-4 p-3 bg-red-900/30 border border-red-800 rounded text-sm text-red-300">{error}</div>}
+      {error && <div role="alert" className="m-3 sm:m-4 p-3 bg-red-900/30 border border-red-800 rounded text-sm text-red-300">{friendlyError(error)}</div>}
 
       <div className="p-3 sm:p-4 space-y-3 sm:space-y-4">
-        <div className="surface rounded-xl overflow-hidden">
-          <div className="px-3 py-2 flex items-center justify-between border-b app-border text-xs">
-            <div className="app-text-muted uppercase tracking-widest">{timeframe} chart</div>
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={hideIndicators}
-                onChange={e => setHideIndicators(e.target.checked)}
-                className="accent-blue-500"
-              />
-              <span className="app-text-secondary">Hide all indicators</span>
-            </label>
-          </div>
-          <StockChart ticker={ticker} timeframe={timeframe} liveQuote={liveQuote} theme={theme} hideIndicators={hideIndicators} />
-        </div>
-
-        {analysis?.timeframe_alignment && <TimeframeAlignment alignment={analysis.timeframe_alignment} signals={analysis.signals} />}
-
-        {timeframeSignal && <SignalCard signal={timeframeSignal} currentPrice={analysis?.current_price} />}
-
-        {analysis?.primary_signal && timeframeSignal?.timeframe !== analysis.primary_signal.timeframe && (
-          <div>
-            <div className="text-xs text-gray-500 mb-2">Strongest signal across all timeframes:</div>
-            <SignalCard signal={analysis.primary_signal} currentPrice={analysis?.current_price} />
-          </div>
+        {/* r49: My-position banner — only when holding this ticker */}
+        {myPosition && analysis?.current_price && (
+          <MyPositionBanner ticker={ticker} position={myPosition} currentPrice={analysis.current_price} signal={analysis?.primary_signal} />
         )}
 
-        <NewsPanel ticker={ticker} />
+        <div className="surface rounded-xl overflow-hidden">
+          <div className="px-3 py-2 flex items-center justify-between border-b app-border text-xs flex-wrap gap-2">
+            <div className="app-text-muted uppercase tracking-widest">{timeframe} chart</div>
+            {/* r49: layered overlay toggles + Clean preset + compact mode */}
+            <div className="flex items-center gap-1 flex-wrap" role="group" aria-label="Chart overlays">
+              {[
+                { k: 'mas', label: 'MAs' },
+                { k: 'bb', label: 'BB' },
+                { k: 'sr', label: 'S/R' },
+                { k: 'zones', label: 'Zones' },
+                { k: 'fibs', label: 'Fibs' },
+                { k: 'news', label: 'News' },
+              ].map(t => (
+                <button
+                  key={t.k}
+                  onClick={() => setOverlay(o => ({ ...o, [t.k]: !o[t.k] }))}
+                  className={`text-[10px] px-1.5 py-0.5 rounded font-semibold uppercase tracking-wide ${
+                    overlay[t.k]
+                      ? 'bg-blue-500/20 border border-blue-500/40 text-blue-300'
+                      : 'border app-border-soft app-text-muted'
+                  }`}
+                  aria-pressed={overlay[t.k]}
+                >{t.label}</button>
+              ))}
+              <button
+                onClick={() => setOverlay({ mas: false, bb: false, sr: false, zones: false, fibs: false, news: false })}
+                className="text-[10px] px-1.5 py-0.5 rounded border app-border-soft app-text-muted"
+                title="Clean preset — all overlays off"
+              >Clean</button>
+              <button
+                onClick={() => setOverlay({ mas: true, bb: true, sr: true, zones: true, fibs: true, news: true })}
+                className="text-[10px] px-1.5 py-0.5 rounded border app-border-soft app-text-muted"
+                title="All overlays on"
+              >All</button>
+              <button
+                onClick={() => setCompactMode(c => !c)}
+                className={`text-[10px] px-1.5 py-0.5 rounded ${compactMode ? 'bg-amber-500/20 border border-amber-500/40 text-amber-300' : 'border app-border-soft app-text-muted'}`}
+                aria-pressed={compactMode}
+                title="Compact mode"
+              >⊟</button>
+            </div>
+          </div>
+          <StockChart
+            ticker={ticker}
+            timeframe={timeframe}
+            liveQuote={liveQuote}
+            theme={theme}
+            hideIndicators={hideIndicators}
+            showMAs={overlay.mas}
+            showBB={overlay.bb}
+            showSR={overlay.sr}
+            showZones={overlay.zones}
+            showFibs={overlay.fibs}
+            showNews={overlay.news}
+            signal={timeframeSignal || analysis?.primary_signal}
+            position={myPosition}
+            newsEvents={newsEvents}
+            height={compactMode ? 280 : 460}
+          />
+        </div>
 
-        <OptionsPanel ticker={ticker} signal={analysis?.primary_signal} />
+        {/* r49: TimeframeAlignment moves under chart but only when not compact */}
+        {!compactMode && analysis?.timeframe_alignment && <TimeframeAlignment alignment={analysis.timeframe_alignment} signals={analysis.signals} />}
 
-        <BacktestPanel ticker={ticker} />
+        {/* r49: dedup'd SignalCard — single card, internal TF tabs replace duplicate */}
+        {timeframeSignal && (
+          <SignalCard
+            signal={timeframeSignal}
+            currentPrice={analysis?.current_price}
+            // pass primary signal as a hint so card can show "↗ Primary: 1d 75 BUY" pill
+            primarySignal={analysis?.primary_signal}
+          />
+        )}
+
+        {/* r49: collapsed-by-default for News/Options/Backtest. Compact mode forces collapsed. */}
+        <CollapsibleSection title="News" defaultOpen={!compactMode && newsEvents.length > 0}>
+          <NewsPanel ticker={ticker} />
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Options" defaultOpen={false}>
+          <OptionsPanel ticker={ticker} signal={analysis?.primary_signal} />
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Backtest" defaultOpen={false}>
+          <BacktestPanel ticker={ticker} />
+        </CollapsibleSection>
       </div>
     </div>
   );
@@ -3139,35 +4449,45 @@ function TradingPanel({ ticker, reloadToken }) {
 
   const setBusyKey = (k, v) => setBusy(b => ({ ...b, [k]: v }));
 
-  const closePos = async (sym, p) => {
-    // r42 fix #1.17: per-symbol guard + qty/notional preview in confirm.
+  // r49 UX-P0: replace native confirm() with undoable toast — staged action,
+  // 4s undo window, friendly error feedback. No more "did I mean to click that?"
+  const closePos = (sym, p) => {
     if (busy[`close:${sym}`]) return;
     const notional = p?.qty != null && p?.current_price != null ? Math.abs(p.qty * p.current_price) : null;
-    const msg = `Close ${Math.abs(p?.qty || 0)} ${p?.side || ''} ${sym} at market?\n` +
-                (notional != null ? `Approx notional $${notional.toFixed(2)}.\n` : '') +
-                'This is a real broker order on your paper account.';
-    if (!confirm(msg)) return;
-    setBusyKey(`close:${sym}`, true); setActionError(null); setActionInfo(null);
-    try {
-      await api.post(`/api/trading/close/${sym}`);
-      setActionInfo(`Close submitted for ${sym}`);
-      await load();
-    } catch (e) {
-      setActionError(`Close ${sym} failed: ${e?.detail || e?.message || e}`);
-    } finally { setBusyKey(`close:${sym}`, false); }
+    const label = `Closing ${Math.abs(p?.qty || 0)} ${sym}${notional ? ` ≈ $${notional.toFixed(0)}` : ''} — undo within 4s`;
+    stageAction({
+      label, delayMs: 4000, kind: 'warn',
+      onConfirm: async () => {
+        setBusyKey(`close:${sym}`, true); setActionError(null); setActionInfo(null);
+        try {
+          await api.post(`/api/trading/close/${sym}`);
+          toast({ msg: `Close submitted for ${sym}`, kind: 'success', duration: 3000 });
+          pushNotification({ severity: 'info', category: 'manual_close', message: `Manually closed ${sym}` });
+          await load();
+        } catch (e) {
+          setActionError(`Close ${sym} failed: ${friendlyError(e)}`);
+          toast({ msg: `Close ${sym} failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
+        } finally { setBusyKey(`close:${sym}`, false); }
+      },
+    });
   };
-  const cancelOrd = async (id, label) => {
-    // r42 fix #1.16 + #2.14: confirm + show real error feedback (was empty catch).
+  const cancelOrd = (id, label) => {
     if (busy[`cxl:${id}`]) return;
-    if (!confirm(`Cancel order ${label || id}?`)) return;
-    setBusyKey(`cxl:${id}`, true); setActionError(null); setActionInfo(null);
-    try {
-      await api.delete(`/api/trading/orders/${id}`);
-      setActionInfo('Cancelled');
-      await load();
-    } catch (e) {
-      setActionError(`Cancel failed: ${e?.detail || e?.message || e}`);
-    } finally { setBusyKey(`cxl:${id}`, false); }
+    stageAction({
+      label: `Cancelling order ${label || id} — undo within 3s`,
+      delayMs: 3000, kind: 'warn',
+      onConfirm: async () => {
+        setBusyKey(`cxl:${id}`, true); setActionError(null); setActionInfo(null);
+        try {
+          await api.delete(`/api/trading/orders/${id}`);
+          toast({ msg: 'Order cancelled', kind: 'success', duration: 3000 });
+          await load();
+        } catch (e) {
+          setActionError(`Cancel failed: ${friendlyError(e)}`);
+          toast({ msg: `Cancel failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
+        } finally { setBusyKey(`cxl:${id}`, false); }
+      },
+    });
   };
 
   if (!account && !error) {
@@ -3250,33 +4570,55 @@ function TradingPanel({ ticker, reloadToken }) {
         </div>
       </div>
 
-      {/* Positions — collapsible with scrolling body */}
-      <div className="mb-4">
+      {/* r49 UX-P0: Sector exposure widget when N≥2 positions */}
+      <SectorExposureWidget positions={positions} />
+
+      {/* r49 UX-P0: Positions section — open by default when non-empty;
+          richer cards with R-progress, distance-to-stop, time held. */}
+      <div className="mb-4 mt-3">
         <CollapsibleSection
           title="Open Positions"
           count={positions.length}
-          defaultOpen={false}
-          maxHeight={460}
+          defaultOpen={positions.length > 0}
+          maxHeight={520}
         >
           {positions.length === 0 ? (
             <div className="text-center text-sm app-text-muted italic py-4">
               {/* r42 fix #1.22: distinguish "fetch failed" from "empty book". */}
-              {error ? <span className="text-amber-300">Couldn't load positions: {error}</span> : 'No open positions.'}
+              {error ? <span className="text-amber-300">Couldn't load positions: {friendlyError(error)}</span> : 'No open positions.'}
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
               {[...tickerPositions, ...otherPositions].map(p => {
                 const isWin = p.unrealized_pl >= 0;
                 const rowHighlight = p.symbol === ticker ? 'ring-1 ring-blue-500/50' : '';
+                const side = (p.side || (p.qty < 0 ? 'sell' : 'buy')).toLowerCase();
+                const isLong = side === 'buy' || side === 'long';
+                const direction = isLong ? 'BUY' : 'SELL';
+                const stop = p.current_stop || p.stop_loss;
+                const t1 = p.target1, t2 = p.target2, t3 = p.target3;
+                const r = stop && p.avg_entry_price && p.current_price
+                  ? (p.current_price - p.avg_entry_price) / Math.max(1e-9, Math.abs(p.avg_entry_price - stop)) * (isLong ? 1 : -1)
+                  : null;
+                const distToStop = stop && p.current_price ? Math.abs(p.current_price - stop) : null;
+                const distToStopPct = distToStop && p.current_price ? (distToStop / p.current_price) * 100 : null;
+                const opened = parseServerDate(p.opened_at) || parseServerDate(p.created_at);
+                const heldMin = opened ? Math.max(0, (Date.now() - opened.getTime()) / 60000) : null;
+                const heldFmt = heldMin == null ? '—' :
+                  heldMin < 60 ? `${heldMin.toFixed(0)}m` :
+                  heldMin < 1440 ? `${(heldMin / 60).toFixed(1)}h` :
+                  `${(heldMin / 1440).toFixed(1)}d`;
                 return (
-                  <div key={p.symbol} className={`app-bg-surface-solid rounded-xl p-3 lift border app-border-soft ${rowHighlight}`}>
+                  <div key={p.symbol} data-r49-card className={`app-bg-surface-solid rounded-xl p-3 lift border app-border-soft ${rowHighlight}`}>
                     <div className="flex items-start justify-between mb-2">
                       <div>
                         <div className="font-bold text-base flex items-center gap-2">
                           <span>{p.symbol}</span>
-                          <span className="text-[10px] px-1.5 py-0.5 rounded app-bg-surface-solid app-text-secondary uppercase tracking-wider">{p.side}</span>
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider ${isLong ? 'bg-emerald-500/20 text-emerald-300' : 'bg-red-500/20 text-red-300'}`}>
+                            <DirIcon dir={direction} /> {direction}
+                          </span>
                         </div>
-                        <div className="text-[11px] app-text-muted font-mono">Qty {p.qty} @ ${p.avg_entry_price.toFixed(2)}</div>
+                        <div className="text-[10px] app-text-muted font-mono">Qty {Math.abs(p.qty)} @ ${p.avg_entry_price?.toFixed(2)} · held {heldFmt}</div>
                       </div>
                       <button
                         disabled={!!busy[`close:${p.symbol}`]}
@@ -3286,22 +4628,34 @@ function TradingPanel({ ticker, reloadToken }) {
                         {busy[`close:${p.symbol}`] ? 'Closing…' : 'Close'}
                       </button>
                     </div>
-                    <div className="flex items-baseline justify-between">
+                    <div className="flex items-baseline justify-between mb-2">
                       <div>
-                        <div className="text-[10px] uppercase tracking-wider app-text-muted">Last</div>
-                        <div className="font-mono text-base font-semibold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
+                        <div className="text-[9px] uppercase tracking-wider app-text-muted">Last</div>
+                        <div className="font-mono text-base font-bold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
                       </div>
                       <div className="text-right">
                         <div className={`font-mono text-lg font-bold ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {isWin ? '+' : ''}${p.unrealized_pl.toFixed(2)}
+                          <DirIcon dir={isWin ? 'up' : 'down'} className="text-xs mr-1" />
+                          {isWin ? '+' : ''}${p.unrealized_pl?.toFixed(2)}
                         </div>
-                        <div className={`text-xs font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {/* Backend pre-multiplies Alpaca's `unrealized_plpc`
-                              fraction by 100 (services/paper_trader.py),
-                              so we render it directly here. */}
-                          {isWin ? '+' : ''}{p.unrealized_plpc.toFixed(2)}%
+                        <div className={`text-[10px] font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {isWin ? '+' : ''}{p.unrealized_plpc?.toFixed(2)}% · {r != null ? `${r >= 0 ? '+' : ''}${r.toFixed(2)}R` : '—'}
                         </div>
                       </div>
+                    </div>
+                    {p.avg_entry_price && stop && (
+                      <RProgressBar
+                        entry={p.avg_entry_price} stop={stop}
+                        target1={t1} target2={t2} target3={t3}
+                        current={p.current_price} side={direction}
+                      />
+                    )}
+                    <div className="grid grid-cols-3 gap-1 mt-2 text-[9px] font-mono">
+                      <div className="text-red-400">stop ${stop?.toFixed(2) ?? '—'}</div>
+                      <div className="text-amber-400 text-center">
+                        {distToStop != null ? `Δ$${distToStop.toFixed(2)} (${distToStopPct?.toFixed(1)}%)` : '—'}
+                      </div>
+                      <div className="text-emerald-400 text-right">T1 ${t1?.toFixed(2) ?? '—'}</div>
                     </div>
                   </div>
                 );
@@ -3311,77 +4665,172 @@ function TradingPanel({ ticker, reloadToken }) {
         </CollapsibleSection>
       </div>
 
-      {/* Recent orders — collapsible with scrolling body */}
-      <CollapsibleSection
-        title="Recent Orders"
-        count={orders.length}
-        defaultOpen={false}
-        maxHeight={420}
-      >
-        {(actionError || actionInfo) && (
-          <div className={`mb-2 text-xs px-2 py-1 rounded-md ${actionError ? 'bg-red-500/10 border border-red-500/40 text-red-200' : 'bg-emerald-500/10 border border-emerald-500/40 text-emerald-200'}`}>
-            {actionError || actionInfo}
-          </div>
-        )}
-        {orders.length === 0 ? (
-          <div className="text-center text-sm app-text-muted italic py-4">No orders yet.</div>
-        ) : (
-          // r42 fix #2.21: horizontal scroll wrapper for mobile.
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[640px] text-xs">
-              <thead className="sticky top-0 app-bg-surface-solid z-10">
-                <tr className="app-text-muted border-b app-border">
-                  <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Symbol</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
-                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
-                  <th className="py-2 px-3"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.map(o => {
-                  // r42 fix #2.18: precise side/status matching. Alpaca order
-                  // fields can be string enums ("OrderSide.BUY"), bare names
-                  // ("BUY"/"buy"), or full lower-case ("buy"). Normalize.
-                  const side = String(o.side || '').replace(/^OrderSide\./, '').toUpperCase();
-                  const isBuy = side === 'BUY';
-                  const status = String(o.status || '').replace(/^OrderStatus\./, '').toLowerCase();
-                  const cancellable = ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced'].includes(status);
-                  // r42 fix #2.10: render submitted timestamp in operator's TZ
-                  // with explicit format (was a raw HH:MM:SS slice from the
-                  // ISO string, which was UTC-time displayed without label).
-                  const submitted = parseServerDate(o.submitted_at);
-                  const submittedLabel = submitted ? submitted.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
-                  return (
-                    <tr key={o.id} className="border-b app-border-soft last:border-0 hover:bg-white/3">
-                      <td className="py-2 px-3 font-semibold font-mono">{o.symbol}</td>
-                      <td className={`text-right py-2 px-3 font-semibold ${isBuy ? 'text-emerald-400' : 'text-red-400'}`}>{side || '—'}</td>
-                      <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
-                      <td className="text-right py-2 px-3 app-text-muted">{String(o.type || '').replace(/^OrderType\./, '').toUpperCase()}</td>
-                      <td className="text-right py-2 px-3 app-text-secondary">{status.replace(/_/g, ' ')}</td>
-                      <td className="text-right py-2 px-3 app-text-muted font-mono" title={submitted ? submitted.toLocaleString() : ''}>{submittedLabel}</td>
-                      <td className="text-right py-2 px-3">
-                        {cancellable ? (
-                          <button
-                            disabled={!!busy[`cxl:${o.id}`]}
-                            aria-label={`Cancel order ${o.symbol}`}
-                            onClick={() => cancelOrd(o.id, `${o.symbol} ${side}`)}
-                            className="text-[10px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 app-text-secondary disabled:opacity-50 border app-border">
-                            {busy[`cxl:${o.id}`] ? '…' : 'Cancel'}
-                          </button>
-                        ) : null}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </CollapsibleSection>
+      {/* r49 UX-P0: Recent orders — filter chips + group-by-parent */}
+      <OrdersTable
+        orders={orders}
+        actionError={actionError}
+        actionInfo={actionInfo}
+        busy={busy}
+        onCancel={cancelOrd}
+      />
     </div>
+  );
+}
+
+// r49: orders table with filter chips + group-by-parent_order_id
+function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
+  const [filter, setFilter] = usePersistentState('ordersFilter', 'working');
+  const [grouped, setGrouped] = usePersistentState('ordersGrouped', true);
+  const [tickerFilter, setTickerFilter] = useState('');
+
+  const normStatus = (s) => String(s || '').replace(/^OrderStatus\./, '').toLowerCase();
+  const isWorking = (s) => ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced'].includes(s);
+  const isFilled = (s) => s === 'filled' || s === 'partially_filled';
+  const isCancelled = (s) => ['canceled', 'cancelled', 'rejected', 'expired'].includes(s);
+
+  const filteredOrders = useMemo(() => {
+    let arr = orders || [];
+    if (filter === 'working') arr = arr.filter(o => isWorking(normStatus(o.status)));
+    else if (filter === 'filled') arr = arr.filter(o => isFilled(normStatus(o.status)));
+    else if (filter === 'cancelled') arr = arr.filter(o => isCancelled(normStatus(o.status)));
+    if (tickerFilter) arr = arr.filter(o => String(o.symbol || '').toLowerCase().includes(tickerFilter.toLowerCase()));
+    return arr;
+  }, [orders, filter, tickerFilter]);
+
+  // Group by parent_order_id (legs roll up under their bracket parent)
+  const groups = useMemo(() => {
+    if (!grouped) return null;
+    const byId = new Map();
+    const out = [];
+    filteredOrders.forEach(o => {
+      const parentId = o.legs ? o.id : (o.parent_order_id || null);
+      if (parentId && parentId === o.id) {
+        // this is the parent
+        if (!byId.has(o.id)) byId.set(o.id, { parent: o, children: [] });
+        else byId.get(o.id).parent = o;
+        out.push(byId.get(o.id));
+      } else if (parentId) {
+        if (!byId.has(parentId)) byId.set(parentId, { parent: null, children: [], parentId });
+        byId.get(parentId).children.push(o);
+        if (!out.find(g => g.parentId === parentId || g.parent?.id === parentId)) out.push(byId.get(parentId));
+      } else {
+        out.push({ parent: o, children: [], parentId: o.id });
+      }
+    });
+    return out;
+  }, [filteredOrders, grouped]);
+
+  const counts = {
+    all: orders?.length || 0,
+    working: (orders || []).filter(o => isWorking(normStatus(o.status))).length,
+    filled: (orders || []).filter(o => isFilled(normStatus(o.status))).length,
+    cancelled: (orders || []).filter(o => isCancelled(normStatus(o.status))).length,
+  };
+
+  const renderRow = (o, isChild = false) => {
+    const side = String(o.side || '').replace(/^OrderSide\./, '').toUpperCase();
+    const isBuy = side === 'BUY';
+    const status = normStatus(o.status);
+    const cancellable = isWorking(status);
+    const submitted = parseServerDate(o.submitted_at);
+    const submittedLabel = submitted ? submitted.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+    return (
+      <tr key={o.id} className={`border-b app-border-soft last:border-0 hover:bg-white/3 ${isChild ? 'app-text-muted' : ''}`}>
+        <td className="py-2 px-3 font-semibold font-mono">{isChild && <span className="opacity-50">↳ </span>}{o.symbol}</td>
+        <td className={`text-right py-2 px-3 font-semibold ${isBuy ? 'text-emerald-400' : 'text-red-400'}`}>
+          <DirIcon dir={side} className="text-xs mr-0.5" />{side || '—'}
+        </td>
+        <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
+        <td className="text-right py-2 px-3 app-text-muted">{String(o.type || '').replace(/^OrderType\./, '').toUpperCase()}</td>
+        <td className="text-right py-2 px-3 app-text-secondary">{status.replace(/_/g, ' ')}</td>
+        <td className="text-right py-2 px-3 app-text-muted font-mono" title={submitted ? submitted.toLocaleString() : ''}>{submittedLabel}</td>
+        <td className="text-right py-2 px-3">
+          {cancellable ? (
+            <button
+              disabled={!!busy[`cxl:${o.id}`]}
+              aria-label={`Cancel order ${o.symbol}`}
+              onClick={() => onCancel(o.id, `${o.symbol} ${side}`)}
+              className="text-[10px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 app-text-secondary disabled:opacity-50 border app-border">
+              {busy[`cxl:${o.id}`] ? '…' : 'Cancel'}
+            </button>
+          ) : null}
+        </td>
+      </tr>
+    );
+  };
+
+  return (
+    <CollapsibleSection
+      title="Recent Orders"
+      count={(orders || []).length}
+      defaultOpen={counts.working > 0}
+      maxHeight={460}
+    >
+      {(actionError || actionInfo) && (
+        <div role={actionError ? 'alert' : 'status'} className={`mb-2 text-xs px-2 py-1 rounded-md ${actionError ? 'bg-red-500/10 border border-red-500/40 text-red-200' : 'bg-emerald-500/10 border border-emerald-500/40 text-emerald-200'}`}>
+          {actionError || actionInfo}
+        </div>
+      )}
+      <div className="flex items-center gap-1 mb-2 flex-wrap">
+        {[
+          { k: 'working', label: `Working (${counts.working})` },
+          { k: 'filled', label: `Filled (${counts.filled})` },
+          { k: 'cancelled', label: `Cancelled (${counts.cancelled})` },
+          { k: 'all', label: `All (${counts.all})` },
+        ].map(t => (
+          <button
+            key={t.k}
+            onClick={() => setFilter(t.k)}
+            aria-pressed={filter === t.k}
+            className={`text-[10px] px-2 py-0.5 rounded-full font-semibold uppercase tracking-wider ${
+              filter === t.k
+                ? 'bg-blue-500/25 border border-blue-500/50 text-blue-200'
+                : 'border app-border-soft app-text-muted hover:app-text-primary'
+            }`}
+          >{t.label}</button>
+        ))}
+        <input
+          value={tickerFilter}
+          onChange={e => setTickerFilter(e.target.value)}
+          placeholder="Filter by ticker"
+          className="ml-2 bg-transparent border app-border-soft rounded px-2 py-0.5 text-[10px] w-32"
+          aria-label="Filter orders by ticker"
+        />
+        <label className="ml-auto flex items-center gap-1 text-[10px] app-text-muted cursor-pointer">
+          <input type="checkbox" checked={grouped} onChange={e => setGrouped(e.target.checked)} className="accent-blue-500" />
+          Group by bracket
+        </label>
+      </div>
+      {filteredOrders.length === 0 ? (
+        <div className="text-center text-sm app-text-muted italic py-4">No matching orders.</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[640px] text-xs">
+            <thead className="sticky top-0 app-bg-surface-solid z-10">
+              <tr className="app-text-muted border-b app-border">
+                <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Symbol</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
+                <th className="py-2 px-3"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {grouped && groups
+                ? groups.map(g => (
+                    <React.Fragment key={g.parent?.id || g.parentId}>
+                      {g.parent && renderRow(g.parent, false)}
+                      {g.children.map(c => renderRow(c, true))}
+                    </React.Fragment>
+                  ))
+                : filteredOrders.map(o => renderRow(o, false))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </CollapsibleSection>
   );
 }
 
@@ -4113,11 +5562,15 @@ function App() {
 
 function AuthedApp({ onLogout }) {
   const [overview, setOverview] = useState([]);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = usePersistentState('lastTicker', null);
   const [reloadToken, setReloadToken] = useState(0);
-  const [view, setView] = useState('charts'); // 'charts' | 'trading'
+  const [view, setView] = usePersistentState('view', 'charts'); // 'charts' | 'trading'
   const [theme, toggleTheme] = useTheme();
+  const [density, setDensity] = useDensity();
   const [mobileWatchOpen, setMobileWatchOpen] = useState(false);
+  const [tradingTab, setTradingTab] = usePersistentState('tradingTab', 'overview');
+  // r49: ⌘K quick-trade palette
+  const [quickOpen, setQuickOpen] = useState(false);
 
   // Stabilise loadOverview by reading `selected` from a ref instead of a dep.
   // Previously [selected] in the dep array re-created loadOverview on every
@@ -4197,24 +5650,65 @@ function AuthedApp({ onLogout }) {
       await api.post('/api/watchlist', { ticker });
       await loadOverview();
       setSelected(ticker);
+      toast({ msg: `Added ${ticker} to watchlist`, kind: 'success', duration: 2500 });
     } catch (e) {
-      alert('Add failed: ' + (e?.detail || e?.message || e));
+      toast({ msg: `Add ${ticker} failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
     }
   }, [loadOverview]);
 
-  const handleRemove = useCallback(async (ticker) => {
-    if (!confirm(`Remove ${ticker} from watchlist?`)) return;
-    try {
-      await api.delete(`/api/watchlist/${ticker}`);
-      await loadOverview();
-      if (selectedRef.current === ticker) setSelected(null);
-    } catch (e) {
-      alert('Remove failed: ' + (e?.detail || e?.message || e));
-    }
+  const handleRemove = useCallback((ticker) => {
+    // r49: replace confirm() with undoable toast
+    stageAction({
+      label: `Removing ${ticker} from watchlist — undo within 4s`,
+      delayMs: 4000, kind: 'warn',
+      onConfirm: async () => {
+        try {
+          await api.delete(`/api/watchlist/${ticker}`);
+          await loadOverview();
+          if (selectedRef.current === ticker) setSelected(null);
+          toast({ msg: `Removed ${ticker}`, kind: 'success', duration: 2000 });
+        } catch (e) {
+          toast({ msg: `Remove ${ticker} failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
+        }
+      },
+    });
   }, [loadOverview]);
+
+  // r49: keyboard shortcuts
+  useKeyboard(({ key, cmd, isInput }) => {
+    if (cmd && key === 'k' && !isInput) {
+      // ⌘K — quick trade palette (always allow even from input via cmd)
+      setQuickOpen(o => !o);
+      return;
+    }
+    if (cmd && key === 'k' && isInput) {
+      // Allow ⌘K even when typing
+      setQuickOpen(o => !o);
+      return;
+    }
+    if (isInput) return;
+    if (key === 'g') {
+      // 'g' then 'c'/'t' — view toggle
+      // Simple version: just toggle on bare g
+      setView(v => v === 'charts' ? 'trading' : 'charts');
+      return;
+    }
+    if (key === '?') {
+      toast({ msg: '⌘K quick ticket · ⌘I alerts · g toggle view · / focus filter · Esc close', kind: 'info', duration: 5000 });
+      return;
+    }
+    if (key === 'r' && !cmd) {
+      loadOverview();
+      toast({ msg: 'Refreshed', kind: 'info', duration: 1200 });
+    }
+  }, [setView, loadOverview]);
 
   return (
+    <ErrorBoundary>
     <div className="h-screen flex flex-col">
+      <SkipLink />
+      <ToastHost />
+      {quickOpen && <QuickTradePalette onClose={() => setQuickOpen(false)} />}
       <header className="surface sticky top-0 z-20 px-3 sm:px-5 py-2 sm:py-2.5 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 sm:gap-5 min-w-0">
           {/* Mobile watchlist toggle — visible only on small screens, only in charts view */}
@@ -4247,12 +5741,34 @@ function AuthedApp({ onLogout }) {
             ))}
           </nav>
         </div>
-        <div className="text-xs flex items-center gap-2 sm:gap-4 shrink-0">
-          <span className="hidden lg:inline app-text-muted">Auto-scan 15m · Polling 60s</span>
+        <div className="text-xs flex items-center gap-2 sm:gap-3 shrink-0">
+          {/* r49: per-feed freshness strip */}
+          <div className="hidden lg:block"><FreshnessStrip liveConnected={liveConnected} /></div>
           <span className={`inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-full surface-soft ${liveConnected ? 'text-emerald-400' : 'app-text-muted'}`}>
             <span className={`w-1.5 h-1.5 rounded-full ${liveConnected ? 'bg-emerald-400 live-dot' : 'bg-gray-500'}`}></span>
             <span className="font-semibold tracking-wide text-[10px] sm:text-[11px] uppercase">{liveConnected ? 'Live' : 'Offline'}</span>
           </span>
+          {/* r49: ⌘K quick-trade button */}
+          <button
+            onClick={() => setQuickOpen(true)}
+            title="⌘K — quick trade ticket"
+            aria-label="Open quick trade palette (⌘K)"
+            className="hidden sm:flex items-center gap-1 text-[10px] px-2 py-1 rounded-md surface-soft border app-border-soft app-text-secondary hover:app-text-primary"
+          >
+            <span>⌘K</span>
+            <span className="hidden lg:inline">Quick ticket</span>
+          </button>
+          {/* r49: alert inbox */}
+          <AlertInbox />
+          {/* r49: density toggle */}
+          <button
+            onClick={() => setDensity(density === 'compact' ? 'regular' : 'compact')}
+            title={density === 'compact' ? 'Switch to regular density' : 'Switch to compact density'}
+            aria-label="Toggle density"
+            className="text-[11px] px-2 py-1 rounded-md surface-soft app-text-secondary hover:app-text-primary"
+          >
+            {density === 'compact' ? '⊞' : '⊟'}
+          </button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <button
             onClick={onLogout}
@@ -4304,20 +5820,104 @@ function AuthedApp({ onLogout }) {
           </>
         )}
         {view === 'trading' && (
-          <div className="flex-1 overflow-y-auto scrollbar-thin p-2 sm:p-4 space-y-3 sm:space-y-4">
-            <AlertsPanel />
-            <AdoptedPanel />
-            <RejectedSignalsPanel />
-            <AutoTraderPanel reloadToken={reloadToken} />
-            <CandidatePoolPanel />
-            <NewsAnalysisSummary />
-            <TradingPanel reloadToken={reloadToken} />
+          <div id="r49-main" className="flex-1 overflow-y-auto scrollbar-thin p-2 sm:p-4 space-y-3 sm:space-y-4 pb-20 md:pb-4">
+            {/* r49: sticky command bar */}
+            <div className="sticky top-0 z-10 -mx-2 sm:-mx-4 px-2 sm:px-4 pb-2" style={{ background: 'var(--bg-0)' }}>
+              <CommandBar />
+            </div>
+            {/* r49: internal nav */}
+            <TradingNav active={tradingTab} onChange={setTradingTab} />
+            <ErrorBoundary>
+              {tradingTab === 'overview' && (
+                <>
+                  <EquityCurvePanel lookbackDays={30} />
+                  <DailyLossProgress />
+                  <AlertsPanel />
+                </>
+              )}
+              {tradingTab === 'positions' && <TradingPanel reloadToken={reloadToken} />}
+              {tradingTab === 'autotrader' && <AutoTraderPanel reloadToken={reloadToken} />}
+              {tradingTab === 'universe' && <CandidatePoolPanel />}
+              {tradingTab === 'adopted' && <AdoptedPanel />}
+              {tradingTab === 'rejected' && <RejectedSignalsPanel />}
+              {tradingTab === 'news' && <NewsAnalysisSummary />}
+            </ErrorBoundary>
+            {/* r49: mobile bottom-tab for trading view */}
+            <TradingMobileBottomNav active={tradingTab} onChange={setTradingTab} />
           </div>
         )}
+        {view === 'charts' && <span id="r49-main" />}
       </div>
       <TargetHitToasts />
       <ChatWidget />
     </div>
+    </ErrorBoundary>
+  );
+}
+
+// r49: trading view internal nav (tabs)
+function TradingNav({ active, onChange }) {
+  const tabs = [
+    { k: 'overview', label: 'Overview', icon: '📊' },
+    { k: 'positions', label: 'Positions', icon: '💼' },
+    { k: 'autotrader', label: 'Auto-trader', icon: '🤖' },
+    { k: 'universe', label: 'Universe', icon: '🎯' },
+    { k: 'adopted', label: 'Adopted', icon: '📥' },
+    { k: 'rejected', label: 'Rejected', icon: '🚫' },
+    { k: 'news', label: 'News audit', icon: '📰' },
+  ];
+  return (
+    <nav role="tablist" aria-label="Trading sections" className="hidden md:flex flex-wrap gap-1 surface-soft rounded-xl p-1 text-xs">
+      {tabs.map(t => (
+        <button
+          key={t.k}
+          role="tab"
+          aria-selected={active === t.k}
+          onClick={() => onChange(t.k)}
+          className={`px-3 py-1.5 rounded-lg font-medium ${
+            active === t.k
+              ? 'bg-gradient-to-b from-blue-500 to-blue-600 text-white glow-blue'
+              : 'text-gray-400 hover:text-white hover:bg-white/5'
+          }`}
+        >
+          <span className="mr-1">{t.icon}</span>{t.label}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+// r49: bottom-tab nav for mobile trading view
+function TradingMobileBottomNav({ active, onChange }) {
+  const tabs = [
+    { k: 'overview', label: 'Home', icon: '📊' },
+    { k: 'positions', label: 'Pos', icon: '💼' },
+    { k: 'autotrader', label: 'Bot', icon: '🤖' },
+    { k: 'universe', label: 'Univ', icon: '🎯' },
+    { k: 'rejected', label: 'Skip', icon: '🚫' },
+  ];
+  return (
+    <nav
+      role="tablist"
+      aria-label="Trading sections (mobile)"
+      className="md:hidden fixed bottom-0 left-0 right-0 z-30 surface border-t app-border flex"
+      style={{ paddingBottom: 'env(safe-area-inset-bottom, 0)' }}
+    >
+      {tabs.map(t => (
+        <button
+          key={t.k}
+          role="tab"
+          aria-selected={active === t.k}
+          onClick={() => onChange(t.k)}
+          className={`flex-1 flex flex-col items-center justify-center py-2 ${
+            active === t.k ? 'text-blue-400' : 'app-text-muted'
+          }`}
+        >
+          <span className="text-base">{t.icon}</span>
+          <span className="text-[9px] font-semibold uppercase tracking-wider mt-0.5">{t.label}</span>
+        </button>
+      ))}
+    </nav>
   );
 }
 
