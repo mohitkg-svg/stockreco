@@ -54,11 +54,42 @@ APP_API_KEY=<32+ char hex>
 # List ONLY the exact origins you use; remove `*` if currently set.
 CORS_ALLOW_ORIGINS=https://stockrecs-zcm5tboivq-uc.a.run.app,https://your-frontend-host
 
+# === DATABASE — must be Postgres on live (live boot REFUSES sqlite per r44) ===
+DATABASE_URL=postgresql://...    # Cloud SQL / Neon / etc — NOT sqlite
+
 # === DATA FEED — keep SIP if you have Algo Trader Plus ===
 ALPACA_DATA_FEED=sip
 ALPACA_OPTIONS_FEED=indicative
 ALPACA_NEWS_STREAM=1
-ALPACA_OPTIONS_STREAM=0
+# r44: ALPACA_OPTIONS_STREAM defaults ON now (was off). Keep on if you have
+# Algo Trader Plus (OPRA feed) — required for the marketable-limit option
+# exit to actually save spread vs market orders.
+ALPACA_OPTIONS_STREAM=1
+
+# === r46: STOP-LIMIT vs STOP-MARKET ===
+# 0 = legacy stop-MARKET (gap-through fills at gap price during halts /
+# flash crashes — May 2010 / Aug 2024 yen unwind tail).
+# 0.005 = stop-LIMIT with 50bps band: caps gap-through but risks no-fill
+# on real moves (the manage tick re-evaluates and resubmits if so).
+# RECOMMENDED for live: 0.005.
+STOP_LIMIT_OFFSET_PCT=0.005
+
+# === r45: ML model directory ===
+# Default /tmp/ml_models is volatile on Cloud Run. Mount a persistent
+# disk OR rely on the DB-mirrored artifact path (default behavior).
+ML_MODEL_DIR=/tmp/ml_models
+
+# === r44: AI cost ceilings ===
+# Caps Claude bill in case of feedback bug / leaked key. Defaults are
+# generous; lower if you want a tighter ceiling.
+AI_DAILY_CALL_CAP=5000
+CHAT_DAILY_CALL_CAP=500
+AI_NEWS_EXIT_MAX_AGE_MIN=30      # ignore news > 30min old
+
+# === r43-r46: optional universe override ===
+# Default universe is Alpaca alphabetical first 500 (A-C heavy bias).
+# Provide a constituent file (S&P500 / Russell 1000) to override.
+STOCK_UNIVERSE_FILE=/data/sp500_constituents.txt   # one ticker per line
 
 # === ANTHROPIC (for AI judge + chat) ===
 ANTHROPIC_API_KEY=<your-key>
@@ -124,9 +155,52 @@ Conservative first-month profile. JSON to send:
   "ticker_blacklist": "VTWO,CNTA",           // recent paper losers; add as discovered
 
   // ── ML ──
-  "ml_scoring_enabled": false                // KEEP shadow until ≥200 live closed trades
+  "ml_scoring_enabled": false,               // KEEP shadow until ≥200 live closed trades
+
+  // ── r44/r46: NEW risk overlays (defaults; tighten if needed) ──
+  "vol_target_annual": 0.12,                 // r44: portfolio realized-vol target
+  "leverage_cap": 1.5,                       // r44: gross_notional / equity ceiling
+  "book_var_99_cap_pct": 0.05,               // r44: heat × 1.5 cap as % of equity
+  "max_correlated_open": 1,                  // r43: ρ ≥ 0.7 with N other open trades
+
+  // ── r43/r44: existing overlay knobs ──
+  "auto_promote_adopted": false,             // r41: external positions stay manual
+                                             //      until you've watched the bot a week
+  "rr_min": 1.3,                             // r43: net post-cost R:R floor
+
+  // ── r46: NEW per-trade structural ──
+  "bracket_tif": "gtc",                      // ⚠️ "day" caps weekend-gap exposure
+                                             //    but positions are uncovered after RTH;
+                                             //    the manage tick re-arms at 9:30 next day.
+                                             //    Recommended: "day" for first month.
+  "pyramid_enabled": false                   // r44: scale-in at T1 in strong trends.
+                                             //      Leave OFF until you've watched
+                                             //      ≥50 closed trades.
 }
 ```
+
+---
+
+## r43-r46 post-deploy verification (do FIRST after the env vars deploy, before flipping `enabled=true`)
+
+Several r43-r46 systems are silent on day 1 — they activate only after
+data accumulates. Verify each is working:
+
+| System | Activation requirement | Verification |
+|---|---|---|
+| EquitySnapshot (r46) | 5 min snapshots × 25 min RTH | `GET /api/trading/equity-curve?lookback_days=1` returns ≥5 snapshots |
+| `account_drawdown_multiplier` (r46) | ≥5 EquitySnapshot rows | `GET /api/health` shows `account_dd_mult` non-null after ~30 min RTH |
+| `crisis_mode` (r46) | Always live; True only when ≥5% multi-day DD or ≥4% session DD | `GET /api/health` shows `crisis_mode` present (False on healthy day) |
+| Calibration GATE (r46) | ≥30 closed trades in any conf bucket | First days: gate is no-op (insufficient sample) |
+| Per-ticker overrides (r46) | First weekly `recompute_all_profiles` run | `SELECT * FROM ticker_profiles` returns ≥1 row after weekly job |
+| `MLPrediction.outcome` backfill (r45/r46) | First trade closes after model trained | `SELECT count(*) FROM ml_predictions WHERE outcome IS NOT NULL` > 0 |
+| ML calibrator (r45) | Train fold w/ ≥50 OOF samples | `GET /api/ml/status` shows `calibrator_loaded: true` |
+| News severity gate (r46) | News article on open position | `autotrade_event{event=news_exit}` counter increments (was always 0 pre-r46) |
+| AI news-blind bug fixed (r46) | AI judge call with recent news on ticker | `prompt_summary` in AIDecisionLog includes `recent_news` array (was always `[]`) |
+| Stop-LIMIT (r46) | First trade with `STOP_LIMIT_OFFSET_PCT=0.005` | Alpaca dashboard shows SL leg as STOP_LIMIT, not STOP |
+
+If any of these don't activate within 1 RTH session of expected
+conditions, that's a "stop the line" event — kill the bot and investigate.
 
 ---
 
@@ -183,11 +257,16 @@ Conservative first-month profile. JSON to send:
 | Setting | Why locked |
 |---|---|
 | `ALPACA_LIVE` | Two-key gate's whole point — change requires `I_UNDERSTAND_LIVE_RISK=yes` |
+| `DATABASE_URL` | r44: live mode REFUSES to boot on default sqlite — three-instance Cloud Run = three bots disagreeing |
 | `pdt_enforce` (when on margin <$25k) | One missed gate = 90-day PDT lock + huge headache |
 | `flatten_by_eod` | Overnight gap risk is the single largest single-trade loss vector |
+| `STOP_LIMIT_OFFSET_PCT=0.005` | r46: caps flash-crash / halt-resume gap-through fills |
+| `bracket_tif=day` | r46: caps weekend-gap exposure on Friday positions |
 | `confidence_threshold` ≥ 75 | Below 75 the rule engine has produced losing edge in paper |
 | `max_pct_of_equity` ≤ 0.50 | The 50% reserve isn't decoration — it's the recovery cushion |
 | `RISK_MULT_CEILING` | Hard-coded 2.0× in services/config.py for a reason — the multiplier stack will compound past 5× without it |
+| `auto_promote_adopted=false` | First month: every external position must be manually reviewed before bot management |
+| `pyramid_enabled=false` | r44 scale-in is gated; review trend-detection accuracy on 50+ live trades first |
 
 ---
 
@@ -195,10 +274,14 @@ Conservative first-month profile. JSON to send:
 
 **Pre-market (08:30 ET)**:
 - `/api/health` returns 200, `degraded=false`, `last_manage_at` < 60s
+- `/api/health` shows `crisis_mode=false`, `session_dd_pct` < 2.0, `account_dd_mult >= 0.7` (r46)
 - `/api/trading/auto/pdt` count < 3
-- `/api/trading/auto/status` shows expected open positions
-- Check overnight alerts: `/api/alerts?unacked=true`
+- `/api/trading/auto/status` shows expected open positions; `freeze_reason=null` (r42)
+- Check overnight alerts: `/api/alerts?unacked=true` — including any
+  `drawdown_3pct/5pct/8pct/10pct` alerts (r46 DD-tier alerts)
 - Check `/api/macro/blackout` — note any windows that will fire today
+- Check `/api/trading/equity-curve?lookback_days=7` — 7-day chart should
+  not show step-changes that don't match expected fills (r46)
 
 **During RTH**: 
 - Phone push notifications handle target hits / trade closes
@@ -206,7 +289,14 @@ Conservative first-month profile. JSON to send:
 
 **Post-close (16:30 ET)**:
 - Review the day's closed trades for any with `closed_news_ai`,
-  `closed_slippage`, `closed_kill`, or empty `realized_pl`
+  `closed_slippage`, `closed_kill`, `closed_eod`, `closed_time_stop`,
+  or empty `realized_pl`
+- r46: check `autotrade_skip{reason=...}` distribution — heavy
+  `calibration_gate` / `correlation_cap` / `account_drawdown` / 
+  `book_var_99` / `leverage_cap` / `idempotency_conflict` indicates
+  one of those gates is too tight or a real risk-event tripped
+- r46: check `/api/trading/equity-curve?lookback_days=1` — confirm 5-min
+  snapshots accumulated through the session
 - Skim `/api/ai-judge/decisions` for any honored skips —
   did Claude reject a trade that would have won? Tighten prompts if so
 - Check `/metrics` for `force_close_failed` count > 0 — every one
