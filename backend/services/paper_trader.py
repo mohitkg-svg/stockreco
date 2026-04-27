@@ -260,7 +260,22 @@ def submit_bracket_order(
     tif = tif_map.get(time_in_force.lower(), TimeInForce.DAY)
 
     tp = TakeProfitRequest(limit_price=round(float(take_profit), 2)) if take_profit else None
-    sl = StopLossRequest(stop_price=round(float(stop_loss), 2)) if stop_loss else None
+    # r46 fix #0.4: optional stop-LIMIT (vs stop-MARKET) to cap flash-crash /
+    # halt-resume gap fills. When STOP_LIMIT_OFFSET_PCT > 0, we use a
+    # stop-LIMIT with limit_price slightly worse than the stop (0.5% by
+    # default for longs). Gap-throughs leave the order unfilled — the
+    # manage loop's SL-invariant check (auto_trader.py) detects the
+    # missing fill and re-submits / escalates as needed.
+    sl = None
+    if stop_loss:
+        offset_pct = float(os.getenv("STOP_LIMIT_OFFSET_PCT", "0") or "0")
+        stop_price_r = round(float(stop_loss), 2)
+        if offset_pct > 0:
+            is_buy = (side or "buy").lower() == "buy"
+            limit_price = stop_price_r * (1 - offset_pct) if is_buy else stop_price_r * (1 + offset_pct)
+            sl = StopLossRequest(stop_price=stop_price_r, limit_price=round(limit_price, 2))
+        else:
+            sl = StopLossRequest(stop_price=stop_price_r)
 
     # Bracket only valid when both exits are present
     use_bracket = tp is not None and sl is not None

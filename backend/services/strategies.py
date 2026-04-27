@@ -153,6 +153,103 @@ def _ema_pullback(d: pd.DataFrame) -> Dict:
     }
 
 
+def _opening_reversal(d: pd.DataFrame) -> Dict:
+    """r46 Tier P: Opening Reversal after large gap.
+
+    Heston/Korajczyk/Sadka (2010) and follow-up: first 30 minutes of
+    trading after a >2% gap mean-revert ~55-60% of the time when the gap
+    isn't catalyst-driven. We fade the gap on the first session bar that
+    prints a lower high (gap-up) or higher low (gap-down).
+
+    Regime: chop. Best fit: intraday TFs (5m/15m/30m).
+    """
+    prev_close = d["Close"].shift(1)
+    gap_pct = (d["Open"] - prev_close) / prev_close
+    gap_up = gap_pct > 0.02
+    gap_dn = gap_pct < -0.02
+    # First-bar reversal pattern: gap-up + lower high vs prior bar = exhaustion
+    lower_high = d["High"] < d["High"].shift(1)
+    higher_low = d["Low"] > d["Low"].shift(1)
+    long_e = gap_dn & higher_low & (d["Close"] > d["Open"])
+    short_e = gap_up & lower_high & (d["Close"] < d["Open"])
+    return {
+        "name": "Opening Reversal",
+        "description": "Fade ≥ 2% gap on first-bar exhaustion (lower high / higher low + close-against-open)",
+        "regime": "chop",
+        "entry_long": long_e.fillna(False),
+        "entry_short": short_e.fillna(False),
+    }
+
+
+def _last_30min_momentum(d: pd.DataFrame) -> Dict:
+    """r46 Tier P: Last-30-min momentum predicts next-day open.
+
+    Heston-Korajczyk-Sadka (2010), Bogousslavsky (2021): closing strength
+    (final 30-min vs session VWAP, with elevated volume) predicts next-
+    day open with R²~5%. Buy at close, hold to next-day open.
+
+    Regime: any. Intraday-bar specific; on daily df this no-ops.
+    """
+    empty = pd.Series(False, index=d.index)
+    try:
+        if len(d) < 4 or (d.index[1] - d.index[0]) >= pd.Timedelta(days=1):
+            return {"name": "Last-30min Momentum", "description": "—", "regime": "any",
+                    "entry_long": empty, "entry_short": empty}
+    except Exception:
+        return {"name": "Last-30min Momentum", "description": "—", "regime": "any",
+                "entry_long": empty, "entry_short": empty}
+    if "VWAP" not in d.columns:
+        return {"name": "Last-30min Momentum", "description": "no VWAP", "regime": "any",
+                "entry_long": empty, "entry_short": empty}
+    grp = pd.Index(d.index.date)
+    bar_idx = pd.Series(range(len(d)), index=d.index).groupby(grp).cumcount()
+    n_per_session = pd.Series(range(len(d)), index=d.index).groupby(grp).transform("count")
+    is_last_30 = (n_per_session - bar_idx) <= 6   # last ~30 min on 5m bars
+    vol_ok = d["Volume"] > 1.5 * d["VOL_SMA20"] if "VOL_SMA20" in d.columns else (d["Volume"] > 0)
+    long_e = is_last_30 & (d["Close"] > d["VWAP"]) & vol_ok
+    short_e = is_last_30 & (d["Close"] < d["VWAP"]) & vol_ok
+    return {
+        "name": "Last-30min Momentum",
+        "description": "Last 30-min strength vs VWAP + 1.5× volume = next-day continuation",
+        "regime": "any",
+        "entry_long": long_e.fillna(False),
+        "entry_short": short_e.fillna(False),
+    }
+
+
+def _news_spike_fade(d: pd.DataFrame) -> Dict:
+    """r46 Tier P: After-news-spike fade.
+
+    Tetlock (2007 JF) + retail-attention literature: ~80% of headline-
+    driven intraday spikes >3% retrace 50% within 60 minutes when the
+    news lacks fundamental substance. We approximate "spike" via 1×ATR
+    move + RVOL>3 within a single bar; signal_generator can layer the
+    news-timestamp filter on top.
+
+    Regime: chop.
+    """
+    if "ATR_14" not in d.columns or "VOL_SMA20" not in d.columns:
+        empty = pd.Series(False, index=d.index)
+        return {"name": "News Spike Fade", "description": "—", "regime": "chop",
+                "entry_long": empty, "entry_short": empty}
+    bar_range = (d["High"] - d["Low"]).abs()
+    big_bar = bar_range >= 1.5 * d["ATR_14"]
+    rvol = d["Volume"] / d["VOL_SMA20"]
+    rvol_spike = rvol >= 3.0
+    # Fade direction: bar closed at the extreme = exhaustion
+    bar_color_up = d["Close"] > d["Open"]
+    bar_color_dn = d["Close"] < d["Open"]
+    long_e = big_bar & rvol_spike & bar_color_dn   # huge red bar with spike → fade up
+    short_e = big_bar & rvol_spike & bar_color_up   # huge green bar with spike → fade down
+    return {
+        "name": "News Spike Fade",
+        "description": "Fade ≥ 1.5×ATR bar with RVOL ≥ 3 (mean-reversion of spike)",
+        "regime": "chop",
+        "entry_long": long_e.fillna(False),
+        "entry_short": short_e.fillna(False),
+    }
+
+
 def _gap_fill(d: pd.DataFrame) -> Dict:
     """
     Gap-and-fill mean-reversion. After a session gap, price often retraces to fill it:
@@ -421,6 +518,10 @@ STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
     _nr7_breakout,
     _inside_bar_breakout,
     _high52_proximity,
+    # r46 Tier P additions:
+    _opening_reversal,
+    _last_30min_momentum,
+    _news_spike_fade,
 ]
 
 

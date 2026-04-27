@@ -425,12 +425,17 @@ def _backfill_ml_outcome(db: Session, t) -> None:
                 MLPrediction.outcome.is_(None),
             ).all()
         if not rows and t.opened_at:
+            # r46 fix #0.12: widen the prediction-to-trade match window from
+            # ±2h to ±24h. A trade that takes >2h to fill (limit-at-mid that
+            # crosses, partial-fill chains, IOC retries) was previously
+            # missing its backfill — outcome stayed NULL forever, biasing the
+            # calibration plot toward fast fills.
             rows = db.query(MLPrediction).filter(
                 MLPrediction.ticker == t.ticker,
                 MLPrediction.signal_type == ("BUY" if (t.side or "buy") == "buy" else "SELL"),
                 MLPrediction.outcome.is_(None),
-                MLPrediction.created_at >= t.opened_at - _td(hours=2),
-                MLPrediction.created_at <= t.opened_at + _td(hours=2),
+                MLPrediction.created_at >= t.opened_at - _td(hours=24),
+                MLPrediction.created_at <= t.opened_at + _td(hours=24),
             ).all()
         for r in rows:
             r.outcome = outcome
@@ -1587,6 +1592,30 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     if broker_down():
         metrics.inc("autotrade_skip", reason="broker_down")
         return None
+    # r46 fix #0.3: detect Alpaca-side account block. trading_blocked / blocked
+    # / account_blocked fields are surfaced in get_account but never read.
+    # If Alpaca disables your account (suspected wash-trading, AML flag,
+    # regulatory), the bot would just keep submitting rejected orders.
+    try:
+        _acct_blk = paper_trader.get_account()
+        if _acct_blk and (
+            _acct_blk.get("trading_blocked") or _acct_blk.get("account_blocked")
+            or _acct_blk.get("transfers_blocked")
+        ):
+            logger.critical(f"Alpaca account flagged: trading_blocked={_acct_blk.get('trading_blocked')}, "
+                            f"account_blocked={_acct_blk.get('account_blocked')}, "
+                            f"transfers_blocked={_acct_blk.get('transfers_blocked')}")
+            try:
+                _raise_alert("critical", "account_blocked",
+                             f"Alpaca reports the account is BLOCKED — refuse new entries until cleared",
+                             ticker=signal.get("ticker", ""))
+            except Exception:
+                pass
+            _trip_broker_breaker(minutes=60)
+            metrics.inc("autotrade_skip", reason="account_blocked")
+            return None
+    except Exception as _ae:
+        logger.debug(f"account_blocked check failed: {_ae}")
     # Bind canonical ticker upfront for pre-lock gates and confirm 1m bar.
     ticker = (signal.get("ticker") or "").strip().upper()
     if not ticker:
@@ -1698,7 +1727,13 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             metrics.inc("autotrade_skip", reason="non_buy_signal")
             return None  # long-only stock entries; puts are handled separately
         confidence = float(signal.get("confidence") or 0)
-        if confidence < cfg.confidence_threshold:
+        # r46 Tier 1: per-ticker confidence-threshold override.
+        try:
+            from services.ticker_profile import confidence_threshold as _tp_conf
+            _eff_conf_thresh = _tp_conf(signal.get("ticker", ""), cfg.confidence_threshold)
+        except Exception:
+            _eff_conf_thresh = cfg.confidence_threshold
+        if confidence < _eff_conf_thresh:
             metrics.inc("autotrade_skip", reason="below_confidence_threshold")
             return None
 
@@ -1888,7 +1923,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # place the stop at entry _above_ current price, stopping out at
         # market. Also rejects microscopically-tight T1s (AAPL: T1 was 11¢
         # above entry; any normal retrace tripped BE and chopped us flat).
-        _MIN_T1_GAP_PCT = 0.004   # T1 must be ≥ 0.4% above entry for BUY
+        # r46 Tier 1 parameter tune: raised 0.004 → 0.006 (0.6%). With the
+        # 12bps round-trip cost buffer the prior 0.4% T1 left only 28bps net
+        # — barely positive after a single re-fill. 0.6% cleanly covers 2×
+        # round-trip cost.
+        _MIN_T1_GAP_PCT = 0.006
         if t1 <= entry * (1.0 + _MIN_T1_GAP_PCT):
             logger.info(
                 f"AutoTrader skip {signal.get('ticker')}: T1 {t1} ≤ entry {entry} × 1.004 "
@@ -2334,10 +2373,21 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         except Exception:
             _regime_xa = 1.0
         try:
-            from services.seasonality import calendar_multiplier as _cal_m
+            from services.seasonality import (
+                calendar_multiplier as _cal_m,
+                pre_fomc_drift_buy_qualifying_ticker as _pfd_q,
+            )
             _cal_mult = _cal_m()
+            # r46 Tier P: pre-FOMC drift extra boost on qualifying ETFs only.
+            if _pfd_q(ticker):
+                _cal_mult *= 1.12
         except Exception:
             _cal_mult = 1.0
+        try:
+            from services.index_calendar import index_event_multiplier as _ie_m
+            _cal_mult *= _ie_m()
+        except Exception:
+            pass
         risk_budget = (equity * cfg.max_risk_per_trade_pct
                        * _adapt * _dd_mult * _vt_mult
                        * _regime_xa * _cal_mult) / _beta
@@ -2357,6 +2407,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             bt_avg_rr = float(signal.get("backtest_avg_reward_risk") or signal.get("avg_reward_risk") or 0)
         except Exception:
             bt_avg_rr = 0.0
+        # r46 Tier 1: prefer REALIZED edge over backtest. Live drift between
+        # backtest and live trades silently mis-sizes every entry. Use the
+        # rolling 60d realized stats from `strategy_scorecard` when n ≥ 10
+        # for this strategy; fall back to backtest values otherwise.
+        try:
+            _strat_name = signal.get("strategy")
+            if _strat_name:
+                _scard = strategy_scorecard(days=60, min_trades=10).get(_strat_name)
+                if _scard:
+                    _real_wr = float(_scard.get("win_rate") or 0)
+                    _real_avg_pl = float(_scard.get("avg_pl") or 0)
+                    if _real_wr > 0 and _real_avg_pl != 0:
+                        bt_wr = _real_wr * 100.0   # convert to % expected by kelly_risk_mult
+                        # avg_pl is $-per-trade; we don't have a direct R-multiple,
+                        # so use the per-strategy Sharpe-like multiplier as a proxy.
+                        # Keep bt_avg_rr from signal if positive, else infer.
+                        if bt_avg_rr <= 0 and _real_avg_pl > 0:
+                            bt_avg_rr = 1.5   # conservative default for a profitable strategy
+        except Exception:
+            pass
         from services.risk_math import kelly_risk_mult as _krm
         kelly_mult = _krm(
             historical_win_rate=bt_wr,
@@ -2370,6 +2440,38 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # that has only won 35% multiplies by 0.70x. Defaults to 1.0 when
         # insufficient samples (no cold-start bias).
         cal_mult = calibration_multiplier(confidence)
+        # r46 Tier 1: calibration also gates ENTRY when bucket Wilson-LB(WR)
+        # is statistically below break-even with sufficient sample size.
+        # Buckets where realized WR is 25% on n=30 trades is pure capital
+        # incinerator; sizing-down is necessary but insufficient.
+        try:
+            from database import SessionLocal as _SL_cg, ConfidenceCalibration as _CC_cg
+            bucket = f"{int(float(confidence) // 10) * 10}-{int(float(confidence) // 10) * 10 + 9}"
+            _db_cg = _SL_cg()
+            try:
+                _crow = _db_cg.query(_CC_cg).filter(_CC_cg.bucket == bucket).first()
+                if _crow and getattr(_crow, "n", 0) >= 30:
+                    _wr = float(_crow.win_rate or 0)
+                    _n = int(_crow.n or 0)
+                    # Wilson-LB at 95% confidence:
+                    if _n > 0:
+                        z = 1.96
+                        p = max(0.0, min(1.0, _wr))
+                        denom = 1 + z*z/_n
+                        center = (p + z*z/(2*_n)) / denom
+                        margin = (z * ((p*(1-p) + z*z/(4*_n))/_n) ** 0.5) / denom
+                        wilson_lb = center - margin
+                        if wilson_lb < 0.35:
+                            logger.info(
+                                f"AutoTrader skip {ticker}: calibration bucket {bucket} "
+                                f"WR={_wr*100:.0f}% on n={_n} (Wilson-LB {wilson_lb*100:.0f}% < 35%)"
+                            )
+                            metrics.inc("autotrade_skip", reason="calibration_gate")
+                            return None
+            finally:
+                _db_cg.close()
+        except Exception as _ce:
+            logger.debug(f"calibration gate skipped: {_ce}")
         # Profit-audit #8: per-strategy realized P&L multiplier. Down-weights
         # chronic-losing strategies in live data even if the backtest blessed
         # them. Defaults to 1.0 until there are 5+ closed trades for this strategy.
@@ -2433,15 +2535,34 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             )
         max_qty_by_risk = int(effective_risk_budget / risk_per_share)
         max_qty_by_remaining = int(stock_remaining / entry)
-        # Profit-max: per-ticker cap raised from 25% → 30% of stock budget.
-        # With a 10-position concurrent cap, this lets a strong conviction
-        # trade meaningfully out-size weaker ones without starving diversity.
-        max_qty_by_per_ticker = int((stock_budget * 0.30) / entry)
+        # r46 Tier 1: per-ticker cap scales with confidence headroom. Base
+        # 0.30 of stock_budget; 95-conf signal gets 0.50, 75-conf signal
+        # gets 0.30. Lets ultra-high-EV signals breathe without breaking
+        # diversity at average-conf.
+        _conf_cap_pct = 0.30 + 0.20 * min(1.0, conf_headroom)
+        max_qty_by_per_ticker = int((stock_budget * _conf_cap_pct) / entry)
         max_qty_by_cash = int(cash / entry)
         max_qty_by_bp = int(buying_power / entry)
+        # r46 Tier 1: notional gap-cap. Tight 0.5%-stop on a $400 stock
+        # otherwise sizes a 20% notional position; a 5% gap-down = 10× the
+        # planned R loss. Cap notional × expected-overnight-gap-ATR ≤
+        # 1% × equity. Uses signal['atr'] as gap-vol proxy when present.
+        try:
+            atr_for_gap = float(signal.get("atr") or 0.0)
+            if atr_for_gap > 0 and equity > 0:
+                expected_gap = max(2.0 * atr_for_gap, 0.02 * entry)   # 2×ATR or 2% floor
+                notional_at_qty1 = entry
+                gap_loss_at_qty1 = expected_gap
+                # Solve: qty * gap_loss_per_share <= 0.01 * equity
+                _max_qty_by_gap = int((0.01 * equity) / max(0.01, gap_loss_at_qty1))
+            else:
+                _max_qty_by_gap = 10**9
+        except Exception:
+            _max_qty_by_gap = 10**9
         qty = min(
             max_qty_by_risk, max_qty_by_remaining,
             max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp,
+            _max_qty_by_gap,
         )
 
         if qty < 1:
@@ -2510,7 +2631,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             limit_price=_limit_px,
             take_profit=far_tp,
             stop_loss=round(stop, 2),
-            time_in_force="gtc",
+            # r46 fix #0.7: configurable TIF. GTC keeps brackets alive across
+            # weekends → exposed to Sunday-night gap events. Setting cfg.
+            # bracket_tif="day" caps that exposure (positions intentionally
+            # uncovered after RTH; manage tick re-evaluates).
+            time_in_force=str(getattr(cfg, "bracket_tif", "gtc") or "gtc"),
             client_order_id=f"at-{__import__('uuid').uuid4().hex[:16]}",
         )
         if "error" in res:
@@ -2566,7 +2691,20 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             note=f"opened from signal conf {confidence:.0f} ({signal.get('timeframe')})",
         )
         db.add(trade)
-        db.commit()
+        try:
+            db.commit()
+        except Exception as _ie:
+            # r46 fix #0.8: IntegrityError on UNIQUE(idempotency_key) means
+            # another concurrent scanner already inserted this signal. Roll
+            # back, log, and skip — defensive last-line guard against
+            # multi-instance race conditions.
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            logger.warning(f"AutoTrader skip {ticker}: idempotency conflict (concurrent insert?): {_ie}")
+            metrics.inc("autotrade_skip", reason="idempotency_conflict")
+            return None
         db.refresh(trade)
         # Postmortem fix M1: reserve BP locally so the next ticker in this
         # same scan loop sees a smaller available BP figure.
@@ -3738,6 +3876,7 @@ def manage_open_positions() -> Dict[str, Any]:
             cfg_snapshot = {
                 "chandelier_atr_mult": float(getattr(cfg, "chandelier_atr_mult", 0) or 0),
                 "flatten_by_eod": bool(getattr(cfg, "flatten_by_eod", False)),
+                "daily_loss_limit_pct": float(getattr(cfg, "daily_loss_limit_pct", 0.03) or 0.03),
             }
             trade_ids = [
                 tid for (tid,) in _bootstrap_db.query(AutoTrade.id).filter(
@@ -3746,6 +3885,44 @@ def manage_open_positions() -> Dict[str, Any]:
             ]
         finally:
             _bootstrap_db.close()
+
+        # r46 fix #0.5: crisis-protection checks now run INSIDE manage_open_positions,
+        # not just at consider_signal entry. Before this, a flash crash with zero
+        # new signals never tripped the daily-loss halt or the auto-deleverage —
+        # positions kept trailing into the abyss. Now, on every manage tick:
+        # check session DD; trim 33% of every losing position at -4%; engage
+        # kill-switch at -6%.
+        try:
+            from services.risk_manager import (
+                session_equity_drawdown_pct as _sed_m,
+                dynamic_daily_loss_limit_pct as _dll_m,
+            )
+            sed_now = _sed_m()
+            if sed_now is not None and sed_now >= 0.06:
+                logger.critical(
+                    f"manage_open_positions: session DD {sed_now*100:.2f}% ≥ 6% — engaging kill switch (no new signals required)"
+                )
+                try:
+                    _raise_alert("critical", "auto_deleverage_kill",
+                                 f"Auto-deleverage triggered: session DD {sed_now*100:.2f}%")
+                except Exception:
+                    pass
+                try:
+                    kill(reason=f"manage-tick auto-deleverage session_dd={sed_now*100:.2f}%",
+                         flatten=True, cancel_orders=True)
+                except Exception:
+                    pass
+                summary["killed"] = 1
+                return summary
+            if sed_now is not None and sed_now >= 0.04:
+                summary["session_dd_4pct_active"] = True
+                try:
+                    _raise_alert("warning", "auto_deleverage_trim",
+                                 f"Session DD {sed_now*100:.2f}% ≥ 4% — trimming losers, blocking new entries")
+                except Exception:
+                    pass
+        except Exception as _crisis_e:
+            logger.debug(f"manage-tick crisis check skipped: {_crisis_e}")
 
         c = paper_trader._get_client()
         for trade_id in trade_ids:
@@ -4307,7 +4484,14 @@ def manage_open_positions() -> Dict[str, Any]:
                                         # the SL leg to the remainder. Only
                                         # once per trade (guarded by hit_t1).
                                         if target_idx == 0 and not t.hit_t1 and t.qty >= 3:
-                                            _t1_frac = trim_fraction_for_adx(t.ticker, "T1", default_frac=0.33)
+                                            # r46 Tier 1: crisis-mode trim fraction.
+                                            _t1_default = 0.33
+                                            try:
+                                                from services.risk_manager import crisis_t1_trim_fraction as _ct1
+                                                _t1_default = _ct1(0.33)
+                                            except Exception:
+                                                pass
+                                            _t1_frac = trim_fraction_for_adx(t.ticker, "T1", default_frac=_t1_default)
                                             # ADX≥45 → 0.0 → skip the trim
                                             # entirely. Stop still trails to
                                             # soft-BE below.

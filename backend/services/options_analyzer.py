@@ -105,9 +105,12 @@ MIN_DTE = 10        # Post-mortem fix (CRWV -$2,561): weeklies ≤ 3 DTE get
                     # shredded by theta even when the underlying moves in
                     # your favor. 10 DTE minimum keeps us in contracts
                     # where a 2-3 day thesis has time to play out.
-MAX_DTE = 90
-MIN_VOLUME = 5
-MIN_OI = 25
+# r46 Tier 1 parameter tune: 90 → 75 (gamma is anemic past 60 DTE),
+# MIN_VOLUME 5 → 25, MIN_OI 25 → 100 (hard liquidity floor — even SPY
+# weeklies clear these comfortably; the spread filter catches everything else).
+MAX_DTE = 75
+MIN_VOLUME = 25
+MIN_OI = 100
 WEEKLY_DTE = 7
 PREMIUM_STOP_PCT = 0.50   # exit when contract has lost 50% of its premium
 

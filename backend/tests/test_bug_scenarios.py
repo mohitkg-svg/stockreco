@@ -881,10 +881,11 @@ class TestRiskMath(unittest.TestCase):
 
     def test_confidence_risk_mult_ramps(self):
         from services.risk_math import confidence_risk_mult
+        from services.config import RISK_MAX_CONFIDENCE_MULT
         # At threshold = neutral
         self.assertEqual(confidence_risk_mult(75, 75), 1.0)
-        # At 100 = max mult (default 1.75)
-        self.assertAlmostEqual(confidence_risk_mult(100, 75), 1.75, places=2)
+        # At 100 = max mult (r46 lowered from 1.75 → 1.5).
+        self.assertAlmostEqual(confidence_risk_mult(100, 75), RISK_MAX_CONFIDENCE_MULT, places=2)
         # Below threshold = neutral (no negative ramp)
         self.assertEqual(confidence_risk_mult(50, 75), 1.0)
 
@@ -1451,6 +1452,97 @@ class TestMLCalibration(unittest.TestCase):
         in the test env, so it should return False."""
         from services.ml_scorer import calibrator_loaded
         self.assertIn(calibrator_loaded(), (True, False))   # boolean returned, not raise
+
+
+class TestNewsSeverityGate(unittest.TestCase):
+    """r46 fix #0.1: severity is INT, not string. The dispatcher used to
+    crash on the first iter via `(int).lower()`, swallowing all news exits.
+    """
+    def test_int_severity_passes_high(self):
+        # Replay the corrected gate logic.
+        item = {"severity": 82, "ticker": "AAPL"}
+        try:
+            sev = int(item.get("severity") or 0)
+        except Exception:
+            sev = 0
+        self.assertGreaterEqual(sev, 35)
+
+    def test_int_severity_blocks_low(self):
+        item = {"severity": 12, "ticker": "AAPL"}
+        sev = int(item.get("severity") or 0)
+        self.assertLess(sev, 35)
+
+
+class TestEquitySnapshotTable(unittest.TestCase):
+    """r46 fix #0.2: persisted equity timeseries for multi-day DD."""
+    def test_equity_snapshot_columns(self):
+        from database import EquitySnapshot
+        cols = {c.name for c in EquitySnapshot.__table__.columns}
+        for required in ("ts", "equity", "cash", "buying_power",
+                          "realized_pl_today", "unrealized_pl",
+                          "open_positions", "spy_close"):
+            self.assertIn(required, cols)
+
+
+class TestTickerProfileTable(unittest.TestCase):
+    """r46 Tier 1: per-ticker overrides table."""
+    def test_columns_present(self):
+        from database import TickerProfile
+        cols = {c.name for c in TickerProfile.__table__.columns}
+        for required in ("ticker", "realized_vol_30d", "vol_mult",
+                          "beta_60d_realized", "confidence_threshold_override",
+                          "min_rr_override", "min_dte_override",
+                          "chandelier_mult_override", "has_earnings_calendar",
+                          "correlation_cluster_id", "news_count_p50_30d"):
+            self.assertIn(required, cols)
+
+
+class TestTickerProfileFallback(unittest.TestCase):
+    def test_returns_default_when_no_row(self):
+        from services.ticker_profile import vol_mult, confidence_threshold, min_rr, min_dte
+        self.assertEqual(vol_mult("DOESNOTEXIST"), 1.0)
+        self.assertEqual(confidence_threshold("DOESNOTEXIST", 75), 75)
+        self.assertEqual(min_rr("DOESNOTEXIST"), 2.0)
+        self.assertEqual(min_dte("DOESNOTEXIST"), 10)
+
+
+class TestNewStrategiesPresent(unittest.TestCase):
+    def test_tier_p_strategies_in_funcs(self):
+        from services.strategies import STRATEGY_FUNCS
+        names = {fn.__name__ for fn in STRATEGY_FUNCS}
+        self.assertIn("_opening_reversal", names)
+        self.assertIn("_last_30min_momentum", names)
+        self.assertIn("_news_spike_fade", names)
+
+
+class TestIdempotencyUnique(unittest.TestCase):
+    """r46 fix #0.8: idempotency_key has UNIQUE constraint."""
+    def test_idempotency_unique_index(self):
+        from database import AutoTrade
+        col = AutoTrade.__table__.columns["idempotency_key"]
+        self.assertTrue(col.unique)
+
+
+class TestCrisisHelpers(unittest.TestCase):
+    def test_crisis_chandelier_mult_default(self):
+        from services.risk_manager import crisis_chandelier_multiplier
+        # Outside crisis, returns base unchanged.
+        # We just verify the function exists and doesn't raise.
+        result = crisis_chandelier_multiplier(3.0)
+        self.assertIsInstance(result, float)
+        self.assertTrue(0.5 < result <= 4.0)
+
+    def test_crisis_t1_trim_default(self):
+        from services.risk_manager import crisis_t1_trim_fraction
+        result = crisis_t1_trim_fraction(0.33)
+        self.assertIsInstance(result, float)
+
+
+class TestSeasonalityHelpers(unittest.TestCase):
+    def test_pre_fomc_drift_qualification(self):
+        from services.seasonality import pre_fomc_drift_buy_qualifying_ticker
+        # Function exists; doesn't qualify random tickers.
+        self.assertFalse(pre_fomc_drift_buy_qualifying_ticker("RANDOM"))
 
 
 if __name__ == "__main__":

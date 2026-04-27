@@ -1087,6 +1087,112 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 46 — 13-agent maximum-spread audit + Tier 0/1/P implementation
+
+13 parallel deep-dive agents on angles never previously audited. ~250
+findings + ~150 strategy proposals. ALL Tier 0/1/P implemented.
+
+**Tier 0 — verified critical bugs (12)**:
+- News severity gate type bug — `severity` is `int`, prior code did
+  `(severity or "").lower()` and crashed silently → ALL AI news exits
+  silently dropped since r41. Now numeric ≥35 gate.
+- `account_drawdown_multiplier` referenced `paper_trader.get_portfolio_history()`
+  which doesn't exist; r44's "graduated 60d DD multiplier" was silently
+  degraded to single-day session DD. Now backed by new EquitySnapshot
+  table populated every 5 min during RTH.
+- `trading_blocked` from Alpaca account surfaced but never read. Live
+  account flagged → bot keeps submitting rejected orders. Now consider_
+  signal pre-flight checks all 3 block flags + alerts + breaker.
+- Stop-LIMIT optional via STOP_LIMIT_OFFSET_PCT env var (caps flash-
+  crash / halt-resume gap fills; manage tick re-evaluates if not filled).
+- Daily-loss / session-DD / kill-switch now run INSIDE
+  `manage_open_positions`, not just at consider_signal entry. A flash
+  crash with zero new signals previously skated past every guard.
+- DD-tier alerts: one-shot alerts on -3%/-5%/-8%/-10% crossings via
+  `_dd_tier_last_alerted` state.
+- Bracket TIF configurable via `cfg.bracket_tif` (DAY caps weekend gap
+  exposure; default still GTC for paper continuity).
+- UNIQUE constraint on `auto_trades.idempotency_key` so multi-instance
+  concurrent inserts can't double-position on the same signal.
+- `current_price()` accepts `max_age_sec` budget so the manage tick can
+  bypass the 60s WS / 30s REST stale cache during fast moves.
+- `_backfill_ml_outcome` window widened ±2h → ±24h so slow-fill trades
+  don't lose their MLPrediction outcome backfill.
+
+**Tier 1 — backtest robustness**:
+- Random early-flatten injection in `_simulate` — 5% of trades get a
+  noise-bar exit between bar +2 and +8, modeling reverse-thesis exits,
+  news force-closes, and time-stops the backtester would otherwise miss.
+- Bonferroni haircut softer (`0.05 * sqrt(log2(n))` per Bailey/López de
+  Prado) — was punishing strong strategies too aggressively.
+- Partial-exit slippage: T1/T2 trims pay an extra ~8 bps in the
+  backtester to model the live cancel-and-resize round-trip.
+
+**Tier 1 — sizing/capital**:
+- Conviction-scaled per-ticker cap: 30%-50% of stock_budget based on
+  confidence headroom (was flat 30%).
+- Notional gap-cap: tight-stop on a high-priced stock with a 2×ATR or
+  2% expected gap can't size > 1% equity loss exposure.
+- Universe scan EV-interleaving: pool sorted by score is interleaved
+  with watchlist instead of watchlist-first-pool-last.
+
+**Tier 1 — observability**:
+- New `EquitySnapshot` table + `record_equity_snapshot` job (5-min
+  during RTH) + `/api/trading/equity-curve` endpoint with derived
+  drawdown_pct + SPY-relative overlay.
+- `/api/health` surfaces `crisis_mode`, `session_dd_pct`, `account_dd_mult`.
+
+**Tier 1 — crisis playbook**:
+- New `in_crisis_mode()` predicate (5% account DD OR 4% session DD OR
+  VIX>30+SPY-5d<-5% OR `should_freeze_trading`).
+- `crisis_chandelier_multiplier` tightens trail 33% in crisis.
+- `crisis_t1_trim_fraction` raises T1 trim from 33% to 50% in crisis.
+- Auto-deleverage moved into `manage_open_positions` so it fires
+  without needing a new signal arrival.
+
+**Tier 1 — per-ticker customization**:
+- New `TickerProfile` table + `services/ticker_profile.py` accessors.
+- Per-ticker confidence threshold override read in consider_signal.
+- Per-ticker `vol_mult` overlay on adaptive chandelier.
+- Recompute job populates realized_vol_30d, beta_60d_realized, vol_mult.
+
+**Tier 1 — news pipeline**:
+- Cross-source headline dedup: same primary_ticker + same first-60-char
+  headline within 30min = duplicate. Reuters + Benzinga + Bloomberg
+  same M&A story → 1 ingest event, not 3.
+- Per-ticker AI-judge rate limit: 3 articles/hour cap so earnings day
+  doesn't burn AI budget against the same open position 50×.
+
+**Tier 1 — ML/AI**:
+- Calibration as a GATE, not just sizer. Buckets where Wilson-LB(WR) <
+  35% on n≥30 trades hard-reject new entries.
+- Kelly multiplier prefers REALIZED 60d strategy edge over backtest WR
+  when n≥10 (closes the live-vs-backtest drift loop).
+
+**Tier 1 — parameter tuning**:
+- `_MIN_T1_GAP_PCT` 0.4% → 0.6% (covers 2× round-trip cost).
+- `RISK_MAX_CONFIDENCE_MULT` 1.75 → 1.5 (90+ bucket data is sparse).
+- options `MAX_DTE` 90 → 75 (gamma anemic past 60).
+- options `MIN_VOLUME` 5 → 25, `MIN_OI` 25 → 100 (hard liquidity floor).
+
+**Tier P — new strategies**:
+- `_opening_reversal` — fade ≥2% gap on first-bar exhaustion (HKS 2010).
+- `_last_30min_momentum` — closing strength + RVOL>1.5 vs VWAP →
+  next-day continuation (HKS / Bogousslavsky).
+- `_news_spike_fade` — fade ≥1.5×ATR + RVOL≥3 bars (Tetlock 2007).
+- `seasonality.pre_fomc_drift_buy_qualifying_ticker` — Lucca-Moench
+  +49bps SPX-on-FOMC-eve drift; 1.12× confidence boost on SPY/QQQ/IWM
+  family the day before FOMC.
+- New `services/index_calendar.py` — Russell reconstitution + MSCI
+  quarterly window detection with 1.05× sizing nudge.
+
+**Tests**: 10 new regression tests (TestNewsSeverityGate,
+TestEquitySnapshotTable, TestTickerProfileTable,
+TestTickerProfileFallback, TestNewStrategiesPresent,
+TestIdempotencyUnique, TestCrisisHelpers, TestSeasonalityHelpers).
+Existing TestRiskMath updated for new RISK_MAX_CONFIDENCE_MULT=1.5.
+Full suite: 163 passed.
+
 ### Revision 45 — ML isotonic calibration
 
 LightGBM tree outputs are systematically over-confident at the tails: a

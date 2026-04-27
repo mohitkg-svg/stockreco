@@ -167,6 +167,29 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
     _new_for_open: List[Dict[str, Any]] = []
 
     db = SessionLocal()
+    # r46 Tier 1: cross-source headline dedup. Reuters + Benzinga + Bloomberg
+    # publishing the same M&A story = 3 separate ingest events otherwise.
+    # We dedupe by (normalized_headline_first_60_chars + primary_ticker)
+    # within a 30-minute window. Same primary ticker + same opening 60
+    # chars of headline within 30 min = treated as duplicate.
+    seen_headline_keys: set = set()
+    try:
+        from datetime import datetime as _dt_dh, timedelta as _td_dh
+        recent_cut = _dt_dh.utcnow() - _td_dh(minutes=30)
+        recent_rows = db.query(NewsEvent.headline, NewsEvent.ticker).filter(
+            NewsEvent.published_at >= recent_cut
+        ).all()
+        for hl, tk in recent_rows:
+            key = (str(tk or "").upper(), (hl or "").lower()[:60].strip())
+            seen_headline_keys.add(key)
+    except Exception:
+        pass
+    # r46 Tier 1: per-(ticker, hour) AI-judge rate limit. Earnings day on
+    # AAPL produces 50+ articles in 30 min; without this each fires its
+    # own AI judge → races itself to close the position 50×.
+    _ai_rate: Dict[str, int] = {}
+    _AI_RATE_PER_TICKER_HOUR = 3
+
     try:
         # Batch the existence check — one query vs N per-article selects.
         ext_ids = [str(it.get("id")) for it in items if it.get("id") is not None]
@@ -201,6 +224,12 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
                 if not symbols:
                     continue
                 primary = symbols[0].upper()
+                # r46 Tier 1: cross-source headline dedup.
+                _hkey = (primary, headline.lower()[:60].strip())
+                if _hkey in seen_headline_keys:
+                    out["skipped_dup"] += 1
+                    continue
+                seen_headline_keys.add(_hkey)
                 # Score headline + first line of summary for a richer signal
                 text_for_score = headline
                 if summary:
@@ -225,6 +254,13 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
                     for s in symbols:
                         s_up = s.upper()
                         if s_up in _open_pos_tickers:
+                            # r46 Tier 1: per-ticker AI-judge rate limit
+                            # (earnings day = 50+ articles per ticker;
+                            # without this every article fires its own AI
+                            # judge against the same open position).
+                            if _ai_rate.get(s_up, 0) >= _AI_RATE_PER_TICKER_HOUR:
+                                break
+                            _ai_rate[s_up] = _ai_rate.get(s_up, 0) + 1
                             _new_for_open.append({
                                 "ticker": s_up,
                                 "title": headline,
@@ -284,8 +320,17 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
     db = SessionLocal()
     try:
         for item in news_for_open:
-            # Only escalate medium+ severity; "low" is routine flow.
-            if (item.get("severity") or "").lower() in ("low", ""):
+            # r46 fix #0.1: severity is INT (sentiment.py:70 → int(round(abs(compound)*100))),
+            # not string. Prior code did `(severity or "").lower()` which raised
+            # AttributeError on the first iter — caught by an outer try/except,
+            # silently dropping ALL news exits since this code shipped (r41).
+            # Now: gate on numeric severity ≥ 35 (matches the |compound| ≥ 0.35
+            # threshold used by sentiment.py for "neutral" vs "positive/negative").
+            try:
+                sev = int(item.get("severity") or 0)
+            except Exception:
+                sev = 0
+            if sev < 35:
                 continue
             ticker = item["ticker"]
             open_trades = db.query(AutoTrade).filter(

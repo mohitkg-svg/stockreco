@@ -123,11 +123,17 @@ def adaptive_chandelier_mult(base_mult: float, ticker: str) -> float:
                     vol_factor = 0.85
     except Exception:
         pass
+    # r46 Tier 1: per-ticker vol_mult overlay (TSLA gets 1.6×; KO gets 0.8×).
+    try:
+        from services.ticker_profile import vol_mult as _tp_vm
+        ticker_vol = _tp_vm(ticker, default=1.0)
+    except Exception:
+        ticker_vol = 1.0
     if adx > 30:
-        return base_mult * 1.33 * vol_factor
+        return base_mult * 1.33 * vol_factor * ticker_vol
     if adx < 20:
-        return base_mult * 1.25 * vol_factor
-    return base_mult * vol_factor
+        return base_mult * 1.25 * vol_factor * ticker_vol
+    return base_mult * vol_factor * ticker_vol
 
 
 # --------------------- Live price lookup -----------------------------------
@@ -135,22 +141,34 @@ def adaptive_chandelier_mult(base_mult: float, ticker: str) -> float:
 _price_fallback_cache: Dict[str, tuple] = {}
 
 
-def current_price(ticker: str) -> Optional[float]:
+def current_price(ticker: str, max_age_sec: Optional[float] = None) -> Optional[float]:
     """Use live WS quote first (no network), fall back to a TTL-cached
     REST/Yahoo fetch so the manage loop doesn't hammer external APIs
-    every minute for tickers that aren't streaming."""
+    every minute for tickers that aren't streaming.
+
+    r46 fix #0.10: callers can pin a tighter freshness budget via
+    `max_age_sec`. The stop-evaluation path (manage_open_positions) now
+    requires a 30-second-fresh price; if WS is stale beyond that, we
+    skip the cache and fetch a fresh REST price.
+    """
     try:
         from services import live_quotes
-        live = live_quotes.get_live_price(ticker)
+        # Caller-pinned age cap, else use the module default.
+        live = live_quotes.get_live_price(ticker, max_age_sec=max_age_sec)
         if live and live > 0:
             return live
     except Exception:
         pass
 
+    # When the caller explicitly passed a tight age budget (e.g., 30s),
+    # bypass the fallback cache entirely — a 30s-old REST cache cannot
+    # claim freshness for a 30s-old WS query.
+    bypass_cache = max_age_sec is not None and max_age_sec <= _PRICE_FALLBACK_TTL
     now = time.time()
-    cached = _price_fallback_cache.get(ticker.upper())
-    if cached and now < cached[1]:
-        return cached[0]
+    if not bypass_cache:
+        cached = _price_fallback_cache.get(ticker.upper())
+        if cached and now < cached[1]:
+            return cached[0]
     try:
         from services.data_fetcher import get_current_price as fetch_current_price
         pi = fetch_current_price(ticker)

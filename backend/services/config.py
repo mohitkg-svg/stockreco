@@ -45,7 +45,10 @@ MTF_WEIGHTS = {"1mo": 4, "1d": 3, "4h": 2, "1h": 1}
 
 # ---- Risk envelope (auto_trader) -------------------------------------------
 # Confidence-risk multiplier ramps from 1.0 at threshold to this at 100% conf.
-RISK_MAX_CONFIDENCE_MULT = 1.75
+# r46 Tier 1 parameter tune: lowered 1.75 → 1.5. Confidence buckets above
+# 90 are sparse pre-100-closed-trades, and the 95-conf signal otherwise
+# gets a 1.6× headroom mult that compounds with calibration + Kelly.
+RISK_MAX_CONFIDENCE_MULT = 1.5
 # Kelly-criterion multiplier cap. Tightened from 1.35 to 1.2 during the
 # pre-live phase: with <100 closed trades we don't trust bucket win-rates
 # enough to let Kelly size up aggressively. Raise back to 1.35 once

@@ -15,6 +15,27 @@ inclusion / continued-deferral rationale. Deferred items whose rationale
 has gone stale should either move to ✅ done or be re-categorized as
 ❌ rejected — don't let the list rot into "we'll get to it eventually".
 
+## r46 13-agent maximum-spread audit (2026-04-27)
+
+13 parallel agents on angles never previously audited. ALL Tier 0/1/P
+implemented. Critical bugs verified + fixed:
+- News severity gate type bug (silently dropping ALL AI news exits since r41)
+- `account_drawdown_multiplier` referenced a non-existent function (multi-
+  day DD silently degraded to single-session DD)
+- `trading_blocked` flag never read (live account block = silent submit storm)
+- Stop-LIMIT now optional (env-gated) for flash-crash protection
+- Crisis playbook: kill / DD trim now run inside manage_open_positions
+- DD-tier alerts on -3/-5/-8/-10% crossings
+- UNIQUE on idempotency_key (multi-instance concurrent dedup)
+- Per-ticker overrides (TickerProfile table + accessors)
+- News cross-source dedup + per-ticker AI rate limit
+- Calibration as gate (Wilson-LB < 35% rejects)
+- Kelly on realized 60d edge (was backtest-only)
+- Tier P: opening-reversal, last-30min-momentum, news-spike-fade,
+  pre-FOMC drift, Russell/MSCI rebalance windows.
+
+163 tests pass.
+
 ## r45 ML calibration (2026-04-27)
 
 Closes the largest deferred item from r44: isotonic calibration on top

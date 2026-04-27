@@ -317,58 +317,236 @@ def vol_target_multiplier(target_annual_vol: float = 0.12) -> float:
     return float(max(0.5, min(1.5, raw)))
 
 
-def account_drawdown_multiplier() -> float:
-    """r44 fix #1.2: graduated account-level drawdown control.
-    Reads `paper_trader.get_portfolio_history()` peak-to-trough over
-    60d. Returns:
+# r46 fix #0.6: track which DD tier we're in to fire one-shot alerts on
+# crossings (don't spam the same alert every manage tick).
+_dd_tier_last_alerted: Optional[str] = None
+
+
+def _maybe_raise_dd_alert(drop_pct: float) -> None:
+    """Fire a one-shot alert when DD crosses 3/5/8/10% thresholds.
+    Tracks last-alerted tier to avoid spamming."""
+    global _dd_tier_last_alerted
+    tier = None
+    severity = "info"
+    if drop_pct >= 0.10:
+        tier, severity = "10pct", "critical"
+    elif drop_pct >= 0.08:
+        tier, severity = "8pct", "critical"
+    elif drop_pct >= 0.05:
+        tier, severity = "5pct", "warning"
+    elif drop_pct >= 0.03:
+        tier, severity = "3pct", "warning"
+    if tier and tier != _dd_tier_last_alerted:
+        _dd_tier_last_alerted = tier
+        try:
+            from services.alerts import alert as _raise_dd
+            _raise_dd(severity, f"drawdown_{tier}",
+                      f"Account drawdown {drop_pct*100:.1f}% — entering tier {tier}")
+        except Exception:
+            pass
+    elif drop_pct < 0.03 and _dd_tier_last_alerted is not None:
+        # Recovered; reset so the next breach fires fresh.
+        _dd_tier_last_alerted = None
+
+
+def account_drawdown_multiplier(lookback_days: int = 60) -> float:
+    """Graduated account-level drawdown control. Returns:
       ≤  3% drawdown → 1.0
       3-5%           → 0.70
       5-8%           → 0.50
       8-10%          → 0.25
       ≥ 10%          → 0.0  (caller treats as skip)
-    Falls back to 1.0 when broker history unavailable.
+
+    r46 fix #0.2: now reads from the persisted EquitySnapshot table
+    (populated every 5 min by `record_equity_snapshot`). Prior code
+    called `paper_trader.get_portfolio_history()` which doesn't exist —
+    fell through to `last_equity` (single-session DD) and the graduated
+    60d tier system was effectively single-day session DD, silently
+    degrading the r44 fix.
+    Falls back to session-DD only when no snapshots exist (cold start).
     """
     try:
+        from database import SessionLocal as _SL_dd, EquitySnapshot as _ES_dd
+        from datetime import datetime as _dt_dd, timedelta as _td_dd
+        db = _SL_dd()
+        try:
+            since = _dt_dd.utcnow() - _td_dd(days=lookback_days)
+            rows = (
+                db.query(_ES_dd.equity)
+                .filter(_ES_dd.ts >= since)
+                .order_by(_ES_dd.ts.asc())
+                .all()
+            )
+            eq = [float(r[0]) for r in rows if r[0] is not None]
+        finally:
+            db.close()
+        if len(eq) >= 5:
+            peak = max(eq)
+            cur = eq[-1]
+            if peak > 0:
+                drop = max(0.0, (peak - cur) / peak)
+                _maybe_raise_dd_alert(drop)
+                if drop >= 0.10: return 0.0
+                if drop >= 0.08: return 0.25
+                if drop >= 0.05: return 0.50
+                if drop >= 0.03: return 0.70
+                return 1.0
+    except Exception as e:
+        logger.debug(f"account_drawdown_multiplier (snapshot path): {e}")
+    # Cold-start fallback: session DD via last_equity. Same shape as before.
+    try:
         from services import paper_trader as _pt_dd
-        hist = getattr(_pt_dd, "get_portfolio_history", lambda: None)()
-        if not hist or "equity" not in hist:
-            # Fallback: use cumulative realized + current unrealized vs starting equity.
-            acct = _pt_dd.get_account()
-            if not acct:
-                return 1.0
-            equity = float(acct.get("equity") or 0)
-            last_equity = float(acct.get("last_equity") or 0)
-            if last_equity <= 0:
-                return 1.0
-            drop = max(0.0, (last_equity - equity) / last_equity)
-            if drop >= 0.10:
-                return 0.0
-            if drop >= 0.08:
-                return 0.25
-            if drop >= 0.05:
-                return 0.50
-            if drop >= 0.03:
-                return 0.70
+        acct = _pt_dd.get_account()
+        if not acct:
             return 1.0
-        eq = [float(x) for x in hist["equity"] if x is not None]
-        if len(eq) < 5:
+        equity = float(acct.get("equity") or 0)
+        last_equity = float(acct.get("last_equity") or 0)
+        if last_equity <= 0:
             return 1.0
-        peak = max(eq)
-        cur = eq[-1]
-        if peak <= 0:
-            return 1.0
-        drop = max(0.0, (peak - cur) / peak)
-        if drop >= 0.10:
-            return 0.0
-        if drop >= 0.08:
-            return 0.25
-        if drop >= 0.05:
-            return 0.50
-        if drop >= 0.03:
-            return 0.70
+        drop = max(0.0, (last_equity - equity) / last_equity)
+        if drop >= 0.10: return 0.0
+        if drop >= 0.08: return 0.25
+        if drop >= 0.05: return 0.50
+        if drop >= 0.03: return 0.70
         return 1.0
     except Exception:
         return 1.0
+
+
+def in_crisis_mode() -> bool:
+    """r46 Tier 1: aggregate "crisis regime" predicate. True iff:
+      * account drawdown ≥ 5% (multi-day from EquitySnapshot)
+      * OR session DD ≥ 4%
+      * OR (VIX > 30 AND SPY 5-day return < -5%)
+      * OR `should_freeze_trading` is True
+
+    Position-management code branches on this to tighten chandelier,
+    raise T1 trim, halve time-stop, and block new entries.
+    """
+    try:
+        # Multi-day DD from equity snapshots.
+        from database import SessionLocal as _SL_cm, EquitySnapshot as _ES_cm
+        from datetime import datetime as _dt_cm, timedelta as _td_cm
+        db = _SL_cm()
+        try:
+            since = _dt_cm.utcnow() - _td_cm(days=30)
+            rows = db.query(_ES_cm.equity).filter(_ES_cm.ts >= since).all()
+            eq = [float(r[0]) for r in rows if r[0] is not None]
+            if len(eq) >= 5:
+                peak = max(eq); cur = eq[-1]
+                if peak > 0 and (peak - cur) / peak >= 0.05:
+                    return True
+        finally:
+            db.close()
+    except Exception:
+        pass
+    try:
+        sed = session_equity_drawdown_pct()
+        if sed is not None and sed >= 0.04:
+            return True
+    except Exception:
+        pass
+    try:
+        from services.position_manager import current_price as _cp_cm
+        from services.data_fetcher import fetch_ohlcv as _fo_cm
+        vix = _cp_cm("^VIX")
+        spy_df = _fo_cm("SPY", "1d")
+        if vix and vix > 30 and spy_df is not None and len(spy_df) >= 6:
+            spy_5d = float(spy_df["Close"].iloc[-1] / spy_df["Close"].iloc[-6] - 1)
+            if spy_5d < -0.05:
+                return True
+    except Exception:
+        pass
+    try:
+        if should_freeze_trading() is not None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def crisis_chandelier_multiplier(base: float) -> float:
+    """In crisis mode, tighten chandelier from 3× to 2× ATR (cuts trail
+    distance ~33%). Outside crisis, return base unchanged."""
+    try:
+        if in_crisis_mode():
+            return base * 0.67
+    except Exception:
+        pass
+    return base
+
+
+def crisis_t1_trim_fraction(base: float) -> float:
+    """In crisis, raise T1 trim from 33% to 50%. Banks more on early wins
+    when subsequent reversion risk is elevated."""
+    try:
+        if in_crisis_mode():
+            return min(0.5, max(base, 0.5))
+    except Exception:
+        pass
+    return base
+
+
+def record_equity_snapshot() -> None:
+    """r46 fix #0.2: persist current equity / cash / BP / open-pnl to
+    EquitySnapshot table. Called by the scheduler every 5 minutes during
+    RTH and once at EOD. Cheap (single row); 5-min cadence × 7h = 84
+    rows/trading-day, manageable for years.
+    """
+    try:
+        from database import SessionLocal as _SL_es, EquitySnapshot as _ES_es
+        from services import paper_trader as _pt_es
+        from datetime import datetime as _dt_es
+        acct = _pt_es.get_account()
+        if not acct:
+            return
+        equity = float(acct.get("equity") or 0)
+        if equity <= 0:
+            return
+        cash = float(acct.get("cash") or 0)
+        bp = float(acct.get("buying_power") or 0)
+        rpnl = 0.0
+        try:
+            from services.auto_trader import realized_pnl_today as _rpnl_t
+            rpnl = float(_rpnl_t() or 0)
+        except Exception:
+            pass
+        unr = 0.0
+        try:
+            for p in (_pt_es.get_positions() or []):
+                unr += float(p.get("unrealized_pl") or 0.0)
+        except Exception:
+            pass
+        n_open = 0
+        try:
+            n_open = len(_pt_es.get_positions() or [])
+        except Exception:
+            pass
+        spy_close = None
+        try:
+            from services.data_fetcher import fetch_ohlcv as _fo_es
+            df_spy = _fo_es("SPY", "1d")
+            if df_spy is not None and not df_spy.empty:
+                spy_close = float(df_spy["Close"].iloc[-1])
+        except Exception:
+            pass
+        db = _SL_es()
+        try:
+            db.add(_ES_es(
+                ts=_dt_es.utcnow(),
+                equity=equity,
+                cash=cash,
+                buying_power=bp,
+                realized_pl_today=rpnl,
+                unrealized_pl=unr,
+                open_positions=n_open,
+                spy_close=spy_close,
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"record_equity_snapshot: {e}")
 
 
 def slippage_aware_risk_per_share(entry: float, stop: float, atr: float, spread: float = 0.0) -> float:

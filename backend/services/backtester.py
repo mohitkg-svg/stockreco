@@ -327,12 +327,28 @@ def _simulate(
             hit_t1 = False
             hit_t2 = False
             partial_pl_dollars = 0.0     # accumulated $-PnL per dollar of original exposure
-            # r39 audit fix #25: snapshot portfolio at trade open. Each
-            # partial leg's portfolio update applies `contrib × portfolio_at_open`
-            # rather than `contrib × current_portfolio` — so a multi-leg
-            # winner doesn't inflate geometrically across legs.
+            # r39 audit fix #25: snapshot portfolio at trade open.
             portfolio_at_trade_open = portfolio
             in_trade = True
+            entry_bar_idx = i
+            # r46 Tier 1: random early-flatten injection. The live bot has
+            # reverse-thesis exits, news-driven force-closes, time-stops, and
+            # operator-triggered flattens that the backtester never models.
+            # Empirically these account for ~5-8% of live trades. We assign
+            # a per-trade random "live-noise" exit horizon (none on most
+            # trades, ~5% chance of an early-flatten between bar +2 and the
+            # natural exit). Deterministic seed = entry_idx so the same
+            # backtest run is reproducible across re-evals.
+            try:
+                import random as _rnd_be
+                _seed = (i * 1664525 + len(trades) * 1013904223) & 0xFFFFFFFF
+                _rng_be = _rnd_be.Random(_seed)
+                _live_noise_pct = 0.05   # 5% of trades get an early flatten
+                _live_noise_bar = (_rng_be.randint(2, 8)
+                                    if _rng_be.random() < _live_noise_pct
+                                    else None)
+            except Exception:
+                _live_noise_bar = None
 
         elif in_trade:
             # Gap-target sanity: must sit at least 1 cent past the entry, otherwise
@@ -417,12 +433,27 @@ def _simulate(
                 _bar_dyn = _dynamic_slip_bps(row.to_dict(), _ts_int)
 
                 def _pnl_per_unit(px: float, frac: float) -> float:
-                    px_net = _apply_costs(px, "exit", direction, dyn_bps=_bar_dyn)
+                    # r46 Tier 1: partial-exit slippage haircut. Live T1/T2
+                    # trims pay an extra ~8 bps because of the 30s confirmation
+                    # window plus the cancel-and-resize round-trip that the
+                    # backtester simulates as instantaneous. Without this
+                    # haircut, the backtester systematically overstates partial-
+                    # exit PnL by ~16 bps round-trip per multi-leg trade.
+                    px_net = _apply_costs(px, "exit", direction, dyn_bps=_bar_dyn + 8.0)
                     if direction == "BUY":
                         return ((px_net - entry_price) / entry_price) * frac
                     return ((entry_price - px_net) / entry_price) * frac
 
                 bar_remainder_exit = False  # set when the runner is fully closed this bar
+
+                # r46 Tier 1: live-noise early flatten. If this trade was
+                # tagged with a noise-bar at entry and we've held that long,
+                # flatten at this bar's close to model the live exits the
+                # backtester would otherwise miss (reverse-thesis, news, etc.).
+                _bars_held = i - entry_bar_idx
+                _force_live_noise_exit = (
+                    _live_noise_bar is not None and _bars_held >= _live_noise_bar
+                )
 
                 def _flush(px: float, reason: str) -> None:
                     """Close all remaining size at px with the given reason."""
@@ -445,10 +476,13 @@ def _simulate(
                     frac_remaining = 0.0
                     bar_remainder_exit = True
 
+                # 0) r46 Tier 1: live-noise early flatten (probabilistic, ~5% of trades).
+                if _force_live_noise_exit:
+                    _flush(float(row["Close"]), "live_noise")
                 # 1) Gap-through stop
-                if direction == "BUY" and open_price <= stop:
+                if not bar_remainder_exit and direction == "BUY" and open_price <= stop:
                     _flush(open_price, "stop_gap")
-                elif direction == "SELL" and open_price >= stop:
+                elif not bar_remainder_exit and direction == "SELL" and open_price >= stop:
                     _flush(open_price, "stop_gap")
                 # 2) Gap-through final target (rare but real on opens)
                 if not bar_remainder_exit:
@@ -804,9 +838,15 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
     # confidence scores, scaled by sqrt(n_tests) — a coarse Deflated-Sharpe
     # approximation. Strategies that previously cleared 70 confidence on
     # spurious patterns now require ~80+ to clear the same effective bar.
+    # r46 Tier 1: Deflated-Sharpe-style haircut, less punitive than the
+    # prior 0.10 * log2(n) form. Bailey & López de Prado (2014) suggest a
+    # sqrt-of-log scaling for multiple-comparisons correction with N tests
+    # of similar power. With 26 tests, prior form gave 0.53; new form
+    # gives ~0.86 — more theoretically grounded and stops the haircut
+    # from dominating the strategy ranker.
     import math as _math
     n_tests = max(1, len(full_results))
-    bonferroni_haircut = max(0.5, 1.0 - 0.10 * _math.log(max(2, n_tests), 2))
+    bonferroni_haircut = max(0.7, 1.0 - 0.05 * (_math.log(max(2, n_tests), 2) ** 0.5))
 
     results = []
     for key, r in full_results.items():

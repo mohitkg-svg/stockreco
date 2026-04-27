@@ -277,7 +277,12 @@ class AutoTrade(Base):
     post_mortem = Column(Text, nullable=True)
     # Idempotency hash (ticker+signal_type+rounded entry/stop/T1) — prevents
     # the same signal from opening duplicate trades within the same scan window.
-    idempotency_key = Column(String, index=True, nullable=True)
+    # r46 fix #0.8: unique=True so the DB is the final guard against
+    # duplicate concurrent inserts (multi-instance autoscale + Cloud Run
+    # deploy overlap). Two scanners passing the dedup query before either
+    # commits → second commit hard-fails with IntegrityError instead of
+    # silently double-positioning.
+    idempotency_key = Column(String, index=True, unique=True, nullable=True)
     # High-water-mark price reached during the trade (for chandelier-exit trail)
     high_water_mark = Column(Float, nullable=True)
     low_water_mark = Column(Float, nullable=True)   # for short trades
@@ -654,6 +659,53 @@ class AnalystRating(Base):
     target_high = Column(Float, nullable=True)
     target_low = Column(Float, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+
+class TickerProfile(Base):
+    """r46 Tier 1: per-ticker overrides + cached statistics. Bot used to be
+    fully uniform (TSLA's 4%/day vol got the same ATR-mult floor as KO's
+    0.7%/day). Populated by the weekly walk-forward best-strategy run; reads
+    are best-effort with global config fallback at every site.
+    """
+    __tablename__ = "ticker_profiles"
+    ticker = Column(String, primary_key=True)
+    realized_vol_30d = Column(Float, nullable=True)        # daily stdev, 30d
+    vol_mult = Column(Float, default=1.0, nullable=True)   # ATR-mult scaler
+    beta_60d_realized = Column(Float, nullable=True)
+    confidence_threshold_override = Column(Float, nullable=True)
+    median_chain_spread_pct = Column(Float, nullable=True)
+    min_rr_override = Column(Float, nullable=True)
+    min_dte_override = Column(Integer, nullable=True)
+    trend_persistence_score = Column(Float, nullable=True)
+    chandelier_mult_override = Column(Float, nullable=True)
+    has_earnings_calendar = Column(Boolean, default=True, nullable=True)
+    correlation_cluster_id = Column(String, nullable=True)
+    news_count_p50_30d = Column(Float, nullable=True)
+    median_winning_hold_bars = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class EquitySnapshot(Base):
+    """r46 fix #0.2: persisted equity timeseries so multi-day drawdown
+    tracking actually works. Prior code referenced
+    `paper_trader.get_portfolio_history()` which doesn't exist; the
+    fallback used last_equity (1-day session DD) as a stand-in for 60-day
+    DD, silently degrading the graduated DD multiplier from r44 #1.2.
+
+    Recorder writes one row every 5 minutes during RTH plus one at EOD.
+    `account_drawdown_multiplier` reads peak-to-trough over the configured
+    horizon (default 60d).
+    """
+    __tablename__ = "equity_snapshots"
+    id = Column(Integer, primary_key=True)
+    ts = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)
+    equity = Column(Float, nullable=False)
+    cash = Column(Float, nullable=True)
+    buying_power = Column(Float, nullable=True)
+    realized_pl_today = Column(Float, nullable=True)
+    unrealized_pl = Column(Float, nullable=True)
+    open_positions = Column(Integer, nullable=True)
+    spy_close = Column(Float, nullable=True)             # SPY price for benchmark overlay
 
 
 class AIDecisionLog(Base):

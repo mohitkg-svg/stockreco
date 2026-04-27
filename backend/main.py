@@ -41,6 +41,7 @@ NOT in this module:
 """
 import logging
 import os
+from typing import Optional
 from logging.handlers import RotatingFileHandler
 from contextlib import asynccontextmanager
 
@@ -268,14 +269,33 @@ def scheduled_scan():
         if cfg and getattr(cfg, "use_universe_scanner", False):
             try:
                 from services.universe_scanner import get_candidate_tickers
-                pool = get_candidate_tickers()
-                # Union (watchlist first for UI-priority, then candidates).
+                pool = get_candidate_tickers()   # already sorted by score desc
+                # r46 Tier 1: union with EV-bias ordering. Prior code put
+                # watchlist FIRST and then appended pool — meaning if budget
+                # ran out mid-scan, watchlist names always processed but
+                # high-conviction pool tickers were skipped. Now: interleave
+                # so the top 50% of slots alternates pool↔watchlist by
+                # score-rank, ensuring high-EV pool names see the same
+                # priority as watchlist.
                 seen = set(tickers)
-                for t in pool:
-                    if t not in seen:
-                        tickers.append(t)
-                        seen.add(t)
-                logger.info(f"Scan universe: watchlist={len(tickers) - len(pool) + len(seen - set(pool))}, candidates={len(pool)}")
+                # Take pool order as authoritative (already EV-sorted).
+                interleaved = []
+                w_iter = iter(tickers)
+                for p_t in pool:
+                    if p_t not in seen:
+                        interleaved.append(p_t); seen.add(p_t)
+                    try:
+                        w_t = next(w_iter)
+                        if w_t not in {x for x in interleaved}:
+                            interleaved.append(w_t)
+                    except StopIteration:
+                        pass
+                # Drain remaining watchlist
+                for w_t in w_iter:
+                    if w_t not in {x for x in interleaved}:
+                        interleaved.append(w_t)
+                tickers = interleaved
+                logger.info(f"Scan universe (EV-interleaved): {len(tickers)} tickers (watchlist + {len(pool)} candidates)")
             except Exception as e:
                 logger.warning(f"universe_scanner read failed: {e}")
     finally:
@@ -588,6 +608,21 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"low_signal_volume job not scheduled: {_e}")
+
+    # r46 fix #0.2: equity snapshot recorder. 5-min during RTH (13:30-20:00 UTC,
+    # weekdays) so the persisted equity timeseries actually exists for
+    # account_drawdown_multiplier to read.
+    try:
+        from services.risk_manager import record_equity_snapshot
+        from apscheduler.triggers.cron import CronTrigger as _CronES
+        scheduler.add_job(
+            record_equity_snapshot,
+            trigger=_CronES(day_of_week="mon-fri", hour="13-20", minute="*/5"),
+            id="equity_snapshot",
+            max_instances=1, coalesce=True, misfire_grace_time=120,
+        )
+    except Exception as _e:
+        logger.warning(f"equity_snapshot job not scheduled: {_e}")
 
     # Institutional holdings (13F proxy via yfinance) — weekly Sunday 05:15
     # UTC. 13F cadence is quarterly-with-lag so weekly is plenty.
@@ -974,7 +1009,36 @@ def health():
         "killed": killed_flag,
         "killed_reason": killed_reason,
         "alerts_unacked": alerts_unacked,
+        # r46 Tier 1: surface crisis state + key risk-overlay diagnostics.
+        "crisis_mode": _crisis_mode_flag(),
+        "session_dd_pct": _session_dd_pct(),
+        "account_dd_mult": _acct_dd_mult(),
     }
+
+
+def _crisis_mode_flag() -> bool:
+    try:
+        from services.risk_manager import in_crisis_mode
+        return bool(in_crisis_mode())
+    except Exception:
+        return False
+
+
+def _session_dd_pct() -> Optional[float]:
+    try:
+        from services.risk_manager import session_equity_drawdown_pct
+        v = session_equity_drawdown_pct()
+        return round(v * 100, 2) if v is not None else None
+    except Exception:
+        return None
+
+
+def _acct_dd_mult() -> Optional[float]:
+    try:
+        from services.risk_manager import account_drawdown_multiplier
+        return account_drawdown_multiplier()
+    except Exception:
+        return None
 
 
 @app.post("/api/admin/clear-cache", dependencies=[Depends(require_api_key)])

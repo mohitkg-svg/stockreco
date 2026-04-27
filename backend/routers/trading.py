@@ -80,6 +80,50 @@ class OrderRequest(BaseModel):
     extended_hours: Optional[str] = Field("auto", pattern="^(auto|true|false|on|off|AUTO|TRUE|FALSE|ON|OFF)$")
 
 
+@router.get("/equity-curve")
+def equity_curve(lookback_days: int = 30):
+    """r46 Tier 1 observability: persisted equity timeseries with derived
+    drawdown_pct (vs rolling max). Populated by `record_equity_snapshot`
+    every 5min during RTH. SPY-relative overlay included for benchmark.
+    """
+    from database import EquitySnapshot
+    from datetime import datetime as _dt_ec, timedelta as _td_ec
+    from database import SessionLocal as _SL_ec
+    db = _SL_ec()
+    try:
+        since = _dt_ec.utcnow() - _td_ec(days=int(lookback_days))
+        rows = (
+            db.query(EquitySnapshot)
+            .filter(EquitySnapshot.ts >= since)
+            .order_by(EquitySnapshot.ts.asc())
+            .all()
+        )
+        out = []
+        peak = 0.0
+        spy_anchor = None
+        for r in rows:
+            peak = max(peak, float(r.equity or 0))
+            dd = ((peak - float(r.equity or 0)) / peak * 100.0) if peak > 0 else 0.0
+            if spy_anchor is None and r.spy_close:
+                spy_anchor = float(r.spy_close)
+            spy_rel = (float(r.spy_close) / spy_anchor * float(rows[0].equity or 1) if (r.spy_close and spy_anchor) else None)
+            out.append({
+                "ts": r.ts.isoformat() + "Z",
+                "equity": float(r.equity or 0),
+                "cash": float(r.cash) if r.cash is not None else None,
+                "buying_power": float(r.buying_power) if r.buying_power is not None else None,
+                "realized_pl_today": float(r.realized_pl_today) if r.realized_pl_today is not None else None,
+                "unrealized_pl": float(r.unrealized_pl) if r.unrealized_pl is not None else None,
+                "open_positions": int(r.open_positions) if r.open_positions is not None else None,
+                "drawdown_pct": round(dd, 3),
+                "spy_close": float(r.spy_close) if r.spy_close else None,
+                "spy_relative_equity": round(spy_rel, 2) if spy_rel else None,
+            })
+        return {"lookback_days": lookback_days, "n_snapshots": len(out), "snapshots": out}
+    finally:
+        db.close()
+
+
 @router.get("/account")
 def account():
     if not paper_trader.is_enabled():

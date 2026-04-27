@@ -94,6 +94,17 @@ def is_holiday_drift_week() -> bool:
     return False
 
 
+def pre_fomc_drift_buy_qualifying_ticker(ticker: str) -> bool:
+    """r46 Tier P: gate to authorize a Pre-FOMC drift LONG entry.
+    Lucca-Moench (2015): SPX +49 bps mean on day before FOMC. Restricted
+    to large-cap index ETFs to avoid naming-specific noise.
+    """
+    if not is_pre_fomc_day():
+        return False
+    target_set = {"SPY", "QQQ", "IWM", "DIA", "IVV", "VOO", "VTI"}
+    return ticker.upper() in target_set
+
+
 def calendar_multiplier() -> float:
     """Combined calendar-effects sizing multiplier. Conservative bounds.
 
