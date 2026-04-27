@@ -98,6 +98,224 @@ research, numerical edge cases, observability gaps).
 
 174 tests pass (was 163; 11 new r47 regression tests).
 
+### r47 ⏸️ Deferred to r48+ — items found this pass but NOT shipped
+
+The 14-agent audit surfaced ~250 findings. r47 implemented the highest-
+leverage P0 cutover blockers + Tier P new strategies that had a clean
+single-revision implementation. The items below are real findings that
+were deliberately deferred — most are multi-day/multi-week, need data
+ingestion, or need infrastructure (multi-leg options, point-in-time
+data) that doesn't exist yet.
+
+**⏸️ Concurrency P1/P2 (need atomic-SQL-UPDATE refactor for hot fields)**:
+| Finding | File | Defer reason |
+|---|---|---|
+| `_target_touch_counts` read-modify-write race vs DB column | auto_trader.py:100-131 | Convert to `UPDATE auto_trades SET target_touch_count = target_touch_count + 1` atomic SQL — refactor across all touch sites |
+| `force_close_trade` `realized_pl` ORM read-modify-write | execution_engine.py:213-216 | Switch to `UPDATE ... SET realized_pl = COALESCE(realized_pl, 0) + :delta` atomic SQL |
+| `update_config` row-level lost-update races | auto_trader.py:1261-1272 | `with_for_update()` on Postgres + targeted UPDATE statements |
+| `kill()` vs `update_config` interleave | auto_trader.py:599 | Same atomic-update treatment |
+| ML scorer model+calibrator load race | ml_scorer.py:81-134 | Atomic dir-swap or version-pinned filenames |
+| `_stock_quotes` torn writes (last vs ts pair) | live_quotes.py:208-218 | Replace inner-dict mutation with whole-dict swap |
+| `_subscribed_symbols` race on reconnect | live_quotes.py:367-413 | Lock guard + snapshot iteration |
+| `paper_trader._market_clock_cache` thundering herd | paper_trader.py:62-75 | Single-flight `threading.Event` |
+| `_subscribers` mutated/iterated unsynchronized | live_quotes.py:41,134-160 | `_subscribers_lock` |
+| `_in_flight_bp_last_check_ts` unprotected gate | risk_manager.py:88-124 | Move read into the lock |
+| `trip_bp_breaker` / `trip_broker_breaker` no lock | risk_manager.py:127-160 | `_breaker_lock` |
+| `_post_mortem_pending` leak on submit-mid-error | auto_trader.py:280-313 | Track via Future.add_done_callback |
+| `_corr_cache` torn reads (rets + ts separate writes) | auto_trader.py:344-369 | Single tuple per ticker |
+| `auto_reconcile_positions` interleaves with manage tick | auto_trader.py:868-924 | Acquire `_manage_lock` in reconcile path |
+| `_chandelier_atr_cache` / `_chandelier_adx_cache` / `_price_fallback_cache` unsynchronized | position_manager.py:38-86 | Per-ticker lock or single-flight |
+| `_NEWS_AI_POOL` not joined on shutdown | news.py:36 | Add to lifespan teardown |
+| `partial-fill cancel-remainder` doesn't release BP delta | auto_trader.py:4077-4090 | `_release_bp(unfilled * entry)` immediately |
+
+**⏸️ DB integrity P0/P1 (multi-day or pool-tier dependency)**:
+| Finding | File | Defer reason |
+|---|---|---|
+| Connection pool exhaustion under multi-instance Cloud Run (15 conns × 3 instances vs Cloud SQL f1-micro 25 cap) | database.py:62-66 | Operator decision: bump Cloud SQL tier to db-g1-small OR cap max_instances=1 — outside engineering scope this revision |
+| No FK constraints anywhere (AutoTrade.signal_id, Alert.trade_id, etc.) | database.py | Migration risk; requires careful ON DELETE planning |
+| Money fields stored as Float not Numeric — cents drift on multi-leg accumulation | database.py:139-256 | ALTER COLUMN per money column + read-path audit |
+| Missing composite indexes on hot queries | database.py | Postgres CONCURRENTLY migration; non-trivial ordering |
+| `consider_signal` long-running txn holds session through Alpaca + Claude | auto_trader.py:1680-2742 | Refactor into "read-gates / network-IO / write" sections |
+| News cross-source dedup TOCTOU under multi-instance ingest | news.py:175-186 | DB-layer UNIQUE on (ticker, headline_prefix, ts_bucket) — schema migration |
+| CandidatePool wipe-and-rebuild not atomic | universe_scanner.py:338-358 | Switch to `INSERT ... ON CONFLICT(ticker) DO UPDATE` upsert |
+| AutoTraderConfig CHECK(id=1) singleton hardening | database.py:151-241 | Migration |
+| `realized_pnl_today` SERIALIZABLE around daily-loss gate | auto_trader.py:551-566 | Postgres-only feature; needs Postgres-prod confirmation |
+| SQLite "database is locked" silently swallowed in manage loop | auto_trader.py:4800 | Specialize OperationalError → retry-once before swallow |
+| Cold-start `_in_flight_bp_reserved` lost — fresh instance over-sizes | risk_manager.py:43-46 | Persist to Memorystore/DB table; design choice |
+
+**⏸️ Position lifecycle P1/P2 (real bugs, defensive but not catastrophic)**:
+| Finding | Defer reason |
+|---|---|
+| Bracket parent NACK orphan (rare race) | Need broker-state probe via client_order_id on submit failure |
+| Cancel-and-cross double-bracket race | Pre-cross broker query for parent-terminal status |
+| PDT 403 retry storm — no breaker | Add `pdt_lockout_until` 24h cooldown breaker |
+| Reverse-thesis `check_reversals_for` races manage tick | Acquire `_manage_lock` in reverse-thesis path |
+| Slippage-shift force-close doesn't release BP | Add `_release_bp` to force_close_trade |
+| `closed_external` doesn't compute realized_pl from broker history | Fetch last 5 SELL fills per ticker on reconcile |
+| Adopted placeholder $0.95×entry doesn't reflect real risk | Use 5% notional as fixed risk for adopted rows |
+| Option assignment leaves option AutoTrade row open | "option open + no broker position" → closed_external + alert |
+| Realized_pl on multi-leg trim uses live snapshot, not actual fill price | Await trim fill via get_order_by_id; use filled_avg_price |
+| T1 trim not idempotent on commit failure | Set hit_t1=True + commit BEFORE SL-resize round-trip |
+| Promoted-adopted reverse-thesis defaults to "1d" TF | Add `source_timeframe` column |
+| Stale price guard missing in `_manage_option_trade` underlying-stop | Pass `max_age_sec=30` |
+| Bracket TIF=DAY orphans TP at session close | Add daily TP resubmit alongside SL invariant |
+| Wash-sale enforcement (cfg knob added, no enforcement code) | r48 — compose from closed-loss tracker + cooldown gate |
+
+**⏸️ Memory / perf P1 (degrade over weeks; not immediate)**:
+| Finding | Defer reason |
+|---|---|
+| Manage walltime 37s P50 / 250s P99 at 50 positions | `ThreadPoolExecutor.map(_process_trade, trade_ids)` — needs DB pool bump first |
+| WS stop-threat fast-path opens fresh `SessionLocal()` per tick (~40 sessions/sec) | Cache `{ticker: current_stop}` in manage tick; fast-path reads cache |
+| `_chandelier_atr_cache` / `_adx_cache` / `_price_fallback_cache` unbounded | LRU cap of 1000 each |
+| `_corr_cache` holds pd.Series unbounded | LRU cap 256 |
+| `alerts._dedup` unbounded over months | Periodic prune entries older than 2× DEDUP_WINDOW |
+| `regime_score()` recomputed per signal | Pre-compute every 60s in scheduler, broadcast cached |
+| ML scoring per-ticker microstructure adds 100s to scan | Pass shared `daily_cache` through scan-orchestration |
+| News dedup query per batch | Memoize 30-min window across polls |
+| `fetch_ohlcv` `df.copy()` per cache hit | Read-only view or write-on-mutate |
+| `_tick_rule_imbalance` Python for-loop on 10K trades | Vectorize via numpy diff/sign |
+| Kill broadcast 6.4MB JSON payload on 50-position kill-all | Pre-serialize bytes once per fan-out |
+| `_recompute_task` uses asyncio default executor | Bounded executor `max_workers=4` |
+| APScheduler `misfire_grace_time=60` too low for 10s manage | Bump manage misfire to 120s; add metrics counter on misfires |
+| `_NEWS_AI_POOL` queue unbounded | Switch to `Queue(maxsize=20)` + drop-oldest-on-full |
+| httpx per-call TLS handshake on 9 modules | Module-level reused `httpx.Client` |
+| `equity_curve` no GZip middleware | Add `GZipMiddleware(minimum_size=1024)` |
+| `_load_if_needed` ml_scorer DB hit per-call when calibrator missing | "checked-in-last-5min" guard |
+
+**⏸️ Backtest validity / edge quantification (multi-week / multi-month)**:
+| Finding | Defer reason |
+|---|---|
+| `portfolio_backtest.py` charges ZERO transaction cost (~2-5%/yr drag missing) | Wire `_apply_costs` from per-ticker backtester; re-run all stress windows |
+| Universe-construction look-ahead — current Alpaca tradable list applied to past | Need point-in-time CSV per `as_of_date` (data ingestion) |
+| Survivorship/look-ahead in fundamentals — current yfinance.info read for past bars | Snapshot fundamentals quarterly into versioned table OR disable in backtest |
+| Insider-multiplier reads CURRENT InsiderSummary regardless of bar timestamp | Versioned InsiderSummary per `as_of_date` OR disable in non-live |
+| News timestamp leakage (`updated_at` vs `created_at`) | Prefer `created_at`; +5min decision-delay floor on backtest |
+| Earnings-date rescheduling leak | Versioned earnings calendar |
+| No Probabilistic / Deflated Sharpe (Bailey-LdP) — current Bonferroni proxy too lax | Implement DSR with proper trial count (strategies × params × tickers) + skew/kurt moments |
+| WF IS/OOS climate-mismatch test missing | Implement Combinatorial Purged CV (CPCV) + KS test on return distributions |
+| Slippage too generous on small caps (~30-50 bps under-modeled) | Replace heuristic adders with Corwin-Schultz effective spread |
+| Stop fills assume zero slippage past stop level | Add 25 bps stop-slippage adder |
+| No alpha-decay analysis (fold-Sharpe slope) | Report fold-Sharpe slope; demote strategies with slope < -0.3 |
+| No bootstrap / permutation null per strategy | Stationary bootstrap on shuffled entries → p_value |
+| Sharpe annualization assumes IID trade returns (~18% inflation) | Newey-West HAC standard error |
+| `calibrated_weights.py` still `NotImplementedError` | Walk-forward CV per (strategy, timeframe) |
+| Multiplier independence assumed but signals correlated | PCA orthogonalization of regime score (Macro C16) |
+| 14-factor signal_generator stack auto-correlated within [0.7, 1.4] clamp | Cluster-aware combine (factor count → discount) |
+| AI confidence multiplier envelope [0.6, 1.4] is largest single multiplier with no backtest | Shrink to [0.85, 1.15] before active mode flip |
+| Pre-FOMC drift ETF 1.232× (1.10×1.12) too aggressive post-publication | Reduce 1.10 → 1.05; drop ETF-specific 1.12 |
+| Russell rebalance applied to ALL signals not just inclusion list | Gate on `cfg.index_inclusion_tickers` whitelist |
+| OPEX 0.92× applied universally — small caps don't pin | Gate on `options_open_interest > 5000` |
+| Insider cluster amplifier 1.12× has no OOS validation in repo | Backtest 12-cluster rule on this codebase's universe |
+| Sector-rotation lookback 126d too long (mean-reversion at 6-12mo) | Switch to 63d |
+| Strategy WR baseline 0.55 doesn't account for SPY uptrend base rate | Regime-adjust to 0.60 in uptrend |
+| Per-bucket multiplier needs Bayesian shrinkage at small N | `Beta(11, 9)` posterior |
+| Crisis chandelier 0.67× and T1 50% are hand-picked | Backtest 0.5/0.67/0.75/0.90 on crisis windows |
+| `_high52_proximity` fires too often (no cooldown) | Add 5-bar cooldown after fire |
+| Seven r46/r47 new strategies have no per-strategy realized-edge gate | Require `n>=30` per ticker before signal-blend contribution |
+| 60/40 backtest blend arbitrary | Shrinking-toward-tech `n/(n+30)` |
+| `vol_target_multiplier` reads trade-PnL series (noisy) | Switch to EquitySnapshot returns; require ≥30 snapshots |
+| Confidence→sizing monotonicity broken at tight-stop boundary | Hard cap single-entry notional at 50% × equity |
+| `winrate_to_multiplier` step function | Smooth `tanh` ramp |
+| `regime_multiplier` clamp [0.6, 1.2] asymmetric without rationale | Document or rederive empirically |
+
+**⏸️ Options pricing P0/P1 (real money, but mostly require Greeks persistence first)**:
+| Finding | Defer reason |
+|---|---|
+| **Long-option entries STILL use MARKET orders** (exits are limit) | Need `submit_option_buy_marketable_limit` + cross-fallback primitive — high impact, contained |
+| Greeks NOT persisted on AutoTrade — `portfolio_greeks` uses hardcoded defaults | ALTER TABLE add entry_delta/gamma/theta/vega/iv columns + plumb |
+| No portfolio vega/gamma/net-delta cap | Depends on Greeks persistence |
+| Theta-stop OCC parse `len >= 13` should be `>= 16` | Trivial 1-line, deferred for batching |
+| R:R reward ignores theta-decay-to-target | Subtract `theta × expected_days_to_target` |
+| IV-rank is realized-vol-rank (proxy) — anti-edge in 30-40% regimes | Ingest historical IV30 daily into `iv_history` table |
+| `_iv_is_expensive` falls back to absolute 100% IV cap | Use sector-median IV when RV unknown |
+| Premium-at-stop estimate missing gamma | Add 0.5×gamma×Δs² term (mirror of reward fix) |
+| Strike-width ATR band ignores DTE — too tight for monthlies, too wide for weeklies | Scale by √DTE |
+| Earnings post-print IV-crush window not gated for options (B6 partially mitigates) | Extend earnings gate to [-48h, +72h] for options |
+| `managed_risk` $0.05 floor inflates R:R on cheap contracts | Require `true_managed_risk >= 0.10` AND drop premium < $0.50 |
+| Bid-ask check stale (10min cached chain) at order time | Re-fetch live `live_quotes.get_option_quote(occ)` just before submit |
+| Theta-stop measures underlying not contract value (misses pure IV-crush) | Add parallel premium-progress gate |
+| Per-contract sizing missing gamma | Tied to gamma-corrected estimate |
+| Trading-DTE vs calendar-DTE for theta scoring | `pandas_market_calendars` |
+| Single-stock CAPE / quality cross-sectional rank | New module + sector aggregates |
+| Multi-leg options infrastructure (vertical/calendar/iron condor/strangle/dispersion) | Multi-week rebuild of execution engine |
+| Skew-aware strike selection | Track rolling 60d ATM call-IV vs put-IV |
+| Term-structure-aware DTE selection | Hook to `vix_term_ratio` for monthly vs weekly bias |
+
+**⏸️ Strategy proposals not yet shipped**:
+| Strategy | Defer reason |
+|---|---|
+| A2 Earnings-revision momentum | Need analyst-revisions historical store (current code overwrites on refresh) |
+| A3 Macro-surprise drift (CPI/NFP/GDP) | Surprise→drift mapping + post-release windowed sizing |
+| A4 Cross-sectional 12-1 momentum | New `services/factors.py` module with cross-sectional rank |
+| A5 Real-yield → growth/value rotation | Need TIPS / 10y real yield ingestion |
+| A7 FOMC hawkish/dovish surprise | Need Fed Funds futures-implied prob |
+| B8 Quality cross-sectional (sector-neutral) | Rewrite quality_score against sector aggregates |
+| B9 BAB low-vol tilt | New cross-sectional rank in factors.py |
+| B10 DXY → small/large-cap tilt | Need DXY ingestion + intl-revenue-pct fundamentals |
+| B11 Yield-curve → defensive sectors | Trivial extension of `yield_curve_2s10s` |
+| B12 Oil regime overlay | New `cross_asset.oil_regime()` |
+| B13 Single-stock CAPE value | Need 5y EPS series |
+| C14 Opportunistic insider differentiation | Trader-frequency heuristic in insider_trades |
+| C15 Squeeze setup (high SI + breakout) | Verify already in code; cooldown |
+| C16 PCA orthogonalization of regime score | Multi-week — needs rolling-PCA infrastructure |
+| Vol A3 Earnings long strangle | Paired-leg book-keeping in single-leg infra |
+| Vol B1 Pre-FOMC calendar (long-back-only variant) | Single-leg degraded version |
+| Microstructure: block-print lean, sweep detector, aggressor-flow override, spread-widening defer, opening drive bias, tape-accel confirm, halt-resume continuation/fade, VWAP reversion (band fade), ticker-personality router, VWAP-limit entry, HVN-aware stops, round-number stop-hunt fade, EOD pre-MOC continuation, earnings overshoot fade, pre-market gap reversal, quote-stuffing detector, NOPE proxy | New `services/order_flow.py` module + manage-tick hooks; multi-revision build |
+| Lev-ETF decay short | Whitelist + chop-regime detector |
+| GEX proxy / OPEX pin (stock-only proxy) | Need OI history quality (Alpaca currently 0) |
+| Iron condor low-RV harvest | Multi-leg + short-premium broker support |
+
+**⏸️ Observability not shipped (P1/P2 — most are 1-day each, batch in r48)**:
+| Item | Implementation hint |
+|---|---|
+| Generic `submit_rejected` alert (PDT/wash/sub-penny/not-tradable) | One `else: _raise_alert(...)` after BP/5xx branches |
+| SL-resubmit-failure threshold counter (storm precursor) | Per-trade in-memory dict; alert at 3+ in 30min |
+| Data-freshness alert during RTH | Bar-age check in `data_fetcher` after fetch |
+| Frontend error reporter (`/api/log/frontend-error` + window.onerror) | ~80 LOC |
+| Execution latency p99 metrics (signal→submit→fill→broadcast) | Three new `Histogram` instruments |
+| Daily PnL attribution digest | Cron at 22:30 UTC writing structured Alert |
+| Broker-balance reconciliation alert | Hourly: expected_realized vs alpaca.cash drift |
+| Self-emitted heartbeat from manage loop | Webhook payload every 5min |
+| AI-veto rate alert (>50% vetoed → signal_gen too aggressive) | Nightly job |
+| Zero-entries sentinel | Daily 22:00 UTC job |
+| Consecutive-skip cluster alert | 30-min bucket counter per skip reason |
+| **AI cost ($) tracker** — currently only call count | `resp.usage.input_tokens / output_tokens` × price table; surface on `/api/health` |
+| ML drift / brier-deviation alert | Pre-train `brier_score_loss(outcomes, calibrated_probs)` vs stored |
+| `MLPrediction.outcome IS NULL` backlog metric | End of `_ml_outcome_backfill` |
+| Options chain & earnings cache freshness on `/api/health` | Per-ticker `last_successful_fetch_ts` |
+| Idempotency-collision alert | Nightly count |
+| Backtest-vs-live drift alert | Weekly job: 30d-realized-WR-by-strategy vs `calibrated_weights[strat].backtest_wr` |
+| Spread/cost realism check (live vs backtest assumption) | Once SLIPPAGE_BPS histogram has data |
+| Win-rate trending-down rolling alert (30-trade WR < 45%) | Nightly job |
+| Correlation-spike alert (median pair-corr > 0.80) | Per manage-tick when N≥5 open |
+| Drawdown attribution per-position | New `DrawdownAttribution` table |
+| Equity-curve sparseness check | Frontend coverage badge |
+| Deploy-event marker on equity-curve chart | `Alert(severity=info, category=deploy)` at startup |
+| DB connection-pool exhaust alert | 60s healthcheck sampling `pool.checkedout()` |
+| 15-min RTH low-signal-volume probe | Catches yfinance outages within minutes |
+
+**⏸️ Numerical (deferred — narrower than the dead-multiplier batch)**:
+- Option mid 5¢-tick rounding for premium ≥ $3 (broker silent reject)
+- Bonferroni haircut formula floor `0.7` is dead code (use natural log or lower floor)
+- backtester `_simulate` `frac_remaining` float drift (round to 4 decimals)
+- `_max_qty_by_gap` 2%-of-entry floor too aggressive on low-vol names
+- `kelly_risk_mult` no NaN validation (NaN propagates through sizing)
+- `position_size_by_risk` int() truncation (Alpaca supports fractional)
+- Backtester DEFAULT_STOP_ATR_MULT=1.5 doesn't match any TF in STOP_ATR_MULT_BY_TF
+- `dd_score` weight too low in `score_strategy` (50% DD scores 67/100)
+- `book_var_99 = heat × 1.5` doesn't correspond to any real distribution (should be 2.33×)
+
+These categories together represent ~150-180 deferred items. Most are
+1-2 day implementations once their prerequisites are in place. Priority
+for r48: **(a)** complete the options entry path (marketable-limit
+entries + Greeks persistence + portfolio vega cap), **(b)** complete
+observability (slippage metric ladder, AI cost tracker, ML drift,
+heartbeat, generic submit-rejected), **(c)** atomic-SQL refactor for
+hot fields (`realized_pl`, `target_touch_count`, BP), **(d)** Kelly
+proper R-data plumb-through (currently still placebo). Multi-week
+items (point-in-time data, multi-leg options, calibrated_weights
+implementation, CPCV, DSR) gated on operational triggers.
+
 ## r46 13-agent maximum-spread audit (2026-04-27)
 
 13 parallel agents on angles never previously audited. ALL Tier 0/1/P
