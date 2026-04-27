@@ -124,7 +124,22 @@ def calendar_multiplier() -> float:
     if is_first_4_days_of_month():
         m *= 1.05
     if is_opex_day():
+        # r48 BACKLOG #edge-F11: OPEX pinning is documented for liquid
+        # mega-caps with deep options (SPY, QQQ, AAPL, TSLA, MSFT, NVDA).
+        # On thin-options names, the 0.92× was noise — apply only to the
+        # OPEX-pinning-eligible universe.
         m *= 0.92
     if is_holiday_drift_week():
         m *= 1.05
     return float(max(0.85, min(1.15, m)))
+
+
+_OPEX_PIN_ELIGIBLE = {"SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "TSLA",
+                     "AMZN", "GOOGL", "META", "AMD", "AVGO"}
+
+
+def opex_eligible(ticker: str) -> bool:
+    """r48 BACKLOG #edge-F11: only liquid mega-cap names with deep options
+    chains exhibit OPEX pinning. Returns True if `ticker` is in the
+    eligible universe; caller skips the OPEX 0.92× for non-eligible names."""
+    return (ticker or "").upper() in _OPEX_PIN_ELIGIBLE

@@ -204,9 +204,12 @@ _CONFIDENCE_MULT_TOOL = {
             "multiplier": {
                 "type": "number",
                 "description": (
-                    "A real number in [0.6, 1.4]. 1.0 = neutral. "
+                    "A real number in [0.85, 1.15]. 1.0 = neutral. "
                     "Below 1.0 = down-size for caution. Above 1.0 = up-size for "
-                    "high conviction (use sparingly — most trades are neutral)."
+                    "high conviction (use sparingly — most trades are neutral). "
+                    "r48 BACKLOG: tightened from [0.6, 1.4] — the wider envelope "
+                    "made AI the largest single multiplier in the stack with no "
+                    "backtest validation; tighter range damps untested LLM bias."
                 ),
             },
             "reason": {
@@ -230,6 +233,22 @@ import os as _os_aij
 _ai_call_counter: Dict[str, int] = {}
 _AI_DAILY_CALL_CAP = int(_os_aij.getenv("AI_DAILY_CALL_CAP", "5000"))
 
+# r48 BACKLOG #observability-P1-15: AI cost ($) tracker. Per-day input/
+# output token totals × the model price table → estimated $ spend.
+# Surfaced on /api/health; alerts fire above `AI_DAILY_USD_CAP` (cfg).
+_ai_token_input: Dict[str, int] = {}
+_ai_token_output: Dict[str, int] = {}
+# Approximate USD per 1M tokens for Claude models (Apr 2026, Anthropic public)
+_AI_PRICE_PER_M_TOK = {
+    "claude-opus-4-7": (15.0, 75.0),     # input, output
+    "claude-opus-4-5": (15.0, 75.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    # Default fallback for unknown models — assume Sonnet pricing
+    "_default": (3.0, 15.0),
+}
+
 
 def _ai_budget_check() -> bool:
     """True iff today's AI call count is below the cap."""
@@ -240,6 +259,35 @@ def _ai_budget_check() -> bool:
         return False
     _ai_call_counter[day] = n + 1
     return True
+
+
+def _record_ai_usage(model: str, input_tokens: int, output_tokens: int) -> None:
+    """Accumulate today's per-model token usage. Cheap, no I/O."""
+    from datetime import datetime as _dt_au
+    day = _dt_au.utcnow().strftime("%Y-%m-%d")
+    _ai_token_input[day] = _ai_token_input.get(day, 0) + max(0, int(input_tokens or 0))
+    _ai_token_output[day] = _ai_token_output.get(day, 0) + max(0, int(output_tokens or 0))
+
+
+def ai_cost_today_usd(model_hint: str = "claude-opus-4-7") -> Dict[str, Any]:
+    """Estimate today's $ spend on AI calls using a public-list price
+    table. Surfaced via /api/health for the operator. No external lookup."""
+    from datetime import datetime as _dt_co
+    day = _dt_co.utcnow().strftime("%Y-%m-%d")
+    inp = _ai_token_input.get(day, 0)
+    out = _ai_token_output.get(day, 0)
+    inp_price, out_price = _AI_PRICE_PER_M_TOK.get(
+        model_hint, _AI_PRICE_PER_M_TOK["_default"]
+    )
+    cost = (inp / 1_000_000.0) * inp_price + (out / 1_000_000.0) * out_price
+    return {
+        "day": day,
+        "calls": _ai_call_counter.get(day, 0),
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cost_estimate_usd": round(cost, 4),
+        "model_hint": model_hint,
+    }
 
 
 def _wrap_external_data(label: str, payload: Any) -> str:
@@ -304,6 +352,17 @@ def _call_with_tool(
         except Exception as e:
             logger.warning(f"ai_judge: API call failed ({type(e).__name__}: {e})")
             return None
+        # r48 BACKLOG #observability-P1-15: record token usage for $ tracking.
+        try:
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                _record_ai_usage(
+                    AI_JUDGE_MODEL,
+                    int(getattr(usage, "input_tokens", 0) or 0),
+                    int(getattr(usage, "output_tokens", 0) or 0),
+                )
+        except Exception:
+            pass
         try:
             for block in resp.content or []:
                 if getattr(block, "type", None) == "tool_use":
@@ -398,7 +457,7 @@ def confidence_multiplier(signal: Dict[str, Any], context: Dict[str, Any]) -> Di
     started = time.time()
     sys_prompt = (
         "You are sizing a trade that has already passed every rule-based "
-        "filter. Output a multiplier in [0.6, 1.4] for position size: "
+        "filter. Output a multiplier in [0.85, 1.15] for position size: "
         "1.0 = neutral (the rule-engine size is correct), <1.0 = downsize "
         "(some semantic concern), >1.0 = upsize (rare — only when the "
         "setup AND the surrounding context are unusually clean). "

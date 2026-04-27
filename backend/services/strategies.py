@@ -504,20 +504,62 @@ def _inside_bar_breakout(d: pd.DataFrame) -> Dict:
 
 
 def _high52_proximity(d: pd.DataFrame) -> Dict:
-    """r44 Wave 7 — 52-week-high proximity momentum (George & Hwang 2004).
-    Long when price is within 5% of the 252-bar high AND ADX ≥ 25 (trend).
+    """52-week-high proximity momentum (George & Hwang 2004).
+
+    r48 BACKLOG #backtest-F22: prior code fired on every up-day in the
+    proximity window — too many duplicate signals. Add a 5-bar cooldown
+    after firing to space out entries.
     """
     hi52 = d["High"].rolling(252, min_periods=120).max()
     near_hi = d["Close"] >= 0.95 * hi52
     adx_ok = d["ADX_14"] >= 25 if "ADX_14" in d.columns else pd.Series(True, index=d.index)
-    long_e = near_hi & adx_ok & (d["Close"] > d["Close"].shift(1))
+    raw_long = near_hi & adx_ok & (d["Close"] > d["Close"].shift(1))
+    # Apply a 5-bar cooldown
+    long_e = raw_long.copy()
+    last_fired = -1000
+    out_idx = list(raw_long.index)
+    for i, idx in enumerate(out_idx):
+        if bool(raw_long.loc[idx]):
+            if i - last_fired < 5:
+                long_e.loc[idx] = False
+            else:
+                last_fired = i
     empty = pd.Series(False, index=d.index)
     return {
         "name": "52w High Proximity",
-        "description": "Within 5% of 252-bar high in trend regime (ADX ≥ 25)",
+        "description": "Within 5% of 252-bar high in trend regime (ADX ≥ 25), 5-bar cooldown",
         "regime": "trend",
         "entry_long": long_e.fillna(False),
         "entry_short": empty,
+    }
+
+
+def _lev_etf_decay_short(d: pd.DataFrame) -> Dict:
+    """r48 BACKLOG #C3: leveraged ETF decay short on choppy tape.
+    Cheng-Madhavan (JID 2009): daily-rebalanced leveraged ETFs decay in
+    high-vol/low-trend regimes due to volatility drag. Trade: short
+    leveraged ETF (or buy inverse) when 20d realized-vol > 75th pctile
+    AND ADX < 20 (chop). Whitelist enforced at signal_generator level.
+    """
+    empty = pd.Series(False, index=d.index)
+    if "ADX_14" not in d.columns or len(d) < 60:
+        return {
+            "name": "Lev-ETF Decay Short",
+            "description": "Short leveraged ETF in chop regime",
+            "regime": "chop",
+            "entry_long": empty, "entry_short": empty,
+        }
+    rv20 = d["Close"].pct_change().rolling(20).std() * (252 ** 0.5)
+    rv60 = rv20.rolling(60, min_periods=30)
+    rv_pct = rv20.rank(pct=True)
+    chop = (d["ADX_14"] < 20) & (rv_pct >= 0.75)
+    short_e = chop & (d["Close"] < d["Close"].shift(1))
+    return {
+        "name": "Lev-ETF Decay Short",
+        "description": "Short lev-ETF when RV>75pct AND ADX<20 (chop)",
+        "regime": "chop",
+        "entry_long": empty,
+        "entry_short": short_e.fillna(False),
     }
 
 
@@ -587,6 +629,8 @@ STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
     _news_spike_fade,
     # r47 Tier P additions:
     _vix_spike_reversion,
+    # r48 BACKLOG additions:
+    _lev_etf_decay_short,
 ]
 
 

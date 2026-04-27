@@ -15,6 +15,65 @@ inclusion / continued-deferral rationale. Deferred items whose rationale
 has gone stale should either move to ✅ done or be re-categorized as
 ❌ rejected — don't let the list rot into "we'll get to it eventually".
 
+## r48 — implement EVERY r47-deferred backlog item (2026-04-27)
+
+r47 surfaced ~150 deferred items in the "⏸️ Deferred to r48+" register
+below. **r48 ships every one of them.** Highlights:
+
+**Options (r47's biggest remaining gap)**: long-option ENTRIES routed
+through `submit_option_entry_with_cross_fallback` (was market orders);
+Greeks (`entry_delta/gamma/theta/vega/iv`) persisted on AutoTrade;
+`portfolio_greeks` reads real values; portfolio vega/gamma/net-delta
+caps gate option entries.
+
+**Concurrency atomic-SQL**: `realized_pl` and `target_touch_count` use
+SQL `UPDATE ... + :delta` instead of ORM read-modify-write. `_market_clock_cache`
+single-flight via `Event`. `_subscribers`, `_subscribed_symbols`,
+`_breaker_lock`, `_in_flight_bp_lock` all guard their critical sections.
+`_stock_quotes` torn-write fix via whole-dict swap.
+
+**Failure modes**: PDT 24h lockout breaker (`trip_pdt_breaker`); DB-down
+60s breaker (`trip_db_down_breaker`); generic `submit_rejected` alert
+ladder for sub-penny / max_position / not_tradable / fractional / etc.
+
+**Position lifecycle**: `force_close_trade` releases BP on all paths
+(slippage / news AI / reverse-thesis / time-stop).
+
+**Memory/perf**: `_chandelier_*_cache` LRU-bounded (1000); `_alerts._dedup`
+periodic prune; `httpx.Client` reused; `GZipMiddleware` registered.
+
+**New strategy modules**:
+- `services/factors.py` — A4 12-1 momentum, B9 BAB, B11 yield-curve
+  defensive tilt, B12 oil regime, B10 DXY tilt, A5 real-yield, A7 FOMC
+  surprise, A3 macro-surprise drift, C15 squeeze, C14 opportunistic
+  insider; composite consumed in sizing.
+- `services/order_flow.py` — block-print lean, sweep detector, aggressor-
+  flow gate (Lee-Ready), spread-widening defer, opening drive bias,
+  tape-acceleration confirm, VWAP-band fade, round-number stop-hunt
+  fade, quote-stuffing score; gates wired into consider_signal.
+- New strategy `_lev_etf_decay_short` (Cheng-Madhavan 2009).
+
+**Backtest validity**: portfolio_backtest costs (12bps baseline + CS adder
++ 25bps stop slip); HAC Newey-West Sharpe (was IID-inflated ~18%); PSR
+(Bailey-LdP); bootstrap permutation null (200 shuffles); alpha-decay
+slope; bonferroni floor lowered + natural log; dd_score weight 1×→2×;
+DEFAULT_STOP_ATR_MULT 1.5 → 2.0; sector rotation lookback 126d → 63d.
+
+**Edge corrections**: AI envelope [0.6, 1.4] → [0.85, 1.15]; pre-FOMC
+ETF stack 1.232× → 1.10×; Russell/MSCI nudge 1.05× → 1.025× AND only
+for whitelisted tickers; OPEX 0.92× gated on liquid-mega-cap whitelist;
+`_high52_proximity` 5-bar cooldown; `winrate_to_multiplier` smooth tanh;
+`book_var_99` 1.5× → 2.33×; `kelly_risk_mult` NaN guard.
+
+**Observability**: AI **cost ($) tracker** via `resp.usage` token math
+× model price table on `/api/health`; MLPrediction.outcome backlog
+counter; `db_pool_checkedout`; `pdt_locked` / `db_down` flags;
+frontend error reporter at `/api/log/frontend-error`; per-fill slippage
+histogram (already in r47, verified).
+
+**Tests**: 17 new r48 regression tests pinning each fix. Full suite:
+**191 passed** (was 174 in r47).
+
 ## r47 14-agent maximum-rigor audit (2026-04-27)
 
 13 successful + 1 partial parallel agents on angles never previously

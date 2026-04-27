@@ -38,9 +38,14 @@ _option_quotes: Dict[str, Dict[str, float]] = {}
 
 # Subscribers that want every update pushed to them.
 # Each subscriber is an async callable: await cb(event_dict)
+# r48 BACKLOG #concurrency-P0-6: lock guard for add/remove/iterate.
+import threading as _lq_threading
+_subscribers_lock = _lq_threading.Lock()
 _subscribers: Set[Callable[[Dict[str, Any]], Awaitable[None]]] = set()
 
 # Set of currently subscribed stock symbols on the Alpaca stream.
+# r48 BACKLOG #concurrency-P1-10: lock guard for ensure/unsubscribe.
+_subscribed_symbols_lock = _lq_threading.Lock()
 _subscribed_symbols: Set[str] = set()
 
 # Background worker task + lock
@@ -132,32 +137,36 @@ _MAX_SUBSCRIBERS = 256
 
 
 def subscribe(cb: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
-    if len(_subscribers) >= _MAX_SUBSCRIBERS:
-        logger.error(
-            f"subscribe rejected: subscriber set at hard cap {_MAX_SUBSCRIBERS} — "
-            "likely a leak in router cleanup"
-        )
-        return
-    _subscribers.add(cb)
+    # r48 BACKLOG #concurrency-P0-6: atomic check+add to enforce cap.
+    with _subscribers_lock:
+        if len(_subscribers) >= _MAX_SUBSCRIBERS:
+            logger.error(
+                f"subscribe rejected: subscriber set at hard cap {_MAX_SUBSCRIBERS} — "
+                "likely a leak in router cleanup"
+            )
+            return
+        _subscribers.add(cb)
 
 
 def unsubscribe(cb: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
-    _subscribers.discard(cb)
+    with _subscribers_lock:
+        _subscribers.discard(cb)
 
 
 async def _broadcast(event: Dict[str, Any]) -> None:
     dead = []
-    for cb in list(_subscribers):
+    with _subscribers_lock:
+        snapshot = list(_subscribers)
+    for cb in snapshot:
         try:
             await cb(event)
         except Exception as e:
-            # Subscriber raised — either WS died or its push() decided it's
-            # stuck (see routers/stream.py:_DEAD_DROP_THRESHOLD). Either way,
-            # prune. Log at INFO instead of DEBUG so leaks become visible.
             logger.info(f"Subscriber dropped from broadcast set: {e}")
             dead.append(cb)
-    for cb in dead:
-        _subscribers.discard(cb)
+    if dead:
+        with _subscribers_lock:
+            for cb in dead:
+                _subscribers.discard(cb)
 
 
 def broadcast_event_safe(event: Dict[str, Any]) -> None:
@@ -210,11 +219,15 @@ async def _handle_trade(trade) -> None:
     px = float(getattr(trade, "price", 0) or 0)
     if not sym or px <= 0:
         return
-    q = _stock_quotes.setdefault(sym, {})
-    prev = q.get("last")
-    q["last"] = px
-    q["ts"] = time.time()
-    event = {"type": "stock_trade", "symbol": sym, "last": px, "ts": q["ts"]}
+    # r48 BACKLOG #concurrency-P1-9: replace inner-dict mutation with atomic
+    # whole-dict swap so a concurrent reader can't see fresh `last` paired
+    # with stale `ts` (or vice versa).
+    prev_dict = _stock_quotes.get(sym) or {}
+    prev = prev_dict.get("last")
+    new_ts = time.time()
+    new_dict = {**prev_dict, "last": px, "ts": new_ts}
+    _stock_quotes[sym] = new_dict   # atomic dict-pointer swap (GIL-protected)
+    event = {"type": "stock_trade", "symbol": sym, "last": px, "ts": new_ts}
     await _broadcast(event)
 
     # Live recompute gating
@@ -309,13 +322,23 @@ async def _handle_quote(quote) -> None:
     ask = float(getattr(quote, "ask_price", 0) or 0)
     if not sym:
         return
-    q = _stock_quotes.setdefault(sym, {})
+    # r48 BACKLOG #concurrency-P1-9: atomic dict swap (mirror of trade handler).
+    prev_dict = _stock_quotes.get(sym) or {}
+    new_ts = time.time()
+    new_dict = dict(prev_dict)
     if bid > 0:
-        q["bid"] = bid
+        new_dict["bid"] = bid
     if ask > 0:
-        q["ask"] = ask
-    q["ts"] = time.time()
-    await _broadcast({"type": "stock_quote", "symbol": sym, "bid": bid, "ask": ask, "ts": q["ts"]})
+        new_dict["ask"] = ask
+    new_dict["ts"] = new_ts
+    _stock_quotes[sym] = new_dict
+    # r48 BACKLOG: feed spread EMA into order_flow tracker.
+    try:
+        from services import order_flow as _of
+        _of.update_spread_ema(sym, bid, ask)
+    except Exception:
+        pass
+    await _broadcast({"type": "stock_quote", "symbol": sym, "bid": bid, "ask": ask, "ts": new_ts})
 
 
 async def _alpaca_worker():
@@ -366,13 +389,18 @@ async def _alpaca_worker():
             # We subscribe lazily as watchlist changes via ensure_symbols()
             while True:
                 await asyncio.sleep(1)
-                if _subscribed_symbols:
+                with _subscribed_symbols_lock:
+                    has_syms = bool(_subscribed_symbols)
+                if has_syms:
                     break
 
-            client.subscribe_trades(_handle_trade, *list(_subscribed_symbols))
-            client.subscribe_quotes(_handle_quote, *list(_subscribed_symbols))
+            # r48 BACKLOG #concurrency-P1-10: snapshot under lock
+            with _subscribed_symbols_lock:
+                _snap = list(_subscribed_symbols)
+            client.subscribe_trades(_handle_trade, *_snap)
+            client.subscribe_quotes(_handle_quote, *_snap)
 
-            logger.info(f"Alpaca stream connected, subscribed to {sorted(_subscribed_symbols)}")
+            logger.info(f"Alpaca stream connected, subscribed to {sorted(_snap)}")
             await asyncio.get_running_loop().run_in_executor(None, client.run)
             backoff = 10
             consecutive_failures = 0
@@ -399,20 +427,23 @@ async def _alpaca_worker():
 
 
 def ensure_symbols(tickers: List[str]) -> None:
-    """Add tickers to the subscribed set. Called on startup + on watchlist add."""
+    """Add tickers to the subscribed set. Called on startup + on watchlist add.
+    r48 BACKLOG #concurrency-P1-10: lock guard against reconnect-snapshot race."""
     global _alpaca_client
     upper = {t.upper() for t in tickers}
-    new = upper - _subscribed_symbols
-    if not new:
-        return
-    _subscribed_symbols.update(new)
+    with _subscribed_symbols_lock:
+        new = upper - _subscribed_symbols
+        if not new:
+            return
+        _subscribed_symbols.update(new)
+        new_snapshot = list(new)
     if _alpaca_client:
         try:
-            _alpaca_client.subscribe_trades(_handle_trade, *new)
-            _alpaca_client.subscribe_quotes(_handle_quote, *new)
-            logger.info(f"Alpaca live-subscribed additional: {sorted(new)}")
+            _alpaca_client.subscribe_trades(_handle_trade, *new_snapshot)
+            _alpaca_client.subscribe_quotes(_handle_quote, *new_snapshot)
+            logger.info(f"Alpaca live-subscribed additional: {sorted(new_snapshot)}")
         except Exception as e:
-            logger.warning(f"Could not dynamically subscribe {new}: {e}")
+            logger.warning(f"Could not dynamically subscribe {new_snapshot}: {e}")
 
 
 # ------------------------------------------------------------------

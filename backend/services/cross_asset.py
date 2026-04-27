@@ -181,18 +181,23 @@ _SECTOR_ETFS = ["XLK", "XLF", "XLV", "XLE", "XLY", "XLP", "XLI", "XLU", "XLB", "
 
 
 def sector_rotation_score(sector_etf: str) -> Optional[float]:
-    """r44 Wave 7 — sector rotation tilt. Rank `sector_etf` by 126-day
-    return against all S&P sector ETFs. Top-3 → +0.08, bottom-3 → -0.08,
-    else 0. Drives a sector_confidence_multiplier overlay.
+    """r44 Wave 7 — sector rotation tilt. Rank `sector_etf` against all
+    S&P sector ETFs. Top-3 → +0.08, bottom-3 → -0.08, else 0.
+
+    r48 BACKLOG #backtest-F21: lookback shortened from 126d to 63d.
+    Sector rotation mean-reverts at 6-12 month horizons (Faber 2010,
+    Antonacci 2014); the 6-month signal is buying near reversal points.
+    3-month aligns with the documented edge regime.
     """
+    LOOKBACK = 63
     def _compute():
         from services.data_fetcher import fetch_ohlcv
         rets: Dict[str, float] = {}
         for sym in _SECTOR_ETFS:
             df = fetch_ohlcv(sym, "1d")
-            if df is None or df.empty or len(df) < 127:
+            if df is None or df.empty or len(df) < LOOKBACK + 1:
                 continue
-            r = float(df["Close"].iloc[-1] / df["Close"].iloc[-127] - 1)
+            r = float(df["Close"].iloc[-1] / df["Close"].iloc[-(LOOKBACK + 1)] - 1)
             rets[sym] = r
         if sector_etf not in rets or len(rets) < 6:
             return None

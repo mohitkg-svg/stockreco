@@ -94,5 +94,8 @@ AI_JUDGE_TIMEOUT_SEC = 5.0
 # AI confidence multiplier is a downward-bias range — symmetric envelope
 # would let "AI loves it" double the bet; not what we want from an LLM.
 # Stack ceiling RISK_MULT_CEILING already caps everything at 2.0×.
-AI_MULT_MIN = 0.6
-AI_MULT_MAX = 1.4
+# r48 BACKLOG #edge-F12: tightened from [0.6, 1.4] — the prior envelope
+# made the AI multiplier the largest single multiplier in the stack, with
+# no backtest validation; tighter range damps untested LLM bias.
+AI_MULT_MIN = 0.85
+AI_MULT_MAX = 1.15

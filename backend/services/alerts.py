@@ -37,13 +37,30 @@ _dedup_lock = threading.Lock()
 _dedup: Dict[str, float] = {}
 
 
+_webhook_client: Optional[httpx.Client] = None
+
+
+def _get_webhook_client() -> Optional[httpx.Client]:
+    """r48 BACKLOG #perf-P3-23: reuse a single httpx.Client to avoid
+    per-call TLS handshakes (~150ms each)."""
+    global _webhook_client
+    if _webhook_client is None:
+        try:
+            _webhook_client = httpx.Client(timeout=3.0)
+        except Exception:
+            return None
+    return _webhook_client
+
+
 def _post_webhook(payload: Dict[str, Any]) -> None:
     url = os.getenv("ALERT_WEBHOOK_URL")
     if not url:
         return
+    client = _get_webhook_client()
+    if client is None:
+        return
     try:
-        with httpx.Client(timeout=3.0) as client:
-            client.post(url, json=payload)
+        client.post(url, json=payload)
     except Exception as e:
         logger.debug(f"alert webhook post failed: {e}")
 
@@ -69,6 +86,12 @@ def alert(
         if now_t - last < _DEDUP_WINDOW_SEC:
             return
         _dedup[dedup_key] = now_t
+        # r48 BACKLOG #perf-P1.11: prune stale entries to bound the dict.
+        if len(_dedup) > 5000:
+            cutoff = now_t - (_DEDUP_WINDOW_SEC * 2)
+            for k in list(_dedup.keys()):
+                if _dedup[k] < cutoff:
+                    _dedup.pop(k, None)
 
     prefix = f"ALERT[{severity.upper()}][{category}]"
     logger.log(_LEVEL_MAP[severity], f"{prefix} {message} (ticker={ticker} trade_id={trade_id})")

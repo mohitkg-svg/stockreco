@@ -1724,5 +1724,140 @@ class TestR47ConfidenceBoostFiresOnDirectionMatch(unittest.TestCase):
         self.assertGreaterEqual(mult, 1.05)
 
 
+class TestR48Backlog(unittest.TestCase):
+    """r48 BACKLOG: pin every fix that addresses a deferred r47 finding."""
+
+    def test_marketable_limit_option_entries(self):
+        """r48 BACKLOG #options-P0-2: option entries route through the new
+        marketable-limit-with-cross-fallback primitive."""
+        from services import paper_trader
+        self.assertTrue(hasattr(paper_trader, "submit_option_entry_with_cross_fallback"))
+
+    def test_greeks_persistence_columns(self):
+        """r48 BACKLOG #options-P0-4: AutoTrade has entry_delta/gamma/theta/vega/iv."""
+        from database import AutoTrade
+        cols = set(AutoTrade.__table__.columns.keys())
+        for c in ("entry_delta", "entry_gamma", "entry_theta", "entry_vega",
+                  "entry_iv", "source_timeframe"):
+            self.assertIn(c, cols)
+
+    def test_portfolio_greeks_caps_function_exists(self):
+        from services.risk_manager import portfolio_greeks_caps_breached
+        # Smoke: empty book should not breach any cap at $100k equity
+        br = portfolio_greeks_caps_breached(100_000, 0, 0, 0)
+        self.assertIn("vega", br)
+        self.assertIn("gamma", br)
+        self.assertIn("delta", br)
+
+    def test_atomic_realized_pl_helper_exists(self):
+        from services.execution_engine import atomic_accumulate_realized_pl, atomic_increment_target_touch
+        # Just ensure callables exist (smoke; behavior tested by integration paths)
+        self.assertTrue(callable(atomic_accumulate_realized_pl))
+        self.assertTrue(callable(atomic_increment_target_touch))
+
+    def test_pdt_breaker(self):
+        from services.risk_manager import trip_pdt_breaker, is_pdt_locked, clear_pdt_breaker
+        clear_pdt_breaker()
+        self.assertFalse(is_pdt_locked())
+        trip_pdt_breaker(hours=1)
+        self.assertTrue(is_pdt_locked())
+        clear_pdt_breaker()
+        self.assertFalse(is_pdt_locked())
+
+    def test_db_down_breaker(self):
+        from services.risk_manager import trip_db_down_breaker, is_db_down
+        # initially not down
+        self.assertFalse(is_db_down())
+        trip_db_down_breaker(seconds=60)
+        self.assertTrue(is_db_down())
+
+    def test_factor_composite(self):
+        from services.factors import factor_composite
+        m, parts = factor_composite("SPY", sector="ETF")
+        self.assertGreaterEqual(m, 0.6)
+        self.assertLessEqual(m, 1.4)
+        self.assertIn("momentum", parts)
+
+    def test_order_flow_module_exposes_gates(self):
+        from services import order_flow
+        for fn in ("update_spread_ema", "spread_widening_defer",
+                   "aggressor_flow_imbalance", "aggressor_flow_gate",
+                   "detect_block_lean", "detect_sweep",
+                   "tape_acceleration_factor", "vwap_band_reversion_signal",
+                   "round_number_proximity_fade", "opening_drive_bias",
+                   "quote_stuffing_score"):
+            self.assertTrue(hasattr(order_flow, fn), f"missing: {fn}")
+
+    def test_winrate_smoothness(self):
+        """r48 BACKLOG #F19: smooth tanh ramp, monotonic, in-envelope."""
+        from services.ml_scorer import winrate_to_multiplier
+        # No ProgressBar steps — small p increments produce small multiplier deltas
+        m_lo = winrate_to_multiplier(0.40)
+        m_mid = winrate_to_multiplier(0.50)
+        m_hi = winrate_to_multiplier(0.60)
+        self.assertLess(m_lo, m_mid)
+        self.assertLess(m_mid, m_hi)
+        self.assertGreater(m_hi - m_mid, 0)
+        self.assertLess(abs(m_mid - 1.00), 0.01)  # centered
+
+    def test_book_var_99_uses_2_33(self):
+        """r48 BACKLOG #numerical-P2-20: 99% VaR multiplier corrected from 1.5 → 2.33."""
+        from services import risk_manager as _rm
+        from unittest.mock import patch
+        with patch.object(_rm, "current_portfolio_heat", return_value=1000.0):
+            v = _rm.book_var_99(equity=100_000)
+        self.assertAlmostEqual(v, 2330.0, places=1)
+
+    def test_default_stop_atr_mult(self):
+        """r48 BACKLOG #numerical-P2-22: default aligned to daily TF (was 1.5, now 2.0)."""
+        from services.backtester import DEFAULT_STOP_ATR_MULT
+        self.assertEqual(DEFAULT_STOP_ATR_MULT, 2.0)
+
+    def test_lev_etf_strategy_in_registry(self):
+        from services.strategies import STRATEGY_FUNCS
+        names = {f.__name__ for f in STRATEGY_FUNCS}
+        self.assertIn("_lev_etf_decay_short", names)
+
+    def test_kelly_nan_guard(self):
+        """r48 BACKLOG #numerical-P1-11: NaN inputs return 1.0 instead of NaN."""
+        import math
+        from services.risk_math import kelly_risk_mult
+        m = kelly_risk_mult(historical_win_rate=float("nan"), avg_reward_risk=1.5)
+        self.assertEqual(m, 1.0)
+        m = kelly_risk_mult(historical_win_rate=60.0, avg_reward_risk=float("nan"))
+        self.assertEqual(m, 1.0)
+
+    def test_ai_envelope_tightened(self):
+        """r48 BACKLOG #edge-F12: AI mult envelope shrunk to [0.85, 1.15]."""
+        from services.config import AI_MULT_MIN, AI_MULT_MAX
+        self.assertAlmostEqual(AI_MULT_MIN, 0.85, places=4)
+        self.assertAlmostEqual(AI_MULT_MAX, 1.15, places=4)
+
+    def test_ai_cost_tracker(self):
+        """r48 BACKLOG #observability-P1-15: $ cost tracker with token math."""
+        from services.ai_judge import ai_cost_today_usd, _record_ai_usage
+        _record_ai_usage("claude-opus-4-7", 1_000_000, 100_000)
+        out = ai_cost_today_usd("claude-opus-4-7")
+        self.assertIn("cost_estimate_usd", out)
+        # 1M input × $15 + 100K output × $75 / 1M = 15 + 7.5 = 22.5
+        self.assertGreater(out["cost_estimate_usd"], 0)
+
+    def test_index_event_requires_ticker(self):
+        """r48 BACKLOG #edge-F10: boost only fires for whitelisted inclusion tickers."""
+        from services.index_calendar import index_event_multiplier
+        from unittest.mock import patch
+        # Even mid-window, a non-whitelisted ticker returns 1.0
+        with patch("services.index_calendar.is_in_index_event_window", return_value=True):
+            m = index_event_multiplier(ticker="UNKNOWN_TICKER_ZZZ")
+            self.assertEqual(m, 1.0)
+
+    def test_opex_eligible_universe(self):
+        """r48 BACKLOG #edge-F11: OPEX 0.92× only for liquid mega-caps."""
+        from services.seasonality import opex_eligible
+        self.assertTrue(opex_eligible("SPY"))
+        self.assertTrue(opex_eligible("AAPL"))
+        self.assertFalse(opex_eligible("CNTA"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -56,6 +56,63 @@ def _rsc_pop(key: str) -> None:
         _replace_stop_cache.pop(key, None)
 
 
+def atomic_accumulate_realized_pl(db: Session, trade_id: int, delta: float) -> None:
+    """r48 BACKLOG #concurrency-P1-11: atomic SQL accumulator for realized_pl.
+
+    Replaces the lost-update-prone ORM read-modify-write pattern
+    `t.realized_pl = (t.realized_pl or 0) + delta; db.commit()`. Two
+    threads racing on the same trade row no longer wipe each other's
+    contribution — the UPDATE is committed in a single round-trip with
+    `realized_pl = COALESCE(realized_pl, 0) + :d`.
+    """
+    from database import AutoTrade as _AT_acc
+    from sqlalchemy import update as _sql_update
+    try:
+        delta_r = round(float(delta), 2)
+        db.execute(
+            _sql_update(_AT_acc)
+            .where(_AT_acc.id == trade_id)
+            .values(realized_pl=(
+                _AT_acc.__table__.c.realized_pl.op("COALESCE")(0.0) + delta_r
+            ))
+        )
+        db.commit()
+    except Exception:
+        # Fallback: read-modify-write (still better than crashing)
+        db.rollback()
+        t = db.query(_AT_acc).filter(_AT_acc.id == trade_id).first()
+        if t is not None:
+            t.realized_pl = round(float(t.realized_pl or 0.0) + float(delta), 2)
+            db.commit()
+
+
+def atomic_increment_target_touch(db: Session, trade_id: int) -> int:
+    """r48 BACKLOG #concurrency-P1-1: atomic increment of target_touch_count.
+    Returns the post-increment count."""
+    from database import AutoTrade as _AT_tt
+    from sqlalchemy import update as _sql_update_tt
+    try:
+        db.execute(
+            _sql_update_tt(_AT_tt)
+            .where(_AT_tt.id == trade_id)
+            .values(target_touch_count=(
+                _AT_tt.__table__.c.target_touch_count + 1
+            ))
+        )
+        db.commit()
+        t = db.query(_AT_tt).filter(_AT_tt.id == trade_id).first()
+        return int((t.target_touch_count if t else 0) or 0)
+    except Exception:
+        db.rollback()
+        t = db.query(_AT_tt).filter(_AT_tt.id == trade_id).first()
+        if t is None:
+            return 0
+        n = int(t.target_touch_count or 0) + 1
+        t.target_touch_count = n
+        db.commit()
+        return n
+
+
 def get_legs(parent_id: str) -> List[Any]:
     """Return child orders (TP + SL) of a bracket parent."""
     c = paper_trader._get_client()
@@ -237,10 +294,10 @@ def force_close_trade(
             return
         px = _current_price(t.ticker)
         if px and t.entry_price:
-            # r42 fix #0.1: ADD runner-leg PnL to accumulated partial-trim
-            # PnL; prior `=` overwrite erased T1/T2 partials.
-            existing = float(t.realized_pl or 0.0)
-            t.realized_pl = round(existing + (px - t.entry_price) * t.qty, 2)
+            # r48 BACKLOG #concurrency-P1-11: atomic SQL accumulator (was
+            # ORM read-modify-write, racing manage tick + AI exit threads).
+            atomic_accumulate_realized_pl(db, t.id, (px - t.entry_price) * t.qty)
+            db.refresh(t)
     else:
         # r43 fix #2.7: use marketable-limit-with-cross-fallback on emergency
         # option closes too — saves spread on the common case while still
@@ -263,9 +320,11 @@ def force_close_trade(
             return
         pos = paper_trader.get_option_position(t.symbol)
         if pos and pos.get("current_price") is not None and t.entry_price:
-            # r42 fix #0.1: ADD runner-leg PnL to accumulated partial PL.
-            existing = float(t.realized_pl or 0.0)
-            t.realized_pl = round(existing + (pos["current_price"] - t.entry_price) * t.qty * 100, 2)
+            # r48 BACKLOG #concurrency-P1-11: atomic SQL accumulator (option side).
+            atomic_accumulate_realized_pl(
+                db, t.id, (pos["current_price"] - t.entry_price) * t.qty * 100
+            )
+            db.refresh(t)
 
     t.status = status_override or "closed_reverse"
     t.closed_at = datetime.utcnow()
@@ -274,6 +333,19 @@ def force_close_trade(
     try:
         from services.auto_trader import _backfill_ml_outcome as _bf
         _bf(db, t)
+    except Exception:
+        pass
+    # r48 BACKLOG #lifecycle-P1-15: release BP reservation on every force-close
+    # path (slippage-reject, news AI, reverse-thesis, time-stop, etc.). Prior
+    # code only released on the manage-loop reconcile path, leaking reservations.
+    try:
+        from services.risk_manager import _release_bp as _rb_fc
+        if (t.asset_type or "stock") == "stock":
+            _rb_fc(float(t.entry_price or t.requested_entry or 0)
+                   * float(t.original_qty or t.qty or 0))
+        else:
+            _rb_fc(float(t.entry_price or t.requested_entry or 0)
+                   * float(t.original_qty or t.qty or 0) * 100.0)
     except Exception:
         pass
     db.commit()

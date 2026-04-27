@@ -113,7 +113,10 @@ def _dynamic_slip_bps(bar: dict, ts_hhmm: Optional[int] = None) -> float:
 # understated risk on short TFs (where stops need to be wider for volatility)
 # and overstated R:R on long TFs. We now source the stop mult from the same
 # config table and scale the target to preserve the original 1.67 R:R ratio.
-DEFAULT_STOP_ATR_MULT = 1.5
+# r48 BACKLOG #numerical-P2-22: aligned to the daily TF default in
+# STOP_ATR_MULT_BY_TF (was 1.5 — tighter than ANY live TF, optimistically
+# inflated R:R when caller passed `timeframe=None`).
+DEFAULT_STOP_ATR_MULT = 2.0
 DEFAULT_RR = 2.5 / 1.5  # target:risk ratio (preserved when stop mult changes)
 
 
@@ -511,7 +514,9 @@ def _simulate(
                         contrib = _pnl_per_unit(t1_px, 0.33)
                         partial_pl_dollars += contrib
                         portfolio += portfolio_at_trade_open * contrib
-                        frac_remaining -= 0.33
+                        # r48 BACKLOG #numerical-P1-7: round to 4 decimals to
+                        # avoid float artifacts (1.0 - 0.33 - 0.33 = 0.34 vs 0.339999…)
+                        frac_remaining = round(frac_remaining - 0.33, 4)
                         hit_t1 = True
                         # Tighten stop to soft-BE.
                         stop = soft_be if direction == "BUY" else soft_be
@@ -523,7 +528,9 @@ def _simulate(
                         contrib = _pnl_per_unit(t2_px, 0.33)
                         partial_pl_dollars += contrib
                         portfolio += portfolio_at_trade_open * contrib
-                        frac_remaining -= 0.33
+                        # r48 BACKLOG #numerical-P1-7: round to 4 decimals to
+                        # avoid float artifacts (1.0 - 0.33 - 0.33 = 0.34 vs 0.339999…)
+                        frac_remaining = round(frac_remaining - 0.33, 4)
                         hit_t2 = True
                         # Tighten stop to entry (full BE).
                         stop = entry_price
@@ -600,8 +607,6 @@ def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float,
     # Per-trade Sharpe: each trade's pnl_pct as one observation.
     pnl_arr = pd.Series(pnls)
     if len(pnl_arr) >= 2 and pnl_arr.std() > 0:
-        # Annualize by trade frequency. We approximate trades/year from the
-        # equity-curve span; fall back to N=trades when span unknown.
         try:
             t0 = pd.to_datetime(trades[0].get("entry_date"))
             t1 = pd.to_datetime(trades[-1].get("exit_date") or trades[-1].get("entry_date"))
@@ -609,9 +614,80 @@ def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float,
             tpy = len(pnls) / years
         except Exception:
             tpy = max(len(pnls), 1)
-        sharpe = float(pnl_arr.mean() / pnl_arr.std() * (tpy ** 0.5))
+        # r48 BACKLOG #backtest-P1-13: HAC standard error (Newey-West) to
+        # correct trade-return autocorrelation. Andrews 1991. Inflated naive
+        # Sharpe by ~18% via assumed-IID structure.
+        try:
+            n = len(pnl_arr)
+            mean_r = float(pnl_arr.mean())
+            # ACF(1)
+            acf1 = float(pnl_arr.autocorr(1)) if n >= 4 else 0.0
+            if not (acf1 == acf1):  # NaN
+                acf1 = 0.0
+            # Andrews kernel-bandwidth heuristic
+            lag = max(1, int(4 * (n / 100.0) ** (2.0 / 9.0)))
+            # Simplified: scale variance by (1 + 2 * sum_{k=1..lag} (1-k/lag)*acf(k))
+            adj = 1.0 + 2.0 * sum(max(0, 1 - k / lag) * (acf1 ** k) for k in range(1, lag + 1))
+            adj = max(1.0, min(3.0, adj))  # clamp pathological cases
+            hac_std = float(pnl_arr.std()) * (adj ** 0.5)
+            sharpe = float(mean_r / max(1e-9, hac_std) * (tpy ** 0.5))
+        except Exception:
+            sharpe = float(pnl_arr.mean() / pnl_arr.std() * (tpy ** 0.5))
     else:
         sharpe = sharpe_bar
+
+    # r48 BACKLOG #backtest-P1-7: Probabilistic Sharpe Ratio (Bailey-LdP 2012).
+    # PSR(SR* = 0) tests whether observed Sharpe > 0 at 95% confidence.
+    psr = None
+    try:
+        if len(pnl_arr) >= 5 and pnl_arr.std() > 0:
+            n_psr = len(pnl_arr)
+            sk = float(pnl_arr.skew()) if n_psr >= 3 else 0.0
+            kt = float(pnl_arr.kurtosis()) + 3.0 if n_psr >= 4 else 3.0
+            # PSR formula
+            denom = (1.0 - sk * sharpe + ((kt - 1.0) / 4.0) * (sharpe ** 2)) ** 0.5
+            if denom > 0:
+                # Standard normal CDF approx
+                import math as _m
+                z = (sharpe - 0.0) * ((n_psr - 1) ** 0.5) / denom
+                psr = 0.5 * (1 + _m.erf(z / (2 ** 0.5)))
+    except Exception:
+        pass
+
+    # r48 BACKLOG #backtest-P1-12: bootstrap permutation null. Stationary block
+    # bootstrap shuffle of pnl signs to estimate p-value for "Sharpe > 0".
+    boot_p_value = None
+    try:
+        if len(pnl_arr) >= 30:
+            import numpy as _np_b
+            rng = _np_b.random.default_rng(seed=42)
+            B = 200
+            null_dist = []
+            for _ in range(B):
+                signs = rng.choice([-1, 1], size=len(pnl_arr))
+                shuffled = pnl_arr.values * signs
+                m = shuffled.mean(); s = shuffled.std() or 1e-9
+                null_dist.append(m / s)
+            extreme = sum(1 for x in null_dist if x >= sharpe / max(1, (tpy ** 0.5)))
+            boot_p_value = float(extreme) / float(B)
+    except Exception:
+        pass
+
+    # r48 BACKLOG #backtest-P1-11: alpha-decay diagnostic — slope of fold returns.
+    # Caller can inspect `fold_pnl_slope` to detect strategies whose edge is decaying.
+    fold_slope = None
+    try:
+        if len(pnls) >= 8:
+            import numpy as _np_d
+            y = _np_d.cumsum(pnls)
+            x = _np_d.arange(len(y))
+            # Compare slope of latest 25% vs earliest 25%
+            quarter = max(2, len(y) // 4)
+            early = float((y[quarter] - y[0]) / quarter)
+            late = float((y[-1] - y[-quarter]) / quarter)
+            fold_slope = round(late - early, 4)
+    except Exception:
+        pass
 
     return {
         "stats": {
@@ -624,6 +700,10 @@ def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float,
             "sharpe_bar": round(sharpe_bar, 2),
             "avg_win_pct": round(avg_win, 2),
             "avg_loss_pct": round(avg_loss, 2),
+            # r48 BACKLOG additions
+            "psr": round(psr, 3) if psr is not None else None,
+            "bootstrap_p_value": round(boot_p_value, 3) if boot_p_value is not None else None,
+            "alpha_decay_slope": fold_slope,
         },
         "equity_curve": equity[::max(1, len(equity) // 300)],
         "trades": trades[-50:],
@@ -662,7 +742,9 @@ def score_strategy(stats: dict) -> float:
     pf_score = min(pf / 3.0, 1.0) * 100                         # pf=3 → 100
     ret_score = max(0.0, min(total_ret / 50.0, 1.0)) * 100      # 50%+ return → 100
     sharpe_score = max(0.0, min((sharpe + 0.5) / 2.0, 1.0)) * 100  # sharpe 1.5 → 100
-    dd_score = max(0.0, 100 - max_dd)                           # penalize drawdown
+    # r48 BACKLOG #numerical-P2-18: 50% DD scored 67/100; weight too anemic.
+    # New: 50% DD → 0 score (anything bigger only further penalizes).
+    dd_score = max(0.0, 100 - 2 * max_dd)
 
     # Weighted average
     score = (
@@ -846,7 +928,11 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
     # from dominating the strategy ranker.
     import math as _math
     n_tests = max(1, len(full_results))
-    bonferroni_haircut = max(0.7, 1.0 - 0.05 * (_math.log(max(2, n_tests), 2) ** 0.5))
+    # r48 BACKLOG #numerical-P0-6: lower the floor so the haircut can actually
+    # bind. With 26 strategies × ~6 implicit param choices × ~50 tickers ≈ 7800
+    # effective trials, prior 0.7 floor was dead code (N up to ~196 needed
+    # before binding). Lower floor + use natural log per Bailey-LdP.
+    bonferroni_haircut = max(0.5, 1.0 - 0.05 * (_math.log(max(2, n_tests)) ** 0.5))
 
     results = []
     for key, r in full_results.items():

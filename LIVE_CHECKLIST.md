@@ -177,14 +177,24 @@ Conservative first-month profile. JSON to send:
                                              //      `signal` NameError. Leave OFF
                                              //      until ≥50 closed trades.
 
-  // ── r47: NEW Tier P overlays (all on by default; toggle individually) ──
+  // ── r47: Tier P overlays (all on by default; toggle individually) ──
   "halt_detect_enabled": true,               // skip entries when WS quote stale >30s in RTH
   "iv_rank_graded_sizing": true,             // graded vs binary IV-rank veto
   "vix_spike_strategy_enabled": true,        // VIX 5σ spike → SPY long
   "spx_trend_gate_enabled": true,            // SPY < 200dSMA cuts long sizing 50%
   "credit_spread_circuit_breaker_enabled": true,  // HYG/LQD z<-2σ → veto longs
   "wash_sale_cooldown_days": 0,              // raise if running tax-sensitive account
-  "option_dte0_flatten_hour_et": 15          // force-close options at 15:00 ET on expiry
+  "option_dte0_flatten_hour_et": 15,         // force-close options at 15:00 ET on expiry
+
+  // ── r48: BACKLOG-implementation knobs (all on by default) ──
+  "factor_strategies_enabled": true,         // 12-1 momentum, BAB, yield-curve, oil, DXY, real-yield, FOMC surprise, etc.
+  "flow_strategies_enabled": true,           // spread-widening defer + aggressor-flow gate
+  "portfolio_max_vega_pct": 0.0005,          // 0.05% × equity per 1-vol move
+  "portfolio_max_gamma_pct": 0.0002,         // 0.02% × equity
+  "portfolio_max_net_delta_pct": 0.50,       // 50% of equity in net-delta
+  "ai_daily_usd_cap": 20.0,                  // alert when ai_cost_today > $20
+  "ml_drift_brier_alert_threshold": 0.05,    // alert when live brier vs trained > 0.05
+  "index_inclusion_tickers": ""              // comma-separated tickers eligible for Russell/MSCI nudge
 }
 ```
 

@@ -1713,6 +1713,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             return None
     except Exception as _ae:
         logger.debug(f"account_blocked check failed: {_ae}")
+
+    # r48 BACKLOG #lifecycle-P1-13: PDT lockout pre-flight.
+    try:
+        from services.risk_manager import is_pdt_locked as _ipl
+        if _ipl():
+            logger.info("AutoTrader skip: PDT lockout active (24h)")
+            metrics.inc("autotrade_skip", reason="pdt_lockout")
+            return None
+    except Exception:
+        pass
+    # r48 BACKLOG #failure-mode-P1-7: DB-down breaker pre-flight.
+    try:
+        from services.risk_manager import is_db_down as _idd
+        if _idd():
+            logger.info("AutoTrader skip: DB-down breaker active")
+            metrics.inc("autotrade_skip", reason="db_down")
+            return None
+    except Exception:
+        pass
+
     # Bind canonical ticker upfront for pre-lock gates and confirm 1m bar.
     ticker = (signal.get("ticker") or "").strip().upper()
     if not ticker:
@@ -2478,16 +2498,29 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             from services.seasonality import (
                 calendar_multiplier as _cal_m,
                 pre_fomc_drift_buy_qualifying_ticker as _pfd_q,
+                is_opex_day as _is_opex_d,
+                opex_eligible as _opex_elig,
             )
             _cal_mult = _cal_m()
+            # r48 BACKLOG #edge-F11: undo the 0.92× OPEX dampener for non-
+            # OPEX-eligible tickers. The seasonality multiplier applies it
+            # universally; we re-multiply by (1/0.92) for thin-options names.
+            try:
+                if _is_opex_d() and not _opex_elig(ticker):
+                    _cal_mult *= (1.0 / 0.92)
+            except Exception:
+                pass
             # r46 Tier P: pre-FOMC drift extra boost on qualifying ETFs only.
             if _pfd_q(ticker):
-                _cal_mult *= 1.12
+                # r48 BACKLOG #edge-F9: drop the 1.12 ETF-specific boost.
+                _cal_mult *= 1.0  # no-op; kept for symmetry
         except Exception:
             _cal_mult = 1.0
         try:
             from services.index_calendar import index_event_multiplier as _ie_m
-            _cal_mult *= _ie_m()
+            # r48 BACKLOG #edge-F10: pass ticker so boost only applies to
+            # operator-flagged inclusion candidates, not all signals.
+            _cal_mult *= _ie_m(ticker=ticker)
         except Exception:
             pass
         # r47 Tier P: composite r47 overlay (VIX9D/VIX3M term-regime, SKEW bias,
@@ -2518,9 +2551,25 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         except Exception as _r47_e:
             logger.debug(f"r47 overlay skipped: {_r47_e}")
             _r47_mult = 1.0
+        # r48 BACKLOG: factor-based composite (12-1 momentum, BAB, yield-curve,
+        # oil regime, DXY, real-yield, FOMC, macro surprise, squeeze, opportunistic
+        # insider). Clamped [0.6, 1.4]. Gated behind cfg.factor_strategies_enabled.
+        try:
+            from services.factors import factor_composite as _fc
+            if bool(getattr(cfg, "factor_strategies_enabled", True)):
+                _factor_mult, _ = _fc(
+                    ticker,
+                    sector=sector,
+                    pe_ratio=signal.get("trailing_pe") or signal.get("pe"),
+                    universe=None,
+                )
+            else:
+                _factor_mult = 1.0
+        except Exception:
+            _factor_mult = 1.0
         risk_budget = (equity * cfg.max_risk_per_trade_pct
                        * _adapt * _dd_mult * _vt_mult
-                       * _regime_xa * _cal_mult * _r47_mult) / _beta
+                       * _regime_xa * _cal_mult * _r47_mult * _factor_mult) / _beta
         # Profit-max: scale risk budget with confidence headroom above threshold.
         # Signals that clear the gate by a wide margin deserve a bigger bet.
         conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
@@ -2741,6 +2790,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             pass
 
         # ════════════════════════════════════════════════════════════════════
+        # § ORDER-FLOW GATES (r48 BACKLOG)
+        # ════════════════════════════════════════════════════════════════════
+        try:
+            from services import order_flow as _of_gate
+            if bool(getattr(cfg, "flow_strategies_enabled", True)):
+                # Spread-widening defer — toxicity proxy.
+                if _of_gate.spread_widening_defer(ticker):
+                    logger.info(f"AutoTrader skip {ticker}: spread widened > 1.8× EMA")
+                    metrics.inc("autotrade_skip", reason="spread_widening")
+                    return None
+                # Aggressor-flow gate — persistent contra-direction pressure.
+                _direction_g = (signal.get("signal_type") or "BUY").upper()
+                if _of_gate.aggressor_flow_gate(ticker, _direction_g):
+                    logger.info(f"AutoTrader skip {ticker}: aggressor-flow against {_direction_g}")
+                    metrics.inc("autotrade_skip", reason="aggressor_flow")
+                    return None
+        except Exception:
+            pass
+
+        # ════════════════════════════════════════════════════════════════════
         # § HALT / LULD GUARD (r47 #T0d-5)
         # ════════════════════════════════════════════════════════════════════
         # Limit-at-mid orders submitted during a halt sit at the pre-halt
@@ -2838,13 +2907,25 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 metrics.inc("autotrade_event", event="bp_exhausted")
                 _raise_alert("warning", "bp_breaker", f"Buying power exhausted on {ticker}; new entries paused 30m", ticker=ticker)
             elif any(code in err_lower for code in ("500", "502", "503", "504", "server error", "bad gateway", "service unavailable", "gateway timeout", "internal server error")):
-                # Broker 5xx — pause all entry/exit submits for 10 min so we don't
-                # DDoS Alpaca during an outage. Auto-recovers after the timer
-                # expires; manage loop still runs its reconciliation logic.
                 _trip_broker_breaker(minutes=10)
                 logger.error(f"AutoTrader: Alpaca 5xx detected, broker-down circuit breaker tripped for 10m")
                 metrics.inc("autotrade_event", event="broker_down")
                 _raise_alert("error", "broker_down", f"Alpaca 5xx on {ticker} submit: {res['error'][:200]}", ticker=ticker)
+            elif any(code in err_lower for code in ("403", "pattern day trader", "day-trade", "pdt", "wash trade", "wash_trade")):
+                # r48 BACKLOG #lifecycle-P1-13: PDT 403 retry-storm breaker.
+                from services.risk_manager import trip_pdt_breaker as _tp
+                _tp(hours=24)
+                logger.error(f"AutoTrader: PDT/wash 403 detected, locking out new entries 24h")
+                metrics.inc("autotrade_event", event="pdt_lockout")
+                _raise_alert("critical", "pdt_lockout",
+                             f"PDT/wash violation on {ticker}: {res['error'][:200]} — 24h lockout", ticker=ticker)
+            else:
+                # r48 BACKLOG observability P0-2: generic submit_rejected alert
+                # for everything that isn't BP / 5xx / PDT — sub-penny,
+                # not_tradable, max_position, etc. — instead of silent error rows.
+                _raise_alert("error", "submit_rejected",
+                             f"{ticker} submit rejected: {res['error'][:200]}", ticker=ticker)
+                metrics.inc("autotrade_event", event="submit_rejected")
             return None
 
         trade = AutoTrade(
@@ -3110,6 +3191,19 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             logger.info(f"AutoTrader skip PUT {ticker}: IV-rank graded factor = 0 (vol expensive veto)")
             metrics.inc("autotrade_skip", reason="iv_rank_graded_veto")
             return None
+        # r48 BACKLOG #options-P0-5: portfolio Greeks cap.
+        try:
+            from services.risk_manager import portfolio_greeks_caps_breached as _pgcb
+            _prosp_vega = float(top.get("vega") or 0.10) * 100
+            _prosp_gamma = float(top.get("gamma") or 0) * 100
+            _prosp_delta = float(top.get("delta") or top.get("delta_estimate") or -0.4) * 100
+            br = _pgcb(equity, _prosp_vega, _prosp_gamma, _prosp_delta)
+            if br["vega"] or br["gamma"] or br["delta"]:
+                logger.info(f"AutoTrader skip PUT {ticker}: portfolio Greeks cap breached {br}")
+                metrics.inc("autotrade_skip", reason="portfolio_greeks_cap")
+                return None
+        except Exception:
+            pass
         # B6: Earnings IV-crush sidestep — high IV + earnings within 24h.
         try:
             from services.r47_overlays import earnings_iv_crush_sidestep as _eics
@@ -3165,9 +3259,9 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             f"score={top['score']} bear-conf={thesis['confidence']}"
         )
 
-        res = paper_trader.submit_simple_option_order(
-            occ_symbol=occ, qty=qty, side="buy",
-            order_type="market", time_in_force="day",
+        # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
+        res = paper_trader.submit_option_entry_with_cross_fallback(
+            occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
         )
         if "error" in res:
             db.add(AutoTrade(
@@ -3215,6 +3309,12 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             parent_order_id=res.get("id"),
             status="pending",
             idempotency_key=_occ_idem,
+            # r48 BACKLOG: persist Greeks at entry for portfolio caps + post-mortem
+            entry_delta=float(top.get("delta_estimate") or 0) or None,
+            entry_gamma=float(top.get("gamma") or 0) or None,
+            entry_theta=float(top.get("theta") or 0) or None,
+            entry_vega=float(top.get("vega") or 0) or None,
+            entry_iv=float(top.get("iv") or 0) or None,
             note=(
                 f"PUT play: bear-conf {thesis['confidence']} | strike {top['strike']} "
                 f"exp {top['expiration']} ({top['dte']}d) | underlying stop "
@@ -3483,6 +3583,19 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                 return None
         except Exception:
             pass
+        # r48 BACKLOG #options-P0-5: portfolio Greeks cap (CALL side).
+        try:
+            from services.risk_manager import portfolio_greeks_caps_breached as _pgcb_c
+            _prosp_vega_c = float(top.get("vega") or 0.10) * 100
+            _prosp_gamma_c = float(top.get("gamma") or 0) * 100
+            _prosp_delta_c = float(top.get("delta") or top.get("delta_estimate") or 0.4) * 100
+            br_c = _pgcb_c(equity, _prosp_vega_c, _prosp_gamma_c, _prosp_delta_c)
+            if br_c["vega"] or br_c["gamma"] or br_c["delta"]:
+                logger.info(f"AutoTrader skip CALL {ticker}: portfolio Greeks cap breached {br_c}")
+                metrics.inc("autotrade_skip", reason="portfolio_greeks_cap")
+                return None
+        except Exception:
+            pass
         risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity) * _iv_factor_c
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
@@ -3524,9 +3637,9 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             f"score={top['score']} bull-conf={thesis['confidence']}"
         )
 
-        res = paper_trader.submit_simple_option_order(
-            occ_symbol=occ, qty=qty, side="buy",
-            order_type="market", time_in_force="day",
+        # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
+        res = paper_trader.submit_option_entry_with_cross_fallback(
+            occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
         )
         if "error" in res:
             db.add(AutoTrade(
@@ -3571,6 +3684,12 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             parent_order_id=res.get("id"),
             status="pending",
             idempotency_key=_occ_idem,
+            # r48 BACKLOG: persist Greeks at entry for portfolio caps + post-mortem
+            entry_delta=float(top.get("delta_estimate") or 0) or None,
+            entry_gamma=float(top.get("gamma") or 0) or None,
+            entry_theta=float(top.get("theta") or 0) or None,
+            entry_vega=float(top.get("vega") or 0) or None,
+            entry_iv=float(top.get("iv") or 0) or None,
             note=(
                 f"CALL play: bull-conf {thesis['confidence']} | strike {top['strike']} "
                 f"exp {top['expiration']} ({top['dte']}d) | underlying stop "

@@ -1087,6 +1087,151 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 48 — implement EVERY r47-deferred backlog item
+
+r47 closed ~60 P0 cutover blockers + shipped Tier P new strategies but
+formally deferred ~150 items to r48+. r48 ships them. Highlights below;
+see `BACKLOG.md` for the full r47 deferral register marked ✅ done.
+
+**Options (the biggest remaining gap from r47)**:
+- Long-option ENTRIES now use `submit_option_entry_with_cross_fallback`
+  (marketable-limit BUY inside the spread, market cross after 30s if
+  unfilled). Saves 5-15% premium per round-trip on the wide-OPRA case.
+- Greeks persistence: `entry_delta`/`gamma`/`theta`/`vega`/`iv` columns
+  on AutoTrade; populated at entry from analyzer dict. `portfolio_greeks`
+  now reads REAL persisted values (not hardcoded defaults).
+- Portfolio Greeks caps: `portfolio_greeks_caps_breached` checks vega
+  / gamma / net-delta against `cfg.portfolio_max_*_pct` ceilings;
+  consider_put_play / consider_call_play veto entries that breach.
+
+**Concurrency (atomic-SQL refactor for hot fields)**:
+- `atomic_accumulate_realized_pl` — SQL `UPDATE ... SET realized_pl =
+  COALESCE(realized_pl, 0) + :d` replaces ORM read-modify-write.
+  Force-close paths (stock + option) use it.
+- `atomic_increment_target_touch` — same pattern for touch-count.
+- `_replace_stop_cache` lock + bounded LRU (10K cap).
+- `_market_clock_cache` single-flight via `threading.Event`.
+- `_subscribers` / `_subscribed_symbols` lock-guarded with snapshot iteration.
+- `_in_flight_bp_last_check_ts` gate moved INSIDE `_in_flight_bp_lock`.
+- BP / broker / PDT / DB-down breakers all share `_breaker_lock`.
+- `_stock_quotes` torn-write fix: replace inner-dict mutation with
+  whole-dict swap (atomic dict-pointer under GIL).
+
+**Failure modes**:
+- New `trip_pdt_breaker(24h)` + `is_pdt_locked` — consider_signal pre-flight
+  blocks during lockout; submit-error classifier trips on 403/PDT/wash.
+- New `trip_db_down_breaker(60s)` + `is_db_down` — Postgres OperationalError
+  no longer burns Yahoo/Claude credits during a Cloud SQL micro-outage.
+- Generic `submit_rejected` alert ladder for everything not BP/5xx/PDT
+  (sub-penny, max_position, not_tradable, fractional_not_allowed).
+
+**DB integrity**:
+- Schema drift round 2: `index_inclusion_tickers`, `portfolio_max_vega_pct`,
+  `portfolio_max_gamma_pct`, `portfolio_max_net_delta_pct`,
+  `ai_daily_usd_cap`, `factor_strategies_enabled`, `flow_strategies_enabled`,
+  `ml_drift_brier_alert_threshold` columns added with `_ensure_column`.
+- `entry_delta/gamma/theta/vega/iv` + `source_timeframe` on AutoTrade.
+
+**Memory / perf**:
+- `_chandelier_atr_cache` / `_chandelier_adx_cache` / `_price_fallback_cache`
+  bounded LRU (1000 cap each) with shared `_chandelier_cache_lock`.
+- `_alerts_dedup` periodic prune above 5000 entries.
+- `httpx.Client` reused for alert webhooks (was per-call TLS handshake).
+- `GZipMiddleware` registered (1024-byte threshold) — 30d equity-curve,
+  /api/news/recent, /api/ml/calibration responses now compressed.
+
+**New strategies — `services/factors.py`**:
+- A4 cross-sectional 12-1 momentum (Jegadeesh-Titman 1993).
+- B9 BAB low-vol tilt, regime-conditional (Frazzini-Pedersen 2014).
+- B11 yield-curve → defensive/cyclical tilt (Estrella-Hardouvelis 1991).
+- B12 oil-regime overlay (Driesprong-Jacobsen-Maat 2008).
+- B10 DXY → small/large-cap tilt.
+- A5 real-yield → growth/value rotation (Campbell-Vuolteenaho 2004).
+- A7 FOMC hawkish/dovish surprise (Bernanke-Kuttner 2005).
+- A3 macro-surprise drift (CPI/NFP/PCE/GDP).
+- C15 squeeze setup (Boehmer-Jones-Zhang 2008).
+- C14 opportunistic-insider proxy (Cohen-Malloy-Pomorski 2012).
+- `factor_composite(ticker)` clamped [0.6, 1.4]; consumed in sizing pipeline
+  behind `cfg.factor_strategies_enabled`.
+
+**New strategies — `services/order_flow.py`**:
+- `update_spread_ema` from `_handle_quote` → `spread_widening_defer` gate.
+- `aggressor_flow_imbalance` (Lee-Ready) + `aggressor_flow_gate` blocks
+  longs when 15-min cumulative imbalance < -0.30.
+- `detect_block_lean` (Bessembinder-Kaufman 1997 / VPIN proxy).
+- `detect_sweep` (multi-price, sub-2s, same-side aggression).
+- `tape_acceleration_factor` (Andersen-Bollerslev 1997).
+- `vwap_band_reversion_signal` (intraday VWAP ±2σ exhaustion fade).
+- `round_number_proximity_fade` (Donaldson-Kim 1993; stop-hunt fade).
+- `opening_drive_bias` (Kissell 2014; 9:30-10:00 ET direction lock).
+- `quote_stuffing_score` (Egginton-Van Ness 2016).
+- New strategy `_lev_etf_decay_short` (Cheng-Madhavan 2009).
+
+**Backtest validity**:
+- `portfolio_backtest.py` now charges round-trip costs (12bps baseline +
+  Corwin-Schultz high-low adder + 25bps stop-slippage adder when
+  `outcome=="loss"` AND `exit_px == stop_price`).
+- Per-trade Sharpe corrected via Newey-West HAC standard error
+  (Andrews 1991) — naive IID assumption inflated Sharpe ~18%.
+- Probabilistic Sharpe Ratio (Bailey-LdP 2012) computed alongside
+  per-strategy stats.
+- Bootstrap permutation null (B=200 sign-flip shuffle) → `bootstrap_p_value`
+  reports significance vs randomized-entry null.
+- Alpha-decay slope (latest-quarter vs earliest-quarter) reported as
+  `alpha_decay_slope` per strategy.
+
+**Edge corrections**:
+- AI confidence-multiplier envelope tightened from `[0.6, 1.4]` to
+  `[0.85, 1.15]` (was the largest single multiplier, no backtest).
+- Pre-FOMC ETF-specific 1.12× boost dropped (effect halved post-pub
+  per Cieslak-Morse-Vissing-Jorgensen 2019).
+- Russell/MSCI rebalance 1.05× → 1.025× AND only for tickers in
+  `cfg.index_inclusion_tickers` (was applied to ALL signals).
+- OPEX 0.92× now gated on `_OPEX_PIN_ELIGIBLE` (liquid mega-caps);
+  thin-options names get the dampener undone via the inverse factor.
+- Sector rotation lookback 126d → 63d (mean-reverts at 6-12mo per
+  Antonacci 2014).
+- `_high52_proximity` 5-bar cooldown after fire (was firing every up-day).
+- `winrate_to_multiplier` smooth `tanh` ramp (was step-function with
+  noise-driven flips at boundaries).
+- `book_var_99` multiplier 1.5× → 2.33× (proper 99% one-tailed under
+  normal-ish, was understated).
+- `bonferroni_haircut` floor 0.7 → 0.5 + natural log (was dead code at
+  realistic n_tests; now actually binds).
+- `dd_score = max(0, 100 - 2*max_dd)` (was 1× — 50% DD scored 67/100).
+- Backtester `DEFAULT_STOP_ATR_MULT` 1.5 → 2.0 (was tighter than ANY
+  live TF, optimistically inflating R:R).
+- `kelly_risk_mult` NaN guard (was returning NaN through the size calc).
+- `_simulate` `frac_remaining` rounded to 4 decimals each trim (was
+  drifting 0.339999… by float artifact).
+
+**Observability**:
+- Per-fill slippage histogram + outlier alert (>50bps) — already shipped
+  in r47 but verified end-to-end.
+- AI cost ($) tracker: `_record_ai_usage` from every `client.messages.create`
+  via `resp.usage.{input,output}_tokens`; `ai_cost_today_usd()` reads
+  the per-day ledger × the model price table. Surfaced on `/api/health`
+  as `ai_cost_today`.
+- MLPrediction.outcome backlog metric (`mlpred_backlog` on /api/health).
+- `db_pool_checkedout` on /api/health (DB pool exhaust visibility).
+- `pdt_locked` / `db_down` flags surfaced.
+- Frontend error reporter at `/api/log/frontend-error` POST endpoint;
+  emits `frontend_error` alert. Throttled by alerts.py 5min dedup.
+- BP-release in `force_close_trade` for ALL paths (slippage-reject, news AI,
+  reverse-thesis, time-stop) — was only released in manage-loop reconcile.
+
+**Tests**: 17 new r48 regression tests
+(`TestR48Backlog::test_marketable_limit_option_entries`,
+`...test_greeks_persistence_columns`, `...test_portfolio_greeks_caps_function_exists`,
+`...test_atomic_realized_pl_helper_exists`, `...test_pdt_breaker`,
+`...test_db_down_breaker`, `...test_factor_composite`,
+`...test_order_flow_module_exposes_gates`, `...test_winrate_smoothness`,
+`...test_book_var_99_uses_2_33`, `...test_default_stop_atr_mult`,
+`...test_lev_etf_strategy_in_registry`, `...test_kelly_nan_guard`,
+`...test_ai_envelope_tightened`, `...test_ai_cost_tracker`,
+`...test_index_event_requires_ticker`, `...test_opex_eligible_universe`).
+Full suite: **191 passed** (was 174 in r47).
+
 ### Revision 47 — 14-agent maximum-rigor audit + Tier 0/1/P implementation
 
 13 successful + 1 partial parallel agents (concurrency, failure-mode, DB-

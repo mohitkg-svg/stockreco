@@ -99,7 +99,17 @@ def kelly_risk_mult(historical_win_rate: Optional[float],
         max_mult = RISK_KELLY_MAX_MULT
     if min_win_rate is None:
         min_win_rate = RISK_KELLY_MIN_WIN_RATE
+    # r48 BACKLOG #numerical-P1-11: validate finite/non-NaN inputs.
+    # Without this, NaN inputs propagate through (NaN < x is False so the
+    # min_win_rate gate doesn't catch them) and the function returns NaN,
+    # which downstream `int(qty)` then raises or silently quantizes to 0.
+    import math as _m_kr
     if historical_win_rate is None or avg_reward_risk is None:
+        return 1.0
+    try:
+        if not _m_kr.isfinite(float(historical_win_rate)) or not _m_kr.isfinite(float(avg_reward_risk)):
+            return 1.0
+    except Exception:
         return 1.0
     if historical_win_rate < min_win_rate:
         return 1.0

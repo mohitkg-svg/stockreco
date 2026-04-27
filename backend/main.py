@@ -778,6 +778,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Stock Technical Analysis API", lifespan=lifespan)
 
+# r48 BACKLOG #perf-P3.24: gzip large responses (equity-curve, news/recent,
+# /api/ml/calibration). 30d × 78 5min snapshots ≈ 500KB JSON / poll otherwise.
+try:
+    from fastapi.middleware.gzip import GZipMiddleware
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+except Exception as _gz_e:
+    logger.warning(f"GZipMiddleware not installed: {_gz_e}")
+
+
+# r48 BACKLOG #observability-P0-6: frontend error reporter endpoint.
+# Without this any runtime exception in the UI is silent — operator
+# sees a blank dashboard and assumes the bot is dead.
+@app.post("/api/log/frontend-error")
+def _log_frontend_error(payload: dict):
+    """Accept a minimal error payload from the dashboard and emit it as
+    a `frontend_error` alert. Throttled by the alerts.py 5min dedup."""
+    try:
+        msg = (payload.get("msg") or "")[:500]
+        url = (payload.get("url") or "")[:200]
+        if msg:
+            from services.alerts import alert as _ra
+            _ra("warning", "frontend_error", f"{msg} (url={url})")
+    except Exception:
+        pass
+    return {"ok": True}
+
 # ----- Real-money safety banner (A3) --------------------------------------
 # Flipping `ALPACA_LIVE=1` alone is one keystroke away from live trading; a
 # stray env var in a deploy, a typo, or a copy-pasted .env moves real money.
@@ -1075,7 +1101,68 @@ def health():
         "crisis_mode": _crisis_mode_flag(),
         "session_dd_pct": _session_dd_pct(),
         "account_dd_mult": _acct_dd_mult(),
+        # r48 BACKLOG #observability-P1-15: AI cost tracker
+        "ai_cost_today": _ai_cost_today(),
+        # r48 BACKLOG #observability-P1-17: MLPrediction backlog
+        "mlpred_backlog": _mlpred_backlog(),
+        # r48 BACKLOG #observability-P1-18: cache freshness
+        "options_chain_oldest_age_sec": None,
+        "earnings_calendar_oldest_age_sec": None,
+        # r48 BACKLOG #observability-P3-27: DB pool checkout
+        "db_pool_checkedout": _db_pool_checkedout(),
+        # r48 BACKLOG #failure-mode P1-7 / lifecycle P1-13: surface breakers
+        "pdt_locked": _pdt_locked(),
+        "db_down": _db_down_flag(),
     }
+
+
+def _ai_cost_today() -> dict:
+    try:
+        from services.ai_judge import ai_cost_today_usd
+        return ai_cost_today_usd()
+    except Exception:
+        return {}
+
+
+def _mlpred_backlog() -> int:
+    try:
+        from database import SessionLocal as _SL_b, MLPrediction as _MP_b
+        from datetime import datetime as _dt_b, timedelta as _td_b
+        db = _SL_b()
+        try:
+            cutoff = _dt_b.utcnow() - _td_b(days=2)
+            return int(db.query(_MP_b).filter(
+                _MP_b.outcome.is_(None),
+                _MP_b.created_at < cutoff,
+            ).count())
+        finally:
+            db.close()
+    except Exception:
+        return 0
+
+
+def _db_pool_checkedout() -> int:
+    try:
+        from database import engine as _eng
+        return int(_eng.pool.checkedout())
+    except Exception:
+        return 0
+
+
+def _pdt_locked() -> bool:
+    try:
+        from services.risk_manager import is_pdt_locked
+        return bool(is_pdt_locked())
+    except Exception:
+        return False
+
+
+def _db_down_flag() -> bool:
+    try:
+        from services.risk_manager import is_db_down
+        return bool(is_db_down())
+    except Exception:
+        return False
 
 
 def _crisis_mode_flag() -> bool:

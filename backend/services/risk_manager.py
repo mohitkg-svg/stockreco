@@ -49,6 +49,12 @@ _in_flight_bp_last_check_ts: float = 0.0
 _bp_exhausted_until: Optional[datetime] = None
 # Broker-down circuit breaker (5xx from Alpaca).
 _broker_down_until: Optional[datetime] = None
+# r48 BACKLOG #lifecycle-P1-13: PDT 403 lockout breaker.
+_pdt_lockout_until: Optional[datetime] = None
+# r48 BACKLOG #failure-mode-P1-7: DB-down breaker (Postgres OperationalError).
+_db_down_until: Optional[datetime] = None
+# r48 BACKLOG #concurrency-P1-4: lock guard for breaker timestamps.
+_breaker_lock = threading.Lock()
 # Rolling 1h count of SL-resubmit failures.
 _sl_resubmit_failures: List[float] = []
 _sl_resubmit_lock = threading.Lock()
@@ -97,19 +103,18 @@ def _reset_in_flight_bp() -> None:
 
 def decay_in_flight_bp_if_stale() -> None:
     """Re-read Alpaca's BP every 60s. Decay reservation only when the broker
-    BP has dropped by AT LEAST our last reservation amount — meaning our
-    submitted bracket was likely the cause of the drop.
+    BP has dropped by AT LEAST our last reservation amount.
 
-    r39 audit fix #24: previously zeroed the reservation any time broker
-    BP dropped, including external causes (deposits, withdrawals, manual
-    orders outside the bot, account-wide bracket releases). That re-
-    introduced the same stale-BP bug the reservation was added to prevent.
+    r48 BACKLOG #concurrency-P1-3: gate read+write of `_last_check_ts` is
+    now inside the lock — prior code allowed two concurrent decay calls to
+    both pass the 60s gate and double-fetch + double-decay.
     """
     global _in_flight_bp_reserved, _in_flight_bp_last_seen_broker_bp, _in_flight_bp_last_check_ts
     now = time.time()
-    if now - _in_flight_bp_last_check_ts < 60:
-        return
-    _in_flight_bp_last_check_ts = now
+    with _in_flight_bp_lock:
+        if now - _in_flight_bp_last_check_ts < 60:
+            return
+        _in_flight_bp_last_check_ts = now
     try:
         from services import paper_trader
         acct = paper_trader.get_account()
@@ -135,39 +140,66 @@ def decay_in_flight_bp_if_stale() -> None:
 
 
 def trip_bp_breaker(minutes: int = 30) -> None:
-    """Trip the buying-power circuit breaker for `minutes`. Called from
-    `consider_signal` after an Alpaca 422 (insufficient BP) — pauses
-    new entries so a tight scan loop doesn't generate retry storms
-    against the broker. Default 30 min absorbs typical end-of-day BP
-    constraints without manual intervention.
-    """
+    """Trip the buying-power circuit breaker. r48 BACKLOG: lock-guarded."""
     global _bp_exhausted_until
     from datetime import timedelta
-    _bp_exhausted_until = datetime.utcnow() + timedelta(minutes=minutes)
+    with _breaker_lock:
+        _bp_exhausted_until = datetime.utcnow() + timedelta(minutes=minutes)
 
 
 def trip_broker_breaker(minutes: int = 5) -> None:
-    """Trip the broker-down circuit breaker for `minutes`. Called from
-    `consider_signal` after an Alpaca 5xx — pauses new entries until
-    the broker stabilizes. Shorter window than BP breaker because 5xx
-    recoveries are typically minutes, not tens of minutes.
-    """
+    """Trip the broker-down circuit breaker. r48 BACKLOG: lock-guarded."""
     global _broker_down_until
     from datetime import timedelta
-    _broker_down_until = datetime.utcnow() + timedelta(minutes=minutes)
+    with _breaker_lock:
+        _broker_down_until = datetime.utcnow() + timedelta(minutes=minutes)
+
+
+def trip_pdt_breaker(hours: int = 24) -> None:
+    """r48 BACKLOG #lifecycle-P1-13: trip the PDT lockout breaker for `hours`.
+    Called from consider_signal when Alpaca returns 403 with a PDT/wash
+    error string. Stops the bot from retry-storming PDT-rejected entries."""
+    global _pdt_lockout_until
+    from datetime import timedelta
+    with _breaker_lock:
+        _pdt_lockout_until = datetime.utcnow() + timedelta(hours=hours)
+
+
+def trip_db_down_breaker(seconds: int = 60) -> None:
+    """r48 BACKLOG #failure-mode-P1-7: pause new entries on DB connection error
+    for `seconds` so a Cloud SQL micro-outage doesn't burn Yahoo/Claude credits."""
+    global _db_down_until
+    from datetime import timedelta
+    with _breaker_lock:
+        _db_down_until = datetime.utcnow() + timedelta(seconds=seconds)
+
+
+def is_pdt_locked() -> bool:
+    with _breaker_lock:
+        return _pdt_lockout_until is not None and datetime.utcnow() < _pdt_lockout_until
+
+
+def is_db_down() -> bool:
+    with _breaker_lock:
+        return _db_down_until is not None and datetime.utcnow() < _db_down_until
 
 
 def clear_bp_breaker() -> None:
-    """Manually clear the BP circuit breaker (admin / recovery action).
-    Doesn't re-arm the auto-trader — just removes this one gate."""
     global _bp_exhausted_until
-    _bp_exhausted_until = None
+    with _breaker_lock:
+        _bp_exhausted_until = None
 
 
 def clear_broker_breaker() -> None:
-    """Manually clear the broker-down circuit breaker (admin action)."""
     global _broker_down_until
-    _broker_down_until = None
+    with _breaker_lock:
+        _broker_down_until = None
+
+
+def clear_pdt_breaker() -> None:
+    global _pdt_lockout_until
+    with _breaker_lock:
+        _pdt_lockout_until = None
 
 
 def bp_breaker_active() -> bool:
@@ -602,6 +634,9 @@ def portfolio_greeks() -> Dict[str, float]:
     when Greeks are missing (delta=0.5 for ATM, etc.).
     Returns {delta, gamma, theta, vega} all in $ terms (×100 contract).
     """
+    # r48 BACKLOG #options-P0-4: read REAL persisted Greeks (entry_delta,
+    # entry_gamma, entry_theta, entry_vega). Fall back to OCC-direction-aware
+    # defaults only when the row is missing them (older rows pre-r48).
     out = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
     try:
         from database import SessionLocal as _SL_g, AutoTrade as _AT_g
@@ -615,22 +650,49 @@ def portfolio_greeks() -> Dict[str, float]:
                 qty = float(t.qty or 0)
                 if qty <= 0:
                     continue
-                # AutoTrade doesn't persist per-contract Greeks today; we
-                # use sign-of-delta from the OCC symbol (P=put → negative
-                # delta on a long put), magnitude default 0.4 for OTM.
                 is_put = isinstance(t.symbol, str) and len(t.symbol) > 12 and t.symbol[-9] == "P"
-                d_default = -0.4 if is_put else 0.4
-                # Spot proxy: t.entry_price is the option premium, NOT
-                # underlying. Skip the underlying multiplication and just
-                # report contract-greek totals as informational.
-                out["delta"] += qty * 100 * d_default
-                out["theta"] -= qty * 100 * 0.05   # rough $5/day per contract
-                out["vega"] += qty * 100 * 0.10    # rough $10 per 1% IV move
+                d = float(getattr(t, "entry_delta", None) or (-0.4 if is_put else 0.4))
+                g = float(getattr(t, "entry_gamma", None) or 0.0)
+                th = float(getattr(t, "entry_theta", None) or -0.05)
+                v = float(getattr(t, "entry_vega", None) or 0.10)
+                # All on per-contract basis × 100 multiplier
+                out["delta"] += qty * 100 * d
+                out["gamma"] += qty * 100 * g
+                out["theta"] += qty * 100 * th  # theta is negative for long
+                out["vega"] += qty * 100 * v
         finally:
             db.close()
     except Exception as e:
         logger.debug(f"portfolio_greeks: {e}")
     return out
+
+
+def portfolio_greeks_caps_breached(equity: float, prospective_vega: float = 0.0,
+                                   prospective_gamma: float = 0.0,
+                                   prospective_delta: float = 0.0) -> Dict[str, bool]:
+    """r48 BACKLOG #options-P0-5: check whether ADDING `prospective_*` to the
+    current book would breach configured Greeks caps. Returns dict of
+    `{"vega": bool, "gamma": bool, "delta": bool}` — True means cap breached.
+    Caps default: vega ≤ 0.05% × equity per 1-vol move; gamma ≤ 0.02%; net
+    delta ≤ 50% of equity (in $ terms)."""
+    try:
+        from database import SessionLocal as _SL_gc, AutoTraderConfig as _C_gc
+        db = _SL_gc()
+        try:
+            cfg = db.query(_C_gc).filter(_C_gc.id == 1).first()
+            vega_cap_pct = float(getattr(cfg, "portfolio_max_vega_pct", 0.0005) or 0.0005)
+            gamma_cap_pct = float(getattr(cfg, "portfolio_max_gamma_pct", 0.0002) or 0.0002)
+            delta_cap_pct = float(getattr(cfg, "portfolio_max_net_delta_pct", 0.50) or 0.50)
+        finally:
+            db.close()
+    except Exception:
+        vega_cap_pct, gamma_cap_pct, delta_cap_pct = 0.0005, 0.0002, 0.50
+    g = portfolio_greeks()
+    return {
+        "vega": (abs(g["vega"]) + abs(prospective_vega)) > equity * vega_cap_pct,
+        "gamma": (abs(g["gamma"]) + abs(prospective_gamma)) > equity * gamma_cap_pct,
+        "delta": (abs(g["delta"]) + abs(prospective_delta)) > equity * delta_cap_pct,
+    }
 
 
 def earnings_cluster_count(window_hours: int = 168) -> int:
@@ -662,14 +724,17 @@ def earnings_cluster_count(window_hours: int = 168) -> int:
 
 
 def book_var_99(equity: float) -> float:
-    """r44 fix #1.7: rough 99% parametric VaR using current heat as
-    1.5-sigma proxy. Heat is dollar-stop-loss-cost; multiply by ~1.5 for
-    the 99% tail under a normal-ish distribution. Returns 0 on missing data.
+    """99% parametric VaR.
+
+    r48 BACKLOG #numerical-P2-20: prior `heat * 1.5` understated the 99%
+    tail. For normal(0, σ), one-tailed 99% is at 2.326σ. Heat is roughly
+    a 1σ stop-loss measure (assuming stops sit ~1σ wide), so the right
+    multiplier is ~2.33, not 1.5. Updated.
     """
     if equity <= 0:
         return 0.0
     heat = current_portfolio_heat()
-    return heat * 1.5
+    return heat * 2.33
 
 
 def book_leverage_pct(equity: float) -> float:

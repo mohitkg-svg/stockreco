@@ -48,32 +48,58 @@ def is_enabled() -> bool:
 
 
 _market_clock_cache: Optional[tuple] = None  # (is_open: bool, expiry_ts: float)
+import threading as _pt_threading
+_market_clock_lock = _pt_threading.Lock()
+_market_clock_inflight = _pt_threading.Event()
+_market_clock_inflight.set()  # initial state: not in-flight
 
 
 def is_market_open() -> bool:
     """True if US equity/options market is currently open. Cached 30s.
 
-    Cheap gate to keep auto-trader from submitting option market orders
-    outside RTH — Alpaca rejects those with code 42210000 and the retry
-    storm (one submission per 15-min scan) was filling auto_trades with
-    dead error rows.
+    r48 BACKLOG #concurrency-P0-5: single-flight via threading.Event so
+    concurrent callers after expiry don't all hit `c.get_clock()`. Lock
+    guards the read+write of the cache tuple.
     """
     import time as _t
     global _market_clock_cache
     now = _t.time()
-    if _market_clock_cache and now < _market_clock_cache[1]:
-        return _market_clock_cache[0]
-    c = _get_client()
-    if not c:
-        return False
+    with _market_clock_lock:
+        if _market_clock_cache and now < _market_clock_cache[1]:
+            return _market_clock_cache[0]
+        # Decide whether THIS thread will do the broker call.
+        if not _market_clock_inflight.is_set():
+            # Another thread is fetching. Drop lock + wait briefly.
+            pass
+        else:
+            _market_clock_inflight.clear()
+            in_flight_owner = True
+        in_flight_owner = locals().get("in_flight_owner", False)
+    if not in_flight_owner:
+        # Wait up to 5s for the in-flight call to finish, then re-read cache.
+        _market_clock_inflight.wait(timeout=5.0)
+        with _market_clock_lock:
+            if _market_clock_cache and now < _market_clock_cache[1]:
+                return _market_clock_cache[0]
+        # Fall through: do our own fetch as a last resort.
     try:
+        c = _get_client()
+        if not c:
+            return False
         clk = c.get_clock()
         is_open = bool(clk.is_open)
     except Exception as e:
         logger.warning(f"get_clock failed: {e}")
-        return False
-    _market_clock_cache = (is_open, now + 30.0)
-    return is_open
+        is_open = False
+    finally:
+        with _market_clock_lock:
+            _market_clock_cache = (is_open if 'is_open' in dir() else False,
+                                   _t.time() + 30.0)
+        try:
+            _market_clock_inflight.set()
+        except Exception:
+            pass
+    return _market_clock_cache[0] if _market_clock_cache else False
 
 
 def minutes_to_close() -> Optional[float]:
@@ -538,6 +564,54 @@ def submit_option_exit_marketable_limit(
             order_type="market", time_in_force="day",
         )
     return {"error": "no quote available for marketable-limit"}
+
+
+def submit_option_entry_with_cross_fallback(
+    occ_symbol: str,
+    qty: int,
+    cross_after_seconds: float = 30.0,
+) -> Dict[str, Any]:
+    """r48 #BACKLOG-options-P0-2: post a marketable-LIMIT BUY inside the
+    spread first, cross to market if unfilled after N seconds.
+
+    Prior to this primitive, option ENTRIES used `submit_simple_option_order`
+    with `order_type="market"` — eating the full ask on every wide OPRA
+    book. r47 deferred this; r48 ships it. Saves 5-15% of premium per trip
+    on the 95% case where the contract has a wide spread.
+
+    Returns the FINAL submitted order dict (market cross if it fired,
+    otherwise the inside-the-spread BUY limit).
+    """
+    first = submit_option_exit_marketable_limit(
+        occ_symbol=occ_symbol, qty=qty, side="buy", fallback_to_market=False,
+    )
+    if "error" in first or not first.get("id"):
+        # Couldn't even submit the inside-spread limit; fall back to market.
+        return submit_simple_option_order(
+            occ_symbol=occ_symbol, qty=qty, side="buy",
+            order_type="market", time_in_force="day",
+        )
+    order_id = first.get("id")
+    deadline = time.time() + cross_after_seconds
+    while time.time() < deadline:
+        time.sleep(min(2.0, deadline - time.time()))
+        try:
+            c = _get_client()
+            if c:
+                o = c.get_order_by_id(order_id)
+                status = str(getattr(o, "status", "")).lower()
+                if "filled" in status:
+                    return first
+        except Exception:
+            break
+    try:
+        cancel_order(order_id)
+    except Exception:
+        pass
+    return submit_simple_option_order(
+        occ_symbol=occ_symbol, qty=qty, side="buy",
+        order_type="market", time_in_force="day",
+    )
 
 
 def submit_option_exit_with_cross_fallback(

@@ -38,6 +38,24 @@ logger = logging.getLogger(__name__)
 _chandelier_atr_cache: Dict[str, tuple] = {}
 _chandelier_adx_cache: Dict[str, tuple] = {}
 _CHANDELIER_ATR_TTL = 300.0
+_CHANDELIER_CACHE_MAX = 1000  # r48 BACKLOG #perf-P1.9: bounded LRU cap
+import threading as _pm_threading
+_chandelier_cache_lock = _pm_threading.Lock()
+
+
+def _bounded_cache_set(cache: Dict[str, tuple], key: str, value: tuple,
+                       max_entries: int = _CHANDELIER_CACHE_MAX) -> None:
+    """LRU-ish set with cap drop oldest 10% on overflow."""
+    with _chandelier_cache_lock:
+        if key in cache:
+            del cache[key]
+        cache[key] = value
+        if len(cache) > max_entries:
+            for _ in range(max(1, max_entries // 10)):
+                try:
+                    cache.pop(next(iter(cache)))
+                except StopIteration:
+                    break
 
 
 def chandelier_atr(ticker: str) -> Optional[float]:
@@ -56,7 +74,7 @@ def chandelier_atr(ticker: str) -> Optional[float]:
             return None
         ind = compute_indicators(df)
         atr = float(ind["ATR_14"].iloc[-1])
-        _chandelier_atr_cache[ticker.upper()] = (atr, now + _CHANDELIER_ATR_TTL)
+        _bounded_cache_set(_chandelier_atr_cache, ticker.upper(), (atr, now + _CHANDELIER_ATR_TTL))
         return atr
     except Exception:
         return None
@@ -80,7 +98,7 @@ def chandelier_adx(ticker: str) -> Optional[float]:
         if "ADX_14" not in ind.columns:
             return None
         adx = float(ind["ADX_14"].iloc[-1])
-        _chandelier_adx_cache[ticker.upper()] = (adx, now + _CHANDELIER_ATR_TTL)
+        _bounded_cache_set(_chandelier_adx_cache, ticker.upper(), (adx, now + _CHANDELIER_ATR_TTL))
         return adx
     except Exception:
         return None
@@ -174,7 +192,7 @@ def current_price(ticker: str, max_age_sec: Optional[float] = None) -> Optional[
         pi = fetch_current_price(ticker)
         if pi:
             px = float(pi[0])
-            _price_fallback_cache[ticker.upper()] = (px, now + _PRICE_FALLBACK_TTL)
+            _bounded_cache_set(_price_fallback_cache, ticker.upper(), (px, now + _PRICE_FALLBACK_TTL))
             return px
     except Exception:
         return None

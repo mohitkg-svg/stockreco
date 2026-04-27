@@ -216,16 +216,25 @@ def calibrator_loaded() -> bool:
 # trades, and (b) we want it to *tilt* the existing signal stack, not dominate it.
 # Envelope values live in services.config (ML_MULT_*).
 def winrate_to_multiplier(p: Optional[float]) -> float:
+    """r48 BACKLOG #backtest-F19: smooth tanh ramp instead of step function.
+
+    Step boundaries with binary jumps + 0.05 isotonic residual on ML output
+    meant a meaningful chunk of trades had their multiplier flip on noise
+    (e.g. p=0.59 → 1.00, p=0.60 → 1.06). The smooth shape lets the size
+    react proportionally to confidence with no sharp boundary effects.
+    Multiplier in [0.88, 1.12] (matches prior envelope width).
+    """
     from services.config import (
         ML_MULT_HIGH, ML_MULT_LIFT, ML_MULT_NEUTRAL, ML_MULT_DAMP, ML_MULT_LOW,
     )
     if p is None:
         return ML_MULT_NEUTRAL
-    if p >= 0.70: return ML_MULT_HIGH
-    if p >= 0.60: return ML_MULT_LIFT
-    if p >= 0.45: return ML_MULT_NEUTRAL
-    if p >= 0.35: return ML_MULT_DAMP
-    return ML_MULT_LOW
+    import math as _m_wm
+    # Ramp centred on 0.5; full envelope width = HIGH - LOW.
+    width = max(0.05, ML_MULT_HIGH - ML_MULT_LOW)
+    centre = (ML_MULT_HIGH + ML_MULT_LOW) / 2.0
+    # tanh maps p in [0,1] → output in [centre - width/2, centre + width/2]
+    return float(centre + (width / 2.0) * _m_wm.tanh(2.0 * (float(p) - 0.5)))
 
 
 def log_prediction(ticker: str, signal: Dict[str, Any], p: Optional[float],

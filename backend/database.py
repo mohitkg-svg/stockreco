@@ -260,6 +260,18 @@ class AutoTraderConfig(Base):
     spx_trend_gate_enabled = Column(Boolean, default=True)
     # r47 — HYG/LQD credit-spread circuit breaker
     credit_spread_circuit_breaker_enabled = Column(Boolean, default=True)
+    # r48 BACKLOG #edge-F10: comma-separated list of inclusion tickers eligible
+    # for the index-event boost. Only operator-flagged tickers receive the
+    # 1.025× nudge during Russell/MSCI rebalance windows.
+    index_inclusion_tickers = Column(String, default="")
+    # r48 BACKLOG: portfolio Greeks caps + ML drift threshold + AI cost cap
+    portfolio_max_vega_pct = Column(Float, default=0.0005)
+    portfolio_max_gamma_pct = Column(Float, default=0.0002)
+    portfolio_max_net_delta_pct = Column(Float, default=0.50)
+    ai_daily_usd_cap = Column(Float, default=20.0)
+    factor_strategies_enabled = Column(Boolean, default=True)
+    flow_strategies_enabled = Column(Boolean, default=True)
+    ml_drift_brier_alert_threshold = Column(Float, default=0.05)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -332,6 +344,18 @@ class AutoTrade(Base):
     # Stocks: this column is None (use entry_price as before).
     # Options: set from thesis["entry"] in consider_call/put_play.
     underlying_entry_price = Column(Float, nullable=True)
+    # r48 BACKLOG fix #options-P0-4: persist option Greeks at entry time so
+    # `portfolio_greeks` reads real values (was hardcoded defaults). Enables
+    # actionable portfolio vega/gamma/delta caps.
+    entry_delta = Column(Float, nullable=True)
+    entry_gamma = Column(Float, nullable=True)
+    entry_theta = Column(Float, nullable=True)
+    entry_vega = Column(Float, nullable=True)
+    entry_iv = Column(Float, nullable=True)
+    # r48 BACKLOG fix #lifecycle-P2-22: source-timeframe column so
+    # promoted-from-adopted positions get a proper TF for reverse-thesis
+    # checks (was always defaulting to "1d").
+    source_timeframe = Column(String, nullable=True)
 
 
 class CandidatePool(Base):
@@ -878,6 +902,22 @@ def create_tables():
     _ensure_column("auto_trader_config", "vix_spike_strategy_enabled", "BOOLEAN DEFAULT TRUE")
     _ensure_column("auto_trader_config", "spx_trend_gate_enabled", "BOOLEAN DEFAULT TRUE")
     _ensure_column("auto_trader_config", "credit_spread_circuit_breaker_enabled", "BOOLEAN DEFAULT TRUE")
+    # r48 BACKLOG: option Greeks persistence + source_timeframe
+    _ensure_column("auto_trades", "entry_delta", "DOUBLE PRECISION")
+    _ensure_column("auto_trades", "entry_gamma", "DOUBLE PRECISION")
+    _ensure_column("auto_trades", "entry_theta", "DOUBLE PRECISION")
+    _ensure_column("auto_trades", "entry_vega", "DOUBLE PRECISION")
+    _ensure_column("auto_trades", "entry_iv", "DOUBLE PRECISION")
+    _ensure_column("auto_trades", "source_timeframe", "VARCHAR")
+    # r48 BACKLOG: AutoTraderConfig — portfolio Greeks caps + new strategy flags
+    _ensure_column("auto_trader_config", "portfolio_max_vega_pct", "DOUBLE PRECISION DEFAULT 0.0005")
+    _ensure_column("auto_trader_config", "portfolio_max_gamma_pct", "DOUBLE PRECISION DEFAULT 0.0002")
+    _ensure_column("auto_trader_config", "portfolio_max_net_delta_pct", "DOUBLE PRECISION DEFAULT 0.50")
+    _ensure_column("auto_trader_config", "ai_daily_usd_cap", "DOUBLE PRECISION DEFAULT 20.0")
+    _ensure_column("auto_trader_config", "factor_strategies_enabled", "BOOLEAN DEFAULT TRUE")
+    _ensure_column("auto_trader_config", "flow_strategies_enabled", "BOOLEAN DEFAULT TRUE")
+    _ensure_column("auto_trader_config", "index_inclusion_tickers", "VARCHAR DEFAULT ''")
+    _ensure_column("auto_trader_config", "ml_drift_brier_alert_threshold", "DOUBLE PRECISION DEFAULT 0.05")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:

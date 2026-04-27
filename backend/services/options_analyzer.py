@@ -556,6 +556,12 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
                 "in_the_money": bool(o.get("inTheMoney")),
                 # r47 Tier P (A5): graded IV-rank for downstream sizing.
                 "iv_rank_pct": _iv_pct,
+                # r48 BACKLOG: surface raw Greeks so AutoTrade row can persist
+                # them (was dropped between selection and management).
+                "delta": real_delta,
+                "gamma": real_gamma,
+                "theta": real_theta,
+                "vega": real_vega,
             })
 
     # Sort by score, return top picks

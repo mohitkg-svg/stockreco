@@ -58,11 +58,31 @@ def is_in_index_event_window() -> bool:
     return is_russell_reconstitution_window() or is_msci_quarterly_window()
 
 
-def index_event_multiplier() -> float:
-    """Sizing nudge during active index-rebalance windows. Conservative
-    +5% — operator should manually flag specific tickers via the
-    inclusion-tickers config for stronger overlay.
+def index_event_multiplier(ticker: Optional[str] = None) -> float:
+    """Sizing nudge during active index-rebalance windows.
+
+    r48 BACKLOG #edge-F10: prior code applied 1.05× to ALL signals during
+    the window — but the academic effect (Madhavan 2003, Cai-Houge 2008)
+    is for SPECIFIC names being added/dropped, not the whole universe.
+    Now: only fire the boost for tickers present in
+    `cfg.index_inclusion_tickers` (comma-separated CSV); also reduced
+    magnitude to 1.025 (post-publication effect compressed ~50%).
     """
-    if is_in_index_event_window():
-        return 1.05
+    if not is_in_index_event_window():
+        return 1.0
+    if ticker is None:
+        return 1.0
+    try:
+        from database import SessionLocal as _SL_ie, AutoTraderConfig as _C_ie
+        db = _SL_ie()
+        try:
+            cfg = db.query(_C_ie).filter(_C_ie.id == 1).first()
+            inclusion = (getattr(cfg, "index_inclusion_tickers", None) or "")
+        finally:
+            db.close()
+    except Exception:
+        return 1.0
+    inc_list = {t.strip().upper() for t in inclusion.split(",") if t.strip()}
+    if ticker.upper() in inc_list:
+        return 1.025
     return 1.0
