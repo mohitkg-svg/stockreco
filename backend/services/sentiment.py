@@ -142,11 +142,24 @@ def _score_finbert(text: str) -> Dict[str, Any]:
 
 # --------------------- Public API ------------------------------------------
 def score_text(text: str) -> Dict[str, Any]:
-    """Route to the configured backend. Default VADER; opt-in FinBERT.
-    Always returns {score, label, severity, backend}."""
+    """Route to the configured backend. r43 fix #1.32: default is now
+    `auto` — try FinBERT first, fall back to VADER if `transformers` /
+    model files are not installed. Operators with the FinBERT deps
+    automatically get the higher-accuracy backend without flipping
+    `SENTIMENT_BACKEND` manually. Set explicitly to `vader` to force the
+    legacy backend."""
     if not text or not text.strip():
         return {"score": 0.0, "label": "neutral", "severity": 0, "backend": "none"}
-    backend = (os.getenv("SENTIMENT_BACKEND") or "vader").lower().strip()
+    backend = (os.getenv("SENTIMENT_BACKEND") or "auto").lower().strip()
+    if backend == "vader":
+        return _score_vader(text)
     if backend == "finbert":
         return _score_finbert(text)
+    # auto: prefer FinBERT, fall back transparently.
+    try:
+        result = _score_finbert(text)
+        if result.get("backend") and "finbert" in str(result["backend"]).lower():
+            return result
+    except Exception:
+        pass
     return _score_vader(text)

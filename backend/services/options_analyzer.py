@@ -54,15 +54,46 @@ def _realized_vol_20d(ticker: str) -> Optional[float]:
 
 def _iv_is_expensive(ticker: str, iv: float) -> bool:
     """True when the contract's IV is > _IV_RV_RATIO_MAX × underlying's RV.
-    False (= allow) when either value is unavailable."""
+    r43 fix #1.23: when RV is unavailable, fall back to an absolute IV cap
+    (1.0 = 100% annualized) so unknown-RV new IPOs / illiquid names don't
+    silently skip the volatility filter — exactly the names where IV is
+    most prone to be inflated.
+    """
     if not iv or iv <= 0:
         return False
     rv = _realized_vol_20d(ticker)
     if rv is None or rv <= 0:
-        return False
-    # Both IV and RV are annualized decimal (e.g. 0.35 = 35%). yfinance
-    # returns IV as a decimal already.
+        return iv > 1.0
+    # Both IV and RV are annualized decimal (e.g. 0.35 = 35%).
     return iv > _IV_RV_RATIO_MAX * rv
+
+
+# r43 fix #1.23: 1y IV-rank lookup. We don't store historical IV per ticker
+# (that would require a separate ingestion job). Instead, we compute an
+# *implied* rank from the underlying's realized-vol distribution: contracts
+# whose IV exceeds the 90th percentile of the underlying's 1y rolling
+# 20d-RV are flagged as IV-expensive. This is a coarse proxy but catches
+# the common case (vol-event-priced contracts on otherwise quiet names).
+def _iv_rank_too_high(ticker: str, iv: float, threshold: float = 0.90) -> bool:
+    if not iv or iv <= 0:
+        return False
+    try:
+        from services.data_fetcher import fetch_ohlcv as _fo
+        import numpy as _np
+        df = _fo(ticker, "1d")
+        if df is None or df.empty or len(df) < 252:
+            return False
+        closes = df["Close"].astype(float).tail(252)
+        rets = _np.log(closes / closes.shift(1)).dropna()
+        # Rolling 20d realized-vol annualized as a sample distribution.
+        rv_series = rets.rolling(20).std() * (252 ** 0.5)
+        rv_series = rv_series.dropna()
+        if len(rv_series) < 50:
+            return False
+        cutoff = float(rv_series.quantile(threshold))
+        return iv > cutoff * 1.05
+    except Exception:
+        return False
 
 
 MIN_RR = 2.0  # Lowered from 3.0 — intraday SELL signals (5m/15m/30m) have
@@ -155,10 +186,26 @@ def _score(
 
     liq = min((vol / 100.0), 1.0) * 10 + min((oi / 500.0), 1.0) * 10
 
-    # Delta fitness: real delta wins when present (accounts for skew, vol
-    # smile, and moneyness non-linearity that the proxy ignores).
+    # r43 fix #1.24: asymmetric delta scoring. The previous symmetric formula
+    # `10 * (1 - |delta - 0.5| / 0.5)` scored delta=0.7 (ITM, tracks
+    # underlying tightly) and delta=0.1 (OTM lottery) the same — both got
+    # ~6 pts. For directional plays on 30-45 DTE, delta 0.4-0.7 is
+    # empirically much better. New scoring:
+    #   |delta| in [0.4, 0.7] → full 10 pts (the directional sweet spot)
+    #   |delta| in [0.25, 0.4] → 5 pts (linear ramp from 5→10)
+    #   |delta| > 0.7         → 7 pts (deep ITM, costs more)
+    #   |delta| < 0.25        → 0 pts (OTM lottery, harsh penalty)
     d_eff = delta if delta is not None else delta_proxy
-    delta_score = 10 * max(0.0, 1.0 - abs(abs(d_eff) - 0.5) / 0.5)
+    abs_d = abs(d_eff)
+    if 0.4 <= abs_d <= 0.7:
+        delta_score = 10.0
+    elif 0.25 <= abs_d < 0.4:
+        # Linear 5 → 10 across [0.25, 0.4].
+        delta_score = 5.0 + (abs_d - 0.25) * (5.0 / 0.15)
+    elif abs_d > 0.7:
+        delta_score = 7.0
+    else:
+        delta_score = 0.0
 
     # ---- Greeks-aware adjustments ----
     theta_efficiency = 0.0
@@ -268,29 +315,63 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
                 continue
             vol = int(o.get("volume") or 0)
             oi = int(o.get("openInterest") or 0)
-            if vol < MIN_VOLUME or oi < MIN_OI:
+            # r43 fix #0.8: when feed-side OI/vol is unknown (Alpaca snapshot
+            # path returns 0/0), don't auto-fail; rely on the spread filter
+            # below + premium-vs-mid sanity. When OI/vol IS known (Yahoo),
+            # apply the historical gates.
+            if (vol > 0 or oi > 0) and (vol < MIN_VOLUME or oi < MIN_OI):
                 continue
-            # r39 audit fix #10: bid-ask spread filter. Module docstring at
-            # line 19 promised "Bid-ask spread < 5% of strike" but the
-            # check was never coded. Wide-spread contracts on illiquid
-            # chains routinely have 10%+ spreads — entering at ask and
-            # exiting at bid eats most of any profit. Reject.
+            # r43 fix #0.9: bid-ask spread filter normalized vs PREMIUM (mid),
+            # not strike. Previously `(ask-bid)/strike > 0.05` — for a
+            # $200-strike $1 put with $4 spread (= 400% of premium,
+            # untradeable), the gate evaluated 4/200=2% and PASSED. The
+            # filter was effectively neutered for cheap OTM contracts —
+            # exactly the ones with the worst spreads. New gate: spread ≤
+            # 20% of mid OR ≤ $0.05 (the cheapest-tick floor).
             bid = float(o.get("bid") or 0)
             ask = float(o.get("ask") or 0)
-            if bid > 0 and ask > bid and strike > 0:
-                if (ask - bid) / strike > 0.05:
+            if bid > 0 and ask > bid:
+                spread = ask - bid
+                mid_for_spread = (ask + bid) / 2.0
+                if mid_for_spread <= 0:
+                    continue
+                if spread > 0.05 and (spread / mid_for_spread) > 0.20:
                     continue
             iv = float(o.get("impliedVolatility") or 0)
 
             # IV-vs-RV gate — skip over-priced premium. Contracts where IV
             # is more than 1.75× the underlying's 20d realized vol get
             # punished by mean-reversion (IV crush) even when direction is
-            # right. No-op when RV is unavailable (caches None for 6h).
+            # right. r43 fix #1.23: also reject when implied IV-rank > 90th
+            # percentile of underlying's rolling 20d-RV distribution
+            # (catches event-priced contracts on otherwise-quiet names).
             if _iv_is_expensive(ticker, iv):
                 continue
+            if _iv_rank_too_high(ticker, iv, threshold=0.90):
+                continue
 
-            # Keep strikes reasonably close to money (within 25% either side for runner plays)
-            if abs(strike - spot) / spot > 0.25:
+            # r43 fix #1.25: ATR-anchored strike-width gate. The previous
+            # hardcoded 25% gate was reasonable for $500 stocks, useless for
+            # $5 stocks (entire chain in-band). Use 5×ATR or 25%-of-spot,
+            # whichever is more restrictive (and never < 10%-of-spot to
+            # preserve the original behavior on mid-priced names).
+            try:
+                from services.indicators import compute_indicators as _ci
+                from services.data_fetcher import fetch_ohlcv as _fo_atr
+                atr_df = _fo_atr(ticker, "1d")
+                if atr_df is not None and not atr_df.empty:
+                    _ind = _ci(atr_df.tail(40))
+                    atr_col = next((c for c in _ind.columns if c.startswith("ATR_")), None)
+                    if atr_col:
+                        atr_val = float(_ind[atr_col].iloc[-1])
+                        atr_band = max(0.10 * spot, min(0.25 * spot, 5.0 * atr_val))
+                    else:
+                        atr_band = 0.25 * spot
+                else:
+                    atr_band = 0.25 * spot
+            except Exception:
+                atr_band = 0.25 * spot
+            if abs(strike - spot) > atr_band:
                 continue
 
             # Reward at each target (intrinsic value at target minus premium paid)
@@ -345,8 +426,21 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             est_prem_at_underlying_stop = max(0.01, premium + delta * (sl - spot))
             est_loss_at_underlying_stop = round((premium - est_prem_at_underlying_stop) * 100, 2)
 
-            # Effective stop = whichever triggers first (gives smaller loss)
-            effective_stop_premium = max(premium_stop, est_prem_at_underlying_stop)
+            # r43 fix #1.9: previously this took max() of the two stops which
+            # made the higher (less-loss) stop bind — but for a typical
+            # delta-0.4 contract `est_prem_at_underlying_stop` is ALWAYS
+            # higher than `premium_stop` (premium - delta*distance >
+            # 0.5*premium), so the underlying-aware stop NEVER bound. The
+            # premium-50% stop always fired first regardless of underlying
+            # direction, closing positions for max-managed-loss when the
+            # underlying was fine.
+            #
+            # New behavior: take the MIN of the two (the more-pessimistic
+            # stop, lower premium = bigger loss accepted before stopping).
+            # This makes the underlying-aware stop bind for tight underlying
+            # stops and the premium-50% stop bind only when underlying
+            # really does fall through. Correct for sizing-by-stop-loss.
+            effective_stop_premium = min(premium_stop, est_prem_at_underlying_stop)
             effective_loss = round((premium - effective_stop_premium) * 100, 2)
 
             # R:R using managed stop instead of full-premium loss.
@@ -365,7 +459,12 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
 
             contracts.append({
                 "type": "CALL" if is_call else "PUT",
-                "symbol": o.get("contractSymbol"),
+                # r43 fix #0.1: Alpaca-feed contracts only set `_occ` (the OCC
+                # symbol). Yahoo-feed contracts set `contractSymbol`. Falling
+                # back keeps both feeds working; without this, every
+                # Alpaca-sourced contract had `symbol=None` and Alpaca rejected
+                # the option order with a confusing error.
+                "symbol": o.get("contractSymbol") or o.get("_occ"),
                 "strike": round(float(strike), 2),
                 "expiration": exp_date,
                 "dte": dte,

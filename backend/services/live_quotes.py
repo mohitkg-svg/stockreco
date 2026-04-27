@@ -56,6 +56,10 @@ _recompute_queue: Optional["asyncio.Queue[str]"] = None
 # r42 fix #2.4: per-ticker last-threat-check timestamps (rate-limit the
 # stop-threat fast-path to once per 5s per ticker).
 _last_threat_check: Dict[str, float] = {}
+# r43 fix #0.4: global single-flight gate so correlated-drawdown ticks don't
+# fire N concurrent manage_open_positions runs.
+import threading as _threading_lq
+_threat_path_lock = _threading_lq.Lock()
 _last_recompute: Dict[str, float] = {}
 _RECOMPUTE_MIN_INTERVAL = 30  # seconds per ticker
 _RECOMPUTE_PRICE_DELTA = 0.001  # 0.1% move triggers recompute
@@ -229,6 +233,13 @@ async def _handle_trade(trade) -> None:
     # waiting for the next scheduler firing. The check is cheap (one DB
     # query, rate-limited per ticker to once per 5s) so it can run on
     # every tick.
+    # r43 fix #0.4: stop-threat fast-path now covers BOTH stocks AND options
+    # (option positions track an UNDERLYING stop, so the same `current_stop`
+    # field applies). Direction is derived from `side`/asset/symbol — long
+    # stock + long call: trigger when px <= stop; long put: trigger when
+    # px >= stop. Rate-limited per-ticker via `_last_threat_check` and
+    # globally via `_threat_path_lock` so a correlated drawdown can't fire
+    # 50 concurrent manage runs.
     try:
         last_threat = _last_threat_check.get(sym, 0.0)
         if time.time() - last_threat >= 5.0:
@@ -236,27 +247,56 @@ async def _handle_trade(trade) -> None:
             from database import SessionLocal as _SL_t, AutoTrade as _AT_t
             _db_t = _SL_t()
             try:
-                _row = _db_t.query(_AT_t).filter(
+                _rows = _db_t.query(_AT_t).filter(
                     _AT_t.ticker == sym,
                     _AT_t.status == "open",
-                    _AT_t.asset_type == "stock",
                     _AT_t.current_stop.isnot(None),
-                ).first()
-                if _row and _row.current_stop:
-                    # threat: long with px ≤ stop+0.25% (close to stop)
-                    threat_band = float(_row.current_stop) * 1.0025
-                    if px <= threat_band:
+                ).all()
+                threat_fired = False
+                for _row in _rows:
+                    if not _row.current_stop:
+                        continue
+                    is_put = (
+                        _row.asset_type == "option"
+                        and isinstance(_row.symbol, str)
+                        and len(_row.symbol) > 12
+                        and _row.symbol[-9] == "P"
+                    )
+                    cs = float(_row.current_stop)
+                    if is_put:
+                        threat_band = cs * 0.9975
+                        threat = px >= threat_band
+                    else:
+                        threat_band = cs * 1.0025
+                        threat = px <= threat_band
+                    if threat:
+                        threat_fired = True
+                        break
+                if threat_fired:
+                    # Global single-flight: only one fast-path manage at a time
+                    # to prevent correlated drawdowns from firing N concurrent
+                    # manage_open_positions runs (broker breaker risk).
+                    if _threat_path_lock.acquire(blocking=False):
                         try:
                             from services import auto_trader as _at_t
-                            # Synchronous call from the WS thread is OK here —
-                            # manage_open_positions is short-circuited to
-                            # this ticker by the existing rate limit.
-                            asyncio.get_event_loop().run_in_executor(
-                                None, _at_t.manage_open_positions
-                            )
-                            logger.info(f"stop-threat fast-path fired for {sym} @ {px} (stop={_row.current_stop})")
-                        except Exception as _me:
-                            logger.debug(f"stop-threat manage dispatch failed for {sym}: {_me}")
+                            try:
+                                asyncio.get_running_loop().run_in_executor(
+                                    None, _at_t.manage_open_positions
+                                )
+                            except RuntimeError:
+                                # No running loop on this WS thread; fall back
+                                # to direct synchronous call (manage already
+                                # uses its own DB connections / locks).
+                                _at_t.manage_open_positions()
+                            logger.info(f"stop-threat fast-path fired for {sym} @ {px}")
+                        finally:
+                            # Release after a brief delay so the manage loop
+                            # has a chance to start without a follow-up tick
+                            # immediately re-acquiring.
+                            try:
+                                asyncio.get_running_loop().call_later(2.0, _threat_path_lock.release)
+                            except Exception:
+                                _threat_path_lock.release()
             finally:
                 _db_t.close()
     except Exception as _e:
@@ -509,7 +549,12 @@ async def _option_stream_worker():
     overlay; future enhancement is event-driven stop-loss evaluation.
     """
     global _option_stream_client
-    if (os.getenv("ALPACA_OPTIONS_STREAM", "0") or "0").lower() not in ("1", "true", "on"):
+    # r43 fix #0.7: default ON when Algo-Trader-Plus credentials are available.
+    # Previously defaulted off, so the entire option-quote pipeline (and the
+    # marketable-limit option exit which depends on it) was silently inactive
+    # for any operator who hadn't set ALPACA_OPTIONS_STREAM=1 explicitly.
+    _flag = (os.getenv("ALPACA_OPTIONS_STREAM", "1") or "1").lower()
+    if _flag not in ("1", "true", "on"):
         return
     key = os.getenv("APCA_API_KEY_ID")
     secret = os.getenv("APCA_API_SECRET_KEY")

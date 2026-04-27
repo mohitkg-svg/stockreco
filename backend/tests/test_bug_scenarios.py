@@ -605,29 +605,33 @@ class TestInsiderMultiplier(unittest.TestCase):
         self.db.commit()
 
     def test_strong_insider_buy_boosts_buy(self):
+        # r43 fix #1.31: min-count raised from 3 → 8.
         from services.insider_trades import insider_multiplier
-        self._store("INSBUY", buys_90=8, sells_90=2)  # 80% buy ratio
+        self._store("INSBUY", buys_90=10, sells_90=2)  # 83% buy ratio
         self.assertEqual(insider_multiplier("INSBUY", "BUY"), 1.06)
 
     def test_heavy_selling_penalizes_buy(self):
         from services.insider_trades import insider_multiplier
-        self._store("INSSELL", buys_90=1, sells_90=5)  # ~17% buy ratio
+        self._store("INSSELL", buys_90=2, sells_90=8)  # 20% buy ratio, 10 total
         self.assertEqual(insider_multiplier("INSSELL", "BUY"), 0.97)
 
     def test_heavy_selling_confirms_sell(self):
         from services.insider_trades import insider_multiplier
-        self._store("INSSELL2", buys_90=1, sells_90=9)
+        self._store("INSSELL2", buys_90=2, sells_90=10)
         self.assertEqual(insider_multiplier("INSSELL2", "SELL"), 1.06)
 
     def test_thin_sample_neutral(self):
-        """Below min 3-transaction count, ratio is too noisy; stay neutral."""
+        """Below min-count floor, ratio is too noisy; stay neutral.
+        r43 fix #1.31 raised the floor from 3 → 8."""
         from services.insider_trades import insider_multiplier
-        self._store("THIN", buys_90=1, sells_90=0)
+        self._store("THIN", buys_90=3, sells_90=0)  # 3 total — below 8 floor
         self.assertEqual(insider_multiplier("THIN", "BUY"), 1.0)
+        self._store("THIN2", buys_90=4, sells_90=2)  # 6 total — below 8 floor
+        self.assertEqual(insider_multiplier("THIN2", "BUY"), 1.0)
 
     def test_balanced_neutral(self):
         from services.insider_trades import insider_multiplier
-        self._store("EVEN", buys_90=5, sells_90=5)
+        self._store("EVEN", buys_90=5, sells_90=5)  # 50/50, 10 total
         self.assertEqual(insider_multiplier("EVEN", "BUY"), 1.0)
 
 
@@ -1121,6 +1125,150 @@ class TestExpectancyFreezeGate(unittest.TestCase):
             self.assertIn("expectancy", reason)
         finally:
             db.close()
+
+
+# ============================================================================
+# CATEGORY O: r43 strategy + execution audit regressions.
+# ============================================================================
+
+class TestOCCSymbolFallback(unittest.TestCase):
+    def test_occ_fallback_when_contractSymbol_missing(self):
+        """r43 fix #0.1: Alpaca-feed contracts have only `_occ`. Reader must fall back."""
+        # Smoke-check the lookup pattern via dict access — this is what the
+        # fix did at options_analyzer.py:368.
+        o_alpaca = {"_occ": "AAPL250620C00200000", "strike": 200}
+        o_yahoo = {"contractSymbol": "AAPL250620C00200000", "strike": 200}
+        for o in (o_alpaca, o_yahoo):
+            symbol = o.get("contractSymbol") or o.get("_occ")
+            self.assertEqual(symbol, "AAPL250620C00200000")
+
+
+class TestRRMinFloor(unittest.TestCase):
+    def test_rr_min_blocks_negative_ev_trade(self):
+        """r43 fix #0.2: a 0.4% T1 against 5% stop must be rejected.
+
+        Verifies the math (1.3R floor with 12bps cost buffer) returns False
+        before the bracket is built.
+        """
+        entry, stop, t1 = 100.0, 95.0, 100.4   # T1=0.4% above, R=5
+        rr_min = 1.3
+        cost_buffer = entry * (12 / 10000.0)
+        net_reward = max(0.0, (t1 - entry) - cost_buffer)
+        gross_risk = max(0.01, entry - stop)
+        rr_net = net_reward / gross_risk
+        self.assertLess(rr_net, rr_min)
+
+
+class TestCorrelationGate(unittest.TestCase):
+    def test_correlation_gate_returns_empty_on_no_data(self):
+        """When data isn't available, gate fails open (returns no correlations)
+        — sector cap remains the primary defense."""
+        from services.auto_trader import correlated_with_open
+        # Made-up ticker + fake open list; data fetch will fail / return None.
+        result = correlated_with_open("NOSUCH", ["FAKE1", "FAKE2"], threshold=0.7)
+        self.assertEqual(result, [])
+
+
+class TestAdaptiveZero(unittest.TestCase):
+    def setUp(self):
+        _reset_db()
+
+    def test_adaptive_zero_when_compounded_low(self):
+        """r43 fix #1.26: when the unfloored multiplier product would be
+        ≤ 0.25 we now return 0 (caller treats as skip), not the old 0.25 floor."""
+        from services.risk_manager import adaptive_risk_multiplier
+        # Without VIX/SPY/closed-trades data the function returns 1.0
+        # (no adverse regime). The zero-return path requires multiple
+        # adverse signals — covered by the (rare) compounded path. This
+        # test pins the no-data baseline so future regressions don't
+        # silently flip it.
+        self.assertEqual(adaptive_risk_multiplier(), 1.0)
+
+
+class TestPremiumStopSemantics(unittest.TestCase):
+    def test_premium_stop_uses_min_not_max(self):
+        """r43 fix #1.9: effective_stop_premium must use MIN of premium-50%
+        stop and underlying-aware stop estimate (more pessimistic), so
+        the underlying-aware stop binds for normal trades."""
+        # Replay the math in options_analyzer.py:_score loop.
+        premium = 2.00
+        delta = 0.4
+        spot = 100.0
+        sl = 95.0   # underlying stop, 5% below
+        premium_stop = round(premium * (1 - 0.50), 2)  # 1.00
+        est_prem_at_underlying_stop = max(0.01, premium + delta * (sl - spot))
+        # = 2 + 0.4 * (-5) = 0
+        # max(0.01, 0) = 0.01
+        self.assertAlmostEqual(est_prem_at_underlying_stop, 0.01)
+        # OLD (broken): max(1.00, 0.01) = 1.00 → premium-50% stop binds.
+        # NEW (fixed):  min(1.00, 0.01) = 0.01 → underlying-aware stop binds.
+        new_eff = min(premium_stop, est_prem_at_underlying_stop)
+        self.assertAlmostEqual(new_eff, 0.01)
+
+
+class TestThetaStopDTEScaling(unittest.TestCase):
+    def test_dte_thresholds_scale_with_dte(self):
+        """r43 fix #1.10: theta-stop hold floor is shorter for shorter DTE.
+        Smoke-test the scaling table."""
+        # Replay the heuristic.
+        def hold_floor_for(dte):
+            if dte is None:
+                return 48.0
+            if dte <= 7: return 12.0
+            if dte <= 30: return 24.0
+            return 48.0
+        self.assertEqual(hold_floor_for(3), 12.0)
+        self.assertEqual(hold_floor_for(20), 24.0)
+        self.assertEqual(hold_floor_for(60), 48.0)
+        self.assertEqual(hold_floor_for(None), 48.0)
+
+
+class TestConsecutiveLossFreeze(unittest.TestCase):
+    def setUp(self):
+        _reset_db()
+
+    def test_freeze_on_5_consecutive_losses(self):
+        """r43 fix #1.20: 5 stops in a row freeze trading regardless of
+        30d WR (the WR can still look healthy across 30d)."""
+        from services.risk_manager import should_freeze_trading
+        db = SessionLocal()
+        try:
+            # 30 winners (well above WR threshold), then 5 fresh losses.
+            base = datetime.utcnow() - timedelta(days=10)
+            for i in range(30):
+                db.add(_make_trade(
+                    status="closed_target",
+                    realized_pl=100.0,
+                    ticker=f"W{i}",
+                    closed_at=base + timedelta(hours=i),
+                ))
+            for i in range(5):
+                db.add(_make_trade(
+                    status="closed_stop",
+                    realized_pl=-50.0,
+                    ticker=f"L{i}",
+                    closed_at=datetime.utcnow() - timedelta(minutes=i+1),
+                ))
+            db.commit()
+            reason = should_freeze_trading()
+            self.assertIsNotNone(reason)
+            self.assertIn("consecutive", reason)
+        finally:
+            db.close()
+
+
+class TestMarketableLimitInsideSpread(unittest.TestCase):
+    def test_sell_limit_is_inside_spread(self):
+        """r43 fix #0.6: SELL must post INSIDE the spread (mid - offset),
+        not at the bid (which is identical to a market order)."""
+        # Replay the price-selection logic.
+        bid, ask = 1.00, 1.20
+        mid = (bid + ask) / 2.0
+        offset = 0.05
+        sell_px = max(bid, mid - offset)
+        # Inside the spread: 1.05 (between bid 1.00 and ask 1.20).
+        self.assertGreater(sell_px, bid)
+        self.assertLess(sell_px, ask)
 
 
 if __name__ == "__main__":

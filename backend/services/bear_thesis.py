@@ -162,9 +162,20 @@ def build_bear_thesis(ticker: str, timeframe: str = "1d") -> Optional[Dict[str, 
         pass
 
     resistances = sorted(set(round(r, 2) for r in resistances))
-    # Nearest resistance, but cap stop distance at 1.5×ATR (don't pay too much theta on a wide stop)
+    # r43 fix #1.8: BUFFER above the nearest resistance. Stops placed AT a
+    # resistance get wicked out by the very pattern that defines the level.
+    # Mirror of the long-side convention (signal_generator places longs
+    # 0.3-0.7% below support); shorts go 0.3% above resistance, capped at
+    # 1.5×ATR. Also bumped the long-stop ATR cap from 1.5× to STOP_ATR_MULT_BY_TF
+    # to harmonize with longs (r43 fix #2 from target-audit M6).
     nearest_res = resistances[0] if resistances else (price + 1.5 * atr)
-    stop = min(nearest_res, price + 1.5 * atr)
+    nearest_res_buffered = round(nearest_res * 1.003, 2) if nearest_res else (price + 1.5 * atr)
+    try:
+        from services.config import STOP_ATR_MULT_BY_TF as _SMM
+        max_atr_dist = max(1.5, _SMM.get(timeframe, 1.5)) * atr
+    except Exception:
+        max_atr_dist = 1.5 * atr
+    stop = min(nearest_res_buffered, price + max_atr_dist)
     # Ensure stop is at least 0.5×ATR away (not stuck at the same bar)
     stop = max(stop, price + 0.5 * atr)
 

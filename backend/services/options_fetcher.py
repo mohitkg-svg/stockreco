@@ -124,9 +124,15 @@ def _fetch_alpaca_chain(ticker: str) -> Optional[Dict[str, Any]]:
         # everything out, so we fake reasonable minimums when the real values
         # are missing. Callers can still veto via quote width.
         volume = int(getattr(lt, "size", 0) or 0) if lt else 0
-        # Rough OI estimate: if bid+ask is wide, unlikely liquid; we just pass
-        # the minimum gate so options_analyzer's scoring still runs.
-        open_interest = 100  # placeholder above MIN_OI=25
+        # r43 fix #0.8: Alpaca's snapshot doesn't carry day-volume / OI. Rather
+        # than fake `OI=100` (which trivially passes the gate for every
+        # contract), we now derive a liquidity-confidence score from quote
+        # width: tight quote = institutional book = trustable; wide quote =
+        # illiquid even if it had OI listed. options_analyzer falls back to
+        # the bid-ask gate (now denominated in premium per r43 fix #0.9), and
+        # we set OI=0 to force the analyzer to treat it as unknown rather
+        # than spoofed-good.
+        open_interest = 0  # unknown — analyzer relies on spread filter
         calls.append if meta["contract_type"] == "call" else puts.append
         item = {
             "strike": meta["strike"],

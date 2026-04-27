@@ -34,22 +34,50 @@ _STRONG_LEAN_PCT = 0.60   # ≥60% bullish (of tagged) = strong bullish lean
 
 
 def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
-    """Pull the last 30 messages for `ticker` from Stocktwits."""
+    """Pull recent messages for `ticker` from Stocktwits.
+
+    r43 fix #1.30: paginate up to 5 pages (≤150 messages) so the 24h
+    window is faithfully covered for both quiet and viral tickers.
+    Previously this fetched ONE page (30 messages) which (a) under-counted
+    viral names — total_24h capped at 30 even when 1000 messages existed —
+    and (b) span-overshot quiet names, where 30 messages span 5 days but
+    only the last 24h were counted, biasing the volume gate.
+    """
+    msgs = []
     try:
         import httpx
         url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker.upper()}.json"
-        with httpx.Client(timeout=10.0,
-                          headers={"User-Agent": "stockrecs-bot/1.0"}) as c:
-            r = c.get(url)
-        if r.status_code != 200:
-            logger.debug(f"stocktwits {ticker}: HTTP {r.status_code}")
-            return None
-        data = r.json() or {}
+        cutoff_24h_ts = (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp()
+        max_id = None
+        with httpx.Client(timeout=10.0, headers={"User-Agent": "stockrecs-bot/1.0"}) as c:
+            for _ in range(5):
+                params = {"max": max_id} if max_id else None
+                r = c.get(url, params=params)
+                if r.status_code != 200:
+                    logger.debug(f"stocktwits {ticker}: HTTP {r.status_code}")
+                    break
+                data = r.json() or {}
+                page = data.get("messages") or []
+                if not page:
+                    break
+                msgs.extend(page)
+                # Stop when oldest message in this page is older than 24h.
+                oldest_ts_str = page[-1].get("created_at") or ""
+                try:
+                    oldest_ts = datetime.fromisoformat(oldest_ts_str.replace("Z", "+00:00"))
+                    if oldest_ts.tzinfo is None:
+                        oldest_ts = oldest_ts.replace(tzinfo=timezone.utc)
+                    if oldest_ts.timestamp() < cutoff_24h_ts:
+                        break
+                except Exception:
+                    break
+                max_id = page[-1].get("id")
+                if not max_id:
+                    break
     except Exception as e:
         logger.debug(f"stocktwits {ticker} fetch failed: {e}")
         return None
 
-    msgs = data.get("messages") or []
     if not msgs:
         return None
 

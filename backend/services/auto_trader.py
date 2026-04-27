@@ -89,6 +89,12 @@ from services.risk_manager import (
 # manage loop, but writes go straight to the row + commit.
 _TARGET_CONFIRM_TICKS = 2
 _target_touch_counts: Dict[int, int] = {}
+# r43 fix #2 / Tier 2 L6: thread-safe touch-counts. Fast-path (WS thread)
+# and scheduler can both increment for the same trade row.
+_target_touch_lock = threading.Lock()
+# r43 fix #1.16: manage-loop reentrancy guard — prevents fast-path and
+# scheduler from interleaving on the same trade rows.
+_manage_lock = threading.Lock()
 
 
 def _touch_get(t) -> int:
@@ -97,13 +103,15 @@ def _touch_get(t) -> int:
         persisted = int(getattr(t, "target_touch_count", 0) or 0)
     except Exception:
         persisted = 0
-    cached = _target_touch_counts.get(t.id, 0)
+    with _target_touch_lock:
+        cached = _target_touch_counts.get(t.id, 0)
     return max(persisted, cached)
 
 
 def _touch_set(t, db, n: int) -> None:
     """Increment / set the touch counter on the row + cache + commit."""
-    _target_touch_counts[t.id] = n
+    with _target_touch_lock:
+        _target_touch_counts[t.id] = n
     try:
         t.target_touch_count = int(n)
         db.commit()
@@ -204,13 +212,35 @@ _STALE_TRADE_TF_MULT = 8
 _STALE_GAP_PCT = 0.02
 # Opening-15-min filter: intraday TFs have wide spreads + direction
 # whipsaws in this window. Higher TFs (1d, 1mo) are unaffected.
-# Profit-audit #7: removed 1h from the opening-15m filter.
-# 5m/15m signals generated in 9:30-9:45 ET are chaotic (high spread, wide
-# wicks), 30m partially so. 1h signals at 9:45 are usually the cleanest
-# setups of the day — we were throwing them away.
+# r43 fix #0.3: zoneinfo-based ET evaluation — the previous hardcoded
+# (13:30, 13:45) UTC was 9:30-9:45 ET only during EDT; during EST (Nov →
+# mid-March) the actual opening was 14:30-14:45 UTC and the filter was
+# silently off for ~4 months/year.
 _OPENING_FILTER_TFS = {"5m", "15m", "30m"}
-_OPENING_FILTER_START_UTC = (13, 30)   # 9:30 ET
-_OPENING_FILTER_END_UTC = (13, 45)     # 9:45 ET
+# r43 fix #0.21: closing-bell filter for the symmetric MOC-imbalance window.
+_CLOSING_FILTER_TFS = {"5m", "15m", "30m"}
+
+
+def _in_opening_filter_window() -> bool:
+    """True iff current ET time is in 9:30-9:45 ET (DST-aware)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
+        return (now_et.hour, now_et.minute) >= (9, 30) and (now_et.hour, now_et.minute) < (9, 45)
+    except Exception:
+        # Fail closed-ish — if we can't evaluate, assume in-window to skip
+        # the trade rather than risk trading the open whipsaw blind.
+        return False
+
+
+def _in_closing_filter_window() -> bool:
+    """True iff current ET time is in 15:50-16:00 ET (last-10-min auction-print window)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
+        return (now_et.hour, now_et.minute) >= (15, 50) and (now_et.hour, now_et.minute) < (16, 0)
+    except Exception:
+        return False
 
 
 def _confirm_1m_bar(ticker: str, direction: str = "BUY") -> bool:
@@ -302,6 +332,76 @@ logger = logging.getLogger(__name__)
 
 
 # ---------- Config ---------------------------------------------------------
+
+# ---------- Correlation cache (r43 fix #0.11) -----------------------------
+# Rolling 30-day daily-return correlation cache. Sector cap catches
+# AAPL+GOOGL+MSFT (all "Technology"), but it doesn't catch NVDA+AMD+AVGO
+# in different sub-sectors that move 1:1 with semis-tape, or KO+PEP that
+# move with consumer-staples sentiment. The correlation gate adds a 0.7
+# threshold across *already-open* positions to prevent silent multi-trade
+# correlated exposure.
+
+_corr_cache: Dict[str, "Any"] = {}  # ticker → pd.Series of daily log-returns
+_corr_cache_ts: Dict[str, float] = {}
+_CORR_CACHE_TTL_SEC = 6 * 3600  # refresh twice/day
+
+
+def _get_returns_series(ticker: str):
+    """30-day daily log-returns Series for `ticker`. Cached 6h."""
+    import time as _tt
+    now = _tt.time()
+    cached = _corr_cache.get(ticker)
+    if cached is not None and (now - _corr_cache_ts.get(ticker, 0)) < _CORR_CACHE_TTL_SEC:
+        return cached
+    try:
+        import numpy as _np
+        from services.data_fetcher import fetch_ohlcv as _fo
+        df = _fo(ticker, "1d")
+        if df is None or df.empty or len(df) < 21:
+            return None
+        closes = df["Close"].tail(31).astype(float)
+        rets = _np.log(closes / closes.shift(1)).dropna().tail(30)
+        if len(rets) < 15:
+            return None
+        _corr_cache[ticker] = rets
+        _corr_cache_ts[ticker] = now
+        return rets
+    except Exception:
+        return None
+
+
+def correlated_with_open(new_ticker: str, open_tickers: List[str], threshold: float = 0.70) -> List[str]:
+    """Return list of open tickers whose 30d return-correlation with
+    `new_ticker` exceeds `threshold`. Used by the correlation gate in
+    `consider_signal` to reject piling into already-correlated exposure.
+
+    Empty list when correlation can't be computed (data unavailable, too
+    few overlapping days, etc.) — fail-open in this direction is safe
+    because the sector cap is the primary defense.
+    """
+    if not new_ticker or not open_tickers:
+        return []
+    new_rets = _get_returns_series(new_ticker)
+    if new_rets is None:
+        return []
+    correlated: List[str] = []
+    for t in open_tickers:
+        if t == new_ticker:
+            continue
+        other = _get_returns_series(t)
+        if other is None:
+            continue
+        try:
+            joined = new_rets.to_frame("a").join(other.to_frame("b"), how="inner")
+            if len(joined) < 15:
+                continue
+            corr = float(joined["a"].corr(joined["b"]))
+            if corr >= threshold:
+                correlated.append(t)
+        except Exception:
+            continue
+    return correlated
+
 
 def is_blacklisted(ticker: str, cfg: Optional[Any] = None) -> bool:
     """True if `ticker` appears in `cfg.ticker_blacklist` (CSV). Safe to call
@@ -1561,12 +1661,25 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             _acct_probe = paper_trader.get_account()
             _equity_probe = float(_acct_probe["equity"]) if _acct_probe else 0.0
             _rpnl = realized_pnl_today()
-            if _equity_probe > 0 and _rpnl <= -abs(dll) * _equity_probe:
+            # r43 fix #0.12: include unrealized PnL on open positions. A book
+            # of 8 deep-underwater positions previously kept adding the 9th
+            # because nothing was realized yet. Combined-PnL (realized +
+            # unrealized) is the correct intraday-drawdown signal.
+            _unr = 0.0
+            try:
+                _open_pos = paper_trader.get_positions() or []
+                _unr = sum(float(p.get("unrealized_pl") or 0.0) for p in _open_pos)
+            except Exception:
+                _unr = 0.0
+            _combined = _rpnl + _unr
+            if _equity_probe > 0 and _combined <= -abs(dll) * _equity_probe:
                 logger.warning(
                     f"AutoTrader skip {signal.get('ticker')}: daily-loss limit hit "
-                    f"(realized {_rpnl:.2f} ≤ -{dll*100:.1f}% × equity {_equity_probe:.0f})"
+                    f"(combined {_combined:.2f} = realized {_rpnl:.2f} + unrealized {_unr:.2f} "
+                    f"≤ -{dll*100:.1f}% × equity {_equity_probe:.0f})"
                 )
                 metrics.inc("autotrade_event", event="daily_loss_halt")
+                metrics.inc("autotrade_skip", reason="daily_loss_halt")
                 return None
 
         # C1: Max concurrent positions guard.
@@ -1635,18 +1748,22 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 metrics.inc("autotrade_event", event="portfolio_heat_cap")
                 return None
 
-        # Opening-15-min whipsaw filter for intraday TFs.
+        # Opening / closing window filters for intraday TFs (r43 fix #0.3, #0.21).
         sig_tf_str = (signal.get("timeframe") or "").strip()
-        if sig_tf_str in _OPENING_FILTER_TFS:
-            _now_utc = datetime.utcnow()
-            _hm = (_now_utc.hour, _now_utc.minute)
-            if _OPENING_FILTER_START_UTC <= _hm < _OPENING_FILTER_END_UTC:
-                logger.info(
-                    f"AutoTrader skip {signal.get('ticker')}: opening-15m filter "
-                    f"({_hm[0]:02d}:{_hm[1]:02d} UTC, TF {sig_tf_str})"
-                )
-                metrics.inc("autotrade_event", event="opening_filter")
-                return None
+        if sig_tf_str in _OPENING_FILTER_TFS and _in_opening_filter_window():
+            logger.info(
+                f"AutoTrader skip {signal.get('ticker')}: opening-15m filter (TF {sig_tf_str})"
+            )
+            metrics.inc("autotrade_event", event="opening_filter")
+            metrics.inc("autotrade_skip", reason="opening_filter")
+            return None
+        if sig_tf_str in _CLOSING_FILTER_TFS and _in_closing_filter_window():
+            logger.info(
+                f"AutoTrader skip {signal.get('ticker')}: closing-10m MOC-imbalance filter (TF {sig_tf_str})"
+            )
+            metrics.inc("autotrade_event", event="closing_filter")
+            metrics.inc("autotrade_skip", reason="closing_filter")
+            return None
 
         # F7: Signal freshness — reject stale signals. Freshness window scales
         # with the timeframe (2× tf minutes, floor 15m, ceil 4h).
@@ -1702,6 +1819,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 f"(geometry broken or too tight)"
             )
             metrics.inc("autotrade_event", event="bad_t1_geometry")
+            metrics.inc("autotrade_skip", reason="bad_t1_geometry")
+            return None
+        # r43 fix #0.2: HARD reward:risk floor at consider_signal. The 1.3R
+        # floor in signal_generator only applies to natural-target output;
+        # promoted/adopted/external paths bypass it. Plus the floor must
+        # account for round-trip costs — a 1.3R T1 on a $100 stock with 6bps
+        # round-trip is closer to 1.15R net.
+        _rr_min = float(getattr(cfg, "rr_min", 1.3) or 1.3)
+        # Cost buffer: estimate 1 round-trip slippage on the reward leg.
+        _cost_buffer = entry * (12 / 10000.0)   # 12 bps round-trip
+        _net_reward = max(0.0, (t1 - entry) - _cost_buffer)
+        _gross_risk = max(0.01, entry - stop)
+        _rr_net = _net_reward / _gross_risk
+        if _rr_net < _rr_min:
+            logger.info(
+                f"AutoTrader skip {signal.get('ticker')}: net R:R {_rr_net:.2f} < {_rr_min:.2f} "
+                f"after {_cost_buffer:.2f} cost buffer (entry={entry}, t1={t1}, stop={stop})"
+            )
+            metrics.inc("autotrade_event", event="bad_rr")
+            metrics.inc("autotrade_skip", reason="bad_rr")
             return None
         # C10: Fat-finger guard — risk-per-share outside [0.1%, 10%] of entry
         # almost always indicates a bad level (stop on wrong side of a gap,
@@ -1820,8 +1957,15 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 metrics.inc("autotrade_event", event="earnings_skip")
                 return None
         except Exception as _e:
-            logger.warning(f"earnings gate {ticker}: {_e}")
+            # r43 fix #0.10: FAIL CLOSED on earnings-gate exception. A
+            # yfinance hiccup at exactly the wrong moment was previously
+            # waving the bot through into an earnings print. We now skip
+            # the entry on any earnings-lookup failure — better to miss a
+            # trade than to trade blind through a binary event.
+            logger.warning(f"earnings gate {ticker} FAIL-CLOSED: {_e}")
             metrics.inc("autotrade_event", event="earnings_gate_error")
+            metrics.inc("autotrade_skip", reason="earnings_gate_error")
+            return None
         # Trailing-only exit: park the bracket TP far away so it never fires.
         # Real exit comes from the trailing stop in manage_open_positions().
         risk_per_share = entry - stop
@@ -1843,10 +1987,16 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             if in_blk:
                 logger.info(f"AutoTrader skip {ticker}: macro blackout — {why}")
                 metrics.inc("autotrade_event", event="macro_blackout_stock")
+                metrics.inc("autotrade_skip", reason="macro_blackout")
                 return None
         except Exception as _e:
-            logger.warning(f"macro blackout gate {ticker}: {_e}")
+            # r43 fix #0.10: FAIL CLOSED on macro-blackout exception. A
+            # network blip on CPI/NFP/FOMC release morning previously waved
+            # the bot through into the print.
+            logger.warning(f"macro blackout gate {ticker} FAIL-CLOSED: {_e}")
             metrics.inc("autotrade_event", event="macro_blackout_gate_error")
+            metrics.inc("autotrade_skip", reason="macro_blackout_gate_error")
+            return None
 
         # Per-ticker auto-trade gate
         ws = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
@@ -1896,6 +2046,32 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                            ticker=ticker)
             except Exception:
                 pass
+        # r43 fix #0.11: pair-correlation gate. Sector cap can't catch
+        # NVDA+AMD+AVGO (different sub-sectors, ρ≈0.85 with semis tape).
+        # Reject when new ticker correlates ≥ 0.70 (30d daily returns)
+        # with 2+ already-open tickers — prevents silent triple-counted
+        # exposure on a single risk factor.
+        try:
+            _open_tickers = [
+                row[0] for row in db.query(AutoTrade.ticker).filter(
+                    AutoTrade.status.in_(["pending", "open", "adopted"])
+                ).distinct().all()
+                if row[0] and row[0] != ticker
+            ]
+            if len(_open_tickers) >= 2:
+                _corr_with = correlated_with_open(ticker, _open_tickers, threshold=0.70)
+                _corr_cap = int(getattr(cfg, "max_correlated_open", 1) or 1)
+                if len(_corr_with) > _corr_cap:
+                    logger.info(
+                        f"AutoTrader skip {ticker}: ρ≥0.70 with {len(_corr_with)} open trades "
+                        f"({_corr_with[:5]}); cap {_corr_cap}"
+                    )
+                    metrics.inc("autotrade_event", event="correlation_cap")
+                    metrics.inc("autotrade_skip", reason="correlation_cap")
+                    return None
+        except Exception as _ce:
+            logger.debug(f"correlation gate {ticker}: {_ce}")
+
         if sector and getattr(cfg, "max_per_sector", 3):
             # Include adopted — sector concentration is real regardless
             # of whether the bot is managing the position.
@@ -2013,21 +2189,40 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # Adaptive risk: halve the cap under high VIX (>25) or when recent
         # win-rate is below 55%. Catches regime changes the static cap misses.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk()
+        # r43 fix #1.26: adaptive multiplier returns 0 when the unfloored
+        # product would be ≤ 0.25 (cumulative-adverse-regime). Treat that
+        # as "skip" rather than "size tiny".
+        _adapt = _adapt_risk()
+        if _adapt <= 0.0:
+            logger.info(
+                f"AutoTrader skip {ticker}: adaptive multiplier 0 (cumulative-adverse-regime)"
+            )
+            metrics.inc("autotrade_skip", reason="adaptive_zero")
+            return None
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt
         # Profit-max: scale risk budget with confidence headroom above threshold.
         # Signals that clear the gate by a wide margin deserve a bigger bet.
         conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
         conf_mult = 1.0 + (_MAX_CONFIDENCE_RISK_MULT - 1.0) * min(1.0, conf_headroom)
-        # Kelly-lite: if backtest win-rate is strong, boost further.
+        # r43 fix #1.5: route through the proper fractional-Kelly helper in
+        # risk_math (which now applies quarter-Kelly damping per r42 fix
+        # #1.7). Previously this site had its own ad-hoc linear ramp that
+        # ignored reward:risk entirely — i.e. it wasn't a Kelly fraction.
         try:
             bt_wr = float(signal.get("backtest_win_rate") or 0)
         except Exception:
             bt_wr = 0.0
-        if bt_wr >= _KELLY_MIN_WIN_RATE:
-            kelly_edge = min(1.0, (bt_wr - _KELLY_MIN_WIN_RATE) / (100.0 - _KELLY_MIN_WIN_RATE))
-            kelly_mult = 1.0 + (_KELLY_MAX_MULT - 1.0) * kelly_edge
-        else:
-            kelly_mult = 1.0
+        try:
+            bt_avg_rr = float(signal.get("backtest_avg_reward_risk") or signal.get("avg_reward_risk") or 0)
+        except Exception:
+            bt_avg_rr = 0.0
+        from services.risk_math import kelly_risk_mult as _krm
+        kelly_mult = _krm(
+            historical_win_rate=bt_wr,
+            avg_reward_risk=bt_avg_rr if bt_avg_rr > 0 else None,
+            min_win_rate=_KELLY_MIN_WIN_RATE,
+            max_mult=_KELLY_MAX_MULT,
+        )
         # Profit-audit #4: empirical calibration multiplier — closes the loop
         # from the nightly calibration job. A confidence bucket that has
         # historically won 70% of trades multiplies risk by 1.22x; a bucket
@@ -2152,10 +2347,13 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 q = live_quotes.get_stock_quote(ticker) or {}
                 bid = float(q.get("bid") or 0)
                 ask = float(q.get("ask") or 0)
-                if bid > 0 and ask > 0 and ask > bid:
+                # r43 Tier 2 M9: quote freshness check — bid/ask older than
+                # 5s isn't trustable for limit-at-mid. Fall back to market.
+                qts = float(q.get("ts") or 0)
+                import time as _t_qf
+                fresh = (qts > 0) and ((_t_qf.time() - qts) <= 5.0)
+                if fresh and bid > 0 and ask > 0 and ask > bid:
                     _limit_px = round((bid + ask) / 2.0, 2)
-                    # Floor at mid to avoid paying up; fallback if mid isn't
-                    # between bid/ask (stale quote, locked market, etc).
                     if bid <= _limit_px <= ask:
                         _entry_type = "limit"
                     else:
@@ -2912,6 +3110,7 @@ from services.execution_engine import (
     get_legs as _get_legs,
     identify_legs as _identify_legs,
     replace_stop as _replace_stop,
+    replace_tp as _replace_tp,
     _replace_stop_cache,  # re-exported for any introspection use
 )
 
@@ -3217,20 +3416,55 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
     # < 0.2R toward target after 48h. R is measured against the underlying's
     # initial-risk distance (entry → bear/bull stop on the underlying).
     if not exit_reason and px is not None:
+        # r43 fix #1.10: theta-stop now scales with DTE. Previously fixed
+        # 48h hold + 0.2R progress threshold — too late for a 7-DTE option
+        # (theta has already eaten 30%+ in 48h) and too early for a
+        # 60-DTE that just needs more time.
         try:
             from datetime import datetime as _dt_th
             opened = t.filled_at or t.opened_at
             held_h = (_dt_th.utcnow() - opened).total_seconds() / 3600 if opened else 0
             req_entry = float(getattr(t, "requested_entry", None) or 0)
             req_stop = float(getattr(t, "stop_loss", None) or 0)
-            if held_h >= 48 and req_entry > 0 and req_stop > 0:
+            # Pull DTE from OCC symbol (positions 6-12 yyMMdd) when possible.
+            dte_now = None
+            try:
+                _occ = t.symbol or ""
+                if len(_occ) >= 13:
+                    yymmdd = _occ[-15:-9]
+                    from datetime import datetime as _dt_yymmdd
+                    exp = _dt_yymmdd.strptime(yymmdd, "%y%m%d")
+                    dte_now = max(0.0, (exp - _dt_th.utcnow()).total_seconds() / 86400.0)
+            except Exception:
+                dte_now = None
+            # Hold floor: 12h for ≤7-DTE, 24h for 7-30 DTE, 48h otherwise.
+            if dte_now is None:
+                hold_floor = 48.0
+            elif dte_now <= 7:
+                hold_floor = 12.0
+            elif dte_now <= 30:
+                hold_floor = 24.0
+            else:
+                hold_floor = 48.0
+            # Progress floor: more permissive for shorter DTE (theta eats fast,
+            # we need to stop the bleeding sooner). 0.4R for ≤7 DTE, 0.3R
+            # for 7-30, 0.2R for >30.
+            if dte_now is None:
+                prog_floor = 0.2
+            elif dte_now <= 7:
+                prog_floor = 0.4
+            elif dte_now <= 30:
+                prog_floor = 0.3
+            else:
+                prog_floor = 0.2
+            if held_h >= hold_floor and req_entry > 0 and req_stop > 0:
                 R_under = abs(req_entry - req_stop)
                 if R_under > 0:
                     progress = (req_entry - px) / R_under if is_put else (px - req_entry) / R_under
-                    if progress < 0.2:
+                    if progress < prog_floor:
                         exit_reason = (
-                            f"theta stop: held {held_h:.0f}h, underlying progress "
-                            f"{progress:.2f}R < 0.2R — thesis stalled"
+                            f"theta stop: held {held_h:.0f}h DTE={dte_now}, underlying progress "
+                            f"{progress:.2f}R < {prog_floor:.2f}R — thesis stalled"
                         )
                         final_status = "closed_stop"
                         metrics.inc("autotrade_event", event="theta_stop")
@@ -3328,8 +3562,19 @@ def manage_open_positions() -> Dict[str, Any]:
       • For pending entries — promote to 'open' once filled (capture entry_price + leg ids).
       • For open trades — when current price ≥ T1, move stop to entry (break-even).
       • Reconcile closed trades (status sync from broker).
+
+    r43 fix #1.16: in-process lock prevents the scheduler tick and the
+    stop-threat fast-path (WS thread) from interleaving on the same trade
+    rows — without it, both paths could increment counters / submit
+    duplicate trims / race the level_index advance.
     """
     summary = {"checked": 0, "trailed": 0, "closed": 0, "errors": 0}
+    if not _manage_lock.acquire(timeout=15.0):
+        # Another manage tick is in flight — skip this one rather than
+        # block. Both scheduler and fast-path are best-effort retry-on-tick.
+        logger.info("manage_open_positions: another tick in flight, skipping")
+        summary["skipped_concurrent"] = 1
+        return summary
     _manage_ctx = metrics.timer("manage")
     _manage_ctx.__enter__()
     # Snapshot config + active trade IDs in a SHORT session, then release the
@@ -3571,6 +3816,15 @@ def manage_open_positions() -> Dict[str, Any]:
                                         if t.target1: t.target1 = round(float(t.target1) + slip, 2)
                                         if t.target2: t.target2 = round(float(t.target2) + slip, 2)
                                         if t.target3: t.target3 = round(float(t.target3) + slip, 2)
+                                        # r43 fix #0.5: replace the broker TP
+                                        # leg too. Without this, broker held
+                                        # the original far_tp; bot intent and
+                                        # broker reality silently diverged.
+                                        if t.tp_order_id and (t.target3 or t.target2 or t.target1):
+                                            _new_tp_target = float(t.target3 or t.target2 or t.target1)
+                                            _new_tp_id = _replace_tp(t.tp_order_id, _new_tp_target)
+                                            if _new_tp_id:
+                                                t.tp_order_id = _new_tp_id
                                         if t.stop_loss:
                                             # Original risk-per-share from the SIGNAL.
                                             orig_risk = max(0.0, req_entry - float(t.stop_loss))
@@ -3817,12 +4071,17 @@ def manage_open_positions() -> Dict[str, Any]:
                                             # while we keep meaningful breathing
                                             # room for the winner to develop.
                                             initial_risk = max(0.01, float(t.entry_price) - float(t.stop_loss))
-                                            # Soft-BE distance is the LARGER of 0.3R or 0.25×ATR so we stay
-                                            # outside the 1-bar noise floor for high-volatility names
-                                            # (BE-trail was otherwise chopping them out on normal wicks).
+                                            # r43 fix #1.7: soft-BE buffer must respect T1 distance.
+                                            # Previously stop_dist = max(0.3R, 0.25×ATR) anchored to ENTRY
+                                            # only — at T1=1.5R, runner trailed at entry-0.3R, riding 1.8R
+                                            # underwater on noise (after a successful T1 trim!). Now we
+                                            # anchor to MIN(entry-0.3R, T1-0.3R) so the runner has banked
+                                            # at least 1.2R of cushion before getting stopped.
                                             atr_buffer = _chandelier_atr(t.ticker) or 0.0
                                             stop_dist = max(0.3 * initial_risk, 0.25 * atr_buffer)
-                                            soft_be = float(t.entry_price) - stop_dist
+                                            soft_be_entry = float(t.entry_price) - stop_dist
+                                            t1_anchor = float(next_target) - stop_dist
+                                            soft_be = max(soft_be_entry, t1_anchor)
                                             new_stop = round(max(soft_be, t.current_stop or 0), 2)
                                         elif target_idx == 1:
                                             # At T2: now tighten to full entry (BE).
@@ -3952,6 +4211,11 @@ def manage_open_positions() -> Dict[str, Any]:
                                                         new_targets,
                                                     )
                                                     t.note = (t.note or "") + f" | recalc T1-3: {new_targets}"
+                                                    # r43 fix #0.5: replace broker TP leg to match new T3.
+                                                    if t.tp_order_id and new_targets[2]:
+                                                        _new_tp = _replace_tp(t.tp_order_id, float(new_targets[2]))
+                                                        if _new_tp:
+                                                            t.tp_order_id = _new_tp
                                             elif target_idx == 2:
                                                 # Past the first recompute —
                                                 # just let chandelier trail.
@@ -4062,6 +4326,25 @@ def manage_open_positions() -> Dict[str, Any]:
                                 # leak by trade id over months of operation.
                                 t.target_touch_count = 0
                                 _target_touch_counts.pop(t.id, None)
+                                # r43 fix #1.28: release in-flight BP on every
+                                # close, not just `closed_unfilled`. Otherwise
+                                # the reservation accumulates over a session
+                                # of 30+ closed trades and throttles new entries
+                                # late-day even when broker-side BP is plenty.
+                                try:
+                                    if t.entry_price and t.original_qty:
+                                        _release_bp(float(t.entry_price) * float(t.original_qty))
+                                except Exception:
+                                    pass
+                                # r43 fix #1.29: clean up the stop/tp cache
+                                # entries we leaked on every replace.
+                                try:
+                                    if t.stop_order_id:
+                                        _replace_stop_cache.pop(t.stop_order_id, None)
+                                    if t.tp_order_id:
+                                        _replace_stop_cache.pop(t.tp_order_id, None)
+                                except Exception:
+                                    pass
                                 db.commit()
                                 summary["closed"] += 1
                                 metrics.inc("autotrade_event", event=t.status)
@@ -4109,6 +4392,10 @@ def manage_open_positions() -> Dict[str, Any]:
     finally:
         try:
             _manage_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            _manage_lock.release()
         except Exception:
             pass
     return summary

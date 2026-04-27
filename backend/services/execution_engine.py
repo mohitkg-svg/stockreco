@@ -104,6 +104,43 @@ def replace_stop(stop_order_id: str, new_stop: float) -> Optional[str]:
         return None
 
 
+def replace_tp(tp_order_id: str, new_limit: float) -> Optional[str]:
+    """r43 fix #0.5: replace the TP (limit-take-profit) child of a bracket.
+
+    Mirrors `replace_stop` semantics — returns the rotated leg id on success
+    so callers can persist it back to `t.tp_order_id`. Without this primitive
+    the TP leg sat forever at the original `far_tp = entry + 10×risk` and
+    NEVER reflected slippage shifts or T3 recalcs. A flash spike past
+    `far_tp` filled at the gap-open price; the bot's "trailing-only exit"
+    silently was not what the broker actually held.
+    """
+    rounded = round(float(new_limit), 2)
+    last = _replace_stop_cache.get(tp_order_id)
+    if last is not None and abs(last - rounded) < 0.005:
+        return tp_order_id
+    c = paper_trader._get_client()
+    if not c:
+        logger.warning(f"replace_tp {tp_order_id}: no broker client — keeping old TP")
+        return None
+    try:
+        from alpaca.trading.requests import ReplaceOrderRequest
+        new_order = c.replace_order_by_id(
+            tp_order_id,
+            order_data=ReplaceOrderRequest(limit_price=rounded),
+        )
+        new_id = str(getattr(new_order, "id", "") or tp_order_id)
+        _replace_stop_cache[tp_order_id] = rounded
+        _replace_stop_cache[new_id] = rounded
+        return new_id
+    except Exception as e:
+        err_lower = str(e).lower()
+        if "already replaced" in err_lower:
+            _replace_stop_cache[tp_order_id] = rounded
+            return tp_order_id
+        logger.error(f"replace_tp FAILED {tp_order_id} → {new_limit}: {e}")
+        return None
+
+
 def force_close_trade(
     t: Any,   # AutoTrade
     db: Session,
@@ -178,9 +215,12 @@ def force_close_trade(
             existing = float(t.realized_pl or 0.0)
             t.realized_pl = round(existing + (px - t.entry_price) * t.qty, 2)
     else:
-        sell = paper_trader.submit_simple_option_order(
+        # r43 fix #2.7: use marketable-limit-with-cross-fallback on emergency
+        # option closes too — saves spread on the common case while still
+        # guaranteeing flatten via the 20s market-cross fallback.
+        sell = paper_trader.submit_option_exit_with_cross_fallback(
             occ_symbol=t.symbol, qty=int(t.qty), side="sell",
-            order_type="market", time_in_force="day",
+            cross_after_seconds=20.0,
         )
         if "error" in sell:
             from services.alerts import alert as _raise_alert

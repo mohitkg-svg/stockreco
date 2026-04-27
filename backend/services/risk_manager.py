@@ -344,28 +344,27 @@ def adaptive_risk_multiplier() -> float:
             )
         except Exception:
             pass
-    # Floor at 0.25× — anything smaller is too small to recover trading
-    # costs even on a winner. Below this we should freeze (see
-    # should_freeze_trading), not just shrink.
-    return max(mult, 0.25)
+    # r43 fix #1.26: when the unfloored product would be ≤ 0.25, return
+    # 0 so caller treats as "skip". A 0.25× position whose stop costs
+    # are still real has negative EV in adverse-stack regimes; floor-
+    # then-keep-trading masks how aggressively reality is fighting us.
+    if mult <= 0.25:
+        return 0.0
+    return mult
 
 
 def should_freeze_trading() -> Optional[str]:
     """Hard freeze trigger on a clear losing streak.
 
-    r42 fix #1.3: combine count-WR with PnL-based expectancy and a sum-
-    realized-PnL drawdown floor. Pure WR was tricked by 9-small-wins-and-
-    1-big-loss patterns into reporting "healthy" while the strategy bled.
-
     Triggers (any one of):
       * WR < 35% AND ≥ 5 closed trades
       * expectancy ≤ 0 AND ≥ 10 closed trades AND sum_PnL ≤ -2× |worst trade|
-        (this last clause skips the gate when the negative expectancy is
-         driven by a single fat-tail loss already in the rear-view mirror)
+      * r43 fix #1.20: 5+ consecutive losing trades (most recent N closed trades).
     """
     try:
         from database import SessionLocal, AutoTrade
         from datetime import datetime, timedelta
+        from sqlalchemy import desc as _desc
         db = SessionLocal()
         try:
             since = datetime.utcnow() - timedelta(days=30)
@@ -393,6 +392,24 @@ def should_freeze_trading() -> Optional[str]:
                     f"trailing-30d expectancy ${expectancy:.2f}/trade ≤ 0, "
                     f"sum=${sum_pl:.2f}, worst=${worst:.2f} — losses span beyond "
                     f"a single fat-tail; trading frozen pending edge review"
+                )
+            # r43 fix #1.20: consecutive-loss circuit breaker. 5 stops in
+            # a row triggers a freeze regardless of 30d stats — it's the
+            # "human would stop trading" reflex.
+            recent = (
+                db.query(AutoTrade)
+                .filter(
+                    AutoTrade.status.like("closed%"),
+                    AutoTrade.realized_pl.isnot(None),
+                )
+                .order_by(_desc(AutoTrade.closed_at))
+                .limit(5)
+                .all()
+            )
+            if len(recent) >= 5 and all((r.realized_pl or 0) <= 0 for r in recent):
+                return (
+                    f"5 consecutive losing trades — trading frozen until next "
+                    f"manual override or until at least one closed-target ages in"
                 )
             return None
         finally:
@@ -678,11 +695,18 @@ def strategy_multiplier(strategy_name: Optional[str]) -> float:
     if cached and now < cached[1]:
         return cached[0]
     try:
-        # Delayed import to avoid auto_trader ↔ risk_manager circular at module load
+        # r43 fix #1.6: enforce min-bucket-N at the call site. With <20
+        # closed trades the multiplier (which can swing 0.5×→1.5×) is
+        # noise; we return 1.0 until we have a meaningful sample. The
+        # underlying scorecard `min_trades=5` is too low to trust at the
+        # call site where it directly multiplies risk.
         from services.auto_trader import strategy_scorecard
         card = strategy_scorecard(days=60, min_trades=5)
         entry = card.get(strategy_name)
-        m = float(entry["multiplier"]) if entry else 1.0
+        if entry and (entry.get("trades") or 0) >= 20:
+            m = float(entry["multiplier"])
+        else:
+            m = 1.0
     except Exception:
         m = 1.0
     _strategy_mult_cache[strategy_name] = (m, now + _STRATEGY_CACHE_TTL)
@@ -705,7 +729,10 @@ def calibration_multiplier(confidence: float) -> float:
         db = SessionLocal()
         try:
             row = db.query(ConfidenceCalibration).filter(ConfidenceCalibration.bucket == bucket).first()
-            if row:
+            # r43 fix #1.6: require ≥20 trades in the bucket before deviating
+            # from 1.0; below that, a single big winner can permanently
+            # 1.5× every signal in that bucket for 60 days.
+            if row and (getattr(row, "n_trades", 0) or 0) >= 20:
                 m = float(row.multiplier)
                 _calibration_cache[bucket] = (m, now + _CALIBRATION_CACHE_TTL)
                 return m

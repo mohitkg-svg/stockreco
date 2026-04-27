@@ -15,6 +15,52 @@ inclusion / continued-deferral rationale. Deferred items whose rationale
 has gone stale should either move to ✅ done or be re-categorized as
 ❌ rejected — don't let the list rot into "we'll get to it eventually".
 
+## r43 audit pickup (2026-04-27) — strategy + execution deep-dive
+
+A 5-agent deep-dive (stock selection, option contract selection, entry
+gates, target/stop math, execution accuracy) surfaced ~130 findings;
+all of Tier 0-3 implemented this revision. Highlights:
+
+- **OCC symbol = None** for every Alpaca-fed option (verified blocking
+  every option entry today). Reader now falls back to `_occ`.
+- **R:R floor at consider_signal** (was only in signal_generator);
+  hard 1.3R floor with 12bps cost buffer.
+- **Opening-filter DST bug** fixed via zoneinfo. New closing-10min filter.
+- **Stop-threat fast-path now covers options too**, with global
+  single-flight gate to prevent correlated-drawdown manage-storms.
+- **TP leg replaced** on slippage shift + T3 recalc (was never updated;
+  bot intent ≠ broker reality).
+- **Marketable-limit option exit posts INSIDE the spread**, not at the
+  bid. Plus a cross-fallback primitive for emergency closes.
+- **Options stream defaults ON**.
+- **Liquidity gate de-spoofed** (was hardcoded OI=100); spread filter
+  denominated in premium not strike.
+- **Macro/earnings gates fail-closed** on exception.
+- **Pair-correlation gate** added (30d daily-return cache, 0.70 threshold).
+- **Daily-loss halt includes UNREALIZED**.
+- **Universe scanner** drops shortable filter; optional point-in-time
+  override; RVOL no longer biased by intraday-partial bar.
+- **Best-strategy** ranked by OOS metric (was display-confidence) +
+  per-direction key bug fixed.
+- **Kelly stack** routed through proper fractional-Kelly helper.
+- **Calibration / strategy multipliers** gated on min-bucket-N=20.
+- **Consecutive-loss freeze** (5 stops in a row).
+- **Adaptive multiplier returns 0** when unfloored product ≤ 0.25 (skip vs size-tiny).
+- **Soft-BE buffer respects T1 distance** (was entry-anchored only).
+- **Bear-thesis stop placed 0.3% above resistance** (was AT).
+- **Premium-stop binding inverted** (was always-binding regardless of underlying).
+- **Theta-stop scales with DTE**.
+- **IV-rank gate** vs 1y RV distribution.
+- **Delta scoring asymmetric**, strike width ATR-anchored.
+- **Manage-loop in-process lock**, thread-safe touch-counts.
+- **Sentiment default → FinBERT auto-preferred** (was VADER).
+- **Insider min-count raised 3 → 8**.
+- **Stocktwits paginates 24h faithfully**.
+- **Limit-at-mid quote freshness check**.
+- **Idempotency 12h → 4h**.
+
+142 tests pass.
+
 ## r42 audit pickup (2026-04-27) — items resolved this revision
 
 The r42 multi-agent audit (BE + UI) picked up the following items from

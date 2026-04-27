@@ -12,6 +12,7 @@ and take-profit alongside the entry — no need for the app to monitor exits.
 from __future__ import annotations
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -477,6 +478,12 @@ def submit_option_exit_marketable_limit(
     trip. Even a marketable limit at the inside ask + $0.05 cuts that
     drastically without sacrificing fill probability.
     """
+    # r43 fix #0.6: post INSIDE the spread first to capture price improvement.
+    # Previous version (r42) sat at bid for sells / ask+offset for buys —
+    # equivalent to a market order on wide books, defeating the purpose. Now:
+    # SELL at `mid - offset` (post 1 tick inside the bid), BUY at `mid +
+    # offset`. Caller may follow up with a market cross if no fill in N seconds
+    # (see `submit_option_exit_marketable_limit_with_cross_fallback`).
     side = side.lower()
     px: Optional[float] = None
     try:
@@ -484,14 +491,16 @@ def submit_option_exit_marketable_limit(
         q = _lq.get_option_quote(occ_symbol)
         if q:
             bid = q.get("bid"); ask = q.get("ask")
-            if side == "sell" and bid:
-                # Sell: sit at the bid for guaranteed fill (cross the spread).
-                px = float(bid) - float(offset_cents) * 0  # at the bid
-                px = max(0.01, float(bid))
+            if bid and ask and ask > bid:
+                mid = (float(bid) + float(ask)) / 2.0
+                if side == "sell":
+                    px = max(float(bid), mid - float(offset_cents))
+                else:  # buy
+                    px = min(float(ask), mid + float(offset_cents))
+            elif side == "sell" and bid:
+                px = float(bid)
             elif side == "buy" and ask:
                 px = float(ask) + float(offset_cents)
-            elif bid and ask:
-                px = (float(bid) + float(ask)) / 2.0
     except Exception:
         px = None
     if px is not None and px > 0:
@@ -506,6 +515,54 @@ def submit_option_exit_marketable_limit(
             order_type="market", time_in_force="day",
         )
     return {"error": "no quote available for marketable-limit"}
+
+
+def submit_option_exit_with_cross_fallback(
+    occ_symbol: str,
+    qty: int,
+    side: str = "sell",
+    cross_after_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    """r43 fix #0.6 sibling: post inside the spread, watch for fill, cross to
+    market if not filled within `cross_after_seconds`. Returns the FINAL
+    submitted order dict (cross order if it fired, otherwise the inside-the-
+    spread limit).
+
+    This is the right primitive for emergency closes (force_close, news_exit,
+    end-of-day flatten) where we want price improvement BUT must guarantee
+    flattening before session-end.
+    """
+    first = submit_option_exit_marketable_limit(
+        occ_symbol=occ_symbol, qty=qty, side=side, fallback_to_market=False,
+    )
+    if "error" in first or not first.get("id"):
+        # Couldn't even submit the inside-spread limit; fall back to market.
+        return submit_simple_option_order(
+            occ_symbol=occ_symbol, qty=qty, side=side,
+            order_type="market", time_in_force="day",
+        )
+    order_id = first.get("id")
+    deadline = time.time() + cross_after_seconds
+    while time.time() < deadline:
+        time.sleep(min(2.0, deadline - time.time()))
+        try:
+            c = _get_client()
+            if c:
+                o = c.get_order_by_id(order_id)
+                status = str(getattr(o, "status", "")).lower()
+                if "filled" in status:
+                    return first
+        except Exception:
+            break
+    # Not filled — cancel + market cross.
+    try:
+        cancel_order(order_id)
+    except Exception:
+        pass
+    return submit_simple_option_order(
+        occ_symbol=occ_symbol, qty=qty, side=side,
+        order_type="market", time_in_force="day",
+    )
 
 
 def get_option_position(occ_symbol: str) -> Optional[Dict[str, Any]]:

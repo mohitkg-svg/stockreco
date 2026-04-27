@@ -61,8 +61,43 @@ def _spy_returns() -> Dict[str, Optional[float]]:
         return {"r20": None, "r60": None}
 
 
+def _read_universe_file() -> Optional[List[str]]:
+    """r43 fix #1.1: optional point-in-time universe override.
+
+    Set `STOCK_UNIVERSE_FILE` to a path containing one ticker per line
+    (S&P 500 / Russell 1000 constituents) to bypass the Alpaca
+    "alphabetical first 500" survivor-biased default. The file is
+    re-read every scan so the operator can swap it without a restart.
+    Returns None when not configured.
+    """
+    path = os.getenv("STOCK_UNIVERSE_FILE")
+    if not path:
+        return None
+    try:
+        with open(path, "r") as f:
+            tickers = []
+            for line in f:
+                s = line.strip().upper()
+                if s and not s.startswith("#"):
+                    tickers.append(s)
+            return tickers or None
+    except Exception as e:
+        logger.warning(f"universe_scanner: STOCK_UNIVERSE_FILE read failed ({path}): {e}")
+        return None
+
+
 def pull_universe(size: int = UNIVERSE_SIZE) -> List[Dict[str, Any]]:
-    """Fetch up to `size` active, tradable US stock symbols from Alpaca.
+    """Fetch up to `size` active, tradable US stock symbols from Alpaca."""
+    # r43 fix #1.1: prefer point-in-time universe file when configured.
+    override = _read_universe_file()
+    if override:
+        return [{"ticker": t, "name": t, "exchange": "list"} for t in override[:size]]
+    return _pull_universe_alpaca(size)
+
+
+def _pull_universe_alpaca(size: int = UNIVERSE_SIZE) -> List[Dict[str, Any]]:
+    """Original Alpaca-assets pull (kept as the default fallback when the
+    operator hasn't configured a constituent file).
 
     Alpaca's /v2/assets endpoint returns ALL listed assets (10k+). We narrow
     to equity + active + tradable + common stock via its filters, then take
@@ -100,8 +135,15 @@ def pull_universe(size: int = UNIVERSE_SIZE) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"universe_scanner: assets API failed: {e}")
         return []
+    # r43 fix #1.1: drop the `shortable` filter for cash longs — many
+    # mid-cap winners (small float, hard-to-borrow) were being silently
+    # excluded. We keep `tradable + active + us_equity` as the basic
+    # tradability gate. Survivor bias against retro-delisted tickers
+    # remains (Alpaca only lists currently-active assets), but that's
+    # an Alpaca-API limitation; mitigated by the constituent-list
+    # fallback added below when env var STOCK_UNIVERSE_FILE is set.
     merged = [a for a in (nasdaq + nyse)
-              if a.get("tradable") and a.get("shortable")  # no low-float gotchas
+              if a.get("tradable")
               and a.get("status") == "active"
               and a.get("class") == "us_equity"]
     # Alpaca returns symbols like "AAPL", "BRK.A", etc. Filter out weird ones.
@@ -153,10 +195,35 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
         price = float(last.get("Close", 0) or 0)
         if price < PREFILTER_MIN_PRICE or price > PREFILTER_MAX_PRICE:
             return None
+        # r43 fix #1.2: RVOL on a partial-bar (during RTH the latest "daily"
+        # bar is in-progress) flipped the score with time-of-day — at 10:30
+        # ET RVOL≈0.15, at 15:55 RVOL≈1.8 for the SAME healthy ticker. Use
+        # the most recently CLOSED day for both numerator and denominator,
+        # OR scale the partial-bar volume by elapsed-session fraction so
+        # the comparison is apples-to-apples.
         vol_20 = float(df["Volume"].iloc[-20:].mean())
         if vol_20 < PREFILTER_MIN_AVG_VOL:
             return None
         vol = float(last.get("Volume", 0) or 0)
+        # If we can detect the bar is intraday-partial, prefer the previous
+        # closed bar's RVOL to avoid the time-of-day bias.
+        try:
+            last_ts = df.index[-1]
+            from datetime import datetime as _dt_rv
+            from zoneinfo import ZoneInfo as _ZI
+            now_et = _dt_rv.utcnow().replace(tzinfo=_ZI("UTC")).astimezone(_ZI("America/New_York"))
+            ts_et = last_ts.tz_convert("America/New_York") if hasattr(last_ts, "tz_convert") else None
+            is_partial = (
+                ts_et is not None
+                and ts_et.date() == now_et.date()
+                and (now_et.hour, now_et.minute) < (16, 0)
+            )
+        except Exception:
+            is_partial = False
+        if is_partial and len(df) >= 2:
+            # Use yesterday's closed bar; today's volume is incomplete.
+            prev = df.iloc[-2]
+            vol = float(prev.get("Volume", 0) or 0)
         rvol = (vol / vol_20) if vol_20 > 0 else 1.0
 
         # Feature values

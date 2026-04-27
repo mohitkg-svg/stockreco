@@ -285,9 +285,11 @@ _MULT_MILD_INSIDER_BUY = 1.03
 _MULT_NEUTRAL = 1.00
 _MULT_INSIDER_SELLING = 0.97
 
-# Minimum 90d insider-transaction count to trust the ratio — below this the
-# sample is too small (one bought tranche looks like 100% buy ratio).
-_MIN_COUNT_90D = 3
+# r43 fix #1.31: bumped min-count from 3 → 8 to filter out noise from
+# director option-grant cycles where a single 3-buy-0-sell sample
+# produces ratio=1.0 → +6% multiplier on noise. 8 transactions is the
+# empirical floor where the 90d ratio reflects intent rather than HR cycles.
+_MIN_COUNT_90D = 8
 
 
 def insider_multiplier(ticker: str, direction: str) -> float:

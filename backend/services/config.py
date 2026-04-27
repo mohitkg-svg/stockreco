@@ -13,7 +13,11 @@ DATA_CACHE_MAX_ENTRIES = 512
 
 # ---- Auto-trader (auto_trader) ---------------------------------------------
 # Window during which a duplicate signal (same ticker/type/levels) is suppressed.
-IDEMPOTENCY_LOOKBACK_HOURS = 12
+# r43 fix #1.27: lowered from 12h to 4h. The bucket-aware idem key (per
+# r41 audit) already prevents same-bucket re-fires; the long lookback was
+# blocking legitimate next-bar setups on volatile names where the same
+# (ticker, direction, levels) reappear after a real intraday move.
+IDEMPOTENCY_LOOKBACK_HOURS = 4
 # Live-price fallback cache TTL — protects the Alpaca/Yahoo quote API from
 # being hammered when manage loop and signal eval both want a fresh price.
 PRICE_FALLBACK_TTL_SEC = 30.0

@@ -38,6 +38,14 @@ def recompute_all() -> Dict[str, Any]:
     if not tickers:
         return {"updated": 0}
 
+    # r43 fix #1.3: rank by OOS Sharpe (with min-trades-per-fold gate),
+    # not by `confidence` (a display number, not OOS expectancy). Also
+    # the original code had a per-direction bug — overwrote BUY with
+    # SELL on the second iteration because the row had only one
+    # (ticker)-keyed slot. We now compute a winner per direction and
+    # store ONLY the strongest direction (BUY OR SELL, whichever has
+    # higher OOS Sharpe AND meets the min-OOS-trades floor).
+    MIN_OOS_TRADES = 10
     updated = 0
     db = SessionLocal()
     try:
@@ -47,40 +55,53 @@ def recompute_all() -> Dict[str, Any]:
                 if df is None or df.empty or len(df) < 252:
                     continue
                 multi = run_multi_strategy(df, timeframe="1d")
-                best = multi.get("best")
-                if not best:
+                if not multi.get("results"):
                     continue
-                # Pick the best for each direction.
-                for direction in ("BUY", "SELL"):
-                    winners = [r for r in multi["results"] if r["direction"] == direction]
-                    if not winners:
-                        continue
-                    w = max(winners, key=lambda r: r["confidence"])
-                    row = db.query(BestStrategyPerTicker).filter(
-                        BestStrategyPerTicker.ticker == ticker
-                    ).first()
-                    # One row per ticker — hold the side with higher confidence
-                    # (BUY is our primary direction; SELL wins only when much stronger).
-                    if row is None:
-                        row = BestStrategyPerTicker(
-                            ticker=ticker, strategy=w["strategy"],
-                            direction=direction, confidence=w["confidence"],
-                            oos_trades=w.get("oos_trades") or 0,
-                            win_rate=(w["stats"].get("win_rate") or 0) / 100.0,
-                            avg_pl=w["stats"].get("avg_pl") or 0.0,
-                        )
-                        db.add(row)
-                        updated += 1
-                    else:
-                        # Overwrite if new winner has higher confidence
-                        if w["confidence"] > row.confidence or row.direction == direction:
-                            row.strategy = w["strategy"]
-                            row.direction = direction
-                            row.confidence = w["confidence"]
-                            row.oos_trades = w.get("oos_trades") or 0
-                            row.win_rate = (w["stats"].get("win_rate") or 0) / 100.0
-                            row.avg_pl = w["stats"].get("avg_pl") or 0.0
-                            updated += 1
+                # Score each candidate with a composite OOS metric:
+                # `oos_trades * win_rate * avg_pl` (positive expectancy ×
+                # sample-size weight). Falls back to `sharpe_ratio` when
+                # avg_pl is missing.
+                def _score(r: Dict[str, Any]) -> float:
+                    s = r.get("stats") or {}
+                    sharpe = float(s.get("sharpe_ratio") or 0.0)
+                    n = int(r.get("oos_trades") or 0)
+                    wr = float(s.get("win_rate") or 0.0) / 100.0
+                    avg = float(s.get("avg_pl") or 0.0)
+                    if n < MIN_OOS_TRADES:
+                        return -1e9   # below sample-size floor — never picked
+                    primary = n * wr * avg
+                    return primary if abs(primary) > 1e-6 else sharpe
+                buy_winners = [r for r in multi["results"] if r["direction"] == "BUY"]
+                sell_winners = [r for r in multi["results"] if r["direction"] == "SELL"]
+                top_buy = max(buy_winners, key=_score) if buy_winners else None
+                top_sell = max(sell_winners, key=_score) if sell_winners else None
+                # If neither side meets the min-trades floor, skip the ticker.
+                cands = [c for c in (top_buy, top_sell) if c and _score(c) > -1e8]
+                if not cands:
+                    continue
+                w = max(cands, key=_score)
+                direction = w["direction"]
+                row = db.query(BestStrategyPerTicker).filter(
+                    BestStrategyPerTicker.ticker == ticker
+                ).first()
+                if row is None:
+                    row = BestStrategyPerTicker(
+                        ticker=ticker, strategy=w["strategy"],
+                        direction=direction, confidence=w["confidence"],
+                        oos_trades=w.get("oos_trades") or 0,
+                        win_rate=(w["stats"].get("win_rate") or 0) / 100.0,
+                        avg_pl=w["stats"].get("avg_pl") or 0.0,
+                    )
+                    db.add(row)
+                    updated += 1
+                else:
+                    row.strategy = w["strategy"]
+                    row.direction = direction
+                    row.confidence = w["confidence"]
+                    row.oos_trades = w.get("oos_trades") or 0
+                    row.win_rate = (w["stats"].get("win_rate") or 0) / 100.0
+                    row.avg_pl = w["stats"].get("avg_pl") or 0.0
+                    updated += 1
             except Exception as e:
                 logger.debug(f"best_strategy {ticker}: {e}")
                 continue

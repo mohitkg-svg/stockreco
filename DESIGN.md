@@ -1087,6 +1087,128 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 43 — Strategy + execution deep-dive (Tier 0-3 across stock/option/level/exec)
+
+Five-agent audit pass focused on edge quality (stock selection, option-contract
+selection, entry signal composition, target/stop math, execution accuracy).
+The user is preparing real-money cutover — every finding is real-money severity.
+
+**Hard pre-live blockers fixed (Tier 0)**:
+- **OCC symbol = None** for every Alpaca-feed contract (options_fetcher wrote
+  `_occ`, options_analyzer read `contractSymbol`). Every option entry was
+  silently failing. Reader now falls back to `_occ`.
+- **No R:R floor in `consider_signal`** — 1.3R floor lived only in
+  signal_generator; promoted/adopted/external paths bypassed it. Hard
+  floor now enforced post-cost (12bps round-trip buffer subtracted).
+- **Opening-15-min filter broken half the year** — hardcoded UTC was
+  9:30 ET only during EDT. Switched to zoneinfo.
+- **Stop-threat fast-path was stocks-only** (asset_type filter) — option
+  positions had 60s worst-case stop latency. Now covers both stocks and
+  options with direction-aware threat detection (long stock/call: px ≤
+  stop; long put: px ≥ stop). Also added a global single-flight gate
+  so correlated drawdowns can't fire 50 concurrent manage runs.
+- **TP leg never replaced** after slippage shift or T3 recalc. Added
+  `replace_tp` primitive in execution_engine; bot intent and broker
+  reality now stay in sync.
+- **Marketable-limit option exit was at the bid** (zero improvement vs
+  market order). Now posts inside the spread (mid - offset) for SELL,
+  ask + offset for BUY. Added
+  `submit_option_exit_with_cross_fallback()` for emergency closes that
+  wants price improvement first, market cross after 20s.
+- **Options stream defaulted OFF** — entire option-quote pipeline
+  silently inactive. Default flipped to ON.
+- **Liquidity gate was fake** on Alpaca path (OI hardcoded 100, vol
+  forced ≥5). Removed the spoof; rely on the spread filter + true
+  feed values when present.
+- **Spread filter divided by STRIKE not premium** — neutered for cheap
+  OTM contracts (4/200=2% passed even with 400% spread). Now
+  denominated in mid: spread > $0.05 AND > 20% of mid → reject.
+- **Macro-blackout / earnings gates failed OPEN** on exception (yfinance
+  hiccup → bot trades into FOMC/CPI print). Both now fail-CLOSED.
+- **Pair-correlation gate** added — sector cap can't catch
+  NVDA+AMD+AVGO (different sub-sectors, ρ≈0.85). New 30d daily-return
+  cache + 0.70 threshold per default.
+- **Daily-loss halt now includes UNREALIZED PnL** — book of 8 deep-
+  underwater positions previously kept adding the 9th.
+
+**Tier 1 BE — sizing, scanner, signals**:
+- Universe drops `shortable` filter (excluded mid-cap longs); optional
+  `STOCK_UNIVERSE_FILE` env override for point-in-time S&P/Russell
+  constituent lists (mitigates survivor bias).
+- RVOL on intraday-partial bar uses yesterday's CLOSED bar instead
+  (the time-of-day oscillation bug — at 10:30 RVOL≈0.15, at 15:55
+  ≈1.8 for the same name).
+- Best-strategy ranked by composite OOS metric (`oos_trades * win_rate
+  * avg_pl`) not display-confidence; per-direction key bug fixed
+  (was overwriting BUY with SELL row); MIN_OOS_TRADES=10 floor.
+- `consider_signal` Kelly path now routes through
+  `risk_math.kelly_risk_mult` (the proper fractional-Kelly helper);
+  previous inline ad-hoc ramp ignored reward:risk entirely.
+- Calibration + strategy multipliers gated on min-bucket-N=20 at the
+  call site (was 5; lottery winners permanently 1.5×'d signals).
+- 5-consecutive-loss circuit breaker added to `should_freeze_trading`.
+- Adaptive risk multiplier returns 0 (skip) when unfloored product ≤
+  0.25 — was floored at 0.25 and bot kept trading at minimum size in
+  cumulative-adverse regimes.
+- Closing-10min MOC-imbalance filter for intraday TFs (mirror of
+  opening filter).
+- Idempotency lookback 12h → 4h (bucket-aware key prevents same-bucket
+  re-fires; long lookback was blocking legitimate next-bar setups).
+- BP reservation released on every close (was only on
+  `closed_unfilled`).
+- `_replace_stop_cache` cleaned on close (no more leak).
+- Stocktwits paginates up to 5 pages so 24h sentiment is faithful for
+  both quiet and viral tickers.
+- Insider min-count raised 3 → 8 (filters director option-grant noise).
+- Sentiment default flipped from `vader` → `auto` (FinBERT preferred
+  when available, transparent fallback).
+
+**Tier 1 — option contract selection**:
+- Premium-stop / underlying-stop binding inverted to `min()` — the
+  underlying-aware stop now binds for normal trades, premium-50% only
+  fires when underlying really does fall through. Without this fix
+  the premium-stop ALWAYS bound first regardless of direction.
+- Theta-stop hold floor and progress threshold scale with DTE
+  (12h/0.4R for ≤7 DTE, 24h/0.3R for 7-30, 48h/0.2R for >30).
+- IV-rank lookup against 1y rolling 20d-RV distribution; reject IV
+  above the 90th percentile (catches event-priced contracts on
+  otherwise-quiet names).
+- Delta-score asymmetric: full credit for |Δ|∈[0.4,0.7], harsh
+  penalty below 0.25. Was symmetric around 0.5.
+- Strike-width gate ATR-anchored (5×ATR or 25%-of-spot, never <10%).
+  Hardcoded 25% was useless on $5 stocks.
+
+**Tier 1 — stops/targets**:
+- Soft-BE buffer respects T1 distance: trail anchored to MIN(entry-0.3R,
+  T1-0.3R) so the runner banks at least 1.2R cushion before getting
+  stopped. Was ENTRY-only — runner could ride 1.8R underwater on
+  noise after a successful T1 trim.
+- Bear-thesis stop placed 0.3% ABOVE nearest resistance (was AT — wicks
+  into the level took out the stop). ATR-cap aligned with longs via
+  `STOP_ATR_MULT_BY_TF`.
+
+**Tier 2 — execution accuracy**:
+- Manage loop in-process lock: scheduler tick + WS-thread fast-path
+  can no longer interleave on same trade rows.
+- Touch-counts dict now thread-safe.
+- Force-close options uses marketable-limit-with-cross-fallback (saves
+  spread on common case, guaranteed flatten via 20s market cross).
+- Limit-at-mid quote freshness check (5s TTL) before submitting.
+
+**Tier 3 polish**:
+- `asyncio.get_running_loop()` instead of deprecated
+  `get_event_loop()` in WS thread.
+- Numerous metric instrumentation calls added (autotrade_skip{reason})
+  on every reject path.
+
+**API additions / changes**: none beyond r42.
+
+**Tests**: 8 new regression tests (TestOCCSymbolFallback, TestRRMinFloor,
+TestCorrelationGate, TestAdaptiveZero, TestPremiumStopSemantics,
+TestThetaStopDTEScaling, TestConsecutiveLossFreeze,
+TestMarketableLimitInsideSpread). Existing TestInsiderMultiplier
+fixtures bumped to reflect the new min-count floor. Full suite: 142 passed.
+
 ### Revision 42 — Comprehensive audit: Tier 0-3 across backend AND frontend
 
 Multi-agent deep audit pass + line-level verification + fixes across the
