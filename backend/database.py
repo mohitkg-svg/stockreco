@@ -799,5 +799,14 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        # r44 fix Wave 6: rollback on exception so the session isn't tainted
+        # for the next caller. On Postgres autocommit-rollback is implicit;
+        # on SQLite-WAL the writer-lock release happens here.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         db.close()

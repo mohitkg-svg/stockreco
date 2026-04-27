@@ -748,15 +748,29 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
 
         # ML scorer: predicts P(win). Always runs (logs prediction); multiplier
         # is 1.0 unless ml_scoring_enabled=True in config (shadow-mode default).
+        # r44 fix #0.2: previously passed `stop_loss=None, target1=None` (stub
+        # signal) — ml_features.py:96-99 then computed `sig_stop_pct=None,
+        # sig_t1_pct=None` and three of the model's four signal features were
+        # absent. Training rows had real values, so inference distribution
+        # diverged from training distribution. Now pass provisional ATR-based
+        # estimates that match the empirical post-_calibrate distribution.
         try:
             from services.ml_scorer import score_and_apply, predict_winrate
             from services.auto_trader import get_config_dict as _cfg_dict
             _ml_enabled = bool(_cfg_dict().get("ml_scoring_enabled", False))
-            _stub_signal = {"signal_type": "BUY", "confidence": confidence_bull,
-                            "entry": price, "stop_loss": None, "target1": None}
-            _ml_mult = score_and_apply(ticker, _stub_signal, scoring_enabled=_ml_enabled)
+            _ml_stop_mult = _stop_atr_mult(timeframe) if (atr is not None and atr > 0) else None
+            _ml_provisional_stop = (price - _ml_stop_mult * atr) if _ml_stop_mult else None
+            _ml_provisional_risk = (price - _ml_provisional_stop) if _ml_provisional_stop else None
+            _ml_provisional_t1 = (price + 1.5 * _ml_provisional_risk) if _ml_provisional_risk else None
+            _scoring_signal = {
+                "signal_type": "BUY", "confidence": confidence_bull,
+                "entry": price,
+                "stop_loss": _ml_provisional_stop,
+                "target1": _ml_provisional_t1,
+            }
+            _ml_mult = score_and_apply(ticker, _scoring_signal, scoring_enabled=_ml_enabled)
             _regime_mult *= _ml_mult
-            _p = predict_winrate(ticker, _stub_signal)
+            _p = predict_winrate(ticker, _scoring_signal)
             if _p is not None:
                 tag = "shadow" if not _ml_enabled else f"×{_ml_mult:.2f}"
                 reasons.append(f"🤖 ML P(win)={_p:.2f} ({tag})")
@@ -987,16 +1001,25 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         except Exception:
             pass
 
-        # ML scorer mirror — see BUY-side comment.
+        # r44 fix #0.2: SELL-side mirror — provisional levels matching the
+        # empirical post-_calibrate distribution.
         try:
             from services.ml_scorer import score_and_apply, predict_winrate
             from services.auto_trader import get_config_dict as _cfg_dict
             _ml_enabled = bool(_cfg_dict().get("ml_scoring_enabled", False))
-            _stub_signal = {"signal_type": "SELL", "confidence": confidence_bear,
-                            "entry": price, "stop_loss": None, "target1": None}
-            _ml_mult = score_and_apply(ticker, _stub_signal, scoring_enabled=_ml_enabled)
+            _ml_stop_mult = _stop_atr_mult(timeframe) if (atr is not None and atr > 0) else None
+            _ml_provisional_stop = (price + _ml_stop_mult * atr) if _ml_stop_mult else None
+            _ml_provisional_risk = (_ml_provisional_stop - price) if _ml_provisional_stop else None
+            _ml_provisional_t1 = (price - 1.5 * _ml_provisional_risk) if _ml_provisional_risk else None
+            _scoring_signal = {
+                "signal_type": "SELL", "confidence": confidence_bear,
+                "entry": price,
+                "stop_loss": _ml_provisional_stop,
+                "target1": _ml_provisional_t1,
+            }
+            _ml_mult = score_and_apply(ticker, _scoring_signal, scoring_enabled=_ml_enabled)
             _regime_mult *= _ml_mult
-            _p = predict_winrate(ticker, _stub_signal)
+            _p = predict_winrate(ticker, _scoring_signal)
             if _p is not None:
                 tag = "shadow" if not _ml_enabled else f"×{_ml_mult:.2f}"
                 reasons.append(f"🤖 ML P(win)={_p:.2f} ({tag})")

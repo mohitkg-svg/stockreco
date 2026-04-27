@@ -20,6 +20,7 @@ Alpaca news API docs:
 from __future__ import annotations
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
@@ -28,6 +29,11 @@ import httpx
 from database import SessionLocal, WatchlistStock, NewsEvent
 
 logger = logging.getLogger(__name__)
+
+# r44 fix #0.6: bounded background pool for AI news-exit dispatch so
+# Claude latency doesn't block the news poller (which holds the SQLite
+# WAL writer lock — see DESIGN.md scan-vs-manage contention design).
+_NEWS_AI_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="news-ai")
 
 _ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
 _POSITIVE_THRESHOLD = 0.35   # VADER compound ≥ this → "positive"
@@ -236,8 +242,15 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
                 logger.debug(f"news: ingest row error: {e}")
         db.commit()
     except Exception as e:
+        # r44 fix Wave 6: on commit failure, clear `_new_for_open` so the
+        # AI news-exit dispatcher doesn't run against rows that didn't persist.
         logger.warning(f"news: ingest batch failed: {e}")
         out["errors"] += 1
+        _new_for_open.clear()
+        try:
+            db.rollback()
+        except Exception:
+            pass
     finally:
         db.close()
 
@@ -245,11 +258,17 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
     # is shadow/active AND the news is at least medium-severity (skip
     # routine PR / sector blurbs). Each call is best-effort — failures
     # never propagate back into ingest's return value.
+    # r44 fix #0.6: dispatch AI news-exit on a worker thread, NOT inline on
+    # the scheduler thread. Prior code held the news poller blocked behind
+    # 5-30s Claude calls × N items. With max_instances=1 + coalesce=True on
+    # the news job, this dropped news polling cadence whenever Claude was
+    # slow. Now the poller returns immediately; the dispatch runs in the
+    # background pool and opens its own DB session.
     if _new_for_open:
         try:
-            _dispatch_ai_news_exit(_new_for_open)
+            _NEWS_AI_POOL.submit(_dispatch_ai_news_exit, list(_new_for_open))
         except Exception as e:
-            logger.debug(f"news: AI exit dispatch skipped: {e}")
+            logger.debug(f"news: AI exit dispatch submit failed: {e}")
     return out
 
 

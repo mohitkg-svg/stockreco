@@ -103,11 +103,31 @@ def adaptive_chandelier_mult(base_mult: float, ticker: str) -> float:
     adx = chandelier_adx(ticker)
     if adx is None:
         return base_mult
+    # r44 fix Wave 4: also key on volatility regime via ATR percentile.
+    # Compressed-vol regime → tighter trail; expanding-vol → wider trail.
+    vol_factor = 1.0
+    try:
+        from services.data_fetcher import fetch_ohlcv as _fo_v
+        from services.indicators import compute_indicators as _ci_v
+        df = _fo_v(ticker, "1d")
+        if df is not None and not df.empty and len(df) >= 60:
+            ind = _ci_v(df.tail(252))
+            atr_col = next((c for c in ind.columns if c.startswith("ATR_")), None)
+            if atr_col and len(ind) > 0:
+                cur_atr = float(ind[atr_col].iloc[-1])
+                pctile = (ind[atr_col].rank(pct=True).iloc[-1])
+                # 80+ pct = high vol → 1.4× wider; <20 pct = low → 0.85× tighter.
+                if pctile >= 0.80:
+                    vol_factor = 1.4
+                elif pctile <= 0.20:
+                    vol_factor = 0.85
+    except Exception:
+        pass
     if adx > 30:
-        return base_mult * 1.33
+        return base_mult * 1.33 * vol_factor
     if adx < 20:
-        return base_mult * 1.25
-    return base_mult
+        return base_mult * 1.25 * vol_factor
+    return base_mult * vol_factor
 
 
 # --------------------- Live price lookup -----------------------------------

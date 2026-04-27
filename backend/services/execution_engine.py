@@ -243,6 +243,12 @@ def force_close_trade(
     t.status = status_override or "closed_reverse"
     t.closed_at = datetime.utcnow()
     t.note = (t.note or "") + f" | {t.status.upper()}: {reason}"
+    # r44 fix #0.3: backfill MLPrediction outcome from force_close path too.
+    try:
+        from services.auto_trader import _backfill_ml_outcome as _bf
+        _bf(db, t)
+    except Exception:
+        pass
     db.commit()
     summary["closed"] = summary.get("closed", 0) + 1
     metrics.inc("autotrade_event", event=t.status)

@@ -15,6 +15,31 @@ inclusion / continued-deferral rationale. Deferred items whose rationale
 has gone stale should either move to ✅ done or be re-categorized as
 ❌ rejected — don't let the list rot into "we'll get to it eventually".
 
+## r44 audit pickup (2026-04-27) — 7-agent ML/risk/regime/strategy deep-dive
+
+Seven parallel agents on different angles than r42/r43. ALL Tier 0/1/2/3
++ Tier P proposals implemented this revision. Headline:
+
+- **AI judge has been blind on news** (column-name bug); AI temperature=1.0
+  (non-deterministic); AI no cost cap; AI no prompt-injection defense.
+- **ML scorer trained on real features, served stub** features
+  (None on stop_loss / target1).
+- **MLPrediction.outcome had no producer** — calibration loop empty.
+- **Live mode silently boots on default sqlite** if DATABASE_URL unset.
+- **`flatten_by_eod` config flag was dead code**.
+- **Best-strategy-of-26 selection had no Bonferroni correction**.
+- **Walk-forward had purge+embargo gaps**.
+- **`current_portfolio_heat` ignored in-flight BP reservations**.
+- **No vol-targeting / drawdown-control / VaR / leverage cap / earnings
+  cluster / portfolio Greeks / auto-deleverage layer**.
+- **No cross-asset regime signals** (VIX term, HYG/SPY, SKEW, etc.).
+- **No calendar / seasonality signals** (pre-FOMC, quarter-end, OPEX).
+- **No PEAD trading** (earnings only as a blackout).
+- **No NR7 / inside-bar / 52w-prox strategies**.
+- **No insider-cluster amplification** (single multiplier ceiling).
+
+151 tests pass.
+
 ## r43 audit pickup (2026-04-27) — strategy + execution deep-dive
 
 A 5-agent deep-dive (stock selection, option contract selection, entry

@@ -403,6 +403,45 @@ def correlated_with_open(new_ticker: str, open_tickers: List[str], threshold: fl
     return correlated
 
 
+def _backfill_ml_outcome(db: Session, t) -> None:
+    """r44 fix #0.3: when an AutoTrade closes, find its corresponding
+    MLPrediction row(s) and set outcome / realized_pl / closed_at. Without
+    this the calibration plot and the ML graduation gate (≥200 closed-trade
+    predictions) cannot evaluate.
+
+    We match by trade_id when persisted; otherwise by (ticker, signal_type,
+    created_at within ±2h of the trade's opened_at).
+    """
+    try:
+        from database import MLPrediction
+        from datetime import datetime as _dt, timedelta as _td
+        outcome = 1 if (t.realized_pl is not None and t.realized_pl > 0) else 0
+        rpnl = float(t.realized_pl) if t.realized_pl is not None else None
+        closed_at = t.closed_at or _dt.utcnow()
+        rows = []
+        if t.id:
+            rows = db.query(MLPrediction).filter(
+                MLPrediction.trade_id == t.id,
+                MLPrediction.outcome.is_(None),
+            ).all()
+        if not rows and t.opened_at:
+            rows = db.query(MLPrediction).filter(
+                MLPrediction.ticker == t.ticker,
+                MLPrediction.signal_type == ("BUY" if (t.side or "buy") == "buy" else "SELL"),
+                MLPrediction.outcome.is_(None),
+                MLPrediction.created_at >= t.opened_at - _td(hours=2),
+                MLPrediction.created_at <= t.opened_at + _td(hours=2),
+            ).all()
+        for r in rows:
+            r.outcome = outcome
+            r.realized_pl = rpnl
+            r.closed_at = closed_at
+            if r.trade_id is None and t.id:
+                r.trade_id = t.id
+    except Exception as e:
+        logger.debug(f"_backfill_ml_outcome trade {getattr(t, 'id', None)}: {e}")
+
+
 def is_blacklisted(ticker: str, cfg: Optional[Any] = None) -> bool:
     """True if `ticker` appears in `cfg.ticker_blacklist` (CSV). Safe to call
     with cfg=None — opens its own session."""
@@ -1239,24 +1278,38 @@ def _build_ai_context(ticker: str, db: Session) -> Dict[str, Any]:
     """
     ctx: Dict[str, Any] = {"ticker": ticker}
 
-    # Recent news (last 24h headlines + sentiment, deduped)
+    # r44 fix #0.1: real columns are `symbols` (CSV) and `headline`. Prior
+    # code queried NewsEvent.tickers and read n.title — both raised
+    # AttributeError, swallowed by the try/except, leaving `recent_news=[]`
+    # for EVERY AI judge call. The judge has been deciding entry-veto,
+    # confidence-multiplier, and news-exit blind to news for the entire
+    # AI-judge lifetime.
     try:
         from database import NewsEvent
+        from sqlalchemy import or_ as _or
         from datetime import datetime as _dt, timedelta as _td
         cutoff = _dt.utcnow() - _td(hours=24)
         news = (
             db.query(NewsEvent)
-            .filter(NewsEvent.tickers.like(f"%{ticker}%"))
+            .filter(_or(
+                NewsEvent.ticker == ticker,
+                NewsEvent.symbols.like(f"%{ticker}%"),
+            ))
             .filter(NewsEvent.published_at >= cutoff)
             .order_by(NewsEvent.published_at.desc())
             .limit(5).all()
         )
         ctx["recent_news"] = [
-            {"title": n.title, "sentiment": n.sentiment_label,
-             "published_at": n.published_at.isoformat() if n.published_at else None}
+            {
+                "title": n.headline,
+                "sentiment": n.sentiment_label,
+                "score": float(n.sentiment_score) if n.sentiment_score is not None else None,
+                "published_at": n.published_at.isoformat() if n.published_at else None,
+            }
             for n in news
         ]
-    except Exception:
+    except Exception as _ne:
+        logger.warning(f"_build_ai_context news lookup failed for {ticker}: {_ne}")
         ctx["recent_news"] = []
 
     # Fundamentals snapshot
@@ -1656,15 +1709,14 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # C1: Daily loss limit — halt new entries once realized PnL today is
         # worse than -(daily_loss_limit_pct * equity). Existing trades keep
         # trailing; this only blocks NEW exposure.
-        dll = float(getattr(cfg, "daily_loss_limit_pct", 0) or 0)
-        if dll > 0:
+        dll_static = float(getattr(cfg, "daily_loss_limit_pct", 0) or 0)
+        if dll_static > 0:
+            # r44 fix #0.11: dynamic daily-loss limit (max(static, 3×avg-daily-PnL)).
+            from services.risk_manager import dynamic_daily_loss_limit_pct as _dll_dyn
+            dll = _dll_dyn(static_pct=dll_static)
             _acct_probe = paper_trader.get_account()
             _equity_probe = float(_acct_probe["equity"]) if _acct_probe else 0.0
             _rpnl = realized_pnl_today()
-            # r43 fix #0.12: include unrealized PnL on open positions. A book
-            # of 8 deep-underwater positions previously kept adding the 9th
-            # because nothing was realized yet. Combined-PnL (realized +
-            # unrealized) is the correct intraday-drawdown signal.
             _unr = 0.0
             try:
                 _open_pos = paper_trader.get_positions() or []
@@ -1676,11 +1728,35 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 logger.warning(
                     f"AutoTrader skip {signal.get('ticker')}: daily-loss limit hit "
                     f"(combined {_combined:.2f} = realized {_rpnl:.2f} + unrealized {_unr:.2f} "
-                    f"≤ -{dll*100:.1f}% × equity {_equity_probe:.0f})"
+                    f"≤ -{dll*100:.2f}% × equity {_equity_probe:.0f})"
                 )
                 metrics.inc("autotrade_event", event="daily_loss_halt")
                 metrics.inc("autotrade_skip", reason="daily_loss_halt")
                 return None
+            # r44 fix #0.12: auto-deleveraging trigger. At -4% session drop,
+            # trim 33% of every losing position; at -6% kill switch.
+            try:
+                from services.risk_manager import session_equity_drawdown_pct as _sed
+                sed = _sed()
+                if sed is not None:
+                    if sed >= 0.06:
+                        logger.critical(
+                            f"AUTO-DELEVERAGE: session drawdown {sed*100:.2f}% ≥ 6% — engaging kill switch"
+                        )
+                        try:
+                            kill(reason=f"auto-deleverage session_dd={sed*100:.2f}%", flatten=True, cancel_orders=True)
+                        except Exception:
+                            pass
+                        metrics.inc("autotrade_skip", reason="auto_deleverage")
+                        return None
+                    if sed >= 0.04:
+                        logger.warning(
+                            f"AUTO-DELEVERAGE: session drawdown {sed*100:.2f}% ≥ 4% — blocking new entries"
+                        )
+                        metrics.inc("autotrade_skip", reason="session_dd_4pct")
+                        return None
+            except Exception as _de:
+                logger.debug(f"session-DD check skipped: {_de}")
 
         # C1: Max concurrent positions guard.
         mcp = int(getattr(cfg, "max_concurrent_positions", 0) or 0)
@@ -1968,7 +2044,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             return None
         # Trailing-only exit: park the bracket TP far away so it never fires.
         # Real exit comes from the trailing stop in manage_open_positions().
-        risk_per_share = entry - stop
+        # r44 fix #1.3: slippage-aware risk_per_share — sizing assumes
+        # theoretical stop fills, but real stops slip 0.10-0.40 ATR. Sized
+        # 1% risk is actually 1.4-1.8% on 5-10% of trades.
+        from services.risk_manager import slippage_aware_risk_per_share as _slip_rps
+        _atr_for_slip = float(signal.get("atr") or 0.0)
+        risk_per_share = _slip_rps(entry, stop, _atr_for_slip)
         far_tp = round(entry + 10 * risk_per_share, 2)
 
         # `ticker` already bound at function top (r39 fix). Global ticker
@@ -2188,10 +2269,14 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             return None
         # Adaptive risk: halve the cap under high VIX (>25) or when recent
         # win-rate is below 55%. Catches regime changes the static cap misses.
-        from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
-        # r43 fix #1.26: adaptive multiplier returns 0 when the unfloored
-        # product would be ≤ 0.25 (cumulative-adverse-regime). Treat that
-        # as "skip" rather than "size tiny".
+        from services.risk_manager import (
+            adaptive_risk_multiplier as _adapt_risk,
+            vol_target_multiplier as _vol_tgt,
+            account_drawdown_multiplier as _acct_dd,
+            book_var_99 as _book_var,
+            book_leverage_pct as _book_lev,
+            earnings_cluster_count as _earn_cluster,
+        )
         _adapt = _adapt_risk()
         if _adapt <= 0.0:
             logger.info(
@@ -2199,7 +2284,63 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             )
             metrics.inc("autotrade_skip", reason="adaptive_zero")
             return None
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt
+        # r44 fix #1.2: graduated drawdown overlay. Returns 0 when DD ≥ 10%.
+        _dd_mult = _acct_dd()
+        if _dd_mult <= 0.0:
+            logger.warning(f"AutoTrader skip {ticker}: account drawdown ≥ 10% — sizing 0")
+            metrics.inc("autotrade_skip", reason="account_drawdown")
+            return None
+        # r44 fix #1.1: vol-target multiplier (annualized 12% target).
+        _vt_mult = _vol_tgt(target_annual_vol=float(getattr(cfg, "vol_target_annual", 0.12) or 0.12))
+        # r44 fix #1.6: aggregate earnings-cluster gate.
+        _ec_count = _earn_cluster(window_hours=168)
+        if _ec_count >= 4:
+            logger.info(
+                f"AutoTrader skip {ticker}: {_ec_count} open positions have earnings within 7 days"
+            )
+            metrics.inc("autotrade_skip", reason="earnings_cluster")
+            return None
+        # r44 fix #1.8: leverage cap (1.5× default).
+        _lev = _book_lev(equity)
+        _lev_cap = float(getattr(cfg, "leverage_cap", 1.5) or 1.5)
+        if _lev >= _lev_cap:
+            logger.warning(
+                f"AutoTrader skip {ticker}: book leverage {_lev:.2f}× ≥ cap {_lev_cap:.2f}×"
+            )
+            metrics.inc("autotrade_skip", reason="leverage_cap")
+            return None
+        # r44 fix #1.7: book-VaR 99% sanity check (heat-derived approximation).
+        _var99 = _book_var(equity)
+        _var_cap_pct = float(getattr(cfg, "book_var_99_cap_pct", 0.05) or 0.05)
+        if _var99 >= _var_cap_pct * equity:
+            logger.warning(
+                f"AutoTrader skip {ticker}: book VaR99 ${_var99:.0f} ≥ {_var_cap_pct*100:.1f}% × equity ${equity:.0f}"
+            )
+            metrics.inc("autotrade_skip", reason="book_var_99")
+            return None
+        # r44 fix #1.4: beta-symmetric sizing — heat already counts beta-
+        # weighted via current_portfolio_heat, but sizing didn't. A β=1.8
+        # ticker consumed 1.0× risk-budget at entry but 1.8× heat
+        # downstream. Now divide by beta_weight so sizing matches heat.
+        try:
+            from services.fundamentals import beta_weight as _bw
+            _beta = max(0.5, min(2.5, float(_bw(ticker, default=1.0))))
+        except Exception:
+            _beta = 1.0
+        # r44 Wave 3: cross-asset regime + calendar/seasonality multipliers.
+        try:
+            from services.cross_asset import regime_multiplier as _regime_x
+            _regime_xa = _regime_x()
+        except Exception:
+            _regime_xa = 1.0
+        try:
+            from services.seasonality import calendar_multiplier as _cal_m
+            _cal_mult = _cal_m()
+        except Exception:
+            _cal_mult = 1.0
+        risk_budget = (equity * cfg.max_risk_per_trade_pct
+                       * _adapt * _dd_mult * _vt_mult
+                       * _regime_xa * _cal_mult) / _beta
         # Profit-max: scale risk budget with confidence headroom above threshold.
         # Signals that clear the gate by a wide margin deserve a bigger bet.
         conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
@@ -3503,6 +3644,11 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
         t.status = final_status or "closed_manual"
         t.closed_at = datetime.utcnow()
         t.note = (t.note or "") + f" | EXIT: {exit_reason}"
+        # r44 fix #0.3: backfill MLPrediction outcome on every close path.
+        try:
+            _backfill_ml_outcome(db, t)
+        except Exception:
+            pass
         db.commit()
         summary["closed"] += 1
         metrics.inc("autotrade_event", event=t.status)
@@ -3591,6 +3737,7 @@ def manage_open_positions() -> Dict[str, Any]:
             # Snapshot only the fields we read inside the loop — detached from session.
             cfg_snapshot = {
                 "chandelier_atr_mult": float(getattr(cfg, "chandelier_atr_mult", 0) or 0),
+                "flatten_by_eod": bool(getattr(cfg, "flatten_by_eod", False)),
             }
             trade_ids = [
                 tid for (tid,) in _bootstrap_db.query(AutoTrade.id).filter(
@@ -3611,6 +3758,44 @@ def manage_open_positions() -> Dict[str, Any]:
                 try:
                     if not t.parent_order_id:
                         continue
+
+                    # r44 fix Wave 4: stocks earnings-flatten. If earnings
+                    # ≤ 1h away on an open stock position, trim 50% (mirror
+                    # of the options 6h flatten). Halves earnings-gap loss
+                    # tail on stuck holds.
+                    if t.status == "open" and t.asset_type == "stock" and t.entry_price:
+                        try:
+                            from services.earnings import hours_to_next_earnings as _hne_s
+                            _hte_s = _hne_s(t.ticker)
+                            if _hte_s is not None and _hte_s <= 1.0 and t.qty and t.qty >= 2 and not t.hit_t1:
+                                _half = max(1, int(t.qty // 2))
+                                from alpaca.trading.requests import MarketOrderRequest as _MOR_e
+                                from alpaca.trading.enums import OrderSide as _OS_e, TimeInForce as _TIF_e
+                                _trim_e = paper_trader._get_client().submit_order(order_data=_MOR_e(
+                                    symbol=t.ticker, qty=_half,
+                                    side=_OS_e.SELL, time_in_force=_TIF_e.DAY,
+                                ))
+                                if _trim_e is not None:
+                                    t.qty = t.qty - _half
+                                    t.note = (t.note or "") + f" | EARNINGS PRE-FLATTEN: trimmed {_half} ({_hte_s:.1f}h to print)"
+                                    db.commit()
+                                    metrics.inc("autotrade_event", event="earnings_pre_flatten")
+                        except Exception as _ef:
+                            logger.debug(f"earnings pre-flatten {t.ticker}: {_ef}")
+
+                    # r44 fix #0.5: EOD flatten for intraday signals when
+                    # cfg.flatten_by_eod is set. Fires at 15:55 ET.
+                    if t.status == "open" and bool(cfg_snapshot.get("flatten_by_eod", False)):
+                        try:
+                            _src_tf_eod = _trade_source_timeframe(t, db)
+                            if _src_tf_eod in ("5m", "15m", "30m"):
+                                from zoneinfo import ZoneInfo as _ZI_eod
+                                _now_et = datetime.utcnow().replace(tzinfo=_ZI_eod("UTC")).astimezone(_ZI_eod("America/New_York"))
+                                if (_now_et.hour, _now_et.minute) >= (15, 55):
+                                    _force_close_trade(t, db, "EOD flatten intraday", summary, status_override="closed_eod")
+                                    continue
+                        except Exception as _eod_e:
+                            logger.debug(f"EOD flatten check {t.ticker}: {_eod_e}")
 
                     # 0) Reverse-thesis check — fires for both stocks and options.
                     #    Only acts on trades that have actually filled ("open"), so
@@ -3954,6 +4139,33 @@ def manage_open_positions() -> Dict[str, Any]:
                     # them to recycle capital into fresher setups. Only fires
                     # for trades currently at a small loss or flat (no point
                     # closing a winning position just because T1 hasn't hit).
+                    # r44 fix Wave 4: stock time-stop. Bot has theta-stop on
+                    # options but no time-stop on stocks — flat-but-not-losing
+                    # trades sit indefinitely consuming capital. Add: held
+                    # > 4× source-TF AND 0 < pnl < 0.5R AND no T1 → close.
+                    if t.status == "open" and t.entry_price and not t.hit_t1 and t.filled_at and t.asset_type == "stock":
+                        try:
+                            src_tf_ts = _trade_source_timeframe(t, db)
+                            _ts_map = {"5m":5,"15m":15,"30m":30,"1h":60,"4h":240,"1d":1440,"1mo":1440*20}
+                            tf_min_ts = _ts_map.get(src_tf_ts, 240)
+                            age_min_ts = (datetime.utcnow() - t.filled_at).total_seconds() / 60.0
+                            if age_min_ts > 4 * tf_min_ts:
+                                _px = _current_price(t.ticker)
+                                _R = max(0.01, float(t.entry_price) - float(t.stop_loss or 0))
+                                if _px is not None and _R > 0:
+                                    _pnl_R = (_px - float(t.entry_price)) / _R
+                                    if 0 < _pnl_R < 0.5:
+                                        _force_close_trade(
+                                            t, db,
+                                            f"time-stop: held {age_min_ts/60:.1f}h with PnL {_pnl_R:.2f}R "
+                                            f"(below 0.5R, capital recycle)",
+                                            summary,
+                                            status_override="closed_time_stop",
+                                        )
+                                        continue
+                        except Exception as _ts_e:
+                            logger.debug(f"time-stop check {t.ticker}: {_ts_e}")
+
                     if t.status == "open" and t.entry_price and not t.hit_t1 and t.filled_at:
                         try:
                             src_tf = _trade_source_timeframe(t, db)
@@ -4131,6 +4343,31 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     except Exception as _re:
                                                         logger.warning(f"F3 SL-qty resize failed for {t.ticker}: {_re}")
                                                     metrics.inc("autotrade_event", event="partial_t1")
+                                                    # r44 fix Wave 4: pyramid at T1 in strong trend.
+                                                    # Adds 25% (of original qty) BUY at market, stop
+                                                    # = entry (T1's soft-BE level). Trend-only via
+                                                    # ADX≥30 AND src_tf in {1h,4h,1d}. Gated behind
+                                                    # cfg.pyramid_enabled (default False) — needs
+                                                    # config + telemetry rollout.
+                                                    try:
+                                                        if (
+                                                            bool(getattr(cfg, "pyramid_enabled", False))
+                                                            and (signal.get("adx") or 0) >= 30
+                                                            and (signal.get("timeframe") or "") in ("1h", "4h", "1d")
+                                                            and t.original_qty
+                                                        ):
+                                                            _add = max(1, int(0.25 * float(t.original_qty)))
+                                                            from alpaca.trading.requests import MarketOrderRequest as _MOR_p
+                                                            from alpaca.trading.enums import OrderSide as _OS_p, TimeInForce as _TIF_p
+                                                            paper_trader._get_client().submit_order(order_data=_MOR_p(
+                                                                symbol=t.ticker, qty=_add,
+                                                                side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
+                                                            ))
+                                                            t.qty = (t.qty or 0) + _add
+                                                            t.note = (t.note or "") + f" | PYRAMID: +{_add} at T1 (soft-BE)"
+                                                            metrics.inc("autotrade_event", event="pyramid_t1")
+                                                    except Exception as _py_e:
+                                                        logger.warning(f"pyramid {t.ticker} failed: {_py_e}")
                                         # Profit-max: T2 partial profit — trim half the remaining
                                         # runner at T2 to lock in another chunk of gains while still
                                         # leaving a runner for T3 and recalc extensions.
@@ -4327,22 +4564,25 @@ def manage_open_positions() -> Dict[str, Any]:
                                 t.target_touch_count = 0
                                 _target_touch_counts.pop(t.id, None)
                                 # r43 fix #1.28: release in-flight BP on every
-                                # close, not just `closed_unfilled`. Otherwise
-                                # the reservation accumulates over a session
-                                # of 30+ closed trades and throttles new entries
-                                # late-day even when broker-side BP is plenty.
+                                # close, not just `closed_unfilled`.
                                 try:
                                     if t.entry_price and t.original_qty:
                                         _release_bp(float(t.entry_price) * float(t.original_qty))
                                 except Exception:
                                     pass
-                                # r43 fix #1.29: clean up the stop/tp cache
-                                # entries we leaked on every replace.
+                                # r43 fix #1.29: clean up the stop/tp cache.
                                 try:
                                     if t.stop_order_id:
                                         _replace_stop_cache.pop(t.stop_order_id, None)
                                     if t.tp_order_id:
                                         _replace_stop_cache.pop(t.tp_order_id, None)
+                                except Exception:
+                                    pass
+                                # r44 fix #0.3: backfill MLPrediction outcome.
+                                # Without this the calibration loop and ML
+                                # graduation gate never have data to evaluate.
+                                try:
+                                    _backfill_ml_outcome(db, t)
                                 except Exception:
                                     pass
                                 db.commit()

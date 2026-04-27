@@ -206,17 +206,52 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     X = samples[cols].astype(float).values
     y = samples["__label"].astype(int).values
 
-    # Walk-forward folds
-    n = len(samples)
-    fold_size = n // (_FOLDS + 1)
+    # r44 fix #0.16: walk-forward by TIME boundaries, not row index. Same
+    # `__ts` boundary across all tickers prevents cross-ticker leakage:
+    # AAPL@2024-Q2 train + MSFT@2024-Q2 test would otherwise be
+    # interleaved-by-row, leaking near-future on the OTHER ticker.
+    # Also adds a 5-day forward EMBARGO between train end and test start
+    # to prevent same-ticker label leakage from neighboring bars (a 5d
+    # label horizon means same-day samples can predict each other).
+    EMBARGO_DAYS = 5
+    timestamps = pd.to_datetime(samples["__ts"]).reset_index(drop=True)
+    if len(timestamps) < (_FOLDS + 1) * 30:
+        # Fall back to row-based folds when sample is too thin for time splits.
+        n = len(samples)
+        fold_size = n // (_FOLDS + 1)
+        fold_iter = []
+        for k in range(1, _FOLDS + 1):
+            train_end = k * fold_size
+            test_end = (k + 1) * fold_size
+            fold_iter.append((slice(0, train_end), slice(train_end, test_end), k))
+    else:
+        # Time-based: split timestamps into _FOLDS+1 quantile boundaries.
+        ts_sorted = timestamps.sort_values()
+        bounds = [
+            ts_sorted.iloc[int(i * len(ts_sorted) / (_FOLDS + 1))]
+            for i in range(1, _FOLDS + 2)
+        ]
+        fold_iter = []
+        for k in range(1, _FOLDS + 1):
+            train_cutoff = bounds[k - 1]
+            embargo_cutoff = train_cutoff + pd.Timedelta(days=EMBARGO_DAYS)
+            test_end_ts = bounds[k]
+            train_mask = (timestamps <= train_cutoff).to_numpy()
+            test_mask = ((timestamps > embargo_cutoff) & (timestamps <= test_end_ts)).to_numpy()
+            fold_iter.append((train_mask, test_mask, k))
+
     fold_metrics: List[Dict[str, Any]] = []
-    for k in range(1, _FOLDS + 1):
-        train_end = k * fold_size
-        test_end = (k + 1) * fold_size
-        X_tr, y_tr = X[:train_end], y[:train_end]
-        X_te, y_te = X[train_end:test_end], y[train_end:test_end]
+    for tr_idx, te_idx, k in fold_iter:
+        X_tr = X[tr_idx]
+        y_tr = y[tr_idx]
+        X_te = X[te_idx]
+        y_te = y[te_idx]
         if len(X_te) < 30 or len(set(y_tr)) < 2 or len(set(y_te)) < 2:
             continue
+        # r44 fix #1.5: handle class imbalance via scale_pos_weight.
+        n_neg = int((y_tr == 0).sum())
+        n_pos = int((y_tr == 1).sum())
+        spw = (n_neg / max(1, n_pos))
         booster = lgb.train(
             params={
                 "objective": "binary",
@@ -227,6 +262,7 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
                 "feature_fraction": 0.85,
                 "bagging_fraction": 0.85,
                 "bagging_freq": 4,
+                "scale_pos_weight": spw,
                 "verbose": -1,
             },
             train_set=lgb.Dataset(X_tr, label=y_tr, feature_name=cols),

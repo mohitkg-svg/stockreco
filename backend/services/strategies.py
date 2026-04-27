@@ -340,6 +340,70 @@ def _opening_range_breakout(d: pd.DataFrame) -> Dict:
     }
 
 
+def _nr7_breakout(d: pd.DataFrame) -> Dict:
+    """r44 Wave 7 — NR7 (Narrow-Range-of-7) volatility breakout.
+
+    Crabel (1990); Connors empirical: a bar whose range is the smallest
+    of the last 7 precedes ≥1×ATR expansion 65-70% of the time. We enter
+    on the FIRST close beyond the NR7 bar's High/Low with volume
+    confirmation.
+
+    Regime: any (volatility-compression precursor — fires before the
+    regime classifier sees the breakout).
+    """
+    rng = d["High"] - d["Low"]
+    is_nr7 = rng == rng.rolling(7, min_periods=7).min()
+    is_nr7_prev = is_nr7.shift(1).fillna(False)
+    vol_ok = d["Volume"] > 1.2 * d["VOL_SMA20"]
+    long_e = is_nr7_prev & (d["Close"] > d["High"].shift(1)) & vol_ok
+    short_e = is_nr7_prev & (d["Close"] < d["Low"].shift(1)) & vol_ok
+    return {
+        "name": "NR7 Breakout",
+        "description": "First close beyond the NR7 (narrowest of 7) bar's H/L with volume>1.2× avg",
+        "regime": "any",
+        "entry_long": long_e.fillna(False),
+        "entry_short": short_e.fillna(False),
+    }
+
+
+def _inside_bar_breakout(d: pd.DataFrame) -> Dict:
+    """r44 Wave 7 — Inside-bar continuation breakout. Bar fully contained
+    inside prior bar's range (high < prev_high AND low > prev_low) signals
+    consolidation; the FIRST close beyond the prior bar's H/L is a high-
+    probability continuation trigger.
+    """
+    prev_h = d["High"].shift(1)
+    prev_l = d["Low"].shift(1)
+    inside = (d["High"].shift(1) < prev_h.shift(1)) & (d["Low"].shift(1) > prev_l.shift(1))
+    long_e = inside & (d["Close"] > prev_h)
+    short_e = inside & (d["Close"] < prev_l)
+    return {
+        "name": "Inside Bar Breakout",
+        "description": "First close beyond a prior-bar inside bar's range (continuation)",
+        "regime": "any",
+        "entry_long": long_e.fillna(False),
+        "entry_short": short_e.fillna(False),
+    }
+
+
+def _high52_proximity(d: pd.DataFrame) -> Dict:
+    """r44 Wave 7 — 52-week-high proximity momentum (George & Hwang 2004).
+    Long when price is within 5% of the 252-bar high AND ADX ≥ 25 (trend).
+    """
+    hi52 = d["High"].rolling(252, min_periods=120).max()
+    near_hi = d["Close"] >= 0.95 * hi52
+    adx_ok = d["ADX_14"] >= 25 if "ADX_14" in d.columns else pd.Series(True, index=d.index)
+    long_e = near_hi & adx_ok & (d["Close"] > d["Close"].shift(1))
+    empty = pd.Series(False, index=d.index)
+    return {
+        "name": "52w High Proximity",
+        "description": "Within 5% of 252-bar high in trend regime (ADX ≥ 25)",
+        "regime": "trend",
+        "entry_long": long_e.fillna(False),
+        "entry_short": empty,
+    }
+
+
 STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
     _trend_following,
     _golden_cross,
@@ -353,6 +417,10 @@ STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
     _fvg_pullback,
     _vwap_reclaim,
     _opening_range_breakout,
+    # r44 Wave 7 additions:
+    _nr7_breakout,
+    _inside_bar_breakout,
+    _high52_proximity,
 ]
 
 

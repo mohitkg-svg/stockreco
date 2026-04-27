@@ -1271,5 +1271,139 @@ class TestMarketableLimitInsideSpread(unittest.TestCase):
         self.assertLess(sell_px, ask)
 
 
+# ============================================================================
+# CATEGORY P: r44 strategy + ML + risk + code-quality regressions.
+# ============================================================================
+
+class TestNewsContextColumnNames(unittest.TestCase):
+    """r44 fix #0.1: _build_ai_context queried `NewsEvent.tickers` (doesn't
+    exist; real column is `symbols`) and read `n.title` (real field is
+    `headline`). Wrapped in try/except so the AI judge silently received
+    `recent_news=[]` for every entry-veto / news-exit / confidence-multiplier
+    call. This regression test asserts the real column names exist."""
+    def test_news_event_real_columns(self):
+        from database import NewsEvent
+        cols = {c.name for c in NewsEvent.__table__.columns}
+        self.assertIn("symbols", cols)
+        self.assertIn("headline", cols)
+        self.assertIn("ticker", cols)
+        self.assertIn("published_at", cols)
+        # The columns the prior buggy code referenced should NOT exist.
+        self.assertNotIn("tickers", cols)
+        self.assertNotIn("title", cols)
+
+
+class TestCalendarMultiplier(unittest.TestCase):
+    def test_calendar_multiplier_in_bounds(self):
+        from services.seasonality import calendar_multiplier
+        m = calendar_multiplier()
+        self.assertGreaterEqual(m, 0.85)
+        self.assertLessEqual(m, 1.15)
+
+
+class TestRegimeMultiplier(unittest.TestCase):
+    def test_regime_multiplier_in_bounds(self):
+        from services.cross_asset import regime_multiplier
+        m = regime_multiplier()
+        self.assertGreaterEqual(m, 0.6)
+        self.assertLessEqual(m, 1.2)
+
+
+class TestInsiderClusterAmplification(unittest.TestCase):
+    def setUp(self):
+        _reset_db()
+
+    def test_cluster_buy_returns_amplified(self):
+        """r44 Wave 7: 12+ buys + ratio≥0.7 → 1.12× cluster bonus."""
+        from database import SessionLocal as _SL_ic, InsiderSummary as _IS_ic
+        from services.insider_trades import insider_multiplier
+        db = _SL_ic()
+        try:
+            db.add(_IS_ic(
+                ticker="CLUST",
+                buy_count_30d=8, sell_count_30d=0,
+                buy_count_90d=15, sell_count_90d=2,
+                net_buy_ratio_90d=0.88,
+            ))
+            db.commit()
+        finally:
+            db.close()
+        self.assertEqual(insider_multiplier("CLUST", "BUY"), 1.12)
+
+
+class TestNR7Strategy(unittest.TestCase):
+    def test_nr7_strategy_returns_dict(self):
+        from services.strategies import _nr7_breakout
+        import pandas as _pd
+        # Synthetic 50-bar OHLCV with one NR7 bar near the end.
+        idx = _pd.date_range("2026-01-01", periods=50, freq="D")
+        df = _pd.DataFrame({
+            "Open": [100.0] * 50,
+            "High": [102.0] * 50,
+            "Low": [98.0] * 50,
+            "Close": [100.0] * 50,
+            "Volume": [1_000_000] * 50,
+            "VOL_SMA20": [1_000_000] * 50,
+        }, index=idx)
+        # Last bar tighter range to make it NR7.
+        df.iloc[-2, df.columns.get_loc("High")] = 100.5
+        df.iloc[-2, df.columns.get_loc("Low")] = 99.5
+        s = _nr7_breakout(df)
+        self.assertIn("entry_long", s)
+        self.assertIn("entry_short", s)
+        self.assertEqual(s["regime"], "any")
+
+
+class TestAIBudgetCheck(unittest.TestCase):
+    def test_budget_check_blocks_after_cap(self):
+        from services import ai_judge
+        # Save and reset state.
+        orig_cap = ai_judge._AI_DAILY_CALL_CAP
+        orig_counter = dict(ai_judge._ai_call_counter)
+        try:
+            ai_judge._AI_DAILY_CALL_CAP = 3
+            ai_judge._ai_call_counter.clear()
+            self.assertTrue(ai_judge._ai_budget_check())
+            self.assertTrue(ai_judge._ai_budget_check())
+            self.assertTrue(ai_judge._ai_budget_check())
+            self.assertFalse(ai_judge._ai_budget_check())
+        finally:
+            ai_judge._AI_DAILY_CALL_CAP = orig_cap
+            ai_judge._ai_call_counter.clear()
+            ai_judge._ai_call_counter.update(orig_counter)
+
+
+class TestAdminTickerValidation(unittest.TestCase):
+    def test_invalid_ticker_rejected(self):
+        from routers.admin import _validate_ticker
+        from fastapi import HTTPException
+        # Valid uppercase short ticker passes.
+        self.assertEqual(_validate_ticker("aapl"), "AAPL")
+        # Garbage rejected.
+        for bad in ("../etc/passwd", "AAPL/MSFT", "TOOLONG12345", "1234", "<script>"):
+            with self.assertRaises(HTTPException):
+                _validate_ticker(bad)
+
+
+class TestBoundedTradeCache(unittest.TestCase):
+    def test_cache_bounded(self):
+        from services.data_fetcher import _BoundedTradeCache
+        c = _BoundedTradeCache(max_entries=10)
+        for i in range(15):
+            c[f"K{i}"] = (i, i + 1)
+        # Should not exceed max_entries (within tolerance of the LRU cutoff).
+        self.assertLessEqual(len(c._d), 12)
+
+
+class TestSlippageAwareRPS(unittest.TestCase):
+    def test_slippage_awareness_increases_risk(self):
+        from services.risk_manager import slippage_aware_risk_per_share
+        gross = 100.0 - 95.0   # 5
+        atr = 2.0
+        rps = slippage_aware_risk_per_share(100.0, 95.0, atr)
+        # Should be ≥ gross + 0.10*ATR = 5.20
+        self.assertGreaterEqual(rps, gross + 0.10 * atr - 1e-9)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

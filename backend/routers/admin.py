@@ -96,6 +96,18 @@ def age_out_trades(req: AgeOutTradesRequest):
     }
 
 
+import re as _re_admin
+
+
+def _validate_ticker(ticker: str) -> str:
+    """r44 fix Wave 6: admin path-segment validation. Refuse non-conforming
+    input (path-traversal, garbage, oversized strings) before any DB query.
+    """
+    if not isinstance(ticker, str) or not _re_admin.match(r"^[A-Z]{1,8}$", ticker.upper()):
+        raise HTTPException(status_code=400, detail=f"invalid ticker: must be 1-8 uppercase letters")
+    return ticker.upper()
+
+
 @router.post("/promote-adopted/{ticker}")
 def promote_adopted(ticker: str):
     """Promote an `adopted` AutoTrade row to `open` with bot-computed
@@ -121,7 +133,14 @@ def promote_adopted(ticker: str):
 
     Idempotent on success: a second call returns "no adopted stock row".
     """
+    ticker = _validate_ticker(ticker)
+    logger.warning(f"ADMIN promote_adopted ticker={ticker}")
     from services.auto_trader import promote_adopted_to_managed
+    try:
+        from services.alerts import alert as _raise_alert_admin
+        _raise_alert_admin("info", "admin_action", f"promote_adopted ticker={ticker}", ticker=ticker)
+    except Exception:
+        pass
     return promote_adopted_to_managed(ticker)
 
 
@@ -150,5 +169,12 @@ def sync_positions():
     bracket leg filled via a path the manage loop missed. Run sync to
     bring the DB in line with reality.
     """
+    # r44 fix Wave 6: admin audit log.
+    logger.warning("ADMIN sync_positions invoked")
+    try:
+        from services.alerts import alert as _raise_alert_admin
+        _raise_alert_admin("info", "admin_action", "sync_positions invoked")
+    except Exception:
+        pass
     from services.auto_trader import sync_positions_from_alpaca
     return sync_positions_from_alpaca()

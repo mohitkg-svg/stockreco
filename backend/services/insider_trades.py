@@ -297,7 +297,11 @@ def insider_multiplier(ticker: str, direction: str) -> float:
     purchases, min 3 total) → 1.06. Moderate (≥60%) → 1.03. Heavy selling
     (≤30%) → 0.97. Else neutral.
 
-    SELL signals: inverse (heavy insider selling confirms bearish).
+    r44 Wave 7: cluster amplification. Cohen, Malloy, Pomorski (2012) show
+    that ≥3 distinct insiders buying within a 30-day window TRIPLES the
+    predictive power vs single-insider buys. We approximate by checking
+    if buy_count_90d ≥ 12 (a multi-insider cluster threshold) AND ratio
+    is strong, returning a 1.12× boost.
     """
     r = get_insider(ticker)
     if r is None:
@@ -309,12 +313,18 @@ def insider_multiplier(ticker: str, direction: str) -> float:
     if ratio is None:
         return _MULT_NEUTRAL
     direction = (direction or "").upper()
+    buy_count = (r.get("buy_count_90d") or 0)
+    sell_count = (r.get("sell_count_90d") or 0)
+    is_cluster_buy = buy_count >= 12 and ratio >= 0.70
+    is_cluster_sell = sell_count >= 12 and ratio <= 0.30
     if direction == "BUY":
+        if is_cluster_buy: return 1.12   # cluster bonus
         if ratio >= 0.70: return _MULT_STRONG_INSIDER_BUY
         if ratio >= 0.60: return _MULT_MILD_INSIDER_BUY
         if ratio <= 0.30: return _MULT_INSIDER_SELLING
         return _MULT_NEUTRAL
     if direction == "SELL":
+        if is_cluster_sell: return 1.12
         if ratio <= 0.30: return _MULT_STRONG_INSIDER_BUY   # i.e. strong-signal agreement
         if ratio <= 0.40: return _MULT_MILD_INSIDER_BUY
         if ratio >= 0.70: return _MULT_INSIDER_SELLING

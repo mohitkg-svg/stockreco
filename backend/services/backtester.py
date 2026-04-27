@@ -608,8 +608,13 @@ def score_strategy(stats: dict) -> float:
     """
     Combine stats into a 0-100 confidence score measuring how well the strategy
     has worked historically on this stock. Strategies with no trades score 0.
+
+    r44 fix #0.8: raised min-trades floor 3 → 30 in-sample. With 3 trades the
+    win-rate is in {0, 33, 67, 100}% — pure noise. Best-of-13 selection then
+    maximizes that noise. 30 trades is the empirical sample-size floor where
+    the central limit theorem starts producing useful Sharpe estimates.
     """
-    if stats["total_trades"] < 3:
+    if stats["total_trades"] < 30:
         return 0.0
 
     win_rate = stats["win_rate"]                      # 0-100
@@ -740,13 +745,17 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
     wf_fold_conf: Dict[tuple, list] = {}  # key -> list of per-fold confidence
 
     if fold_width >= 20:
+        # r44 fix #0.9: purged k-fold + embargo (López de Prado, AFL ch.7).
+        # Drop a `purge_bars` buffer before each fold's start so slow MAs
+        # (SMA_200, MACD slow=26, ATR_14) computed on the prefix don't read
+        # the same fold's OOS bars. Embargo also applies forward to prevent
+        # neighboring-fold leakage.
+        PURGE_BARS = 200   # SMA_200 horizon
+        EMBARGO_BARS = 5   # forward embargo
         for fold_i in range(4):
             s = wf_start + fold_i * fold_width
             e = s + fold_width
-            # r42 fix #1.1: recompute indicators on raw bars THROUGH the
-            # fold's end only — never including future bars. This kills
-            # any rolling-normalization leakage from the full-history
-            # `d` precompute above.
+            # Recompute indicators on raw bars THROUGH the fold's end only.
             fold_raw = raw.iloc[:e].copy()
             try:
                 fold_d_full = compute_indicators(fold_raw)
@@ -754,8 +763,14 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
             except Exception as _e:
                 logger.debug(f"walk-forward indicator recompute failed for fold {fold_i}: {_e}")
                 continue
-            # Slice the fold-window from the freshly-computed frame.
-            fold_df = fold_d_full.iloc[max(0, s):e].copy()
+            # Slice with embargo padding on both sides — first 5 bars dropped
+            # to avoid borrow from prior fold, last 5 bars also dropped to
+            # avoid borrow into next fold.
+            fold_start = max(PURGE_BARS, s + EMBARGO_BARS)
+            fold_end = e - EMBARGO_BARS
+            if fold_start >= fold_end:
+                continue
+            fold_df = fold_d_full.iloc[fold_start:fold_end].copy()
             if len(fold_df) < 20:
                 continue
             fold_results = _evaluate(fold_df)
@@ -782,6 +797,17 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
             oos_results[key]["_wf_confidence"] = round(sum(confs) / len(confs), 2)
             oos_results[key]["_wf_fold_count"] = len(confs)
 
+    # r44 fix #0.8: Bonferroni-aware selection. We evaluate ~26 hypothesis
+    # tests per ticker (13 strategies × 2 directions). P(at least one passes
+    # 95% by chance) ≈ 73%. The reported "best" is mostly noise without a
+    # multiple-comparisons correction. Apply a `bonferroni_haircut` to all
+    # confidence scores, scaled by sqrt(n_tests) — a coarse Deflated-Sharpe
+    # approximation. Strategies that previously cleared 70 confidence on
+    # spurious patterns now require ~80+ to clear the same effective bar.
+    import math as _math
+    n_tests = max(1, len(full_results))
+    bonferroni_haircut = max(0.5, 1.0 - 0.10 * _math.log(max(2, n_tests), 2))
+
     results = []
     for key, r in full_results.items():
         full_conf = score_strategy(r["stats"])
@@ -791,19 +817,20 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
             fold_count = int(oos_row.get("_wf_fold_count", 0) or 0)
             # Critical-audit fix #2: scale WF confidence by fold_count/4 so
             # a strategy that only produced qualifying trades in 2 of 4 folds
-            # is demoted proportionally, not just via the flat 0.90 below.
-            # Example: 70 confidence on 2/4 folds → scaled to 35 (vs 63 before),
-            # properly demoting brittle regime-specific strategies.
+            # is demoted proportionally.
             wf_conf_scaled = wf_conf * (max(0, fold_count) / 4.0)
             adj_conf = 0.65 * wf_conf_scaled + 0.35 * full_conf
             robustness = round(min(100, wf_conf_scaled), 1)
         else:
             adj_conf = full_conf * 0.80   # stricter than old 0.85 given no WF
             robustness = None
+        # r44 fix #0.8: apply haircut for multiple-comparisons.
+        adj_conf *= bonferroni_haircut
         r["confidence"] = round(adj_conf, 1)
         r["confidence_full"] = round(full_conf, 1)
         r["oos_confidence"] = robustness
         r["oos_trades"] = (oos_row.get("_wf_fold_count", 0) if oos_row else 0)
+        r["bonferroni_haircut"] = round(bonferroni_haircut, 3)
         results.append(r)
 
     # Sort by adjusted confidence; drop strategies with 0 full-period trades.

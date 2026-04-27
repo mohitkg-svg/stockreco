@@ -482,7 +482,37 @@ def _alpaca_latest_trade(ticker: str) -> Optional[float]:
     return None
 
 
-_latest_trade_cache: Dict[str, tuple] = {}
+# r44 fix #0.13: bounded TTL cache. Was unbounded — slow memory leak as the
+# universe scanner adds tickers across days. OOM in a long-running Cloud
+# Run instance is a real risk.
+class _BoundedTradeCache:
+    def __init__(self, max_entries: int = 2000):
+        self._d: Dict[str, tuple] = {}
+        self._max = max_entries
+
+    def __setitem__(self, k: str, v: tuple) -> None:
+        if len(self._d) >= self._max:
+            # Drop oldest 10% (LRU-by-insertion approximation; expiry-based
+            # would be more correct but pricier per-write).
+            cutoff = self._max // 10
+            for old_key in list(self._d.keys())[:cutoff]:
+                self._d.pop(old_key, None)
+        self._d[k] = v
+
+    def __getitem__(self, k: str) -> tuple:
+        return self._d[k]
+
+    def get(self, k: str, default=None):
+        return self._d.get(k, default)
+
+    def __contains__(self, k: str) -> bool:
+        return k in self._d
+
+    def pop(self, k: str, default=None):
+        return self._d.pop(k, default)
+
+
+_latest_trade_cache = _BoundedTradeCache(max_entries=2000)
 
 
 def get_current_price(ticker: str) -> Optional[Tuple[float, float]]:

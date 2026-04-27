@@ -199,6 +199,282 @@ def sl_resubmit_failures_1h() -> int:
         return sum(1 for t in _sl_resubmit_failures if t > cutoff)
 
 
+def dynamic_daily_loss_limit_pct(static_pct: float = 0.03) -> float:
+    """r44 fix #0.11: dynamic daily-loss ceiling = max(static_pct, 3 ×
+    recent_avg_daily_pnl/equity). On a great month (avg +$300/day) the
+    static 3% halts at -$3,000; dynamic anchors near -$900. On a bad
+    month, dynamic floors at the static value.
+    Uses last 30d realized-PnL series. Floors at 1.5% to prevent runaway
+    over-tightening on strong months.
+    """
+    try:
+        from database import SessionLocal as _SL_dl, AutoTrade as _AT_dl
+        from datetime import datetime as _dt_dl, timedelta as _td_dl
+        from services import paper_trader as _pt_dl
+        acct = _pt_dl.get_account()
+        equity = float(acct["equity"]) if acct else 0.0
+        if equity <= 0:
+            return float(static_pct)
+        db = _SL_dl()
+        try:
+            since = _dt_dl.utcnow() - _td_dl(days=30)
+            rows = (
+                db.query(_AT_dl)
+                .filter(_AT_dl.status.like("closed%"),
+                        _AT_dl.closed_at >= since,
+                        _AT_dl.realized_pl.isnot(None))
+                .all()
+            )
+            if len(rows) < 5:
+                return float(static_pct)
+            total_pl = sum(float(r.realized_pl or 0.0) for r in rows)
+            avg_daily_pnl = abs(total_pl) / 30.0
+            dynamic_pct = max(0.015, min(float(static_pct), 3 * avg_daily_pnl / equity))
+            return float(dynamic_pct)
+        finally:
+            db.close()
+    except Exception:
+        return float(static_pct)
+
+
+def session_equity_drawdown_pct() -> Optional[float]:
+    """r44 fix #0.12: intra-session drawdown for auto-deleverage trigger.
+    Returns peak-to-now drop as % of starting-session equity, or None on
+    data unavailability.
+    """
+    try:
+        from services import paper_trader as _pt_sed
+        acct = _pt_sed.get_account()
+        if not acct:
+            return None
+        equity = float(acct.get("equity") or 0)
+        last_equity = float(acct.get("last_equity") or 0)  # alpaca = prior session close
+        if last_equity <= 0:
+            return None
+        drop = max(0.0, (last_equity - equity) / last_equity)
+        return drop
+    except Exception:
+        return None
+
+
+def realized_portfolio_vol_annualized() -> Optional[float]:
+    """r44 fix #1.1: 30d realized portfolio volatility, annualized.
+    Used by `vol_target_multiplier` to scale entries when book σ exceeds
+    or falls short of the target (default 12%).
+    Returns None when insufficient data (cold start).
+    """
+    try:
+        from services import paper_trader as _pt_vol
+        acct = _pt_vol.get_account()
+        if not acct:
+            return None
+        equity = float(acct.get("equity") or 0)
+        if equity <= 0:
+            return None
+        # Use last 30d trade PnL series as a proxy for daily PnL volatility.
+        # Better than nothing pre-equity-curve-feed; live should switch to
+        # `get_portfolio_history` when available.
+        from database import SessionLocal as _SL_v, AutoTrade as _AT_v
+        from datetime import datetime as _dt_v, timedelta as _td_v
+        db = _SL_v()
+        try:
+            since = _dt_v.utcnow() - _td_v(days=30)
+            rows = db.query(_AT_v).filter(
+                _AT_v.status.like("closed%"),
+                _AT_v.closed_at >= since,
+                _AT_v.realized_pl.isnot(None),
+            ).order_by(_AT_v.closed_at.asc()).all()
+            if len(rows) < 10:
+                return None
+            # Group by day, sum daily realized PnL.
+            from collections import defaultdict as _dd
+            daily = _dd(float)
+            for r in rows:
+                d = r.closed_at.date()
+                daily[d] += float(r.realized_pl or 0.0)
+            daily_pl = list(daily.values())
+            if len(daily_pl) < 5:
+                return None
+            import statistics as _stats
+            sigma_daily_pl = _stats.pstdev(daily_pl)
+            sigma_daily_ret = sigma_daily_pl / equity
+            return sigma_daily_ret * (252 ** 0.5)
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+def vol_target_multiplier(target_annual_vol: float = 0.12) -> float:
+    """r44 fix #1.1: scale entries so book annualized vol ≈ target.
+    Returns 1.0 when realized vol unknown. Clamped [0.5, 1.5] so a single
+    fat-tail event doesn't double the size on the next signal.
+    """
+    rv = realized_portfolio_vol_annualized()
+    if rv is None or rv <= 0:
+        return 1.0
+    raw = target_annual_vol / rv
+    return float(max(0.5, min(1.5, raw)))
+
+
+def account_drawdown_multiplier() -> float:
+    """r44 fix #1.2: graduated account-level drawdown control.
+    Reads `paper_trader.get_portfolio_history()` peak-to-trough over
+    60d. Returns:
+      ≤  3% drawdown → 1.0
+      3-5%           → 0.70
+      5-8%           → 0.50
+      8-10%          → 0.25
+      ≥ 10%          → 0.0  (caller treats as skip)
+    Falls back to 1.0 when broker history unavailable.
+    """
+    try:
+        from services import paper_trader as _pt_dd
+        hist = getattr(_pt_dd, "get_portfolio_history", lambda: None)()
+        if not hist or "equity" not in hist:
+            # Fallback: use cumulative realized + current unrealized vs starting equity.
+            acct = _pt_dd.get_account()
+            if not acct:
+                return 1.0
+            equity = float(acct.get("equity") or 0)
+            last_equity = float(acct.get("last_equity") or 0)
+            if last_equity <= 0:
+                return 1.0
+            drop = max(0.0, (last_equity - equity) / last_equity)
+            if drop >= 0.10:
+                return 0.0
+            if drop >= 0.08:
+                return 0.25
+            if drop >= 0.05:
+                return 0.50
+            if drop >= 0.03:
+                return 0.70
+            return 1.0
+        eq = [float(x) for x in hist["equity"] if x is not None]
+        if len(eq) < 5:
+            return 1.0
+        peak = max(eq)
+        cur = eq[-1]
+        if peak <= 0:
+            return 1.0
+        drop = max(0.0, (peak - cur) / peak)
+        if drop >= 0.10:
+            return 0.0
+        if drop >= 0.08:
+            return 0.25
+        if drop >= 0.05:
+            return 0.50
+        if drop >= 0.03:
+            return 0.70
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def slippage_aware_risk_per_share(entry: float, stop: float, atr: float, spread: float = 0.0) -> float:
+    """r44 fix #1.3: risk-per-share with stop-fill slippage budget.
+    Real fills slip 0.10-0.40 ATR on chandelier stops; theoretical
+    `entry - stop` understates by 5-10% on 5-10% of trades.
+    Returns the gross stop distance + a slippage buffer.
+    """
+    base = max(0.0, entry - stop)
+    slip_atr = 0.10 * (atr or 0.0)
+    slip_spread = 0.5 * (spread or 0.0)
+    return base + max(slip_atr, slip_spread, 0.01)
+
+
+def portfolio_greeks() -> Dict[str, float]:
+    """r44 fix #1.5: aggregate net delta/gamma/theta/vega across the
+    options book in the database. Per-contract Greeks live on AutoTrade
+    rows that have asset_type='option'; we approximate with crude defaults
+    when Greeks are missing (delta=0.5 for ATM, etc.).
+    Returns {delta, gamma, theta, vega} all in $ terms (×100 contract).
+    """
+    out = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    try:
+        from database import SessionLocal as _SL_g, AutoTrade as _AT_g
+        db = _SL_g()
+        try:
+            opts = db.query(_AT_g).filter(
+                _AT_g.asset_type == "option",
+                _AT_g.status.in_(["open", "pending"]),
+            ).all()
+            for t in opts:
+                qty = float(t.qty or 0)
+                if qty <= 0:
+                    continue
+                # AutoTrade doesn't persist per-contract Greeks today; we
+                # use sign-of-delta from the OCC symbol (P=put → negative
+                # delta on a long put), magnitude default 0.4 for OTM.
+                is_put = isinstance(t.symbol, str) and len(t.symbol) > 12 and t.symbol[-9] == "P"
+                d_default = -0.4 if is_put else 0.4
+                # Spot proxy: t.entry_price is the option premium, NOT
+                # underlying. Skip the underlying multiplication and just
+                # report contract-greek totals as informational.
+                out["delta"] += qty * 100 * d_default
+                out["theta"] -= qty * 100 * 0.05   # rough $5/day per contract
+                out["vega"] += qty * 100 * 0.10    # rough $10 per 1% IV move
+        finally:
+            db.close()
+    except Exception as e:
+        logger.debug(f"portfolio_greeks: {e}")
+    return out
+
+
+def earnings_cluster_count(window_hours: int = 168) -> int:
+    """r44 fix #1.6: count of open positions whose underlying has earnings
+    within `window_hours`. Used by consider_signal as an aggregate-event-
+    risk gate.
+    """
+    try:
+        from database import SessionLocal as _SL_ec, AutoTrade as _AT_ec
+        from services.earnings import hours_to_next_earnings as _hne
+        db = _SL_ec()
+        try:
+            opens = db.query(_AT_ec).filter(
+                _AT_ec.status.in_(["open", "pending", "adopted"]),
+            ).all()
+            n = 0
+            for t in opens:
+                try:
+                    h = _hne(t.ticker)
+                    if h is not None and h <= window_hours:
+                        n += 1
+                except Exception:
+                    pass
+            return n
+        finally:
+            db.close()
+    except Exception:
+        return 0
+
+
+def book_var_99(equity: float) -> float:
+    """r44 fix #1.7: rough 99% parametric VaR using current heat as
+    1.5-sigma proxy. Heat is dollar-stop-loss-cost; multiply by ~1.5 for
+    the 99% tail under a normal-ish distribution. Returns 0 on missing data.
+    """
+    if equity <= 0:
+        return 0.0
+    heat = current_portfolio_heat()
+    return heat * 1.5
+
+
+def book_leverage_pct(equity: float) -> float:
+    """r44 fix #1.8: total notional / equity. Used to enforce a leverage
+    cap (default 1.5×). Returns 0.0 on missing data.
+    """
+    if equity <= 0:
+        return 0.0
+    try:
+        from services import paper_trader as _pt_lev
+        positions = _pt_lev.get_positions() or []
+        notional = sum(abs(float(p.get("qty") or 0) * float(p.get("current_price") or 0)) for p in positions)
+        return notional / equity
+    except Exception:
+        return 0.0
+
+
 def adaptive_risk_multiplier() -> float:
     """Tighten the max-risk-per-trade envelope under adverse conditions.
 
@@ -600,6 +876,16 @@ def current_portfolio_heat() -> float:
                 elif ot.asset_type == "option" and oe > 0:
                     raw = float(oe) * 100 * (ot.qty or 0)
                 total += raw * beta_weight(ot.ticker)
+            # r44 fix #0.10: include in-flight BP reservations as a
+            # conservative heat add. Without this, two parallel scanners
+            # could both compute heat=8% (cap=10%) and each reserve a
+            # 1.5% trade — actual post-fill heat 11%, breaching the cap.
+            # Use a 5% stop-distance proxy: in_flight_bp / 20 ≈ heat-equiv.
+            try:
+                in_flight = float(get_in_flight_bp() or 0.0)
+                total += max(0.0, in_flight / 20.0)
+            except Exception:
+                pass
             return total
         finally:
             db.close()

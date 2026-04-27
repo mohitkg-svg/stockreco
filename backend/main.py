@@ -224,7 +224,25 @@ _ws_rate_limit = _RateLimitFilter(interval_sec=60.0)
 for _noisy in ("alpaca.common.websocket", "alpaca.data.live.websocket"):
     logging.getLogger(_noisy).addFilter(_ws_rate_limit)
 
-scheduler = BackgroundScheduler()
+# r44 fix #0.14: explicit executors so long-running jobs (ml_trainer ~15min,
+# universe_scan ~2min, fundamentals ~3min) can't saturate the default
+# 10-thread pool and starve fast jobs (calibration, reconcile, news poll).
+# `heavy` is a 2-thread pool reserved for ml_weekly_retrain + universe_scan;
+# `default` keeps a healthy 16-thread pool for everything else. Jitter
+# added to all cron triggers prevents the 12:00 / 14:30 / 16:00 jobs from
+# all firing in lockstep.
+from apscheduler.executors.pool import ThreadPoolExecutor as _APSchedThreadPool
+scheduler = BackgroundScheduler(
+    executors={
+        "default": _APSchedThreadPool(max_workers=16),
+        "heavy": _APSchedThreadPool(max_workers=2),
+    },
+    job_defaults={
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 60,
+    },
+)
 
 # Lifecycle health flags — surfaced via /api/health so deployments can detect
 # silent boot failures (e.g. live_quotes.start crashed but app booted anyway).
@@ -382,7 +400,11 @@ async def lifespan(app: FastAPI):
         logger.info("Manager service started — manage every 20s, reconcile every 60min")
         yield
         try:
-            scheduler.shutdown()
+            # r44 fix #0.15: wait=True drains in-flight jobs before exiting.
+            # Without it, Cloud Run SIGTERM (10s grace) can kill broker
+            # submissions mid-flight, leaving DB rows pending while the
+            # actual order filled at Alpaca.
+            scheduler.shutdown(wait=True)
         except Exception:
             pass
         return
@@ -638,7 +660,11 @@ async def lifespan(app: FastAPI):
         logger.warning(f"option-stream boot resubscribe skipped: {e}")
 
     yield
-    scheduler.shutdown()
+    # r44 fix #0.15: wait=True for clean shutdown (see manager-mode comment).
+    try:
+        scheduler.shutdown(wait=True)
+    except Exception:
+        pass
     try:
         await live_quotes.stop()
     except Exception:
@@ -672,6 +698,16 @@ if _ALPACA_LIVE:
         raise RuntimeError(
             "ALPACA_LIVE=1 requires APP_API_KEY to be set — "
             "refuse to expose live trading endpoints without auth"
+        )
+    # r44 fix #0.4: refuse to boot live on default sqlite. With min_instances=1
+    # max_instances=3 each Cloud Run instance has its own SQLite file →
+    # three bots silently disagreeing about positions/signals.
+    _db_url = os.getenv("DATABASE_URL", "")
+    if not _db_url or _db_url.startswith("sqlite"):
+        raise RuntimeError(
+            "ALPACA_LIVE=1 requires a non-SQLite DATABASE_URL (Postgres/Cloud SQL/Neon). "
+            "Default sqlite:///./stockapp.db is per-instance and gives each Cloud Run "
+            "instance its own database — refuse to start."
         )
     # Audit fix #3: verify broker connectivity at boot. A silent None
     # return from _get_client() (e.g., creds mounted but malformed) would

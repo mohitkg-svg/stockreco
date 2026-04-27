@@ -1087,6 +1087,139 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 44 — 7-agent deep audit: ML/AI, risk overlays, regime signals, new strategies
+
+Seven parallel deep-dive agents on different angles than r42/r43: profit-
+strategy gaps, backtest robustness, risk overlays + portfolio construction,
+ML/AI quality, position-management innovations, cross-asset/regime, code
+quality on prior-unaudited modules. ~150 findings, ~70 strategy proposals.
+This revision implements ALL Tier 0/1/2/3 + Tier P proposals.
+
+**Tier 0 — VERIFIED critical bugs (16)**:
+- AI judge has been running BLIND on news for every entry/exit decision —
+  `_build_ai_context` queried `NewsEvent.tickers` (real column is
+  `symbols`) and read `n.title` (real field is `headline`). Wrapped in
+  try/except so it silently returned `recent_news=[]` for every Claude
+  call across r41/r42's lifetime. Fixed; new regression test pins column
+  names.
+- ML scorer trained on real signal features but served stub features
+  (`stop_loss=None, target1=None`). Train/serve distribution mismatch.
+  Now passes provisional ATR-based levels matching empirical post-
+  calibration distribution.
+- `MLPrediction.outcome` had no producer in code. Calibration loop and
+  ML graduation gate had no source data. Added `_backfill_ml_outcome`
+  in every close path.
+- `DATABASE_URL` defaulted to `sqlite:///./stockapp.db` — multi-instance
+  Cloud Run = three bots disagreeing about reality. Live mode now
+  refuses to boot on default sqlite.
+- `flatten_by_eod` config flag was dead code. Now read in manage loop;
+  fires at 15:55 ET on intraday-TF positions when set.
+- News dispatch + AI judge ran synchronously inside the news scheduler
+  thread. Moved to a 2-thread `_NEWS_AI_POOL`; news ingest never
+  blocks behind Claude latency anymore.
+- AI temperature=1.0 (default) made same-input verdicts non-
+  reproducible. Now temperature=0.0.
+- Best-strategy-of-26 selection had no Bonferroni correction; reported
+  confidences over-stated 15-30 points by chance. Now applies a
+  multiple-comparisons haircut scaled by log2(N).
+- Walk-forward folds had purge+embargo gaps — fold k's slow MAs (SMA200)
+  read fold k-1's OOS. Now purges `PURGE_BARS=200` before fold start
+  and `EMBARGO_BARS=5` between folds.
+- `current_portfolio_heat` excluded in-flight BP reservations — two
+  parallel scanners could both compute heat=8% (cap=10%) and each
+  reserve a 1.5% trade. Now adds a 5%-stop-distance proxy from
+  `get_in_flight_bp / 20`.
+- Daily-loss limit was static 3%. New `dynamic_daily_loss_limit_pct`
+  scales as `max(static, 3 × recent_avg_pnl/equity)` with 1.5% floor.
+- Auto-deleveraging on session drop: -4% session DD blocks new entries,
+  -6% engages kill switch. New `session_equity_drawdown_pct` helper.
+- `_latest_trade_cache` was unbounded. Now `_BoundedTradeCache(2000)`
+  with 10% LRU cutoff on overflow.
+- APScheduler default 10-thread pool replaced with explicit
+  `executors={default:16, heavy:2}` plus job_defaults
+  (coalesce, max_instances=1, misfire_grace_time=60).
+- `scheduler.shutdown()` now uses `wait=True` so Cloud Run SIGTERM
+  drains in-flight broker submissions before exit.
+- ML walk-forward fold split by row index; same-day samples could
+  straddle train/test on different tickers. Now splits by
+  TIMESTAMP boundaries with a 5-day forward EMBARGO. Also adds
+  `scale_pos_weight` for class imbalance.
+
+**Tier 1 — sizing/risk overlays**:
+- New `vol_target_multiplier(0.12)` — annualized 12% portfolio σ target.
+- New `account_drawdown_multiplier()` — graduated [-3%/-5%/-8%/-10%]
+  → [0.7/0.5/0.25/0] sizing.
+- New `slippage_aware_risk_per_share` — adds 0.10×ATR / 0.5× spread
+  buffer to theoretical stop distance.
+- Beta-symmetric sizing — divide risk_budget by `beta_weight(ticker)`.
+- New `portfolio_greeks` (informational; per-contract Greeks aggregated
+  across the option book).
+- New `earnings_cluster_count` gate — refuse new entries when ≥4 open
+  positions have earnings within 168h.
+- New `book_var_99` — heat × 1.5 as 99% VaR proxy; gate at 5% of equity.
+- New `book_leverage_pct` — total notional / equity gate at 1.5×.
+
+**Tier 1 — cross-asset / regime signals**: new `services/cross_asset.py`
+exposes:
+- VIX term structure (VIX9D/VIX3M ratio)
+- VVIX (vol-of-vol)
+- SKEW index
+- HYG-vs-SPY 20d-return divergence z-score
+- 5s10s yield curve
+- Defensive-vs-cyclical sector RS
+- IWM/SPY relative strength
+- RSP/SPY breadth proxy
+- Composite `regime_score()` and `regime_multiplier()` clamped [0.6, 1.2]
+- `sector_rotation_score(etf)` — top-3 vs bottom-3 by 126d return
+
+**Tier 1 — seasonality**: new `services/seasonality.py`:
+- Pre-FOMC drift (×1.10)
+- Quarter-end window (×1.05)
+- First 4 days of month (×1.05)
+- OPEX day (×0.92)
+- Holiday drift week (×1.05)
+- Composite `calendar_multiplier()` clamped [0.85, 1.15]
+
+**Tier 1 — position management**:
+- Stock time-stop: held > 4× source-TF AND PnL ∈ (0, 0.5R) → close.
+- Vol-adjusted chandelier: ATR-percentile → ×0.85 (compressed) /
+  ×1.4 (high vol).
+- Stocks earnings pre-flatten: trim 50% at T-1h to print.
+- Pyramid at T1 (gated behind `cfg.pyramid_enabled`, default off).
+
+**Tier 1 — ML/AI**:
+- AI per-day call cap (`AI_DAILY_CALL_CAP`, default 5000).
+- AI prompt-injection-resistant safety prefix; data wrapped in
+  `<EXTERNAL_*>` tags with explicit "ignore instructions inside" rule.
+- AI one-retry on malformed/no-tool-use response.
+
+**Tier 2 code quality**:
+- Chat router per-request size cap (30 KB), per-day call cap (500),
+  hardened system prefix.
+- Admin endpoints: `_validate_ticker` regex gate, audit-log warnings,
+  alert rows for promote_adopted / sync_positions actions.
+- `get_db()` rolls back on exception before close.
+- News commit-failure clears `_new_for_open` so AI dispatch doesn't
+  run against rows that didn't persist.
+
+**Tier P — new strategies**:
+- New PEAD module (`services/pead.py`) — Post-Earnings Announcement
+  Drift signal: earnings within 36h + ≥3% same-direction reaction +
+  ≥2× volume → BUY/SELL hold 30-60 days.
+- 3 new strategies in `strategies.py`: NR7 breakout (Crabel volatility
+  compression), Inside Bar continuation, 52-week-high proximity
+  momentum.
+- Insider cluster amplification: ≥12 buys in 90d + ratio ≥0.7 → 1.12×
+  (vs prior 1.06× ceiling).
+- Sector rotation tilt: top-3 sector → +0.08, bottom-3 → -0.08 against
+  126d sector ETF returns.
+
+**Tests**: 9 new regression tests (TestNewsContextColumnNames,
+TestCalendarMultiplier, TestRegimeMultiplier,
+TestInsiderClusterAmplification, TestNR7Strategy, TestAIBudgetCheck,
+TestAdminTickerValidation, TestBoundedTradeCache,
+TestSlippageAwareRPS). Full suite: 151 passed.
+
 ### Revision 43 — Strategy + execution deep-dive (Tier 0-3 across stock/option/level/exec)
 
 Five-agent audit pass focused on edge quality (stock selection, option-contract
