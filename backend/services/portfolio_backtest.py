@@ -456,7 +456,11 @@ def run_portfolio_backtest(
     losses = sum(1 for t in closed_trades if t.outcome == "loss")
     total = len(closed_trades)
     win_rate = wins / total if total else 0.0
-    # Drawdown
+    # Drawdown — r42 fix #1.10: percentage units (matches backtester.py and
+    # the UI's "X.XX%" rendering). Previously this returned a fraction
+    # while the per-ticker backtester returned a percentage; the UI
+    # rendered them as if both were percentages, so the portfolio number
+    # appeared 100× too small.
     peak = starting_equity
     max_dd_pct = 0.0
     max_dd_days = 0
@@ -466,7 +470,7 @@ def run_portfolio_backtest(
             peak = eq
             dd_start = None
         else:
-            dd = (peak - eq) / peak if peak > 0 else 0.0
+            dd = ((peak - eq) / peak * 100.0) if peak > 0 else 0.0
             if dd > max_dd_pct:
                 max_dd_pct = dd
             if dd_start is None and dd > 0:
@@ -475,8 +479,14 @@ def run_portfolio_backtest(
                 days = (pd.Timestamp(ds) - dd_start).days
                 if days > max_dd_days:
                     max_dd_days = days
-    # Sharpe (simplified, daily). Sortino: same numerator, denominator
-    # is stdev of NEGATIVE returns only — penalizes only downside vol.
+    # Sharpe (simplified, daily). Sortino: same numerator, denominator is
+    # downside-deviation against MAR=0 (RMS of min(0, r)), NOT std of the
+    # already-filtered negative subset.
+    # r42 fix #1.6: previously we used `downside.std()` where `downside =
+    # rets[rets < 0]`. That's the std of negatives, which divides by their
+    # mean, not by zero — the result is amplitude-of-downside-noise, not
+    # downside-vol-vs-MAR. The correct formula is sqrt(mean(min(0, r)^2))
+    # against MAR=0, which is what production sortino implementations use.
     sharpe = None
     sortino = None
     if len(equity_curve) > 30:
@@ -484,22 +494,26 @@ def run_portfolio_backtest(
         rets = eqs.pct_change().dropna()
         if len(rets) and rets.std() > 0:
             sharpe = float(round((rets.mean() / rets.std()) * (252 ** 0.5), 2))
-        downside = rets[rets < 0]
-        if len(downside) and downside.std() > 0:
-            sortino = float(round((rets.mean() / downside.std()) * (252 ** 0.5), 2))
+        if len(rets):
+            downside_returns = rets.where(rets < 0, 0.0)
+            dd_dev = float((downside_returns ** 2).mean() ** 0.5)
+            if dd_dev > 0:
+                sortino = float(round((rets.mean() / dd_dev) * (252 ** 0.5), 2))
 
     # Calmar: annualized_return / |max_drawdown|. Drawdown-adjusted return.
     # period_years derived from the equity curve span; capped at ≥ 0.25y
     # to avoid blow-up on very short backtests.
     calmar = None
     if max_dd_pct > 0 and len(equity_curve) >= 30:
+        # max_dd_pct is now in percent (0-100); convert to fraction for Calmar.
+        _dd_frac_for_calmar = max_dd_pct / 100.0
         try:
             t0 = pd.Timestamp(equity_curve[0][0])
             t1 = pd.Timestamp(equity_curve[-1][0])
             period_years = max(0.25, (t1 - t0).days / 365.25)
             total_return = (ending_equity - starting_equity) / starting_equity
             ann_return = (1 + total_return) ** (1 / period_years) - 1
-            calmar = float(round(ann_return / max_dd_pct, 2))
+            calmar = float(round(ann_return / _dd_frac_for_calmar, 2))
         except Exception as e:
             logger.debug(f"portfolio_bt: calmar calc skipped ({e})")
 

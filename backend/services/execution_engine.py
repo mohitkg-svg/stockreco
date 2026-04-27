@@ -49,34 +49,42 @@ def identify_legs(parent_id: str) -> Dict[str, Optional[str]]:
     return out
 
 
-def replace_stop(stop_order_id: str, new_stop: float) -> bool:
+def replace_stop(stop_order_id: str, new_stop: float) -> Optional[str]:
     """Move the SL child order to a new stop price.
 
-    Returns True only if the broker acknowledged the replacement. Callers
-    MUST guard their DB mutation behind this return value (current pattern:
-    `if new_stop > t.current_stop and replace_stop(...): t.current_stop = ...`)
-    so the database can never carry a tighter stop than the broker actually
-    holds. A False return is logged loudly because every failure means the
-    next manage tick will re-attempt — silent drift is a money bug.
+    r42 fix #0.2: returns the NEW broker order id on success (Alpaca rotates
+    the id on every replace), or None on failure. Callers MUST persist the
+    returned id back to `t.stop_order_id` — without that, the next replace
+    targets a now-terminal id and the broker has no working SL until the
+    bracket parent regenerates one (naked-long window).
+
+    The legacy True/False contract is preserved at the call sites by
+    `bool(returned)`; existing `if replace_stop(...)` patterns continue to
+    work. The new id is what makes future replaces actually land on a live
+    order.
     """
     rounded = round(float(new_stop), 2)
     # Idempotency: if we already sent this exact stop price for this order
-    # (and Alpaca accepted it), skip the round-trip.
+    # (and Alpaca accepted it), skip the round-trip and return the same id.
     last = _replace_stop_cache.get(stop_order_id)
     if last is not None and abs(last - rounded) < 0.005:
-        return True
+        return stop_order_id
     c = paper_trader._get_client()
     if not c:
         logger.warning(f"replace_stop {stop_order_id}: no broker client — keeping old stop")
-        return False
+        return None
     try:
         from alpaca.trading.requests import ReplaceOrderRequest
-        c.replace_order_by_id(
+        new_order = c.replace_order_by_id(
             stop_order_id,
             order_data=ReplaceOrderRequest(stop_price=rounded),
         )
+        new_id = str(getattr(new_order, "id", "") or stop_order_id)
         _replace_stop_cache[stop_order_id] = rounded
-        return True
+        # Mirror the cache entry under the new id so a follow-up no-op
+        # replace is still recognized as idempotent.
+        _replace_stop_cache[new_id] = rounded
+        return new_id
     except Exception as e:
         err_lower = str(e).lower()
         # Alpaca briefly reports "order already replaced" when our previous
@@ -88,12 +96,12 @@ def replace_stop(stop_order_id: str, new_stop: float) -> bool:
                 f"replace_stop {stop_order_id}: already-replaced (racing prior tick), "
                 f"caching intent {rounded}"
             )
-            return True
+            return stop_order_id
         logger.error(
             f"replace_stop FAILED {stop_order_id} → {new_stop}: {e} "
             f"(broker stop unchanged, will retry next manage tick)"
         )
-        return False
+        return None
 
 
 def force_close_trade(
@@ -165,7 +173,10 @@ def force_close_trade(
             return
         px = _current_price(t.ticker)
         if px and t.entry_price:
-            t.realized_pl = (px - t.entry_price) * t.qty
+            # r42 fix #0.1: ADD runner-leg PnL to accumulated partial-trim
+            # PnL; prior `=` overwrite erased T1/T2 partials.
+            existing = float(t.realized_pl or 0.0)
+            t.realized_pl = round(existing + (px - t.entry_price) * t.qty, 2)
     else:
         sell = paper_trader.submit_simple_option_order(
             occ_symbol=t.symbol, qty=int(t.qty), side="sell",
@@ -185,7 +196,9 @@ def force_close_trade(
             return
         pos = paper_trader.get_option_position(t.symbol)
         if pos and pos.get("current_price") is not None and t.entry_price:
-            t.realized_pl = (pos["current_price"] - t.entry_price) * t.qty * 100
+            # r42 fix #0.1: ADD runner-leg PnL to accumulated partial PL.
+            existing = float(t.realized_pl or 0.0)
+            t.realized_pl = round(existing + (pos["current_price"] - t.entry_price) * t.qty * 100, 2)
 
     t.status = status_override or "closed_reverse"
     t.closed_at = datetime.utcnow()

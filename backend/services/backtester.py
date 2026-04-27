@@ -52,9 +52,60 @@ logger = logging.getLogger(__name__)
 # Trading cost model — applied as a per-side haircut to entry/exit prices so
 # every trade pays a realistic spread+commission round-trip drag. These default
 # to retail-broker norms; override via env to tune for your venue.
+#
+# r42 fix #1.4: liquidity-aware slippage. The flat-bps baseline below is the
+# floor; `_dynamic_slip_bps()` adds a multiplier per bar based on
+#   * volatility regime (intraday gap / ATR percentile)
+#   * dollar-volume of the bar (low ADV → wider spread)
+#   * time-of-day (first 5 min and last 5 min are 2-3× wider)
+# Live engine should consult the same model when sizing — the backtest
+# bias was strongest on the lowest-liquidity names, exactly where the
+# scanner finds the highest "edge".
 COMMISSION_BPS = float(os.getenv("BT_COMMISSION_BPS", "1.0"))   # 0.01% per side (most brokers free now)
-SLIPPAGE_BPS   = float(os.getenv("BT_SLIPPAGE_BPS",   "5.0"))   # 0.05% per side (typical retail spread)
+SLIPPAGE_BPS   = float(os.getenv("BT_SLIPPAGE_BPS",   "5.0"))   # 0.05% per side baseline (typical retail spread)
 COST_PER_SIDE  = (COMMISSION_BPS + SLIPPAGE_BPS) / 10000.0      # → 0.06% per side, 0.12% round-trip
+# Cap per-side cost so a pathological ADV/vol combo can't single-handedly
+# eat 5% per side — that's an indicator something else is wrong.
+MAX_COST_PER_SIDE = float(os.getenv("BT_MAX_COST_PER_SIDE", "0.020"))  # 200 bps
+
+
+def _dynamic_slip_bps(bar: dict, ts_hhmm: Optional[int] = None) -> float:
+    """Return additional slippage bps for a bar on top of the flat baseline.
+
+    Args:
+      bar: dict with keys Open/High/Low/Close/Volume — typical OHLCV row.
+      ts_hhmm: time-of-day as integer 0-2359 (e.g. 0935 = 935). Optional.
+
+    Heuristics (all additive):
+      * Low dollar volume: bar_dvol < $1M → +20 bps; < $5M → +5 bps.
+      * High intraday range vs typical: (H-L)/Close > 4% → +10 bps.
+      * Open auction (9:30-9:35 ET) and last-print (15:55-16:00) → +10 bps.
+    """
+    add = 0.0
+    try:
+        close = float(bar.get("Close") or 0)
+        if close > 0:
+            dvol = float(bar.get("Volume") or 0) * close
+            if dvol > 0:
+                if dvol < 1_000_000:
+                    add += 20.0
+                elif dvol < 5_000_000:
+                    add += 5.0
+            hi = float(bar.get("High") or close)
+            lo = float(bar.get("Low") or close)
+            rng = (hi - lo) / close if close > 0 else 0.0
+            if rng > 0.04:
+                add += 10.0
+    except Exception:
+        pass
+    if ts_hhmm is not None:
+        try:
+            t = int(ts_hhmm)
+            if 930 <= t <= 935 or 1555 <= t <= 1600:
+                add += 10.0
+        except Exception:
+            pass
+    return add
 
 # Audit fix C2: the backtester used to hardcode stop=1.5×ATR / target=2.5×ATR
 # regardless of timeframe, while the live signal_generator uses timeframe-
@@ -97,18 +148,25 @@ def _annualization_factor(timeframe: Optional[str]) -> float:
     return float(n ** 0.5)
 
 
-def _apply_costs(price: float, side: str, direction: str) -> float:
+def _apply_costs(price: float, side: str, direction: str,
+                 dyn_bps: float = 0.0) -> float:
     """
-    Worsen the price by COST_PER_SIDE in the direction that hurts the trader.
+    Worsen the price by base + dynamic slippage in the direction that hurts
+    the trader.
       • BUY  entry  → +cost  (you pay slightly more)
       • BUY  exit   → -cost  (you receive slightly less)
       • SELL entry → -cost  (short fills slightly lower)
       • SELL exit  → +cost  (you cover slightly higher)
+    `dyn_bps` is the additional liquidity-aware slippage from
+    `_dynamic_slip_bps`, capped along with the baseline at MAX_COST_PER_SIDE.
     """
+    cost = COST_PER_SIDE + (dyn_bps / 10000.0)
+    if cost > MAX_COST_PER_SIDE:
+        cost = MAX_COST_PER_SIDE
     if direction == "BUY":
-        return price * (1 + COST_PER_SIDE) if side == "entry" else price * (1 - COST_PER_SIDE)
+        return price * (1 + cost) if side == "entry" else price * (1 - cost)
     else:
-        return price * (1 - COST_PER_SIDE) if side == "entry" else price * (1 + COST_PER_SIDE)
+        return price * (1 - cost) if side == "entry" else price * (1 + cost)
 
 
 def _simulate(
@@ -223,7 +281,13 @@ def _simulate(
             a = max(a, 0.01)
 
         if not in_trade and bool(entries.iloc[i - 1]):
-            entry_price = _apply_costs(float(row["Open"]), "entry", direction)
+            # r42 fix #1.4: liquidity-aware slippage on entry.
+            try:
+                ts_int = int(d.index[i].strftime("%H%M")) if hasattr(d.index[i], "strftime") else None
+            except Exception:
+                ts_int = None
+            entry_dyn = _dynamic_slip_bps(row.to_dict(), ts_int)
+            entry_price = _apply_costs(float(row["Open"]), "entry", direction, dyn_bps=entry_dyn)
             entry_date = d.index[i]
             # r39 audit cleanup: removed unused `entry_idx = i`.
             # Compute gap-fill levels from history visible at entry (no look-ahead)
@@ -308,7 +372,13 @@ def _simulate(
                     elif lo <= target:
                         exit_price, exit_reason = target, "target"
                 if exit_price is not None:
-                    exit_price = _apply_costs(exit_price, "exit", direction)
+                    # r42 fix #1.4: liquidity-aware exit slippage.
+                    try:
+                        ts_int = int(d.index[i].strftime("%H%M")) if hasattr(d.index[i], "strftime") else None
+                    except Exception:
+                        ts_int = None
+                    exit_dyn = _dynamic_slip_bps(row.to_dict(), ts_int)
+                    exit_price = _apply_costs(exit_price, "exit", direction, dyn_bps=exit_dyn)
                     pnl_pct = ((exit_price - entry_price) / entry_price) if direction == "BUY" \
                               else ((entry_price - exit_price) / entry_price)
                     portfolio += portfolio * pnl_pct
@@ -339,8 +409,15 @@ def _simulate(
                 # `pnl_for_exit(px, frac)` returns the contribution to total
                 # PnL-per-dollar-of-original-exposure for selling `frac` of
                 # the *original* position at px.
+                # r42 fix #1.4: per-bar dynamic slippage on exit legs.
+                try:
+                    _ts_int = int(d.index[i].strftime("%H%M")) if hasattr(d.index[i], "strftime") else None
+                except Exception:
+                    _ts_int = None
+                _bar_dyn = _dynamic_slip_bps(row.to_dict(), _ts_int)
+
                 def _pnl_per_unit(px: float, frac: float) -> float:
-                    px_net = _apply_costs(px, "exit", direction)
+                    px_net = _apply_costs(px, "exit", direction, dyn_bps=_bar_dyn)
                     if direction == "BUY":
                         return ((px_net - entry_price) / entry_price) * frac
                     return ((entry_price - px_net) / entry_price) * frac
@@ -360,7 +437,7 @@ def _simulate(
                         "entry_date": str(entry_date.date()),
                         "exit_date": str(d.index[i].date()),
                         "entry_price": round(entry_price, 2),
-                        "exit_price": round(_apply_costs(px, "exit", direction), 2),
+                        "exit_price": round(_apply_costs(px, "exit", direction, dyn_bps=_bar_dyn), 2),
                         "pnl_pct": round(partial_pl_dollars * 100, 2),
                         "exit_reason": reason,
                         "type": direction,
@@ -478,9 +555,29 @@ def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float,
     drawdown = (np.array(eq_values) - peak) / peak * 100
     max_dd = float(np.min(drawdown)) if len(drawdown) else 0.0
 
+    # r42 fix #1.2: bar-level Sharpe is diluted by long zero-return idle
+    # stretches between trades — a strategy that trades 1× per week shows
+    # 80%+ zero bars, mean-and-std collapse to noise. Switch to per-trade
+    # Sharpe (trade returns + sqrt(trades_per_year)) and keep the bar-level
+    # number as a debugging aux (`_sharpe_bar`) so we can compare.
     bar_ret = pd.Series(eq_values).pct_change().dropna()
     ann_factor = _annualization_factor(timeframe)
-    sharpe = float(bar_ret.mean() / bar_ret.std() * ann_factor) if bar_ret.std() > 0 else 0.0
+    sharpe_bar = float(bar_ret.mean() / bar_ret.std() * ann_factor) if bar_ret.std() > 0 else 0.0
+    # Per-trade Sharpe: each trade's pnl_pct as one observation.
+    pnl_arr = pd.Series(pnls)
+    if len(pnl_arr) >= 2 and pnl_arr.std() > 0:
+        # Annualize by trade frequency. We approximate trades/year from the
+        # equity-curve span; fall back to N=trades when span unknown.
+        try:
+            t0 = pd.to_datetime(trades[0].get("entry_date"))
+            t1 = pd.to_datetime(trades[-1].get("exit_date") or trades[-1].get("entry_date"))
+            years = max(0.1, (t1 - t0).days / 365.25)
+            tpy = len(pnls) / years
+        except Exception:
+            tpy = max(len(pnls), 1)
+        sharpe = float(pnl_arr.mean() / pnl_arr.std() * (tpy ** 0.5))
+    else:
+        sharpe = sharpe_bar
 
     return {
         "stats": {
@@ -490,6 +587,7 @@ def _build_stats(trades: List[dict], equity: List[dict], final_portfolio: float,
             "total_return_pct": round(total_return, 2),
             "max_drawdown_pct": round(max_dd, 2),
             "sharpe_ratio": round(sharpe, 2),
+            "sharpe_bar": round(sharpe_bar, 2),
             "avg_win_pct": round(avg_win, 2),
             "avg_loss_pct": round(avg_loss, 2),
         },
@@ -556,10 +654,23 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
     if df.empty or len(df) < 120:
         return {"results": [], "best": None}
 
+    # r42 fix #1.1: walk-forward look-ahead leak. We previously called
+    # compute_indicators on the FULL frame before splitting into folds.
+    # The bare EMA/ATR/RSI families are causal, but several supporting
+    # modules pivot on rolling normalization (z-scores, percent-rank)
+    # whose denominator includes future bars when computed on the full
+    # frame. That leaked future information into each test fold.
+    #
+    # Fix: keep `d_full` (full-frame indicators, used only for the UI
+    # `full_results` chart and the liquidity-gate calculation) and
+    # additionally recompute indicators inside each fold from the raw
+    # OHLCV slice `df.iloc[:fold_end]`. The fold simulator only sees
+    # bars that would have existed at the time of the test bar.
     d = compute_indicators(df.copy())
     d = d.dropna(subset=["SMA_50"]).copy()
     if len(d) < 60:
         return {"results": [], "best": None}
+    raw = df.copy()
 
     # Sanity-filter malformed bars before simulating. Yahoo / Alpaca occasionally
     # emit zero-volume halt prints, or High<Low artifacts from corporate-action
@@ -632,7 +743,19 @@ def run_multi_strategy(df: pd.DataFrame, timeframe: Optional[str] = None) -> Dic
         for fold_i in range(4):
             s = wf_start + fold_i * fold_width
             e = s + fold_width
-            fold_df = d.iloc[s:e].copy()
+            # r42 fix #1.1: recompute indicators on raw bars THROUGH the
+            # fold's end only — never including future bars. This kills
+            # any rolling-normalization leakage from the full-history
+            # `d` precompute above.
+            fold_raw = raw.iloc[:e].copy()
+            try:
+                fold_d_full = compute_indicators(fold_raw)
+                fold_d_full = fold_d_full.dropna(subset=["SMA_50"]).copy()
+            except Exception as _e:
+                logger.debug(f"walk-forward indicator recompute failed for fold {fold_i}: {_e}")
+                continue
+            # Slice the fold-window from the freshly-computed frame.
+            fold_df = fold_d_full.iloc[max(0, s):e].copy()
             if len(fold_df) < 20:
                 continue
             fold_results = _evaluate(fold_df)

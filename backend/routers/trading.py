@@ -210,6 +210,18 @@ def auto_trades(limit: int = 50):
     return auto_trader.list_trades(limit=limit)
 
 
+@router.get("/auto/skip-counts")
+def auto_skip_counts():
+    """r42 fix #1.25: counter snapshot for the UI's "rejected signals" view.
+    Pairs `autotrade_skip{reason}` with `autotrade_event{event}` so the
+    operator can see at a glance why the bot is sitting idle."""
+    from services import metrics as _m
+    return {
+        "skips": _m.autotrade_skip_counts(),
+        "events": _m.autotrade_event_counts(),
+    }
+
+
 @router.get("/auto/pdt")
 def auto_pdt():
     """PDT (Pattern Day Trader) day-trade counter for the trailing 5

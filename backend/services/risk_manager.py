@@ -239,7 +239,15 @@ def adaptive_risk_multiplier() -> float:
     except Exception:
         pass
 
-    # 30-day realized win rate from closed auto-trades
+    # 30-day expectancy from closed auto-trades.
+    # r42 fix #1.3: previous logic used count-weighted WR ("9 small wins +
+    # 1 big loss = 90% healthy"). Switch to *expectancy* (avg-PnL per trade).
+    # Expectancy < 0 means the strategy is losing money on average — that
+    # IS the signal to size down regardless of WR. We keep `recent_wr`
+    # for the surface label (operators read WR) but the gate is on
+    # expectancy.
+    recent_wr = None
+    expectancy = None
     try:
         from database import SessionLocal, AutoTrade
         from datetime import datetime, timedelta
@@ -252,12 +260,16 @@ def adaptive_risk_multiplier() -> float:
                 AutoTrade.realized_pl.isnot(None),
             ).all()
             n = len(closed)
-            wins = sum(1 for t in closed if (t.realized_pl or 0) > 0)
-            recent_wr = (wins / n * 100) if n >= 10 else None
+            if n >= 10:
+                wins = sum(1 for t in closed if (t.realized_pl or 0) > 0)
+                recent_wr = (wins / n * 100)
+                pnls = [float(t.realized_pl or 0.0) for t in closed]
+                expectancy = sum(pnls) / n
         finally:
             db.close()
     except Exception:
         recent_wr = None
+        expectancy = None
 
     # Strategy-drawdown trigger (r38, external review pass 5): build a
     # 30-day cumulative-realized-PnL curve from closed AutoTrades; if the
@@ -314,7 +326,11 @@ def adaptive_risk_multiplier() -> float:
         mult *= 0.5
     elif vix_level is not None and vix_level > 20:
         mult *= 0.75
-    if recent_wr is not None and recent_wr < 55.0:
+    # r42 fix #1.3: gate on expectancy first (zero-pnl-bias-free), but
+    # keep the WR fallback for tiny samples where avg-PnL is noisy.
+    if expectancy is not None and expectancy <= 0:
+        mult *= 0.5
+    elif recent_wr is not None and recent_wr < 55.0:
         mult *= 0.5
     if spy_adx is not None and spy_adx < 20.0:
         mult *= 0.5
@@ -335,20 +351,17 @@ def adaptive_risk_multiplier() -> float:
 
 
 def should_freeze_trading() -> Optional[str]:
-    """r39 audit fix #8: hard freeze trigger on a clear losing streak.
+    """Hard freeze trigger on a clear losing streak.
 
-    Returns a reason string when trading should be paused entirely, or
-    None when normal sizing applies.
+    r42 fix #1.3: combine count-WR with PnL-based expectancy and a sum-
+    realized-PnL drawdown floor. Pure WR was tricked by 9-small-wins-and-
+    1-big-loss patterns into reporting "healthy" while the strategy bled.
 
-    Trigger: trailing-30d realized win-rate < 35% with ≥ 5 closed trades.
-    The number 5 is small enough to react fast; below 35% WR we're no
-    longer in "size down to find your edge", we're in "stop and figure
-    out what's wrong". `adaptive_risk_multiplier` already shrinks size on
-    < 55% WR; this is the next step beyond that — the engineering kill
-    switch the strategy needs but the operator hasn't manually tripped.
-
-    Caller in `consider_signal` short-circuits with
-    `autotrade_skip{reason=trading_frozen}` when this returns non-None.
+    Triggers (any one of):
+      * WR < 35% AND ≥ 5 closed trades
+      * expectancy ≤ 0 AND ≥ 10 closed trades AND sum_PnL ≤ -2× |worst trade|
+        (this last clause skips the gate when the negative expectancy is
+         driven by a single fat-tail loss already in the rear-view mirror)
     """
     try:
         from database import SessionLocal, AutoTrade
@@ -366,11 +379,20 @@ def should_freeze_trading() -> Optional[str]:
                 return None
             wins = sum(1 for t in closed if (t.realized_pl or 0) > 0)
             wr_pct = (wins / n) * 100
+            pnls = [float(t.realized_pl or 0.0) for t in closed]
+            sum_pl = sum(pnls)
+            expectancy = sum_pl / n
+            worst = min(pnls) if pnls else 0.0
             if wr_pct < 35.0:
                 return (
                     f"trailing-30d WR {wr_pct:.0f}% < 35% on {n} trades — "
-                    f"trading frozen until streak ends or operator overrides "
-                    f"(extend lookback / wait for closed trades to age out)"
+                    f"trading frozen (extend lookback / wait for closed trades to age out)"
+                )
+            if n >= 10 and expectancy <= 0 and sum_pl <= -2.0 * abs(worst):
+                return (
+                    f"trailing-30d expectancy ${expectancy:.2f}/trade ≤ 0, "
+                    f"sum=${sum_pl:.2f}, worst=${worst:.2f} — losses span beyond "
+                    f"a single fat-tail; trading frozen pending edge review"
                 )
             return None
         finally:

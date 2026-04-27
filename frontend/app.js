@@ -1,4 +1,37 @@
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// r42: max age in ms before a live quote is considered stale (visual dimming
+// + dropped from "live" overlay). Tuned for the ~5s WS quote cadence with
+// generous slack for bg-tab throttling.
+const QUOTE_STALE_MS = 30000;
+
+// Whitelist URL schemes for hrefs supplied by API responses (news, alerts).
+// r42 fix #2.25: protect against `javascript:` URLs in attacker-controlled
+// API content. Returns '#' for anything not http(s) or relative.
+function safeHref(url) {
+  if (!url) return '#';
+  try {
+    const s = String(url).trim();
+    if (s.startsWith('/') || s.startsWith('./') || s.startsWith('#')) return s;
+    const u = new URL(s, window.location.origin);
+    if (u.protocol === 'http:' || u.protocol === 'https:') return u.toString();
+  } catch (_) {}
+  return '#';
+}
+
+// r42 fix #2.9: Naive ISO strings (no Z suffix) coming from
+// `datetime.utcnow().isoformat()` should be parsed as UTC, not local.
+function parseServerDate(s) {
+  if (!s) return null;
+  // ISO with explicit TZ (...Z or +HH:MM) is parsed correctly already.
+  if (/[zZ]|[+\-]\d{2}:?\d{2}$/.test(s)) {
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  // Bare ISO — append Z to force UTC interpretation.
+  const d = new Date(s.endsWith('Z') ? s : s + 'Z');
+  return isNaN(d.getTime()) ? null : d;
+}
 
 // ---------- Theme ----------
 // Persist in localStorage; the index.html pre-paint script applies it before
@@ -75,18 +108,37 @@ const DEFAULT_VISIBLE_BARS = {
   '1mo': 120,   // 10 years
 };
 
-// ---------- API key (shared secret, stored in localStorage) ----------
+// ---------- API key (shared secret) ----------
 // The backend gates every /api/* endpoint with `X-API-Key`. The browser
 // can't set headers on WebSockets, so we also append `?token=` to the WS
-// URL. The login screen in <App/> populates this on first visit.
+// URL. r42 fix #2.26: prefer sessionStorage so the secret dies on tab
+// close; fall back to localStorage only for users who explicitly opted
+// into "remember me" via the login screen.
 const API_KEY_STORAGE = 'app_api_key';
+const API_KEY_REMEMBER = 'app_api_key_remember';
 function getApiKey() {
-  try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch (_) { return ''; }
-}
-function setApiKey(k) {
   try {
-    if (k) localStorage.setItem(API_KEY_STORAGE, k);
-    else   localStorage.removeItem(API_KEY_STORAGE);
+    return sessionStorage.getItem(API_KEY_STORAGE)
+        || localStorage.getItem(API_KEY_STORAGE)
+        || '';
+  } catch (_) { return ''; }
+}
+function setApiKey(k, remember) {
+  try {
+    if (k) {
+      sessionStorage.setItem(API_KEY_STORAGE, k);
+      if (remember) {
+        localStorage.setItem(API_KEY_STORAGE, k);
+        localStorage.setItem(API_KEY_REMEMBER, '1');
+      } else {
+        localStorage.removeItem(API_KEY_STORAGE);
+        localStorage.removeItem(API_KEY_REMEMBER);
+      }
+    } else {
+      sessionStorage.removeItem(API_KEY_STORAGE);
+      localStorage.removeItem(API_KEY_STORAGE);
+      localStorage.removeItem(API_KEY_REMEMBER);
+    }
   } catch (_) {}
 }
 function authHeaders() {
@@ -94,37 +146,81 @@ function authHeaders() {
   return k ? { 'X-API-Key': k } : {};
 }
 
-// Global 401 handler — one bad key invalidates the session and forces a
-// re-login. Dispatches a custom event the App root listens for.
 function on401() {
   setApiKey('');
   window.dispatchEvent(new CustomEvent('app:unauthorized'));
 }
 
+// r42 fix #1.23: surface meaningful error detail to callers instead of
+// reducing every failure to a bare statusText. Callers that want to show
+// a toast/banner can read `err.detail` and `err.status`.
+async function readError(r) {
+  let detail = '';
+  try {
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      const j = await r.json();
+      detail = j.detail || j.error || JSON.stringify(j);
+    } else {
+      detail = (await r.text()).slice(0, 400);
+    }
+  } catch (_) {}
+  const err = new Error(detail || r.statusText || `HTTP ${r.status}`);
+  err.status = r.status;
+  err.detail = detail;
+  return err;
+}
+
 const api = {
   get: (path) => fetch(`${API_BASE}${path}`, { headers: authHeaders() })
-    .then(r => {
-      if (r.status === 401) { on401(); return Promise.reject('unauthorized'); }
-      return r.ok ? r.json() : Promise.reject(r.statusText);
+    .then(async r => {
+      if (r.status === 401) { on401(); throw await readError(r); }
+      if (!r.ok) throw await readError(r);
+      return r.json();
     }),
   post: (path, body) => fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: body ? JSON.stringify(body) : undefined,
-  }).then(r => {
-    if (r.status === 401) { on401(); return Promise.reject('unauthorized'); }
-    return r.ok ? r.json() : r.json().then(e => Promise.reject(e.detail || r.statusText));
+  }).then(async r => {
+    if (r.status === 401) { on401(); throw await readError(r); }
+    if (!r.ok) throw await readError(r);
+    return r.json();
+  }),
+  patch: (path, body) => fetch(`${API_BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: body ? JSON.stringify(body) : undefined,
+  }).then(async r => {
+    if (r.status === 401) { on401(); throw await readError(r); }
+    if (!r.ok) throw await readError(r);
+    return r.json();
   }),
   delete: (path) => fetch(`${API_BASE}${path}`, { method: 'DELETE', headers: authHeaders() })
-    .then(r => {
-      if (r.status === 401) { on401(); return Promise.reject('unauthorized'); }
-      return r.ok ? r.json() : Promise.reject(r.statusText);
+    .then(async r => {
+      if (r.status === 401) { on401(); throw await readError(r); }
+      if (!r.ok) throw await readError(r);
+      return r.json();
     }),
 };
 
 // ---------- Live Quotes WebSocket ----------
 // Connects to /ws/quotes and maintains {SYMBOL: {bid, ask, last, ts}} in state.
-// `onSignalUpdate(ticker)` fires when the server live-recomputes signals so the UI can refetch.
+// `onSignalUpdate(ticker)` fires when the server live-recomputes signals so
+// the UI can refetch.
+//
+// r42 changes:
+//  • Exponential backoff + jitter (#2.8) — was a constant 3s, hammered a
+//    restarting server.
+//  • visibilitychange-driven re-check (#2.7) — when the user returns to a
+//    backgrounded tab the connection is force-recycled if dead, and a
+//    `app:resync` event fires so panels can refetch state lost during the
+//    disconnect window (#1.11 reconnect-event-loss).
+//  • Broader event fan-out (#1.12) — trade_opened, alert, news, option_quote
+//    are forwarded as window events; previously only target_hit and
+//    trade_closed were broadcast.
+//  • Quotes carry `_localTs` (Date.now() at receipt) so the UI can render a
+//    staleness pill independent of server clock skew.
 function useLiveQuotes(onSignalUpdate) {
   const [quotes, setQuotes] = useState({});
   const [connected, setConnected] = useState(false);
@@ -133,20 +229,32 @@ function useLiveQuotes(onSignalUpdate) {
   useEffect(() => {
     let closed = false;
     let reconnectTimer = null;
+    let backoff = 1000;  // start at 1s, cap at 30s
 
     const connect = () => {
-      // Browsers can't set headers on WebSockets; token auth via query param.
-      // The backend verifies it with the same constant-time compare.
       const key = getApiKey();
       const q = key ? `?token=${encodeURIComponent(key)}` : '';
       const wsUrl = API_BASE.replace(/^http/, 'ws') + '/ws/quotes' + q;
-      const ws = new WebSocket(wsUrl);
+      let ws;
+      try { ws = new WebSocket(wsUrl); }
+      catch (_) {
+        if (!closed) reconnectTimer = setTimeout(connect, backoff);
+        backoff = Math.min(30000, backoff * 2) + Math.floor(Math.random() * 500);
+        return;
+      }
       wsRef.current = ws;
 
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        setConnected(true);
+        backoff = 1000;
+        // Tell every panel to refetch — events delivered while the socket
+        // was down are gone; the only safe recovery is a state refresh.
+        try { window.dispatchEvent(new CustomEvent('app:resync')); } catch (_) {}
+      };
       ws.onclose = () => {
         setConnected(false);
-        if (!closed) reconnectTimer = setTimeout(connect, 3000);
+        if (!closed) reconnectTimer = setTimeout(connect, backoff);
+        backoff = Math.min(30000, backoff * 2) + Math.floor(Math.random() * 500);
       };
       ws.onerror = () => { try { ws.close(); } catch (e) {} };
       ws.onmessage = (ev) => {
@@ -157,8 +265,16 @@ function useLiveQuotes(onSignalUpdate) {
           console.warn('ws: missing type', msg);
           return;
         }
+        const localTs = Date.now();
         if (msg.type === 'snapshot') {
-          setQuotes(msg.stocks && typeof msg.stocks === 'object' ? msg.stocks : {});
+          const stocks = msg.stocks && typeof msg.stocks === 'object' ? msg.stocks : {};
+          // Stamp _localTs on each ingested entry so we can flag stale
+          // overlay quotes after disconnect / tab-throttle.
+          const stamped = {};
+          for (const sym of Object.keys(stocks)) {
+            stamped[sym] = { ...stocks[sym], _localTs: localTs };
+          }
+          setQuotes(stamped);
         } else if (msg.type === 'stock_trade' || msg.type === 'stock_quote') {
           if (typeof msg.symbol !== 'string' || !msg.symbol) {
             console.warn('ws: missing symbol on', msg.type);
@@ -166,23 +282,51 @@ function useLiveQuotes(onSignalUpdate) {
           }
           setQuotes(prev => ({
             ...prev,
-            [msg.symbol]: { ...(prev[msg.symbol] || {}), ...msg },
+            [msg.symbol]: { ...(prev[msg.symbol] || {}), ...msg, _localTs: localTs },
           }));
         } else if (msg.type === 'signals_updated' && onSignalUpdate && typeof msg.symbol === 'string') {
           onSignalUpdate(msg.symbol);
         } else if (msg.type === 'target_hit') {
-          // Fire a toast + browser notification for T1/T2/T3 hits.
           try { window.dispatchEvent(new CustomEvent('app:target_hit', { detail: msg })); } catch (_) {}
         } else if (msg.type === 'trade_closed') {
-          // Same fan-out — close-side toast + notification.
           try { window.dispatchEvent(new CustomEvent('app:trade_closed', { detail: msg })); } catch (_) {}
+        } else if (msg.type === 'trade_opened') {
+          try { window.dispatchEvent(new CustomEvent('app:trade_opened', { detail: msg })); } catch (_) {}
+        } else if (msg.type === 'alert') {
+          try { window.dispatchEvent(new CustomEvent('app:alert', { detail: msg })); } catch (_) {}
+        } else if (msg.type === 'news') {
+          try { window.dispatchEvent(new CustomEvent('app:news', { detail: msg })); } catch (_) {}
+        } else if (msg.type === 'option_quote') {
+          try { window.dispatchEvent(new CustomEvent('app:option_quote', { detail: msg })); } catch (_) {}
         }
+        // Unknown types are silently ignored to keep forward-compat — but
+        // we don't drop quote/event semantics behind the user's back.
       };
     };
 
     connect();
+
+    // r42 fix #2.7: when the tab returns to focus, if our socket is
+    // dead, force-reconnect immediately rather than waiting out the
+    // backoff timer.
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        backoff = 1000;
+        connect();
+      } else {
+        // Even if the socket says it's open, force a state refresh on
+        // returning from background — bg-throttled tabs miss events.
+        try { window.dispatchEvent(new CustomEvent('app:resync')); } catch (_) {}
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+
     return () => {
       closed = true;
+      document.removeEventListener('visibilitychange', onVis);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (wsRef.current) { try { wsRef.current.close(); } catch (e) {} }
     };
@@ -199,17 +343,33 @@ function SignalBadge({ type, confidence, isNew }) {
     NEUTRAL: 'bg-slate-500/15 text-slate-300 border-slate-500/25',
   };
   const klass = colors[type] || colors.NEUTRAL;
+  // r42 fix #2.11: confidence tooltip — explains it's a composite weighted
+  // score (0-95), NOT win-probability. Operators were over-trusting "85%".
+  const confTitle = (
+    "Composite signal score, 0-95.\n"
+    + "It's a weighted blend of trend alignment, momentum, S/R position,\n"
+    + "regime, volume, fundamentals, and analyst consensus — NOT a literal\n"
+    + "win-probability. The auto-trader takes signals ≥ confidence_threshold\n"
+    + "and scales risk by a [0.7, 1.4] multiplier within the band."
+  );
   return (
-    <div className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold tracking-wide border ${klass}`}>
+    <div
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold tracking-wide border ${klass}`}
+      title={confidence ? confTitle : undefined}
+    >
       {isNew && <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />}
       {type}
-      {confidence && <span className="opacity-70">{Math.round(confidence)}%</span>}
+      {confidence ? <span className="opacity-70">{Math.round(confidence)}<span aria-hidden>%</span></span> : null}
     </div>
   );
 }
 
 // ---------- Watchlist Panel ----------
-function WatchlistPanel({ overview, selected, onSelect, onAdd, onRemove, onRefresh, onCloseMobile }) {
+// r42 fix #1.26: WatchlistPanel re-renders on every quote tick because
+// `overview` is memoized at the parent. Wrap with React.memo so equal-
+// reference props skip the re-render entirely. Stable parent callbacks
+// (loadOverview, handleAdd, handleRemove) make this safe.
+const WatchlistPanel = React.memo(function WatchlistPanelImpl({ overview, selected, onSelect, onAdd, onRemove, onRefresh, onCloseMobile }) {
   const [newTicker, setNewTicker] = useState('');
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState(null);
@@ -282,7 +442,15 @@ function WatchlistPanel({ overview, selected, onSelect, onAdd, onRemove, onRefre
             </div>
             {item.price != null && (
               <div className="flex items-baseline justify-between mt-1">
-                <span className="text-sm font-mono font-semibold tabular-nums">${item.price.toFixed(2)}</span>
+                <span className={`text-sm font-mono font-semibold tabular-nums ${item.stale ? 'opacity-50' : ''}`}>
+                  ${item.price.toFixed(2)}
+                  {item.stale && (
+                    <span
+                      className="ml-1 text-[9px] uppercase tracking-wider text-amber-400"
+                      title="Quote is stale — last tick > 30s ago, or WS disconnected"
+                    >stale</span>
+                  )}
+                </span>
                 {/* Audit fix M8: `null >= 0` is true in JS, so guard rendering
                     explicitly to avoid showing "+undefined%" when change_pct
                     is null/NaN. */}
@@ -300,7 +468,7 @@ function WatchlistPanel({ overview, selected, onSelect, onAdd, onRemove, onRefre
       </div>
     </div>
   );
-}
+});
 
 // ---------- Stock Chart ----------
 function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideIndicators = false }) {
@@ -627,7 +795,10 @@ function StockChart({ ticker, timeframe, liveQuote = null, theme = 'dark', hideI
       return;
     }
 
-    const tickSec = Math.floor((liveQuote.ts || Date.now() / 1000));
+    // r42 Tier 3: backend ts can arrive in ms (>1e12) or sec; normalize.
+    let _ts = liveQuote.ts;
+    if (typeof _ts === 'number' && _ts > 1e12) _ts = _ts / 1000;
+    const tickSec = Math.floor((_ts || Date.now() / 1000));
     const lastBucket = Math.floor(bar.time / dur) * dur;
     const tickBucket = Math.floor(tickSec / dur) * dur;
 
@@ -1148,7 +1319,11 @@ function SentimentPill({ label, score, severity }) {
 
 function relativeTime(isoStr) {
   if (!isoStr) return '';
-  const d = new Date(isoStr);
+  // r42 fix #2.9: parse via parseServerDate so naive ISO strings (no Z)
+  // are treated as UTC, not local. Previously a naive UTC timestamp was
+  // parsed as local time → "X minutes ago" was wrong by hours-of-offset.
+  const d = parseServerDate(isoStr);
+  if (!d) return '';
   const diffMs = Date.now() - d.getTime();
   const mins = Math.max(1, Math.round(diffMs / 60000));
   if (mins < 60) return `${mins}m ago`;
@@ -1200,7 +1375,7 @@ function NewsPanel({ ticker }) {
           {shown.map(it => (
             <a
               key={it.id}
-              href={it.url || '#'}
+              href={safeHref(it.url)}
               target="_blank"
               rel="noopener noreferrer"
               className="block surface-soft rounded-xl p-3 lift hover:bg-white/3"
@@ -1313,10 +1488,10 @@ function TradeRationale({ tradeId }) {
         <Section title="Best strategy on this ticker (walk-forward)" accent="blue">
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 font-mono text-[11px]">
             <div className="col-span-2">{data.backtest.winning_strategy} <span className="app-text-muted">({data.backtest.winning_direction})</span></div>
-            <div>conf: {fmtNum(data.backtest.confidence, 0)}</div>
+            <div>conf: {fmtNum(data.backtest.confidence, 0)}<span className="app-text-muted">%</span></div>
             <div>OOS trades: {data.backtest.oos_trades ?? '—'}</div>
             <div>win rate: {fmtPct(data.backtest.win_rate)}</div>
-            <div>avg P/L: {fmtNum(data.backtest.avg_pl, 1)}</div>
+            <div>avg P/L: {data.backtest.avg_pl == null ? '—' : `${data.backtest.avg_pl >= 0 ? '+' : ''}${data.backtest.avg_pl.toFixed(1)}%`}</div>
           </div>
         </Section>
       )}
@@ -1418,7 +1593,7 @@ function TradeNewsContext({ tradeId }) {
             <div className="text-[10px] uppercase tracking-wider app-text-muted font-semibold mb-1.5">{label} ({list.length})</div>
             <div className="space-y-1.5">
               {list.slice(0, 5).map(a => (
-                <a key={a.id} href={a.url || '#'} target="_blank" rel="noopener noreferrer"
+                <a key={a.id} href={safeHref(a.url)} target="_blank" rel="noopener noreferrer"
                    className="block hover:bg-white/5 rounded px-1 py-0.5">
                   <div className="flex items-start gap-2">
                     <SentimentPill label={a.sentiment_label} score={a.sentiment_score} severity={a.severity} />
@@ -1858,20 +2033,33 @@ function TradeFromSignal({ signal }) {
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState(null);
   const [err, setErr] = useState(null);
+  // r42 fix #2.22: Escape closes the modal.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') { setOpen(false); setResult(null); setErr(null); }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open]);
 
   const tp = signal[target];
-  // Audit fix M9: validate qty input. Empty input → Number(qty)=NaN → server
-  // 422 with confusing alert. Clamp + Number-coerce here so the displayed
-  // notional/risk are real numbers and submit can be gated.
+  // r42 fix #1.15 + #2.17: validate qty + apply ×100 contract multiplier on
+  // option signals. Audit fix M9: empty input → Number(qty)=NaN.
   const qtyNum = Number(qty);
-  const qtyValid = Number.isFinite(qtyNum) && qtyNum >= 1;
+  const qtyValid = Number.isFinite(qtyNum) && qtyNum >= 1 && qtyNum <= 10000;
   const safeQty = qtyValid ? qtyNum : 0;
-  const cost = (signal.entry * safeQty).toFixed(2);
+  // Heuristic: if the signal carries an option asset_type or has an OCC-style
+  // symbol, treat each unit as 100 shares. r42 fix #1.15.
+  const isOption = signal.asset_type === 'option'
+    || /^[A-Z]+\d{6}[CP]\d{8}$/.test(String(signal.symbol || ''));
+  const contractMultiplier = isOption ? 100 : 1;
+  const cost = (signal.entry * safeQty * contractMultiplier).toFixed(2);
   const risk = signal.stop_loss != null
-    ? (Math.abs(signal.entry - signal.stop_loss) * safeQty).toFixed(2)
+    ? (Math.abs(signal.entry - signal.stop_loss) * safeQty * contractMultiplier).toFixed(2)
     : null;
   const reward = tp != null
-    ? (Math.abs(tp - signal.entry) * safeQty).toFixed(2)
+    ? (Math.abs(tp - signal.entry) * safeQty * contractMultiplier).toFixed(2)
     : null;
 
   const submit = async () => {
@@ -1913,8 +2101,15 @@ function TradeFromSignal({ signal }) {
           <div className="grid grid-cols-3 gap-2 text-xs">
             <div>
               <label className="text-gray-500 block mb-1">Quantity</label>
-              <input type="number" min="1" value={qty} onChange={e => setQty(e.target.value)}
-                     className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm" />
+              <input
+                type="number"
+                min="1"
+                max="10000"
+                step="1"
+                value={qty}
+                onChange={e => setQty(e.target.value)}
+                aria-label={`${isOption ? 'Contracts' : 'Shares'} to buy`}
+                className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm" />
             </div>
             <div>
               <label className="text-gray-500 block mb-1">Take-profit</label>
@@ -1987,8 +2182,7 @@ function CandidatePoolPanel() {
   const rescan = useCallback(async () => {
     setScanning(true); setErr(null);
     try {
-      const r = await api.post('/api/trading/auto/universe-scan');
-      console.info('universe scan result', r);
+      await api.post('/api/trading/auto/universe-scan');
       await load();
     } catch (e) {
       setErr(String(e));
@@ -2094,10 +2288,9 @@ function AutoTraderPanel({ reloadToken }) {
   const [newsExpanded, setNewsExpanded] = useState(null); // trade.id whose news context is open
   const [rationaleExpanded, setRationaleExpanded] = useState(null); // trade.id whose rationale is open
 
-  // Perf: puts-watch iterates the full watchlist, synthesises a bear thesis
-  // per ticker, and fetches option chains — it was gating the whole panel's
-  // first paint. Now: status + trades load fast (they're cheap DB queries);
-  // puts-watch is fetched lazily when the user expands that section.
+  const [error, setError] = useState(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [savedToast, setSavedToast] = useState(null);
   const inFlight = useRef(false);
   const load = useCallback(async () => {
     if (inFlight.current) return;
@@ -2108,36 +2301,71 @@ function AutoTraderPanel({ reloadToken }) {
         api.get('/api/trading/auto/trades?limit=20'),
       ]);
       const [sr, tr] = results;
-      if (sr.status === 'fulfilled') setStatus(sr.value);
-      if (tr.status === 'fulfilled') setTrades(tr.value || []);
+      let anyOk = false;
+      if (sr.status === 'fulfilled') { setStatus(sr.value); anyOk = true; }
+      if (tr.status === 'fulfilled') { setTrades(tr.value || []); anyOk = true; }
+      // r42 fix #1.22 / #1.30: distinguish "the request failed" from "no
+      // data yet". When BOTH fetches reject, surface a banner so the
+      // operator doesn't read an empty panel as "all clear".
+      setLoadFailed(!anyOk);
+      setError(anyOk ? null : (sr.status === 'rejected' ? (sr.reason?.detail || sr.reason?.message || 'Failed to load auto-trader status') : null));
     } finally {
       inFlight.current = false;
     }
   }, []);
 
+  // r42 fix #1.13 + #1.20: refresh on push events (trade_opened, trade_closed,
+  // app:resync) so we don't wait for the 30s poll. Polling moves to 30s
+  // since the WS is now the primary update channel.
   useEffect(() => {
     load();
-    const iv = setInterval(load, 15000);
-    return () => clearInterval(iv);
+    const iv = setInterval(() => {
+      // r42 fix #2.28: skip polling when tab is hidden — push will
+      // catch us up on visibilitychange.
+      if (document.visibilityState !== 'visible') return;
+      load();
+    }, 30000);
+    const onPush = () => load();
+    window.addEventListener('app:trade_opened', onPush);
+    window.addEventListener('app:trade_closed', onPush);
+    window.addEventListener('app:resync', onPush);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener('app:trade_opened', onPush);
+      window.removeEventListener('app:trade_closed', onPush);
+      window.removeEventListener('app:resync', onPush);
+    };
   }, [load, reloadToken]);
+
+  const showToast = useCallback((msg, kind = 'success') => {
+    setSavedToast({ msg, kind });
+    setTimeout(() => setSavedToast(null), 2000);
+  }, []);
 
   const toggle = async () => {
     if (!status) return;
-    setBusy(true);
+    if (status.enabled && !confirm('Pause auto-trader?\nNo new entries will open. Existing positions continue to be managed (trailing stops still trail).')) return;
+    setBusy(true); setError(null);
     try {
-      await api.post('/api/trading/auto/config', { enabled: !status.enabled });
+      // r42 fix #1.14: VERIFY the response before optimistic UI update.
+      const r = await api.post('/api/trading/auto/config', { enabled: !status.enabled });
+      // The status endpoint returns the new config — read back authoritatively.
       await load();
-    } catch (e) { alert('Toggle failed: ' + (e.detail || e)); }
-    finally { setBusy(false); }
+      showToast(r?.enabled === !status.enabled ? 'Updated' : 'Saved', 'success');
+    } catch (e) {
+      setError('Toggle failed: ' + (e?.detail || e?.message || e));
+    } finally { setBusy(false); }
   };
 
   const updateCfg = async (patch) => {
-    setBusy(true);
+    setBusy(true); setError(null);
     try {
       await api.post('/api/trading/auto/config', patch);
       await load();
-    } catch (e) { alert('Update failed: ' + (e.detail || e)); }
-    finally { setBusy(false); }
+      showToast('Saved', 'success');
+    } catch (e) {
+      setError('Update failed: ' + (e?.detail || e?.message || e));
+    } finally { setBusy(false); }
   };
 
   if (!status) {
@@ -2212,6 +2440,18 @@ function AutoTraderPanel({ reloadToken }) {
         </div>
       </div>
 
+      {error && (
+        <div role="alert" className="rounded-lg border border-red-500/40 bg-red-500/10 text-red-200 text-xs px-3 py-2 mb-3">
+          {error}{' '}
+          <button onClick={() => { setError(null); load(); }} className="underline">Retry</button>
+        </div>
+      )}
+      {savedToast && (
+        <div role="status" className={`rounded-lg border text-xs px-3 py-2 mb-3 ${savedToast.kind === 'success' ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/40 bg-amber-500/10 text-amber-200'}`}>
+          {savedToast.msg}
+        </div>
+      )}
+
       {/* Hero stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
         <Stat
@@ -2229,18 +2469,27 @@ function AutoTraderPanel({ reloadToken }) {
           value={liveCount}
           hint={`${trades.length} total`}
         />
-        <Stat
-          label="Today P/L"
-          value={(() => {
-            const pl = trades
-              .filter(t => t.closed_at && new Date(t.closed_at).toDateString() === new Date().toDateString())
-              .reduce((a, t) => a + (t.realized_pl || 0), 0);
-            return `${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`;
-          })()}
-          positive={trades.filter(t => t.closed_at && new Date(t.closed_at).toDateString() === new Date().toDateString()).reduce((a, t) => a + (t.realized_pl || 0), 0) > 0}
-          negative={trades.filter(t => t.closed_at && new Date(t.closed_at).toDateString() === new Date().toDateString()).reduce((a, t) => a + (t.realized_pl || 0), 0) < 0}
-          hint="UTC today, closed"
-        />
+        {(() => {
+          // r42 fix #1.19: compare same-day in the operator's LOCAL timezone
+          // (matches "today" mental model) and label the hint accordingly.
+          // Memoized in a closure so we compute it once.
+          const todayLocal = new Date().toDateString();
+          const todayClosed = trades.filter(t => {
+            if (!t.closed_at) return false;
+            const d = parseServerDate(t.closed_at);
+            return d && d.toDateString() === todayLocal;
+          });
+          const pl = todayClosed.reduce((a, t) => a + (t.realized_pl || 0), 0);
+          return (
+            <Stat
+              label="Today P/L"
+              value={`${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`}
+              positive={pl > 0}
+              negative={pl < 0}
+              hint={`Local today, ${todayClosed.length} closed`}
+            />
+          );
+        })()}
       </div>
 
       {/* Budget gauges */}
@@ -2400,10 +2649,18 @@ function AutoTraderPanel({ reloadToken }) {
               const statusPill =
                 t.status === 'open' ? { cls: 'pill-success', label: 'live' } :
                 t.status === 'pending' ? { cls: 'pill-warn', label: 'pending' } :
+                t.status === 'adopted' ? { cls: 'pill-warn', label: 'adopted' } :
                 t.status === 'closed_target' ? { cls: 'pill-success', label: 'target' } :
                 t.status === 'closed_stop' ? { cls: 'pill-danger', label: 'stopped' } :
                 t.status?.startsWith('closed_') ? { cls: '', label: t.status.replace('closed_', '') } :
                 { cls: '', label: t.status };
+              // r42 fix #1.24: extract the LAST EXIT: tag from `note` so the
+              // exit reason (news_exit, reverse_signal, theta_stop, ...) is
+              // visible without expanding the row.
+              const exitMatch = isClosed && typeof t.note === 'string'
+                ? t.note.match(/EXIT:\s*([^|]+)/)
+                : null;
+              const exitReasonShort = exitMatch ? exitMatch[1].trim().slice(0, 60) : null;
               const plColor = t.realized_pl == null ? 'app-text-muted'
                             : t.realized_pl >= 0 ? 'text-emerald-400'
                             : 'text-red-400';
@@ -2425,11 +2682,19 @@ function AutoTraderPanel({ reloadToken }) {
                       )}
                     </div>
                     <div className={`font-mono text-sm font-bold ${plColor}`}>
+                      {/* r42 fix #2.24: prepend +/− sign so colorblind users
+                          can distinguish wins from losses without color. */}
                       {t.realized_pl == null
                         ? <span className="app-text-muted">—</span>
-                        : `${t.realized_pl >= 0 ? '+' : ''}$${t.realized_pl.toFixed(2)}`}
+                        : `${t.realized_pl > 0 ? '▲ +' : t.realized_pl < 0 ? '▼ ' : ''}$${t.realized_pl.toFixed(2)}`}
                     </div>
                   </div>
+
+                  {exitReasonShort && (
+                    <div className="text-[10px] app-text-muted mb-2 italic" title={exitReasonShort}>
+                      Exit: {exitReasonShort}
+                    </div>
+                  )}
 
                   {/* Middle row: qty, entry, stop, targets */}
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
@@ -2651,6 +2916,11 @@ function PutsWatchSection({ canTrade }) {
 }
 
 function BudgetBar({ label, used, budget, pct, color }) {
+  // r42 Tier 3 polish: clamp the rendered bar width to [0, 100] so over-
+  // deployment (e.g. external positions pushing past cap) doesn't draw
+  // outside the track. Numeric pct in the label still shows the true value.
+  const safePct = Math.max(0, Math.min(100, Number.isFinite(pct) ? pct : 0));
+  const overflowed = pct > 100;
   return (
     <div>
       <div className="flex justify-between text-xs mb-1.5">
@@ -2658,11 +2928,19 @@ function BudgetBar({ label, used, budget, pct, color }) {
         <span className="font-mono app-text-primary">
           ${Number(used).toLocaleString(undefined, {maximumFractionDigits: 0})}
           <span className="app-text-muted"> / ${Number(budget).toLocaleString(undefined, {maximumFractionDigits: 0})}</span>
-          <span className="ml-1.5 app-text-muted">({pct.toFixed(1)}%)</span>
+          <span className={`ml-1.5 ${overflowed ? 'text-amber-400' : 'app-text-muted'}`}>({Number(pct).toFixed(1)}%{overflowed ? ' over' : ''})</span>
         </span>
       </div>
-      <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--surface-border)' }}>
-        <div className={`h-full ${color} transition-all`} style={{ width: `${pct}%` }} />
+      <div
+        className="h-2 rounded-full overflow-hidden"
+        style={{ background: 'var(--surface-border)' }}
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(safePct)}
+        aria-label={`${label} ${safePct.toFixed(0)}%`}
+      >
+        <div className={`h-full ${overflowed ? 'bg-amber-500' : color} transition-all`} style={{ width: `${safePct}%` }} />
       </div>
     </div>
   );
@@ -2750,6 +3028,7 @@ function TickerAutoTradeToggle({ ticker, onChanged }) {
   const [enabled, setEnabled] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
 
   useEffect(() => {
     if (!ticker) return;
@@ -2763,37 +3042,46 @@ function TickerAutoTradeToggle({ ticker, onChanged }) {
 
   if (!ticker || !loaded) return null;
 
+  // r42 fix #1.14: VERIFY the response before flipping UI state. Previously
+  // the UI flipped optimistically on ANY response — silent 4xx desync.
   const toggle = async () => {
-    setBusy(true);
+    if (busy) return;
+    setBusy(true); setErr(null);
+    const next = !enabled;
     try {
-      const next = !enabled;
-      await fetch(`${API_BASE}/api/watchlist/${ticker}/auto-trade`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ enabled: next }),
-      });
-      setEnabled(next);
+      const r = await api.patch(`/api/watchlist/${ticker}/auto-trade`, { enabled: next });
+      // Backend is expected to echo the new state. Trust the server's value
+      // rather than our optimistic guess.
+      const serverEnabled = r && typeof r.auto_trade_enabled === 'boolean' ? r.auto_trade_enabled : next;
+      setEnabled(serverEnabled);
       if (onChanged) onChanged();
+    } catch (e) {
+      setErr(e?.detail || e?.message || 'Toggle failed');
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <button
-      onClick={toggle}
-      disabled={busy}
-      title={enabled
-        ? `Auto-trade is ON for ${ticker}. Click to pause new auto-trades for this ticker.`
-        : `Auto-trade is OFF for ${ticker}. Click to allow new auto-trades.`}
-      className={`text-xs px-2 py-1 rounded border transition-colors disabled:opacity-50 ${
-        enabled
-          ? 'bg-emerald-900/40 border-emerald-700 text-emerald-300 hover:bg-emerald-900/60'
-          : 'bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700'
-      }`}
-    >
-      🤖 Auto-trade: {enabled ? 'ON' : 'OFF'}
-    </button>
+    <div className="flex items-center gap-2">
+      <button
+        onClick={toggle}
+        disabled={busy}
+        aria-pressed={enabled}
+        aria-label={`Auto-trade ${enabled ? 'on' : 'off'} for ${ticker}`}
+        title={enabled
+          ? `Auto-trade is ON for ${ticker}. Click to pause new auto-trades for this ticker.`
+          : `Auto-trade is OFF for ${ticker}. Click to allow new auto-trades.`}
+        className={`text-xs px-2 py-1 rounded border transition-colors disabled:opacity-50 ${
+          enabled
+            ? 'bg-emerald-900/40 border-emerald-700 text-emerald-300 hover:bg-emerald-900/60'
+            : 'bg-gray-800 border-gray-700 text-gray-400 hover:bg-gray-700'
+        }`}
+      >
+        🤖 Auto-trade: {enabled ? 'ON' : 'OFF'}
+      </button>
+      {err && <span className="text-[10px] text-red-400" role="alert">{err}</span>}
+    </div>
   );
 }
 
@@ -2804,48 +3092,92 @@ function TradingPanel({ ticker, reloadToken }) {
   const [positions, setPositions] = useState([]);
   const [orders, setOrders] = useState([]);
   const [error, setError] = useState(null);
-  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState(null);
+  const [actionInfo, setActionInfo] = useState(null);
+  const [busy, setBusy] = useState({});  // r42 fix #1.17: per-key in-flight guard
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const load = useCallback(async () => {
-    try {
-      const [a, p, o] = await Promise.all([
-        api.get('/api/trading/account').catch(() => null),
-        api.get('/api/trading/positions').catch(() => []),
-        api.get('/api/trading/orders?status=all&limit=20').catch(() => []),
-      ]);
-      setAccount(a); setPositions(p || []); setOrders(o || []);
+    // r42 fix #1.22: distinguish "no data" (empty arrays) from "fetch failed"
+    // by tracking each leg independently and surfacing a banner when
+    // every leg failed.
+    const results = await Promise.allSettled([
+      api.get('/api/trading/account'),
+      api.get('/api/trading/positions'),
+      api.get('/api/trading/orders?status=all&limit=20'),
+    ]);
+    const [a, p, o] = results;
+    if (a.status === 'fulfilled') setAccount(a.value);
+    if (p.status === 'fulfilled') setPositions(p.value || []);
+    if (o.status === 'fulfilled') setOrders(o.value || []);
+    const allFailed = results.every(r => r.status === 'rejected');
+    setLoadFailed(allFailed);
+    if (allFailed) {
+      setError(a.reason?.detail || a.reason?.message || 'Trading API unavailable');
+    } else {
       setError(null);
-    } catch (e) {
-      setError(String(e));
     }
   }, []);
 
   useEffect(() => {
     load();
-    const iv = setInterval(load, 15000);
-    return () => clearInterval(iv);
+    const iv = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      load();
+    }, 30000);
+    const onPush = () => load();
+    window.addEventListener('app:trade_closed', onPush);
+    window.addEventListener('app:trade_opened', onPush);
+    window.addEventListener('app:resync', onPush);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener('app:trade_closed', onPush);
+      window.removeEventListener('app:trade_opened', onPush);
+      window.removeEventListener('app:resync', onPush);
+    };
   }, [load, reloadToken]);
 
-  const closePos = async (sym) => {
-    if (!confirm(`Close entire ${sym} position at market?`)) return;
-    setBusy(true);
-    try { await api.post(`/api/trading/close/${sym}`); await load(); }
-    catch (e) { alert('Close failed: ' + (e.detail || e)); }
-    finally { setBusy(false); }
+  const setBusyKey = (k, v) => setBusy(b => ({ ...b, [k]: v }));
+
+  const closePos = async (sym, p) => {
+    // r42 fix #1.17: per-symbol guard + qty/notional preview in confirm.
+    if (busy[`close:${sym}`]) return;
+    const notional = p?.qty != null && p?.current_price != null ? Math.abs(p.qty * p.current_price) : null;
+    const msg = `Close ${Math.abs(p?.qty || 0)} ${p?.side || ''} ${sym} at market?\n` +
+                (notional != null ? `Approx notional $${notional.toFixed(2)}.\n` : '') +
+                'This is a real broker order on your paper account.';
+    if (!confirm(msg)) return;
+    setBusyKey(`close:${sym}`, true); setActionError(null); setActionInfo(null);
+    try {
+      await api.post(`/api/trading/close/${sym}`);
+      setActionInfo(`Close submitted for ${sym}`);
+      await load();
+    } catch (e) {
+      setActionError(`Close ${sym} failed: ${e?.detail || e?.message || e}`);
+    } finally { setBusyKey(`close:${sym}`, false); }
   };
-  const cancelOrd = async (id) => {
-    setBusy(true);
-    try { await fetch(`${API_BASE}/api/trading/orders/${id}`, { method: 'DELETE', headers: authHeaders() }); await load(); }
-    catch (e) {} finally { setBusy(false); }
+  const cancelOrd = async (id, label) => {
+    // r42 fix #1.16 + #2.14: confirm + show real error feedback (was empty catch).
+    if (busy[`cxl:${id}`]) return;
+    if (!confirm(`Cancel order ${label || id}?`)) return;
+    setBusyKey(`cxl:${id}`, true); setActionError(null); setActionInfo(null);
+    try {
+      await api.delete(`/api/trading/orders/${id}`);
+      setActionInfo('Cancelled');
+      await load();
+    } catch (e) {
+      setActionError(`Cancel failed: ${e?.detail || e?.message || e}`);
+    } finally { setBusyKey(`cxl:${id}`, false); }
   };
 
   if (!account && !error) {
     return null; // Trading not configured — hide silently
   }
-  if (error && !account) {
+  if (loadFailed && !account) {
     return (
-      <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 text-xs text-gray-500">
-        Paper trading unavailable: {error}
+      <div role="alert" className="bg-red-500/10 border border-red-500/40 rounded-lg p-4 text-xs text-red-200">
+        Paper trading unavailable: {error}{' '}
+        <button onClick={load} className="underline">Retry</button>
       </div>
     );
   }
@@ -2927,7 +3259,10 @@ function TradingPanel({ ticker, reloadToken }) {
           maxHeight={460}
         >
           {positions.length === 0 ? (
-            <div className="text-center text-sm app-text-muted italic py-4">No open positions.</div>
+            <div className="text-center text-sm app-text-muted italic py-4">
+              {/* r42 fix #1.22: distinguish "fetch failed" from "empty book". */}
+              {error ? <span className="text-amber-300">Couldn't load positions: {error}</span> : 'No open positions.'}
+            </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
               {[...tickerPositions, ...otherPositions].map(p => {
@@ -2943,9 +3278,12 @@ function TradingPanel({ ticker, reloadToken }) {
                         </div>
                         <div className="text-[11px] app-text-muted font-mono">Qty {p.qty} @ ${p.avg_entry_price.toFixed(2)}</div>
                       </div>
-                      <button disabled={busy} onClick={() => closePos(p.symbol)}
-                              className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold">
-                        Close
+                      <button
+                        disabled={!!busy[`close:${p.symbol}`]}
+                        aria-label={`Close ${p.symbol} position`}
+                        onClick={() => closePos(p.symbol, p)}
+                        className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold">
+                        {busy[`close:${p.symbol}`] ? 'Closing…' : 'Close'}
                       </button>
                     </div>
                     <div className="flex items-baseline justify-between">
@@ -2958,6 +3296,9 @@ function TradingPanel({ ticker, reloadToken }) {
                           {isWin ? '+' : ''}${p.unrealized_pl.toFixed(2)}
                         </div>
                         <div className={`text-xs font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {/* Backend pre-multiplies Alpaca's `unrealized_plpc`
+                              fraction by 100 (services/paper_trader.py),
+                              so we render it directly here. */}
                           {isWin ? '+' : ''}{p.unrealized_plpc.toFixed(2)}%
                         </div>
                       </div>
@@ -2977,42 +3318,67 @@ function TradingPanel({ ticker, reloadToken }) {
         defaultOpen={false}
         maxHeight={420}
       >
+        {(actionError || actionInfo) && (
+          <div className={`mb-2 text-xs px-2 py-1 rounded-md ${actionError ? 'bg-red-500/10 border border-red-500/40 text-red-200' : 'bg-emerald-500/10 border border-emerald-500/40 text-emerald-200'}`}>
+            {actionError || actionInfo}
+          </div>
+        )}
         {orders.length === 0 ? (
           <div className="text-center text-sm app-text-muted italic py-4">No orders yet.</div>
         ) : (
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 app-bg-surface-solid z-10">
-              <tr className="app-text-muted border-b app-border">
-                <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Symbol</th>
-                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
-                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
-                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
-                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
-                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
-                <th className="py-2 px-3"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {orders.map(o => (
-                <tr key={o.id} className="border-b app-border-soft last:border-0 hover:bg-white/3">
-                  <td className="py-2 px-3 font-semibold font-mono">{o.symbol}</td>
-                  <td className={`text-right py-2 px-3 font-semibold ${o.side.includes('BUY') ? 'text-emerald-400' : 'text-red-400'}`}>{o.side.replace('OrderSide.', '')}</td>
-                  <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
-                  <td className="text-right py-2 px-3 app-text-muted">{(o.type || '').replace('OrderType.', '')}</td>
-                  <td className="text-right py-2 px-3 app-text-secondary">{(o.status || '').replace('OrderStatus.', '')}</td>
-                  <td className="text-right py-2 px-3 app-text-muted font-mono">{o.submitted_at?.slice(11, 19) || '—'}</td>
-                  <td className="text-right py-2 px-3">
-                    {(o.status || '').includes('NEW') || (o.status || '').includes('ACCEPTED') ? (
-                      <button disabled={busy} onClick={() => cancelOrd(o.id)}
-                              className="text-[10px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 app-text-secondary disabled:opacity-50 border app-border">
-                        Cancel
-                      </button>
-                    ) : null}
-                  </td>
+          // r42 fix #2.21: horizontal scroll wrapper for mobile.
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-xs">
+              <thead className="sticky top-0 app-bg-surface-solid z-10">
+                <tr className="app-text-muted border-b app-border">
+                  <th className="text-left py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Symbol</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
+                  <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
+                  <th className="py-2 px-3"></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {orders.map(o => {
+                  // r42 fix #2.18: precise side/status matching. Alpaca order
+                  // fields can be string enums ("OrderSide.BUY"), bare names
+                  // ("BUY"/"buy"), or full lower-case ("buy"). Normalize.
+                  const side = String(o.side || '').replace(/^OrderSide\./, '').toUpperCase();
+                  const isBuy = side === 'BUY';
+                  const status = String(o.status || '').replace(/^OrderStatus\./, '').toLowerCase();
+                  const cancellable = ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced'].includes(status);
+                  // r42 fix #2.10: render submitted timestamp in operator's TZ
+                  // with explicit format (was a raw HH:MM:SS slice from the
+                  // ISO string, which was UTC-time displayed without label).
+                  const submitted = parseServerDate(o.submitted_at);
+                  const submittedLabel = submitted ? submitted.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+                  return (
+                    <tr key={o.id} className="border-b app-border-soft last:border-0 hover:bg-white/3">
+                      <td className="py-2 px-3 font-semibold font-mono">{o.symbol}</td>
+                      <td className={`text-right py-2 px-3 font-semibold ${isBuy ? 'text-emerald-400' : 'text-red-400'}`}>{side || '—'}</td>
+                      <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
+                      <td className="text-right py-2 px-3 app-text-muted">{String(o.type || '').replace(/^OrderType\./, '').toUpperCase()}</td>
+                      <td className="text-right py-2 px-3 app-text-secondary">{status.replace(/_/g, ' ')}</td>
+                      <td className="text-right py-2 px-3 app-text-muted font-mono" title={submitted ? submitted.toLocaleString() : ''}>{submittedLabel}</td>
+                      <td className="text-right py-2 px-3">
+                        {cancellable ? (
+                          <button
+                            disabled={!!busy[`cxl:${o.id}`]}
+                            aria-label={`Cancel order ${o.symbol}`}
+                            onClick={() => cancelOrd(o.id, `${o.symbol} ${side}`)}
+                            className="text-[10px] px-2 py-0.5 rounded-md bg-white/5 hover:bg-white/10 app-text-secondary disabled:opacity-50 border app-border">
+                            {busy[`cxl:${o.id}`] ? '…' : 'Cancel'}
+                          </button>
+                        ) : null}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
       </CollapsibleSection>
     </div>
@@ -3025,6 +3391,7 @@ function TradingPanel({ ticker, reloadToken }) {
 // auth when auth is configured, so a 200 means the key is valid.
 function LoginScreen({ onSuccess }) {
   const [key, setKey] = useState('');
+  const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
   const submit = async (e) => {
@@ -3032,13 +3399,14 @@ function LoginScreen({ onSuccess }) {
     if (!key.trim()) return;
     setBusy(true); setErr(null);
     try {
-      // /api/analysis/overview is gated and lightweight — perfect probe.
-      const r = await fetch(`${API_BASE}/api/analysis/overview`, {
+      // r42 fix #2.30: probe /api/health (cheap) instead of overview (scans the
+      // whole watchlist). Also doubles as a liveness check.
+      const r = await fetch(`${API_BASE}/api/health`, {
         headers: { 'X-API-Key': key.trim() },
       });
       if (r.status === 401) { setErr('Invalid key'); setBusy(false); return; }
-      if (!r.ok && r.status !== 200) { setErr(`Server ${r.status}`); setBusy(false); return; }
-      setApiKey(key.trim());
+      if (!r.ok) { setErr(`Server ${r.status}`); setBusy(false); return; }
+      setApiKey(key.trim(), remember);
       onSuccess();
     } catch (e) {
       setErr('Network error');
@@ -3059,8 +3427,18 @@ function LoginScreen({ onSuccess }) {
           onChange={e => setKey(e.target.value)}
           placeholder="Paste your API key"
           autoFocus
+          aria-label="API access key"
           className="w-full bg-gray-900/60 border border-white/10 rounded-lg px-3 py-2.5 text-sm placeholder-gray-500 focus:border-blue-500/70 font-mono"
         />
+        <label className="mt-3 flex items-center gap-2 text-[11px] app-text-secondary select-none cursor-pointer">
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={e => setRemember(e.target.checked)}
+            className="accent-blue-500"
+          />
+          Remember on this device (less secure — survives tab close)
+        </label>
         {err && <div className="mt-2 text-xs text-red-400">{err}</div>}
         <button
           type="submit"
@@ -3070,7 +3448,7 @@ function LoginScreen({ onSuccess }) {
           {busy ? 'Verifying…' : 'Unlock'}
         </button>
         <div className="mt-4 text-[10px] app-text-muted leading-relaxed">
-          Your key is stored only in this browser's localStorage. It's never sent anywhere other than the API. Log out from the header pill to clear it.
+          By default your key is held in this tab's sessionStorage and is cleared when the tab closes. Tick "Remember" to persist it to localStorage across sessions.
         </div>
       </form>
     </div>
@@ -3219,6 +3597,14 @@ function ChatWidget() {
        .catch(() => setConfigured(false));
   }, [open, configured]);
 
+  // r42 fix #2.22: Escape closes chat widget.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open]);
+
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, busy]);
@@ -3353,6 +3739,367 @@ function ChatWidget() {
   );
 }
 
+// ---------- Safety banner ----------
+// r42 fix #0.6/0.7: surface freeze/kill/broker-down/BP-breaker/PDT state
+// at the top of the dashboard. Backend exposes them on
+// /api/trading/auto/status; we poll every 30s and on `app:resync`.
+function SafetyBanner() {
+  const [s, setS] = useState(null);
+  const [acct, setAcct] = useState(null);
+  const refresh = useCallback(async () => {
+    try {
+      const [stat, account] = await Promise.all([
+        api.get('/api/trading/auto/status'),
+        api.get('/api/trading/account').catch(() => null),
+      ]);
+      setS(stat); setAcct(account);
+    } catch (e) { /* silent — banner is best-effort */ }
+  }, []);
+  useEffect(() => {
+    refresh();
+    const iv = setInterval(refresh, 30000);
+    const onSync = () => refresh();
+    const onAlert = () => refresh();
+    window.addEventListener('app:resync', onSync);
+    window.addEventListener('app:alert', onAlert);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener('app:resync', onSync);
+      window.removeEventListener('app:alert', onAlert);
+    };
+  }, [refresh]);
+  if (!s) return null;
+  const banners = [];
+  if (s.kill_switch) banners.push({ kind: 'critical', label: 'KILL SWITCH ENGAGED', detail: s.kill_reason || 'auto-trader manually killed; positions flattened' });
+  if (s.freeze_reason) banners.push({ kind: 'critical', label: 'TRADING FROZEN', detail: s.freeze_reason });
+  if (s.broker_down) banners.push({ kind: 'critical', label: 'BROKER UNAVAILABLE', detail: `Alpaca returned 5xx; new entries paused${s.broker_down_until ? ` until ${parseServerDate(s.broker_down_until)?.toLocaleTimeString() || s.broker_down_until}` : ''}` });
+  if (s.bp_breaker_active) banners.push({ kind: 'warning', label: 'BUYING POWER EXHAUSTED', detail: `BP circuit breaker tripped${s.bp_breaker_until ? ` until ${parseServerDate(s.bp_breaker_until)?.toLocaleTimeString() || s.bp_breaker_until}` : ''}` });
+  // PDT — only flag for live margin <$25k, where it actually blocks entries.
+  const isLive = acct && acct.account_blocked === false && (acct.pattern_day_trader === false || acct.pattern_day_trader === undefined);
+  const isPaper = acct && (acct.id || '').toString().toLowerCase().includes('paper');
+  const equity = acct ? Number(acct.equity || 0) : 0;
+  const cfg = s.config || {};
+  // Show PDT warning when not on paper, equity < $25k, and pdt_enforce is OFF.
+  if (!isPaper && equity > 0 && equity < 25000 && cfg.pdt_enforce === false) {
+    banners.push({
+      kind: 'critical',
+      label: 'PDT GATE DISABLED ON LIVE MARGIN ACCOUNT',
+      detail: `Equity $${equity.toFixed(0)} < $25k. Enable "PDT enforce" in Auto-Trader Config or you risk a 90-day PDT lockout. (current day-trades in trailing 5d: ${s.pdt_count})`,
+    });
+  } else if (s.pdt_would_block) {
+    banners.push({
+      kind: 'warning',
+      label: 'PDT THRESHOLD REACHED',
+      detail: `${s.pdt_count} day-trades in trailing 5d ≥ 4. New same-day round-trips will be blocked when PDT enforce is on.`,
+    });
+  }
+  if (s.adopted_count > 0 && cfg.auto_promote_adopted === false) {
+    banners.push({
+      kind: 'warning',
+      label: `${s.adopted_count} ADOPTED POSITION${s.adopted_count > 1 ? 'S' : ''} UNMANAGED`,
+      detail: 'External positions exist as "adopted" but the bot is not managing them (no SL/TP). Promote each in the Adopted panel below, or enable "Auto-promote adopted" in Auto-Trader Config.',
+    });
+  }
+  if (banners.length === 0) return null;
+  return (
+    <div className="space-y-1.5 px-2 sm:px-4 pt-2">
+      {banners.map((b, i) => (
+        <div
+          key={i}
+          role="alert"
+          className={`rounded-xl border px-3 py-2 flex items-start gap-2 ${
+            b.kind === 'critical'
+              ? 'bg-red-500/15 border-red-500/40 text-red-100'
+              : 'bg-amber-500/15 border-amber-500/40 text-amber-100'
+          }`}
+        >
+          <span aria-hidden className="text-base leading-none mt-0.5">{b.kind === 'critical' ? '⛔' : '⚠️'}</span>
+          <div className="flex-1 min-w-0">
+            <div className="text-[11px] font-bold uppercase tracking-wider">{b.label}</div>
+            <div className="text-xs mt-0.5 break-words">{b.detail}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------- Alerts panel ----------
+// r42 fix #0.5: surfaces /api/alerts in a dedicated drawer. Previously
+// the alert log was completely invisible in the UI.
+function AlertsPanel() {
+  const [alerts, setAlerts] = useState([]);
+  const [unacked, setUnacked] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [open, setOpen] = useState(false);
+  const refresh = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const [list, count] = await Promise.all([
+        api.get('/api/alerts?limit=100'),
+        api.get('/api/alerts/count?since_hours=24'),
+      ]);
+      setAlerts(Array.isArray(list) ? list : []);
+      setUnacked(count?.unacked || 0);
+    } catch (e) {
+      setErr(e?.detail || e?.message || 'Failed to load alerts');
+    } finally { setLoading(false); }
+  }, []);
+  useEffect(() => {
+    refresh();
+    const iv = setInterval(refresh, 30000);
+    const onAlert = () => refresh();
+    const onSync = () => refresh();
+    window.addEventListener('app:alert', onAlert);
+    window.addEventListener('app:resync', onSync);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener('app:alert', onAlert);
+      window.removeEventListener('app:resync', onSync);
+    };
+  }, [refresh]);
+  const ackAll = async () => {
+    try { await api.post('/api/alerts/ack-all', {}); refresh(); }
+    catch (e) { setErr(e?.detail || e?.message || 'Ack failed'); }
+  };
+  const ackOne = async (id) => {
+    try { await api.post(`/api/alerts/${id}/ack`, {}); refresh(); }
+    catch (e) { setErr(e?.detail || e?.message || 'Ack failed'); }
+  };
+  return (
+    <div className="surface rounded-2xl border app-border">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-white/3 rounded-2xl"
+        aria-expanded={open}
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Alerts</span>
+          {unacked > 0 && (
+            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-red-500 text-white">
+              {unacked}
+            </span>
+          )}
+          <span className="text-[10px] app-text-muted uppercase tracking-wider">{alerts.length} recent</span>
+        </div>
+        <span className="text-xs app-text-muted">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="px-4 pb-4">
+          <div className="flex items-center justify-end gap-2 mb-2">
+            <button onClick={refresh} className="text-[10px] px-2 py-1 rounded surface-soft app-text-secondary">Refresh</button>
+            <button onClick={ackAll} disabled={unacked === 0} className="text-[10px] px-2 py-1 rounded bg-blue-500/20 border border-blue-500/40 text-blue-300 disabled:opacity-40">Ack all</button>
+          </div>
+          {err && <div className="text-xs text-red-400 mb-2">{err}</div>}
+          {loading ? (
+            <div className="text-xs app-text-muted italic py-4 text-center">Loading…</div>
+          ) : alerts.length === 0 ? (
+            <div className="text-xs app-text-muted italic py-4 text-center">No alerts in the last 24h.</div>
+          ) : (
+            <div className="space-y-1 max-h-96 overflow-y-auto scrollbar-thin">
+              {alerts.map(a => {
+                const sevColor = a.severity === 'critical' || a.severity === 'error'
+                  ? 'border-red-500/40 bg-red-500/10 text-red-200'
+                  : a.severity === 'warning'
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                  : 'border-white/10 bg-white/3 app-text-secondary';
+                const when = parseServerDate(a.created_at);
+                return (
+                  <div key={a.id} className={`rounded-lg border px-2 py-1.5 ${sevColor} ${a.acked ? 'opacity-60' : ''}`}>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-[9px] uppercase font-bold tracking-wider shrink-0">{a.severity}</span>
+                        <span className="text-[10px] app-text-muted shrink-0">{a.kind}</span>
+                        <span className="text-[10px] app-text-muted shrink-0">{when ? when.toLocaleString() : ''}</span>
+                      </div>
+                      {!a.acked && (
+                        <button onClick={() => ackOne(a.id)} className="text-[9px] px-1.5 py-0.5 rounded surface-soft app-text-muted shrink-0">Ack</button>
+                      )}
+                    </div>
+                    <div className="text-xs mt-1 break-words">{a.message}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Rejected signals panel ----------
+// r42 fix #1.25: surfaces /api/trading/auto/skip-counts so the operator
+// can see WHY the bot is sitting idle (PDT-blocked, regime gate, sector
+// cap, AI veto, etc.). Counters are cumulative since process start; the
+// panel shows the most-common reasons sorted by count.
+function RejectedSignalsPanel() {
+  const [data, setData] = useState({ skips: {}, events: {} });
+  const [open, setOpen] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      const r = await api.get('/api/trading/auto/skip-counts');
+      setData(r || { skips: {}, events: {} });
+    } catch (_) {}
+  }, []);
+  useEffect(() => {
+    refresh();
+    const iv = setInterval(refresh, 60000);
+    const onSync = () => refresh();
+    window.addEventListener('app:resync', onSync);
+    return () => { clearInterval(iv); window.removeEventListener('app:resync', onSync); };
+  }, [refresh]);
+  const skips = Object.entries(data.skips || {}).sort((a, b) => b[1] - a[1]);
+  const events = data.events || {};
+  const total = skips.reduce((a, [, v]) => a + v, 0);
+  const opened = (events.opened || 0) + (events.opened_call || 0) + (events.opened_put || 0);
+  return (
+    <div className="surface rounded-2xl border app-border">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-white/3 rounded-2xl"
+        aria-expanded={open}
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Why isn't the bot trading?</span>
+          <span className="text-[10px] app-text-muted uppercase tracking-wider">{opened} opened · {total} signals rejected</span>
+        </div>
+        <span className="text-xs app-text-muted">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="px-4 pb-4">
+          <div className="text-[11px] app-text-muted mb-2 leading-relaxed">
+            Cumulative since process start. Counts the gates inside <span className="font-mono">consider_signal</span>;
+            top reasons here suggest where to relax thresholds (or where the safety net is doing its job).
+          </div>
+          {skips.length === 0 ? (
+            <div className="text-xs app-text-muted italic py-3 text-center">No rejected signals recorded.</div>
+          ) : (
+            <ul className="space-y-1 text-xs">
+              {skips.slice(0, 25).map(([reason, count]) => (
+                <li key={reason} className="flex justify-between items-center px-2 py-1 rounded surface-soft">
+                  <span className="font-mono app-text-secondary">{reason.replace(/_/g, ' ')}</span>
+                  <span className="font-mono app-text-primary">{count}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Adopted positions panel ----------
+// r42 fix #1.20/1.21: list adopted positions with one-click promote, plus
+// the manual sync button. Previously the operator had to run curl.
+function AdoptedPanel() {
+  const [trades, setTrades] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState({});
+  const [err, setErr] = useState(null);
+  const [info, setInfo] = useState(null);
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const all = await api.get('/api/trading/auto/trades?limit=200');
+      setTrades((all || []).filter(t => t.status === 'adopted'));
+    } catch (e) { setErr(e?.detail || e?.message || 'Failed to load trades'); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => {
+    refresh();
+    const iv = setInterval(refresh, 60000);
+    const onTradeOpened = () => refresh();
+    const onTradeClosed = () => refresh();
+    const onSync = () => refresh();
+    window.addEventListener('app:trade_opened', onTradeOpened);
+    window.addEventListener('app:trade_closed', onTradeClosed);
+    window.addEventListener('app:resync', onSync);
+    return () => {
+      clearInterval(iv);
+      window.removeEventListener('app:trade_opened', onTradeOpened);
+      window.removeEventListener('app:trade_closed', onTradeClosed);
+      window.removeEventListener('app:resync', onSync);
+    };
+  }, [refresh]);
+  const setRow = (k, v) => setBusy(b => ({ ...b, [k]: v }));
+  const sync = async () => {
+    if (!confirm('Sync positions with Alpaca?\nThis will adopt any external positions and close-out any DB rows that no longer exist on the broker. No new orders are submitted.')) return;
+    setRow('__sync', true); setErr(null); setInfo(null);
+    try {
+      const r = await api.post('/api/admin/sync-positions', {});
+      const a = (r?.adopted || []).length;
+      const c = (r?.closed_external || []).length;
+      setInfo(`Sync done: ${a} adopted, ${c} closed-external`);
+      refresh();
+    } catch (e) {
+      setErr(e?.detail || e?.message || 'Sync failed');
+    } finally { setRow('__sync', false); }
+  };
+  const promote = async (ticker) => {
+    if (!confirm(`Promote ${ticker} to bot-managed?\nThe bot will compute fresh stop/target levels and submit a stop-loss order to Alpaca. The position will be managed exactly as if the bot had opened it.`)) return;
+    setRow(ticker, true); setErr(null); setInfo(null);
+    try {
+      const r = await api.post(`/api/admin/promote-adopted/${ticker}`, {});
+      setInfo(`Promoted ${ticker}: ${r?.note || 'managed by bot'}`);
+      refresh();
+    } catch (e) {
+      setErr(`Promote ${ticker} failed: ${e?.detail || e?.message || 'unknown'}`);
+    } finally { setRow(ticker, false); }
+  };
+  return (
+    <div className="surface rounded-2xl border app-border p-4">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Adopted Positions</span>
+          <span className="text-[10px] app-text-muted uppercase tracking-wider">
+            {trades.length} unmanaged
+          </span>
+        </div>
+        <button
+          onClick={sync}
+          disabled={!!busy.__sync}
+          className="text-[11px] px-2.5 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-200 border border-blue-500/40 disabled:opacity-50"
+        >
+          {busy.__sync ? 'Syncing…' : 'Sync with Alpaca'}
+        </button>
+      </div>
+      <div className="text-[11px] app-text-muted mb-2 leading-relaxed">
+        Adopted = external positions that exist on Alpaca but were not opened by the bot. The bot does NOT manage them (no stop, no trail) until promoted. Promote to apply bot-computed stop and target levels.
+      </div>
+      {err && <div className="text-xs text-red-400 mb-2">{err}</div>}
+      {info && <div className="text-xs text-emerald-400 mb-2">{info}</div>}
+      {loading ? (
+        <div className="text-xs app-text-muted italic py-3 text-center">Loading…</div>
+      ) : trades.length === 0 ? (
+        <div className="text-xs app-text-muted italic py-3 text-center">No adopted positions.</div>
+      ) : (
+        <div className="space-y-1.5">
+          {trades.map(t => (
+            <div key={t.id} className="flex items-center justify-between rounded-lg border app-border-soft px-3 py-2 surface-soft">
+              <div className="min-w-0">
+                <div className="font-semibold text-sm">{t.ticker}</div>
+                <div className="text-[11px] app-text-muted">
+                  qty {t.qty} @ ${(t.entry_price ?? 0).toFixed(2)}
+                </div>
+              </div>
+              <button
+                onClick={() => promote(t.ticker)}
+                disabled={!!busy[t.ticker]}
+                className="text-[11px] px-2.5 py-1 rounded-md bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 disabled:opacity-50"
+              >
+                {busy[t.ticker] ? 'Promoting…' : 'Promote'}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [authed, setAuthed] = useState(!!getApiKey());
   useEffect(() => {
@@ -3406,32 +4153,65 @@ function AuthedApp({ onLogout }) {
 
   // Merge live last/bid/ask prices into overview rows (without clobbering change_pct
   // — that's computed against prior close by the server's snapshot).
-  const overviewWithLive = overview.map(row => {
+  // r42 fix #0.4: only tag a row `live: true` when the underlying quote is
+  // FRESH and the WS is currently connected. Stale or background-throttled
+  // quotes are returned dimmed (`stale: true`) but never as live, so
+  // operator never makes a close decision against frozen prices.
+  const overviewWithLive = useMemo(() => overview.map(row => {
     const q = liveQuotes[row.ticker];
     if (!q) return row;
     const livePx = q.last || (q.bid && q.ask ? (q.bid + q.ask) / 2 : null);
     if (!livePx) return row;
-    return { ...row, price: Math.round(livePx * 100) / 100, live: true };
-  });
+    const ageMs = q._localTs ? (Date.now() - q._localTs) : Infinity;
+    const fresh = liveConnected && ageMs <= QUOTE_STALE_MS;
+    return {
+      ...row,
+      price: Math.round(livePx * 100) / 100,
+      live: fresh,
+      stale: !fresh,
+      quote_age_ms: ageMs,
+    };
+  }), [overview, liveQuotes, liveConnected]);
 
+  // r42 fix #2.7: visibility-gated polling.
   useEffect(() => {
     loadOverview();
-    const iv = setInterval(loadOverview, 60000);
-    return () => clearInterval(iv);
+    const iv = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      loadOverview();
+    }, 60000);
+    const onVis = () => {
+      if (document.visibilityState === 'visible') loadOverview();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   }, [loadOverview]);
 
-  const handleAdd = async (ticker) => {
-    await api.post('/api/watchlist', { ticker });
-    await loadOverview();
-    setSelected(ticker);
-  };
+  // r42 fix #2.19: in-flight guard so a fast double-click doesn't fire two
+  // POSTs / DELETEs against the watchlist API.
+  const handleAdd = useCallback(async (ticker) => {
+    try {
+      await api.post('/api/watchlist', { ticker });
+      await loadOverview();
+      setSelected(ticker);
+    } catch (e) {
+      alert('Add failed: ' + (e?.detail || e?.message || e));
+    }
+  }, [loadOverview]);
 
-  const handleRemove = async (ticker) => {
+  const handleRemove = useCallback(async (ticker) => {
     if (!confirm(`Remove ${ticker} from watchlist?`)) return;
-    await api.delete(`/api/watchlist/${ticker}`);
-    await loadOverview();
-    if (selected === ticker) setSelected(null);
-  };
+    try {
+      await api.delete(`/api/watchlist/${ticker}`);
+      await loadOverview();
+      if (selectedRef.current === ticker) setSelected(null);
+    } catch (e) {
+      alert('Remove failed: ' + (e?.detail || e?.message || e));
+    }
+  }, [loadOverview]);
 
   return (
     <div className="h-screen flex flex-col">
@@ -3484,6 +4264,7 @@ function AuthedApp({ onLogout }) {
           </button>
         </div>
       </header>
+      <SafetyBanner />
       <div className="flex-1 flex overflow-hidden relative">
         {view === 'charts' && (
           <>
@@ -3524,6 +4305,9 @@ function AuthedApp({ onLogout }) {
         )}
         {view === 'trading' && (
           <div className="flex-1 overflow-y-auto scrollbar-thin p-2 sm:p-4 space-y-3 sm:space-y-4">
+            <AlertsPanel />
+            <AdoptedPanel />
+            <RejectedSignalsPanel />
             <AutoTraderPanel reloadToken={reloadToken} />
             <CandidatePoolPanel />
             <NewsAnalysisSummary />

@@ -78,9 +78,22 @@ def confidence_risk_mult(confidence: float, threshold: float,
 def kelly_risk_mult(historical_win_rate: Optional[float],
                      avg_reward_risk: Optional[float],
                      min_win_rate: Optional[float] = None,
-                     max_mult: Optional[float] = None) -> float:
-    """Kelly-fraction-based risk multiplier. Returns 1.0 when data is
-    missing or win rate is below the trust threshold."""
+                     max_mult: Optional[float] = None,
+                     fractional: float = 0.25) -> float:
+    """Fractional-Kelly risk multiplier. Returns 1.0 when data is missing or
+    win rate is below the trust threshold.
+
+    r42 fix #1.7: previously the function applied the *full* Kelly fraction
+    (`kelly_edge` ∈ [0, 1]) directly. Empirically, full-Kelly sizing has
+    drawdowns that approach the strategy's edge variance — well-known to
+    be over-sized for any non-deterministic edge. We multiply by a default
+    `fractional=0.25` (quarter-Kelly), which preserves most of the EV with
+    a small fraction of the drawdown.
+
+    `fractional` is exposed so tests can verify the math; production should
+    leave it at the default unless the operator has clear evidence of
+    why-half-Kelly-is-fine for their strategy.
+    """
     from services.config import RISK_KELLY_MAX_MULT, RISK_KELLY_MIN_WIN_RATE
     if max_mult is None:
         max_mult = RISK_KELLY_MAX_MULT
@@ -95,7 +108,11 @@ def kelly_risk_mult(historical_win_rate: Optional[float],
     R = max(0.1, float(avg_reward_risk))
     Q = 1 - W
     kelly_edge = max(0.0, min(1.0, W - Q / R))
-    return 1.0 + (max_mult - 1.0) * kelly_edge
+    # Fractional-Kelly: scale the edge by `fractional` before mapping to
+    # the multiplier headroom. This is the only change vs the prior
+    # behavior — same shape, lower amplitude.
+    f_edge = max(0.0, min(1.0, kelly_edge * float(fractional)))
+    return 1.0 + (max_mult - 1.0) * f_edge
 
 
 def position_size_by_risk(equity: float, risk_pct: float, risk_per_share: float) -> int:

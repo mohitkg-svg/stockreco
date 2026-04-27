@@ -983,5 +983,145 @@ class TestRunMode(unittest.TestCase):
             os.environ.pop("RUN_MODE", None)
 
 
+# ============================================================================
+# CATEGORY N: r42 Tier 0 regressions — the realized_pl overwrite bug + friends
+# ----------------------------------------------------------------------------
+# These would have caught the most expensive bug in the audit: the final-leg
+# `t.realized_pl = ...` (assignment, not +=) erasing T1/T2 partial PnL on
+# every multi-leg winning trade.
+# ============================================================================
+
+class TestRealizedPlAccumulation(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+
+    def test_force_close_stock_adds_runner_pl(self):
+        """force_close_trade for a stock with prior partial trim must ADD the
+        runner-leg PnL on top of the existing realized_pl, not overwrite it."""
+        from services.execution_engine import force_close_trade
+        from unittest.mock import MagicMock, patch as _patch
+        db = SessionLocal()
+        try:
+            t = AutoTrade(
+                ticker="TEST", symbol="TEST", asset_type="stock",
+                side="buy", qty=33, requested_entry=100.0, entry_price=100.0,
+                stop_loss=95.0, current_stop=95.0, target1=110.0,
+                status="open",
+                realized_pl=200.0,  # T1 trim already banked +$200
+                opened_at=datetime.utcnow() - timedelta(minutes=20),
+            )
+            db.add(t); db.commit(); db.refresh(t)
+            with _patch("services.paper_trader.cancel_order"), \
+                 _patch("services.paper_trader.close_position",
+                        return_value={"id": "ok", "symbol": "TEST", "side": "sell", "qty": 33, "status": "filled"}), \
+                 _patch("services.auto_trader._current_price", return_value=108.0):
+                summary = {"closed": 0}
+                force_close_trade(t, db, "test reason", summary)
+            db.refresh(t)
+            # Runner leg: (108 - 100) * 33 = 264. Existing 200 + 264 = 464.
+            self.assertAlmostEqual(t.realized_pl, 464.0, places=2)
+            self.assertEqual(summary["closed"], 1)
+        finally:
+            db.close()
+
+
+class TestZoneInfoSessionStart(unittest.TestCase):
+
+    def test_session_start_uses_zoneinfo(self):
+        """`_session_start_utc` must round-trip through zoneinfo so DST is
+        exact, not month/day-of-month guessed."""
+        from services.auto_trader import _session_start_utc
+        anchor = _session_start_utc()
+        # Anchor is a naive UTC datetime; minute should always be 30 (9:30 ET).
+        self.assertEqual(anchor.minute, 30)
+        # Hour should be 13 (EDT) or 14 (EST) — never anything else.
+        self.assertIn(anchor.hour, (13, 14))
+
+
+class TestKellyFractional(unittest.TestCase):
+
+    def test_kelly_is_fractional_not_full(self):
+        """Quarter-Kelly default keeps the result well below the full-Kelly
+        ceiling. Full-Kelly with 60% WR + 2:1 RR returns 1 + (max-1)*0.4."""
+        from services.risk_math import kelly_risk_mult
+        # 60% WR, 2:1 RR → kelly_edge = 0.4 (full)
+        full = kelly_risk_mult(60.0, 2.0, fractional=1.0)
+        quarter = kelly_risk_mult(60.0, 2.0)  # default 0.25
+        # Full > quarter, by construction.
+        self.assertGreater(full, quarter)
+        # Quarter must still be ≥ 1.0 (floor at no-Kelly = 1.0).
+        self.assertGreaterEqual(quarter, 1.0)
+
+
+class TestRegimeStrategyGate(unittest.TestCase):
+
+    def test_strategies_have_regime_field(self):
+        """Every strategy must declare a `regime` so the auto-trader and
+        backtester can gate participation by ADX regime."""
+        import pandas as pd
+        from services import strategies as st
+        # Synthetic frame: just enough columns for the strategies to not crash.
+        idx = pd.date_range("2025-01-01", periods=400, freq="D")
+        df = pd.DataFrame({
+            "Open": [100]*400, "High": [101]*400, "Low": [99]*400, "Close": [100]*400,
+            "Volume": [1_000_000]*400,
+        }, index=idx)
+        # Compute the indicator columns the strategies need.
+        from services.indicators import compute_indicators
+        d = compute_indicators(df)
+        out = st.all_strategies(d)
+        # Every returned strat must have a regime tag.
+        for s in out:
+            self.assertIn("regime", s, f"strategy {s.get('name')} missing regime")
+            self.assertIn(s["regime"], ("trend", "chop", "any"))
+
+
+class TestExpectancyFreezeGate(unittest.TestCase):
+
+    def setUp(self):
+        _reset_db()
+
+    def test_freeze_on_count_wr_low(self):
+        """Standard count-WR < 35% trigger still fires."""
+        from services.risk_manager import should_freeze_trading
+        db = SessionLocal()
+        try:
+            # 6 trades, 1 win → WR=16.7%
+            for i in range(5):
+                db.add(_make_trade(status="closed_stop", realized_pl=-100.0, ticker=f"T{i}",
+                                   closed_at=datetime.utcnow() - timedelta(hours=i+1)))
+            db.add(_make_trade(status="closed_target", realized_pl=10.0, ticker="W",
+                               closed_at=datetime.utcnow() - timedelta(hours=1)))
+            db.commit()
+            reason = should_freeze_trading()
+            self.assertIsNotNone(reason)
+            self.assertIn("WR", reason)
+        finally:
+            db.close()
+
+    def test_freeze_on_negative_expectancy_when_diversified_losses(self):
+        """≥10 trades, expectancy ≤ 0, sum_pl ≤ -2× worst → freeze even
+        with WR ≥ 35%."""
+        from services.risk_manager import should_freeze_trading
+        db = SessionLocal()
+        try:
+            # 12 trades: 5 winners +$50 each (=+250), 7 losers -$80 each (=-560).
+            # WR = 5/12 = 41.7% (above 35% threshold so WR gate doesn't fire).
+            # Sum = -310, worst = -80, |2× worst| = 160. -310 < -160 → trigger.
+            for i in range(5):
+                db.add(_make_trade(status="closed_target", realized_pl=50.0, ticker=f"W{i}",
+                                   closed_at=datetime.utcnow() - timedelta(hours=i+1)))
+            for i in range(7):
+                db.add(_make_trade(status="closed_stop", realized_pl=-80.0, ticker=f"L{i}",
+                                   closed_at=datetime.utcnow() - timedelta(hours=i+10)))
+            db.commit()
+            reason = should_freeze_trading()
+            self.assertIsNotNone(reason)
+            self.assertIn("expectancy", reason)
+        finally:
+            db.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

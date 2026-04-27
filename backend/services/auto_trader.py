@@ -370,24 +370,38 @@ def get_config_dict() -> Dict[str, Any]:
 def _session_start_utc() -> datetime:
     """Start of the current US market session in UTC.
 
-    Audit fix #8: the daily-loss gate used 00:00 UTC, which misaligned with
-    the US market session by ~4-5 hours. If the user closed a big loser at
-    11 PM ET (04:00 UTC next day), it counted against the wrong day. We
-    now anchor to the most recent 9:30 ET boundary (13:30 UTC during EDT,
-    14:30 UTC during EST). DST is handled naively — a 1h drift twice a
-    year is acceptable for a rolling PnL window.
+    r42 fix #1.8: replaced the month-of-year DST guess (which was wrong by
+    1h for the first half of March and last few days of October every year)
+    with a proper IANA-zone computation via zoneinfo. The old logic also
+    had subtle errors at the November boundary; trusting zoneinfo means
+    DST is exactly right every day.
+
+    Anchor: the most recent 9:30 America/New_York boundary, returned as a
+    naive UTC datetime (matches the rest of the codebase, which uses
+    datetime.utcnow()).
     """
     from datetime import timedelta as _td
-    now = datetime.utcnow()
-    # US market opens 9:30 ET = 13:30 UTC (EDT) / 14:30 UTC (EST).
-    # EDT runs ~2nd Sun of March → 1st Sun of Nov.
-    month = now.month
-    is_edt = 3 <= month <= 10 or (month == 11 and now.day <= 7)
-    open_hour_utc = 13 if is_edt else 14
-    session_anchor = now.replace(hour=open_hour_utc, minute=30, second=0, microsecond=0)
-    if now < session_anchor:
-        session_anchor = session_anchor - _td(days=1)
-    return session_anchor
+    try:
+        from zoneinfo import ZoneInfo
+    except Exception:  # py<3.9 — should never happen in our stack
+        ZoneInfo = None
+    now_utc = datetime.utcnow()
+    if ZoneInfo is None:
+        # Fallback to the legacy guess only if zoneinfo is unavailable.
+        is_edt = 3 <= now_utc.month <= 10 or (now_utc.month == 11 and now_utc.day <= 7)
+        open_hour_utc = 13 if is_edt else 14
+        anchor = now_utc.replace(hour=open_hour_utc, minute=30, second=0, microsecond=0)
+        if now_utc < anchor:
+            anchor = anchor - _td(days=1)
+        return anchor
+    et = ZoneInfo("America/New_York")
+    # Today's 9:30 ET in ET coordinates → convert to UTC.
+    now_et = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(et)
+    today_open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    if now_et < today_open_et:
+        today_open_et = today_open_et - _td(days=1)
+    anchor_utc = today_open_et.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    return anchor_utc
 
 
 def realized_pnl_today() -> float:
@@ -1224,7 +1238,14 @@ def _open_allocations(db: Session) -> Dict[str, float]:
 
 
 def status_snapshot() -> Dict[str, Any]:
-    """Return current budget state — used by the UI status pill."""
+    """Return current budget state — used by the UI status pill.
+
+    r42 fix #0.6/0.7: also surfaces freeze reason, BP/broker circuit-breaker
+    state, PDT exposure, and adopted-position count so the dashboard can
+    render unmissable safety banners. The UI was previously blind to all of
+    these states — `Auto-Trader: Paused` looked identical to a manual
+    pause vs a real freeze.
+    """
     db = SessionLocal()
     try:
         cfg = get_config(db)
@@ -1235,10 +1256,31 @@ def status_snapshot() -> Dict[str, Any]:
         # VIX-scaled option allocation: options are punished harder than stocks
         # during vol spikes (IV crush, gamma whipsaw), so we shrink the options
         # bucket when VIX elevates. Stocks bucket is left untouched.
-        from services.risk_manager import vix_options_bucket_multiplier as _vix_opt_mult
+        from services.risk_manager import (
+            vix_options_bucket_multiplier as _vix_opt_mult,
+            should_freeze_trading as _should_freeze,
+            bp_breaker_active as _bp_active,
+            broker_down as _broker_down,
+            bp_exhausted_until as _bp_until,
+            broker_down_until as _broker_until,
+            pdt_day_trade_count as _pdt_count,
+        )
         option_budget = equity * cfg.option_pct_of_equity * _vix_opt_mult()
         total_cap = equity * cfg.max_pct_of_equity
         deployed = alloc["stock"] + alloc["option"]
+        freeze_reason: Optional[str] = None
+        try:
+            freeze_reason = _should_freeze()
+        except Exception:
+            freeze_reason = None
+        # Adopted-positions count — surfaces the "external positions are
+        # being managed by the bot only if you've promoted them" lifecycle.
+        adopted_n = db.query(AutoTrade).filter(AutoTrade.status == "adopted").count()
+        # PDT exposure — informational on paper, gating-relevant on live.
+        try:
+            pdt = _pdt_count(window_business_days=5)
+        except Exception:
+            pdt = {"count": 0, "would_block_under_pdt": False}
         return {
             "enabled": cfg.enabled,
             "broker_connected": acct is not None,
@@ -1255,6 +1297,16 @@ def status_snapshot() -> Dict[str, Any]:
             "open_trades": db.query(AutoTrade).filter(
                 AutoTrade.status.in_(["pending", "open", "adopted"])
             ).count(),
+            "adopted_count": adopted_n,
+            "freeze_reason": freeze_reason,
+            "bp_breaker_active": bool(_bp_active()),
+            "bp_breaker_until": (_bp_until().isoformat() + "Z") if _bp_until() else None,
+            "broker_down": bool(_broker_down()),
+            "broker_down_until": (_broker_until().isoformat() + "Z") if _broker_until() else None,
+            "pdt_count": int(pdt.get("count", 0)),
+            "pdt_would_block": bool(pdt.get("would_block_under_pdt", False)),
+            "kill_switch": bool(getattr(cfg, "killed", False)),
+            "kill_reason": getattr(cfg, "killed_reason", None),
         }
     finally:
         db.close()
@@ -1402,6 +1454,40 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         )
         metrics.inc("autotrade_event", event="one_min_disagree")
         return None
+
+    # r42 fix #1.5: prefetch the AI veto verdict OUTSIDE the entry lock so a
+    # 1-2s Claude round-trip doesn't stall every other ticker's entry path.
+    # The lock now holds only the gate-eval + DB-write critical section;
+    # the only concurrency hazard removed by the lock that this prefetch
+    # could re-introduce is "two threads ask Claude about the same signal
+    # in parallel" — which is fine (idempotent read, model output cached).
+    _ai_veto_prefetched: Optional[Dict[str, Any]] = None
+    try:
+        from services import ai_judge as _aij_pf
+        if _aij_pf.entry_veto_mode() != "off":
+            _pf_db = SessionLocal()
+            try:
+                _ai_ctx_pf = _build_ai_context(ticker, _pf_db)
+            finally:
+                _pf_db.close()
+            _signal_view_pf = {
+                "ticker": ticker,
+                "signal_type": signal.get("signal_type"),
+                "confidence": signal.get("confidence"),
+                "timeframe": signal.get("timeframe"),
+                "entry": signal.get("entry"),
+                "stop_loss": signal.get("stop_loss"),
+                "target1": signal.get("target1"),
+                "strategy": signal.get("strategy"),
+                "reasoning": (signal.get("reasoning") or "")[:1500],
+            }
+            try:
+                _ai_veto_prefetched = _aij_pf.entry_veto(_signal_view_pf, _ai_ctx_pf)
+            except Exception as _pf_e:
+                logger.debug(f"ai_judge prefetch failed (will retry inside lock): {_pf_e}")
+                _ai_veto_prefetched = None
+    except Exception:
+        _ai_veto_prefetched = None
 
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_signal({ticker}): entry lock busy >30s, skipping")
@@ -1790,12 +1876,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.info(f"AutoTrader skip {ticker}: idempotent dup of trade #{recent_dup.id}")
             return None
 
-        # Soft correlation cap: don't pile into the same sector
+        # Soft correlation cap: don't pile into the same sector.
+        # r42 fix #2.5: when sector lookup fails OR returns empty, treat the
+        # ticker as "unknown" and apply the cap against ALL "unknown"
+        # tickers — previously an unmapped ticker silently bypassed the
+        # cap entirely. New names that fall in the gap (the most likely to
+        # be over-concentrated) were exactly the ones evading the throttle.
         try:
             from services.data_fetcher import get_ticker_info
             sector = (get_ticker_info(ticker).get("sector") or "").strip()
         except Exception:
             sector = ""
+        if not sector:
+            sector = "_unknown"
+            try:
+                from services.alerts import alert as _raise_unk
+                _raise_unk("info", "sector_unknown",
+                           f"Ticker {ticker} has no sector classification — counted under '_unknown' bucket",
+                           ticker=ticker)
+            except Exception:
+                pass
         if sector and getattr(cfg, "max_per_sector", 3):
             # Include adopted — sector concentration is real regardless
             # of whether the bot is managing the position.
@@ -1851,9 +1951,14 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # env var to "active" only after reviewing ≥200 shadow decisions).
         # Failure / abstain / off → proceed (rule-engine wins). Honored skips
         # log via metrics so the operator can graph veto rate.
+        # r42 fix #1.5: use the prefetched verdict if we have one (most
+        # common path); only fall back to a synchronous call if prefetch
+        # failed and the operator has the gate enabled.
         try:
             from services import ai_judge as _aij
-            if _aij.entry_veto_mode() != "off":
+            mode = _aij.entry_veto_mode()
+            _veto = _ai_veto_prefetched
+            if _veto is None and mode != "off":
                 _ai_ctx = _build_ai_context(ticker, db)
                 _ai_signal_view = {
                     "ticker": ticker,
@@ -1867,12 +1972,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     "reasoning": (signal.get("reasoning") or "")[:1500],
                 }
                 _veto = _aij.entry_veto(_ai_signal_view, _ai_ctx)
-                if _veto.get("honored") and _veto.get("verdict") == "skip":
-                    logger.info(
-                        f"AutoTrader skip {ticker}: AI veto — {_veto.get('reason', '')}"
-                    )
-                    metrics.inc("autotrade_skip", reason="ai_veto")
-                    return None
+            if _veto and _veto.get("honored") and _veto.get("verdict") == "skip":
+                logger.info(
+                    f"AutoTrader skip {ticker}: AI veto — {_veto.get('reason', '')}"
+                )
+                metrics.inc("autotrade_skip", reason="ai_veto")
+                return None
         except Exception as _e:
             # Hard guarantee: AI judge failure NEVER blocks a trade.
             logger.debug(f"ai_judge entry_veto wrapper failed: {_e}")
@@ -2128,6 +2233,22 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # same scan loop sees a smaller available BP figure.
         _reserve_bp(qty * float(entry))
         metrics.inc("autotrade_event", event="opened")
+        # r42 fix #1.12: broadcast a trade_opened event so the UI can add
+        # the new row immediately instead of waiting for the next 15s poll.
+        try:
+            from services import live_quotes as _lq_open
+            _lq_open.broadcast_event_safe({
+                "type": "trade_opened",
+                "trade_id": trade.id,
+                "ticker": trade.ticker,
+                "asset_type": "stock",
+                "qty": int(qty),
+                "entry_price": float(entry),
+                "stop": float(stop),
+                "target1": float(t1) if t1 else None,
+            })
+        except Exception:
+            pass
         return _serialize(trade)
     except Exception as e:
         from sqlalchemy.exc import OperationalError as _OE
@@ -2431,6 +2552,19 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         metrics.inc("autotrade_event", event="opened_put")
         try:
             live_quotes.ensure_option_symbols([occ])
+        except Exception:
+            pass
+        # r42 fix #1.12: trade_opened broadcast for option puts.
+        try:
+            live_quotes.broadcast_event_safe({
+                "type": "trade_opened",
+                "trade_id": trade.id,
+                "ticker": trade.ticker,
+                "asset_type": "option",
+                "symbol": occ,
+                "qty": int(qty),
+                "entry_price": float(top["premium"]),
+            })
         except Exception:
             pass
         return _serialize(trade)
@@ -2748,6 +2882,19 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             live_quotes.ensure_option_symbols([occ])
         except Exception:
             pass
+        # r42 fix #1.12: trade_opened broadcast for option calls.
+        try:
+            live_quotes.broadcast_event_safe({
+                "type": "trade_opened",
+                "trade_id": trade.id,
+                "ticker": trade.ticker,
+                "asset_type": "option",
+                "symbol": occ,
+                "qty": int(qty),
+                "entry_price": float(top["premium"]),
+            })
+        except Exception:
+            pass
         return _serialize(trade)
     except Exception as e:
         logger.exception(f"consider_call_play error for {ticker}: {e}")
@@ -2901,9 +3048,10 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                     half = max(1, int(orig * _t1_frac))
                     half = min(half, int(t.qty))   # can't trim more than we hold
                 if half >= 1:
-                    trim = paper_trader.submit_simple_option_order(
+                    # r42 fix #2.2: marketable limit on option trim — saves
+                    # ~5-15% of premium vs the prior market order.
+                    trim = paper_trader.submit_option_exit_marketable_limit(
                         occ_symbol=t.symbol, qty=half, side="sell",
-                        order_type="market", time_in_force="day",
                     )
                     trim_ok = (
                         isinstance(trim, dict)
@@ -3090,28 +3238,34 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             pass
 
     if exit_reason:
-        sell = paper_trader.submit_simple_option_order(
+        # r42 fix #2.2: marketable limit on full option exit, fallback to market.
+        sell = paper_trader.submit_option_exit_marketable_limit(
             occ_symbol=t.symbol, qty=int(t.qty), side="sell",
-            order_type="market", time_in_force="day",
         )
         if "error" in sell:
             logger.warning(f"option sell failed for {t.symbol}: {sell['error']}")
             return
         # Capture realised P/L from the position before it disappears.
-        # Guard against pos=None (option-position lookup can fail) AND against
-        # NaN entry_price (rare flake in fill report). Round to 2dp so float
-        # noise doesn't flip closed_target ↔ closed_stop downstream.
+        # r42 fix #0.1: ADD the runner-leg PnL to any partial-trim PnL
+        # already accumulated on this row — the prior assignment overwrote
+        # T1/T2 trim profits, mis-classifying every partial-then-stopped
+        # trade as a clean loss and biasing the freeze gate downward.
         try:
+            existing = float(t.realized_pl or 0.0)
             if pos and pos.get("current_price") is not None and t.entry_price:
-                t.realized_pl = round((float(pos["current_price"]) - float(t.entry_price)) * float(t.qty) * 100, 2)
+                runner_pl = round((float(pos["current_price"]) - float(t.entry_price)) * float(t.qty) * 100, 2)
+                t.realized_pl = round(existing + runner_pl, 2)
             elif cur_premium is not None and t.entry_price:
-                t.realized_pl = round((float(cur_premium) - float(t.entry_price)) * float(t.qty) * 100, 2)
+                runner_pl = round((float(cur_premium) - float(t.entry_price)) * float(t.qty) * 100, 2)
+                t.realized_pl = round(existing + runner_pl, 2)
             else:
-                t.realized_pl = None
-                logger.warning(f"option {t.symbol}: closing without P/L (pos={bool(pos)}, cur_premium={cur_premium})")
+                # Couldn't price the runner leg — keep any accumulated
+                # partial-trim PnL rather than nulling it out.
+                if existing == 0.0:
+                    t.realized_pl = None
+                logger.warning(f"option {t.symbol}: runner P/L unavailable (pos={bool(pos)}, cur_premium={cur_premium}); kept partial PL={existing:.2f}")
         except (TypeError, ValueError) as _e:
-            t.realized_pl = None
-            logger.warning(f"option {t.symbol}: P/L calc skipped: {_e}")
+            logger.warning(f"option {t.symbol}: runner P/L calc skipped: {_e} (kept partial PL={float(t.realized_pl or 0):.2f})")
         t.status = final_status or "closed_manual"
         t.closed_at = datetime.utcnow()
         t.note = (t.note or "") + f" | EXIT: {exit_reason}"
@@ -3259,6 +3413,60 @@ def manage_open_positions() -> Dict[str, Any]:
                     # partial-fill separately and reshape SL/TP legs to the
                     # actual filled quantity, so a cancel of the unfilled
                     # remainder won't leave a mis-sized bracket.
+                    # r42 fix #2.1: limit-at-mid cancel timer. A limit at mid
+                    # can sit unfilled for the rest of the session if the book
+                    # walks away. After 30s of "new"/"accepted" status with no
+                    # fill, cancel-and-cross — submit a fresh market order at
+                    # the new ask to actually take the trade. After 5min total
+                    # without fill, give up and free the BP slot.
+                    try:
+                        if (
+                            t.status == "pending"
+                            and pstatus in ("new", "accepted", "pending_new")
+                            and t.opened_at is not None
+                        ):
+                            age_s = (datetime.utcnow() - t.opened_at).total_seconds()
+                            if age_s > 300:
+                                logger.warning(
+                                    f"AutoTrader {t.ticker} unfilled limit > 5m old; cancelling and freeing slot"
+                                )
+                                try:
+                                    paper_trader.cancel_order(t.parent_order_id)
+                                except Exception:
+                                    pass
+                                t.status = "closed_unfilled"
+                                t.closed_at = datetime.utcnow()
+                                t.note = (t.note or "") + " | UNFILLED: limit timed out"
+                                db.commit()
+                                _release_bp(float(t.qty) * float(t.requested_entry or 0))
+                                metrics.inc("autotrade_event", event="closed_unfilled")
+                                continue
+                            elif age_s > 30:
+                                # Cancel-and-cross: cancel the limit, submit
+                                # a market order at the same qty + bracket.
+                                logger.info(
+                                    f"AutoTrader {t.ticker} limit unfilled after {age_s:.0f}s; crossing to market"
+                                )
+                                try:
+                                    paper_trader.cancel_order(t.parent_order_id)
+                                except Exception:
+                                    pass
+                                cross = paper_trader.submit_bracket_order(
+                                    symbol=t.ticker, qty=int(t.qty), side="buy",
+                                    entry_type="market",
+                                    take_profit=t.target3 or t.target2 or t.target1,
+                                    stop_loss=float(t.stop_loss),
+                                    time_in_force="gtc",
+                                    client_order_id=f"at-cross-{__import__('uuid').uuid4().hex[:12]}",
+                                )
+                                if "error" not in cross:
+                                    t.parent_order_id = cross.get("id") or t.parent_order_id
+                                    t.note = (t.note or "") + f" | CROSSED to market after {age_s:.0f}s unfilled"
+                                    db.commit()
+                                else:
+                                    logger.warning(f"limit-cross resubmit failed for {t.ticker}: {cross.get('error')}")
+                    except Exception as _le:
+                        logger.debug(f"limit cancel-timer skipped: {_le}")
                     if t.status == "pending" and pstatus == "partially_filled":
                         filled_qty = float(getattr(parent, "filled_qty", 0) or 0)
                         if filled_qty > 0 and filled_qty < t.qty:
@@ -3284,6 +3492,34 @@ def manage_open_positions() -> Dict[str, Any]:
                         # Cancel/reject/expired now handled in a separate `if`
                         # block below.
                         legs = _identify_legs(t.parent_order_id)
+                        # r42 fix #2.3: reconcile DB qty with broker filled_qty
+                        # at fill confirmation. If a partial fill earlier
+                        # resized t.qty correctly we're already in sync; this
+                        # defensive check catches the broker-side mismatch case
+                        # (e.g., Alpaca returns filled status with a partial
+                        # filled_qty + cancel reason) and resizes SL/TP legs.
+                        try:
+                            broker_filled = float(getattr(parent, "filled_qty", 0) or 0)
+                            if broker_filled > 0 and abs(broker_filled - float(t.qty)) >= 0.5:
+                                logger.warning(
+                                    f"AutoTrader {t.ticker} fill qty mismatch: DB={t.qty} broker={broker_filled}; "
+                                    f"resizing DB qty + bracket legs to broker truth"
+                                )
+                                t.qty = int(broker_filled)
+                                # Resize SL/TP children to match the actually-held qty.
+                                from alpaca.trading.requests import ReplaceOrderRequest
+                                _client = paper_trader._get_client()
+                                for _leg_id in (legs.get("stop_id"), legs.get("tp_id")):
+                                    if _leg_id and _client:
+                                        try:
+                                            _client.replace_order_by_id(
+                                                _leg_id,
+                                                order_data=ReplaceOrderRequest(qty=int(broker_filled)),
+                                            )
+                                        except Exception as _re:
+                                            logger.warning(f"bracket leg resize failed for {t.ticker}: {_re}")
+                        except Exception as _re:
+                            logger.debug(f"partial-fill reconcile skipped for {t.ticker}: {_re}")
                         t.entry_price = float(parent.filled_avg_price) if parent.filled_avg_price else t.requested_entry
                         t.stop_order_id = legs.get("stop_id")
                         t.tp_order_id = legs.get("tp_id")
@@ -3351,7 +3587,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                                 new_stop = shifted_stop
                                             t.stop_loss = round(new_stop, 2)
                                             if t.stop_order_id and t.stop_loss > 0:
-                                                if _replace_stop(t.stop_order_id, t.stop_loss):
+                                                # r42 fix #0.2: capture rotated stop_order_id.
+                                                _new_id = _replace_stop(t.stop_order_id, t.stop_loss)
+                                                if _new_id:
+                                                    t.stop_order_id = _new_id
                                                     t.current_stop = t.stop_loss
                                         t.note = (t.note or "") + (
                                             f" | slippage {slip:+.2f} ({atr_units:.2f}×ATR) "
@@ -3670,7 +3909,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     except Exception as _re:
                                                         logger.warning(f"T2 SL-qty resize failed for {t.ticker}: {_re}")
                                                     metrics.inc("autotrade_event", event="partial_t2")
-                                        if new_stop > t.current_stop and _replace_stop(t.stop_order_id, new_stop):
+                                        # r42 fix #0.2: replace_stop now returns rotated id.
+                                        _new_sid = _replace_stop(t.stop_order_id, new_stop) if new_stop > t.current_stop else None
+                                        if _new_sid:
+                                            t.stop_order_id = _new_sid
                                             t.current_stop = new_stop
                                             t.level_index = li + 1
                                             if target_idx == 0:
@@ -3778,7 +4020,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                     (chandelier_stop is None or structural_stop >= chandelier_stop)
                                     else "chandelier"
                                 )
-                                if new_trail_stop > t.current_stop and _replace_stop(t.stop_order_id, new_trail_stop):
+                                # r42 fix #0.2: capture rotated id from broker replace.
+                                _new_tid = _replace_stop(t.stop_order_id, new_trail_stop) if new_trail_stop > t.current_stop else None
+                                if _new_tid:
+                                    t.stop_order_id = _new_tid
                                     old_stop = t.current_stop
                                     t.current_stop = new_trail_stop
                                     t.note = (t.note or "") + (
@@ -3801,7 +4046,12 @@ def manage_open_positions() -> Dict[str, Any]:
                             exit_leg = next((l for l in legs if "filled" in str(l.status).lower()), None)
                             exit_px = float(exit_leg.filled_avg_price) if exit_leg and exit_leg.filled_avg_price else None
                             if exit_px is not None and t.entry_price is not None:
-                                t.realized_pl = round((exit_px - (t.entry_price or 0)) * t.qty, 2)
+                                # r42 fix #0.1: ADD runner-leg PnL to any
+                                # partial-trim PnL already on this row;
+                                # prior `=` assignment erased T1/T2 trims.
+                                existing = float(t.realized_pl or 0.0)
+                                runner_pl = round((exit_px - (t.entry_price or 0)) * t.qty, 2)
+                                t.realized_pl = round(existing + runner_pl, 2)
                                 if (t.realized_pl or 0) > 0:
                                     t.status = "closed_target"
                                 else:

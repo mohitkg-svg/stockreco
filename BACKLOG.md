@@ -15,7 +15,51 @@ inclusion / continued-deferral rationale. Deferred items whose rationale
 has gone stale should either move to ✅ done or be re-categorized as
 ❌ rejected — don't let the list rot into "we'll get to it eventually".
 
-## Master deferral register (canonical short-form, current as of r39)
+## r42 audit pickup (2026-04-27) — items resolved this revision
+
+The r42 multi-agent audit (BE + UI) picked up the following items from
+this register and shipped fixes:
+
+- **realized_pl overwrite on multi-leg exits** — promoted from external
+  review pass 5/6 deferral. Fixed at 4 sites with `+=` accumulation +
+  regression test `TestRealizedPlAccumulation`.
+- **Naked-long window via stale `replace_stop` id** — promoted from r41
+  audit deferral. `replace_stop` returns rotated id; all 3 callers persist
+  back to `t.stop_order_id`.
+- **DST handling via zoneinfo** — fix #1.8 — replaced month/day guess.
+- **Count-WR vs expectancy** — fix #1.3 — freeze gate + adaptive multiplier
+  now consider PnL-weighted expectancy alongside WR.
+- **Walk-forward look-ahead** — fix #1.1 — indicators recomputed inside
+  each fold against `df.iloc[:end]`.
+- **Sortino denominator math** — fix #1.6 — RMS of `min(0,r)` against MAR=0.
+- **Fractional-Kelly default** — fix #1.7 — quarter-Kelly.
+- **Backtester unit consistency** — fix #1.10 — `max_drawdown_pct` is now
+  percent in both backtester and portfolio_backtester.
+- **Per-trade Sharpe** — fix #1.2 — alongside per-bar.
+- **Liquidity-aware slippage** — fix #1.4 — dollar-vol + range + auction
+  adders on top of flat baseline.
+- **AI veto outside entry lock** — fix #1.5 — prefetched async; lock no
+  longer holds during 1-2s Claude round-trip.
+- **Strategy regime gating** — fix #1.9 — each strategy declares
+  `regime ∈ {trend, chop, any}`; `all_strategies()` zeroes off-regime
+  entries against ADX_14.
+- **Limit-at-mid cancel timer + cancel-and-cross** — fix #2.1.
+- **Marketable-limit option exits** — fix #2.2 — `submit_option_exit_marketable_limit`
+  saves 5-15% premium per trip.
+- **Partial-fill bracket-leg resize** — fix #2.3 — defensive
+  `replace_order_by_id(qty=...)` on SL/TP children.
+- **Stop-threat fast-path** — fix #2.4 — WS tick within 0.25% of stop fires
+  manage immediately, rate-limited 5s/ticker.
+- **Sector taxonomy strict mode** — fix #2.5 — unmapped tickers fall under
+  `_unknown` bucket.
+- **News-exit freshness gate** — fix #2.6 — skip Claude when headline > 30min.
+- **Frontend Tier 0 (stale-price masking, alerts panel, freeze banner, PDT
+  banner, SRI/CSP/pre-bundle)** + **Tier 1/2/3 polish** — full UI rebuild
+  to surface safety state and remove the Babel-in-browser path.
+
+134 tests pass.
+
+## Master deferral register (canonical short-form, current as of r42)
 
 ### ⏸️ Deferred — multi-week, gated on data accumulation
 

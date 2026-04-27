@@ -388,11 +388,50 @@ def news_exit_decision(trade: Dict[str, Any], news_item: Dict[str, Any]) -> Dict
     """Ask Claude what to do with an open position when news lands on the
     underlying. Returns `{action: "hold"|"trim"|"close", is_thesis_relevant,
     reason, honored, mode}`. In `shadow` mode action is forced to "hold".
+
+    r42 fix #2.6: short-circuit "hold" when the news headline is older than
+    a configurable freshness window (default 30 minutes). A 4-hour-old
+    merger rumor isn't actionable; only fresh news warrants the round trip.
     """
     mode = news_exit_mode()
     if mode == "off":
         return {"action": "hold", "is_thesis_relevant": False, "reason": "off",
                 "honored": False, "mode": "off"}
+
+    # Freshness gate (r42 #2.6) — pre-empts the model call for stale news.
+    try:
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz
+        max_age_min = int(_os.getenv("AI_NEWS_EXIT_MAX_AGE_MIN", "30"))
+        ts = news_item.get("created_at") or news_item.get("published_at") or news_item.get("ts")
+        if ts:
+            if isinstance(ts, (int, float)):
+                age_sec = max(0.0, _dt.now(_tz.utc).timestamp() - float(ts))
+            else:
+                from datetime import datetime as _dt2
+                ts_str = str(ts)
+                # Normalize naive ISO → UTC.
+                if not ts_str.endswith("Z") and "+" not in ts_str[-6:] and "-" not in ts_str[-6:]:
+                    ts_str = ts_str + "Z"
+                try:
+                    parsed = _dt2.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except Exception:
+                    parsed = None
+                age_sec = (
+                    (_dt.now(_tz.utc) - parsed).total_seconds()
+                    if parsed else 0.0
+                )
+            if age_sec > max_age_min * 60:
+                return {
+                    "action": "hold",
+                    "shadow_action": "hold",
+                    "is_thesis_relevant": False,
+                    "reason": f"stale news ({int(age_sec / 60)}m old > {max_age_min}m freshness window)",
+                    "honored": False,
+                    "mode": mode,
+                }
+    except Exception as _e:
+        logger.debug(f"news_exit freshness gate skipped: {_e}")
 
     from services.config import AI_JUDGE_TIMEOUT_SEC
     started = time.time()

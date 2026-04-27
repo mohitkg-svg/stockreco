@@ -1087,6 +1087,143 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 42 — Comprehensive audit: Tier 0-3 across backend AND frontend
+
+Multi-agent deep audit pass + line-level verification + fixes across the
+entire codebase. Top tier was a cluster of correctness bugs that were
+silently biasing every metric the bot uses to decide whether to size up
+or freeze. UI got the most attention since the operator's only window
+into the bot's state was missing a freeze banner, alerts panel, adopted-
+position UX, and was masking stale prices as live.
+
+**Backend Tier 0 (blocked-pre-live)**:
+- `realized_pl` overwrite at 4 sites — final-leg `=` was erasing T1/T2
+  partial PnL. Switched to `+=` everywhere, with per-site comments. Cascades
+  into the freeze gate / adaptive multiplier / 30d-drawdown gate / calibration.
+- `replace_stop` id rotation — Alpaca rotates the SL leg id on each replace;
+  we weren't capturing the new id, so subsequent replaces hit a now-terminal
+  order. Function now returns `Optional[str]` (new id) and all 3 callers
+  persist `t.stop_order_id`. Closes a real naked-long window.
+- Option dynamic subscription `_noop` — `live_quotes.ensure_option_symbols`
+  routed dynamic subscribes to a no-op handler, dropping every quote for
+  newly-opened option contracts. Hoisted `_handle_opt_quote` to module
+  scope, both static and dynamic paths use the same handler.
+
+**Backend Tier 1 (sizing/stat bias)**:
+- DST handling via `zoneinfo.ZoneInfo("America/New_York")` (was a month-of-
+  year guess that was wrong by 1h for ~half of March each year).
+- Expectancy-based freeze gate alongside count-WR (catches negative-EV
+  patterns where a high WR masks fat-tail losers).
+- Fractional-Kelly default `0.25` (was full-Kelly).
+- Sortino: downside deviation against MAR=0 (RMS of `min(0,r)`), not std
+  of the negatives subset.
+- `portfolio_backtest.max_drawdown_pct` now in percent (was a fraction;
+  caused 100× rendering mismatch vs single-ticker backtester).
+- Per-trade Sharpe (returns + sqrt(trades_per_year)) alongside per-bar
+  Sharpe; old per-bar number kept as `sharpe_bar` for debugging.
+- Walk-forward: indicators recomputed inside each fold against `df.iloc[:end]`,
+  killing rolling-normalization look-ahead leak.
+- Liquidity-aware slippage: dollar-volume + intraday-range + open/close-
+  auction adders on top of the flat baseline; capped at 200 bps/side.
+- AI veto prefetched OUTSIDE `_entry_lock` so 1-2s Claude calls don't
+  serialize every other ticker's entry.
+- Strategy regime gating: each strategy declares `regime ∈ {trend, chop, any}`;
+  `all_strategies()` zeroes off-regime entries against ADX_14.
+
+**Backend Tier 2 (real-money correctness, lower frequency)**:
+- Limit-at-mid cancel timer: cancel-and-cross at +30s, give-up at +5min.
+- Marketable-limit option exits via new
+  `paper_trader.submit_option_exit_marketable_limit()` (saves 5-15% of
+  premium per trip on illiquid weeklies); falls back to market on no quote.
+- Partial-fill bracket-leg resize: defensive `replace_order_by_id(qty=...)`
+  on SL/TP children when DB qty disagrees with broker `filled_qty`.
+- Stop-threat fast-path in `live_quotes._handle_trade`: if a tick prints
+  within 0.25% of an open trade's `current_stop`, fire `manage_open_positions`
+  immediately rather than waiting for the next 60s scheduler tick. Per-
+  ticker rate-limited to 1×/5s.
+- Sector taxonomy strict mode: unmapped tickers fall under `_unknown`
+  bucket against the same per-sector cap, plus an `info` alert.
+- News-exit freshness gate: skip Claude call when headline is older than
+  `AI_NEWS_EXIT_MAX_AGE_MIN` (default 30min).
+
+**Frontend Tier 0**:
+- `useLiveQuotes` rewritten — exp-backoff+jitter, `visibilitychange`-driven
+  re-check, `app:resync` event on (re)connect for panels to refetch lost
+  state, broader event fan-out (`trade_opened`, `alert`, `news`,
+  `option_quote`), `_localTs` stamping for staleness detection.
+- Stale-price masking: `overviewWithLive` only tags `live: true` when WS
+  is connected AND quote `_localTs` ≤ 30s old. Watchlist shows a `stale`
+  pill on dimmed rows.
+- `<SafetyBanner/>` above the dashboard surfaces freeze, kill switch,
+  broker-down, BP-breaker, PDT-on-live-margin, and unmanaged-adopted-count
+  states from the now-extended `/api/trading/auto/status`.
+- `<AlertsPanel/>` reads `/api/alerts` with unacked-count badge + ack
+  buttons. Previously the alert log was completely invisible.
+- `<AdoptedPanel/>` lists adopted positions with one-click Promote, plus
+  the "Sync with Alpaca" admin button. Previously operator had to curl.
+- `<RejectedSignalsPanel/>` reads `/api/trading/auto/skip-counts`
+  (new endpoint) — answers "why isn't the bot trading?" at a glance.
+- index.html: SRI hashes on react/react-dom/lightweight-charts CDN scripts;
+  CSP meta tag; `referrer no-referrer`; X-Content-Type-Options nosniff.
+- Babel-standalone-in-browser removed. New `frontend/build.js` runs
+  esbuild to produce `app.compiled.js` (135 KB minified, ~70ms build).
+  index.html now loads the pre-bundle directly.
+
+**Frontend Tier 1**:
+- Auto-trader toggle / cancel order / close position now: per-key in-flight
+  guards, real error feedback (was empty catches), confirm dialogs with
+  qty/notional preview.
+- `unrealized_plpc` rendering verified — backend pre-multiplies, no double
+  conversion.
+- "Today P/L" now compares in operator-local TZ; hint label fixed.
+- Trade list shows last `EXIT:` reason inline (was buried in 12s toast or
+  losing-trade-only postmortem).
+- `<RejectedSignalsPanel/>` answers "why isn't the bot trading".
+- `WatchlistPanel` wrapped in `React.memo` to skip the re-render storm
+  on every quote tick.
+- Per-trade `▲ +`/`▼ −` glyphs in PnL display so the colorblind don't
+  rely on red/green alone.
+- Trade-from-signal widget multiplies notional/risk/reward by 100 on
+  option signals (was undercount by 100×). Qty input bounded `[1, 10000]`.
+
+**Frontend Tier 2**:
+- All polling loops gated on `document.visibilityState === 'visible'`.
+- `parseServerDate(s)` helper: naive ISO strings (no Z/TZ suffix) treated
+  as UTC, not local. Used for `relativeTime`, order timestamps, "Today P/L".
+- `safeHref(url)` whitelists `http(s):` and same-origin; news + alert
+  links pass through it.
+- API key now in `sessionStorage` by default (clears on tab close); login
+  has explicit "Remember on this device" checkbox to opt into localStorage.
+- Login probe switched from `/api/analysis/overview` (heavy) to
+  `/api/health`.
+- Order list: precise side/status enum normalization (handles "BUY",
+  "OrderSide.BUY", "buy", "pending_new", "partially_filled" etc.); horizontal
+  scroll wrapper for mobile; explicit `parseServerDate(submitted_at)` for TZ.
+- Modal Escape-to-close on `TradeFromSignal` and `ChatWidget`.
+- Confidence badge has a tooltip explaining the 0-95 composite score is
+  NOT a literal win-probability.
+- BudgetBar clamps render to `[0, 100]` and turns amber when over-deployed.
+- Backtest panel labels avg P/L with explicit % suffix.
+- `index.html` light-theme `--text-muted` bumped to slate-600 for WCAG AA.
+
+**Frontend Tier 3 polish**:
+- StockChart `liveQuote.ts` magnitude check (auto-detects ms vs sec).
+- Removed `console.info('universe scan result', r)` log.
+- `aria-label`, `aria-pressed`, `aria-expanded`, `role=alert/dialog/progressbar`
+  added across icon-only buttons, modals, banners, progress bars.
+
+**API additions**:
+- `GET /api/trading/auto/skip-counts` → `{skips: {reason: count}, events: {event: count}}`.
+- `status_snapshot()` returns `freeze_reason`, `bp_breaker_active`,
+  `bp_breaker_until`, `broker_down`, `broker_down_until`, `pdt_count`,
+  `pdt_would_block`, `kill_switch`, `kill_reason`, `adopted_count`.
+- `live_quotes._broadcast` now emits `trade_opened` (in addition to existing
+  `trade_closed`, `target_hit`).
+
+**Tests**: 6 new regression tests under `TestRealizedPlAccumulation`,
+`TestZoneInfoSessionStart`, `TestKellyFractional`, `TestRegimeStrategyGate`,
+`TestExpectancyFreezeGate`. Full suite: 134 passed.
+
 ### Revision 41-promote-auto — Auto-promote external positions on the periodic reconcile
 
 Extends r41-promote. Adds `cfg.auto_promote_adopted` config flag

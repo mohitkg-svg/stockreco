@@ -53,6 +53,9 @@ _option_stream_client: Any = None
 _option_subscribed: Set[str] = set()
 # Initialized lazily in start() — must be created on the running loop, not at import time.
 _recompute_queue: Optional["asyncio.Queue[str]"] = None
+# r42 fix #2.4: per-ticker last-threat-check timestamps (rate-limit the
+# stop-threat fast-path to once per 5s per ticker).
+_last_threat_check: Dict[str, float] = {}
 _last_recompute: Dict[str, float] = {}
 _RECOMPUTE_MIN_INTERVAL = 30  # seconds per ticker
 _RECOMPUTE_PRICE_DELTA = 0.001  # 0.1% move triggers recompute
@@ -219,6 +222,45 @@ async def _handle_trade(trade) -> None:
                 _recompute_queue.put_nowait(sym)
             except asyncio.QueueFull:
                 pass
+
+    # r42 fix #2.4: stop-threat fast-path. When the live trade tick prints
+    # within 0.25% of a long auto-trade's current_stop (or above for shorts),
+    # dispatch the manage tick for THIS ticker immediately rather than
+    # waiting for the next scheduler firing. The check is cheap (one DB
+    # query, rate-limited per ticker to once per 5s) so it can run on
+    # every tick.
+    try:
+        last_threat = _last_threat_check.get(sym, 0.0)
+        if time.time() - last_threat >= 5.0:
+            _last_threat_check[sym] = time.time()
+            from database import SessionLocal as _SL_t, AutoTrade as _AT_t
+            _db_t = _SL_t()
+            try:
+                _row = _db_t.query(_AT_t).filter(
+                    _AT_t.ticker == sym,
+                    _AT_t.status == "open",
+                    _AT_t.asset_type == "stock",
+                    _AT_t.current_stop.isnot(None),
+                ).first()
+                if _row and _row.current_stop:
+                    # threat: long with px ≤ stop+0.25% (close to stop)
+                    threat_band = float(_row.current_stop) * 1.0025
+                    if px <= threat_band:
+                        try:
+                            from services import auto_trader as _at_t
+                            # Synchronous call from the WS thread is OK here —
+                            # manage_open_positions is short-circuited to
+                            # this ticker by the existing rate limit.
+                            asyncio.get_event_loop().run_in_executor(
+                                None, _at_t.manage_open_positions
+                            )
+                            logger.info(f"stop-threat fast-path fired for {sym} @ {px} (stop={_row.current_stop})")
+                        except Exception as _me:
+                            logger.debug(f"stop-threat manage dispatch failed for {sym}: {_me}")
+            finally:
+                _db_t.close()
+    except Exception as _e:
+        logger.debug(f"stop-threat fast-path skipped for {sym}: {_e}")
 
 
 async def _handle_quote(quote) -> None:
@@ -439,6 +481,26 @@ async def _news_worker():
             backoff = min(300, backoff * 2)
 
 
+async def _handle_opt_quote(q):
+    """Module-level option-quote handler so dynamic subscriptions via
+    `ensure_option_symbols` use the SAME handler as the initial connect.
+    r42 fix #0.3: previously dynamic subscribes used an `async def _noop`,
+    so quotes for newly-opened option contracts were silently discarded —
+    stop-management fell back to slow REST polling.
+    """
+    sym = getattr(q, "symbol", None)
+    if not sym:
+        return
+    data = {
+        "symbol": sym,
+        "bid": float(q.bid_price) if getattr(q, "bid_price", None) is not None else None,
+        "ask": float(q.ask_price) if getattr(q, "ask_price", None) is not None else None,
+        "ts": time.time(),
+    }
+    _option_quotes[sym] = data
+    await _broadcast({"type": "option_quote", **data})
+
+
 async def _option_stream_worker():
     """Subscribe to option quotes for currently-held contracts via OptionDataStream.
 
@@ -458,19 +520,6 @@ async def _option_stream_worker():
     except Exception as e:
         logger.warning(f"option-stream: OptionDataStream unavailable ({e})")
         return
-
-    async def _handle_opt_quote(q):
-        sym = getattr(q, "symbol", None)
-        if not sym:
-            return
-        data = {
-            "symbol": sym,
-            "bid": float(q.bid_price) if getattr(q, "bid_price", None) is not None else None,
-            "ask": float(q.ask_price) if getattr(q, "ask_price", None) is not None else None,
-            "ts": time.time(),
-        }
-        _option_quotes[sym] = data
-        await _broadcast({"type": "option_quote", **data})
 
     backoff = 5
     while True:
@@ -506,8 +555,11 @@ def ensure_option_symbols(occ_symbols: List[str]) -> None:
     _option_subscribed.update(new)
     if _option_stream_client:
         try:
-            async def _noop(_q): pass
-            _option_stream_client.subscribe_quotes(_noop, *new)
+            # r42 fix #0.3: route dynamic subscriptions to the SAME
+            # handler the static subscription uses, so quotes for newly-
+            # opened option contracts actually flow into _option_quotes
+            # and out via WS broadcast.
+            _option_stream_client.subscribe_quotes(_handle_opt_quote, *new)
             logger.info(f"option-stream: subscribed {sorted(new)}")
         except Exception as e:
             logger.warning(f"option-stream dynamic subscribe {new} failed: {e}")

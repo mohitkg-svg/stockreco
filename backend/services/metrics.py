@@ -104,6 +104,41 @@ def timer(name: str, **labels):
             logger.debug(f"metrics timer({name}) failed: {e}")
 
 
+def autotrade_skip_counts() -> dict:
+    """r42 fix #1.25: snapshot of autotrade_skip counters by reason for the
+    UI's "rejected signals" view. Returns {reason: count}; empty when
+    prometheus_client isn't installed.
+    """
+    if not _ENABLED:
+        return {}
+    out: dict = {}
+    try:
+        for sample in AUTOTRADE_SKIPS.collect():
+            for s in sample.samples:
+                if s.name.endswith("_total"):
+                    reason = s.labels.get("reason") or "unknown"
+                    out[reason] = int(s.value)
+    except Exception as e:
+        logger.debug(f"autotrade_skip_counts failed: {e}")
+    return out
+
+
+def autotrade_event_counts() -> dict:
+    """r42 fix #1.25 sibling: snapshot of autotrade_event counters."""
+    if not _ENABLED:
+        return {}
+    out: dict = {}
+    try:
+        for sample in AUTOTRADE_EVENTS.collect():
+            for s in sample.samples:
+                if s.name.endswith("_total"):
+                    event = s.labels.get("event") or "unknown"
+                    out[event] = int(s.value)
+    except Exception as e:
+        logger.debug(f"autotrade_event_counts failed: {e}")
+    return out
+
+
 def register_metrics_endpoint(app) -> None:
     """Mount /metrics on a FastAPI app. No-op if prometheus_client missing."""
     if not _ENABLED:

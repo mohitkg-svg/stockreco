@@ -3,9 +3,19 @@ Strategy definitions. Each strategy returns a dict:
   {
     "name": str,
     "description": str,
+    "regime": "trend" | "chop" | "any",   # r42 fix #1.9
     "entry_long": pd.Series[bool],   # True = go long on next bar
     "entry_short": pd.Series[bool],  # True = go short on next bar
   }
+
+`regime` declares which ADX regime the strategy is designed for:
+  * "trend": only fires when ADX_14 ≥ ADX_TREND_MIN (typ. 25)
+  * "chop":  only fires when ADX_14 ≤ ADX_CHOP_MAX (typ. 20)
+  * "any":   regime-agnostic
+
+The backtester applies these gates inside `all_strategies(d)` so we no
+longer have a chop strategy and a trend strategy voting BUY+SELL on the
+same bar. r42 fix #1.9.
 
 The backtester consumes these and simulates trades with ATR-based stop/target.
 """
@@ -33,6 +43,7 @@ def _trend_following(d: pd.DataFrame) -> Dict:
     return {
         "name": "Trend Following",
         "description": "Price above SMA50, RSI 50-70, MACD histogram flips positive",
+        "regime": "trend",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -47,6 +58,7 @@ def _golden_cross(d: pd.DataFrame) -> Dict:
     return {
         "name": "Golden/Death Cross",
         "description": "SMA50 crosses SMA200 (major trend reversal)",
+        "regime": "trend",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -62,6 +74,7 @@ def _rsi_mean_reversion(d: pd.DataFrame) -> Dict:
     return {
         "name": "RSI Mean Reversion",
         "description": "Oversold bounce (RSI crosses up through 30) in uptrend; inverse for shorts",
+        "regime": "chop",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -76,6 +89,7 @@ def _macd_crossover(d: pd.DataFrame) -> Dict:
     return {
         "name": "MACD Crossover",
         "description": "MACD line crosses signal line",
+        "regime": "any",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -92,6 +106,7 @@ def _bollinger_breakout(d: pd.DataFrame) -> Dict:
     return {
         "name": "Bollinger Breakout",
         "description": "Close breaks outside Bollinger Band with volume confirmation",
+        "regime": "trend",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -112,6 +127,7 @@ def _donchian_breakout(d: pd.DataFrame) -> Dict:
     return {
         "name": "Donchian Breakout",
         "description": "First close above 20-bar high (long) or below 20-bar low (short) — true breakout, not continuation",
+        "regime": "trend",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -131,6 +147,7 @@ def _ema_pullback(d: pd.DataFrame) -> Dict:
     return {
         "name": "EMA Pullback",
         "description": "In trend, buy pullback that bounces off EMA21",
+        "regime": "trend",
         "entry_long": long,
         "entry_short": short,
     }
@@ -152,6 +169,7 @@ def _gap_fill(d: pd.DataFrame) -> Dict:
     return {
         "name": "Gap Fill",
         "description": "Fade overnight gaps that print against the prevailing trend (gap-down in uptrend → long; gap-up in downtrend → short)",
+        "regime": "chop",
         "entry_long": long,
         "entry_short": short,
     }
@@ -202,6 +220,7 @@ def _fvg_pullback(d: pd.DataFrame) -> Dict:
     return {
         "name": "FVG Pullback",
         "description": "Enter on first retrace into an unfilled fair-value gap (3-bar imbalance) in the direction of the trend",
+        "regime": "trend",
         "entry_long": long,
         "entry_short": short,
     }
@@ -227,6 +246,7 @@ def _gap_and_go(d: pd.DataFrame) -> Dict:
     return {
         "name": "Gap & Go",
         "description": "Trend-aligned gap that holds (close past open, volume>1.5× avg) — launchpad continuation, not fade",
+        "regime": "trend",
         "entry_long": gap_up_hold.fillna(False),
         "entry_short": gap_dn_hold.fillna(False),
     }
@@ -249,7 +269,7 @@ def _vwap_reclaim(d: pd.DataFrame) -> Dict:
     if "VWAP" not in d.columns:
         # No-op strategy on dataframes without VWAP
         empty = pd.Series(False, index=d.index)
-        return {"name": "VWAP Reclaim", "description": "—", "entry_long": empty, "entry_short": empty}
+        return {"name": "VWAP Reclaim", "description": "—", "regime": "any", "entry_long": empty, "entry_short": empty}
     vol_ok = d["Volume"] > 0.8 * d["VOL_SMA20"]
     long = (
         (d["Close"] > d["VWAP"]) & (d["Close"].shift(1) <= d["VWAP"].shift(1))
@@ -262,6 +282,7 @@ def _vwap_reclaim(d: pd.DataFrame) -> Dict:
     return {
         "name": "VWAP Reclaim",
         "description": "Price reclaims VWAP after at least one bar on the wrong side, in trend with normal volume",
+        "regime": "any",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -285,10 +306,10 @@ def _opening_range_breakout(d: pd.DataFrame) -> Dict:
     # Bail on non-intraday bars (heuristic: median diff < 1 day)
     try:
         if len(d) < 4 or (d.index[1] - d.index[0]) >= pd.Timedelta(days=1):
-            return {"name": "Opening Range Breakout", "description": "—",
+            return {"name": "Opening Range Breakout", "description": "—", "regime": "trend",
                     "entry_long": empty, "entry_short": empty}
     except Exception:
-        return {"name": "Opening Range Breakout", "description": "—",
+        return {"name": "Opening Range Breakout", "description": "—", "regime": "trend",
                 "entry_long": empty, "entry_short": empty}
 
     OR_BARS = 3
@@ -313,6 +334,7 @@ def _opening_range_breakout(d: pd.DataFrame) -> Dict:
     return {
         "name": "Opening Range Breakout",
         "description": "First close beyond the session's opening-range high/low (3-bar OR) on volume>1.2× avg",
+        "regime": "trend",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
     }
@@ -335,11 +357,31 @@ STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
 
 
 def all_strategies(d: pd.DataFrame) -> List[Dict]:
-    """Build all strategies against an indicator-enriched dataframe."""
+    """Build all strategies against an indicator-enriched dataframe.
+
+    r42 fix #1.9: regime-gate per strategy. The current ADX_14 value at the
+    last bar of `d` decides which strategies' entries survive — chop
+    strategies are zero'd out on trending bars and vice versa. "any"-regime
+    strategies always pass through. The gate is bar-level (uses ADX_14
+    series), so a single dataframe can have alternating regimes correctly
+    handled: the per-bar mask is multiplied against entry_long/short.
+    """
+    from services.config import ADX_TREND_MIN, ADX_CHOP_MAX
+    has_adx = "ADX_14" in d.columns
     out = []
     for fn in STRATEGY_FUNCS:
         try:
-            out.append(fn(d))
+            s = fn(d)
         except Exception:
             continue
+        regime = s.get("regime", "any")
+        if has_adx and regime in ("trend", "chop"):
+            adx = d["ADX_14"]
+            if regime == "trend":
+                mask = (adx >= ADX_TREND_MIN).fillna(False)
+            else:
+                mask = (adx <= ADX_CHOP_MAX).fillna(False)
+            s["entry_long"] = (s["entry_long"] & mask).fillna(False)
+            s["entry_short"] = (s["entry_short"] & mask).fillna(False)
+        out.append(s)
     return out

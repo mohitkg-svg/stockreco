@@ -458,6 +458,56 @@ def submit_simple_option_order(
         return {"error": str(e)}
 
 
+def submit_option_exit_marketable_limit(
+    occ_symbol: str,
+    qty: int,
+    side: str = "sell",
+    offset_cents: float = 0.05,
+    fallback_to_market: bool = True,
+) -> Dict[str, Any]:
+    """r42 fix #2.2: marketable-limit option exit.
+
+    Reads the live OPRA NBBO via `live_quotes.get_option_quote`, places a
+    limit at NBBO ± offset (whichever side fills the trade), and returns the
+    submitted order. Falls back to a plain market order if the quote is
+    unavailable AND `fallback_to_market` is True — preserves existing
+    behavior on data outages while saving the spread on the 95% common case.
+
+    Why: market orders on illiquid weekly options eat 5-15% of premium per
+    trip. Even a marketable limit at the inside ask + $0.05 cuts that
+    drastically without sacrificing fill probability.
+    """
+    side = side.lower()
+    px: Optional[float] = None
+    try:
+        from services import live_quotes as _lq
+        q = _lq.get_option_quote(occ_symbol)
+        if q:
+            bid = q.get("bid"); ask = q.get("ask")
+            if side == "sell" and bid:
+                # Sell: sit at the bid for guaranteed fill (cross the spread).
+                px = float(bid) - float(offset_cents) * 0  # at the bid
+                px = max(0.01, float(bid))
+            elif side == "buy" and ask:
+                px = float(ask) + float(offset_cents)
+            elif bid and ask:
+                px = (float(bid) + float(ask)) / 2.0
+    except Exception:
+        px = None
+    if px is not None and px > 0:
+        return submit_simple_option_order(
+            occ_symbol=occ_symbol, qty=qty, side=side,
+            order_type="limit", limit_price=round(px, 2),
+            time_in_force="day",
+        )
+    if fallback_to_market:
+        return submit_simple_option_order(
+            occ_symbol=occ_symbol, qty=qty, side=side,
+            order_type="market", time_in_force="day",
+        )
+    return {"error": "no quote available for marketable-limit"}
+
+
 def get_option_position(occ_symbol: str) -> Optional[Dict[str, Any]]:
     """Return current position for an OCC option symbol, or None if no position."""
     c = _get_client()
