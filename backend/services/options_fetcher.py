@@ -20,9 +20,42 @@ from services.data_fetcher import _get_session, _get_crumb, BASE_URL
 logger = logging.getLogger(__name__)
 
 # {ticker:expiration -> (chain_data, expiry_ts)}
+# r47 fix #T0c-5: bound the chain cache. Without a cap, a 500-ticker
+# universe scan × ~6 expiries each = 3000 entries × 50-200KB chain dict
+# = up to 600MB resident in the manager process before TTL evicts. We
+# add an LRU cap so OOM is impossible regardless of universe size.
+import threading as _ofth
+
+_CHAIN_CACHE_MAX = 256
 _chain_cache: Dict[str, tuple] = {}
+_chain_cache_lock = _ofth.Lock()
 _CHAIN_TTL = 600  # 10 minutes — options quotes update fast but 10m cache still
                   # matches ~reasonable freshness for scanning a watchlist
+
+
+def _chain_cache_set(key: str, value: tuple) -> None:
+    """LRU-ish set: when over cap, drop the oldest 10% by insertion order
+    (Python 3.7+ dict preserves insertion order; we move-to-end on hit
+    in the caller)."""
+    with _chain_cache_lock:
+        if key in _chain_cache:
+            del _chain_cache[key]
+        _chain_cache[key] = value
+        if len(_chain_cache) > _CHAIN_CACHE_MAX:
+            drop = max(1, _CHAIN_CACHE_MAX // 10)
+            for _ in range(drop):
+                try:
+                    _chain_cache.pop(next(iter(_chain_cache)))
+                except StopIteration:
+                    break
+
+
+def _chain_cache_touch(key: str) -> None:
+    """Move-to-end on hit so frequently-accessed entries don't get evicted."""
+    with _chain_cache_lock:
+        if key in _chain_cache:
+            v = _chain_cache.pop(key)
+            _chain_cache[key] = v
 
 _alpaca_options_client = None
 
@@ -249,6 +282,7 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
     if cache_key in _chain_cache:
         data, exp = _chain_cache[cache_key]
         if now < exp:
+            _chain_cache_touch(cache_key)
             return data
 
     # Alpaca returns the FULL chain in one call — cache the union-chain under
@@ -258,21 +292,22 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
     if full_key in _chain_cache:
         f_data, f_exp = _chain_cache[full_key]
         if now < f_exp:
+            _chain_cache_touch(full_key)
             full = f_data
     if full is None and _alpaca_opt_feed() != "none":
         full = _fetch_alpaca_chain(ticker)
         if full is not None:
-            _chain_cache[full_key] = (full, now + _CHAIN_TTL)
+            _chain_cache_set(full_key, (full, now + _CHAIN_TTL))
 
     if full is not None:
         result = _filter_by_expiration(full, expiration) if expiration else full
-        _chain_cache[cache_key] = (result, now + _CHAIN_TTL)
+        _chain_cache_set(cache_key, (result, now + _CHAIN_TTL))
         return result
 
     # Yahoo fallback
     data = _fetch_yahoo_chain(ticker, expiration=expiration)
     if data is not None:
-        _chain_cache[cache_key] = (data, now + _CHAIN_TTL)
+        _chain_cache_set(cache_key, (data, now + _CHAIN_TTL))
     return data
 
 

@@ -41,7 +41,7 @@ NOT in this module:
 """
 import logging
 import os
-from typing import Optional
+from typing import Optional, Dict
 from logging.handlers import RotatingFileHandler
 from contextlib import asynccontextmanager
 
@@ -245,6 +245,51 @@ scheduler = BackgroundScheduler(
     },
 )
 
+# r47 fix #T1-1 / observability P0-5: surface scheduler-level job failures
+# and misfires as alerts. Without this, a deploy bug (typo, import error)
+# can silently drop a critical job for hours; jobs that fail before their
+# inner try/except just disappear.
+try:
+    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+    _job_failure_counts: Dict[str, int] = {}
+
+    def _job_error_listener(event):
+        try:
+            from services.alerts import alert as _raise_a
+        except Exception:
+            return
+        jid = getattr(event, "job_id", "?") or "?"
+        n = _job_failure_counts.get(jid, 0) + 1
+        _job_failure_counts[jid] = n
+        try:
+            if n in (1, 3, 10):  # alert ladder
+                exc = getattr(event, "exception", None)
+                _raise_a(
+                    "error" if n == 1 else "critical",
+                    "scheduler_job_failed",
+                    f"job '{jid}' failed (#{n}): {type(exc).__name__ if exc else 'unknown'}: {exc!r}"[:500],
+                )
+        except Exception:
+            pass
+
+    def _job_missed_listener(event):
+        try:
+            from services.alerts import alert as _raise_a
+        except Exception:
+            return
+        try:
+            _raise_a(
+                "warning", "scheduler_misfire",
+                f"job '{getattr(event, 'job_id', '?')}' misfired past grace_time",
+            )
+        except Exception:
+            pass
+
+    scheduler.add_listener(_job_error_listener, EVENT_JOB_ERROR)
+    scheduler.add_listener(_job_missed_listener, EVENT_JOB_MISSED)
+except Exception as _le:
+    logger.warning(f"scheduler listener install failed: {_le}")
+
 # Lifecycle health flags — surfaced via /api/health so deployments can detect
 # silent boot failures (e.g. live_quotes.start crashed but app booted anyway).
 _app_health = {
@@ -347,19 +392,29 @@ def _ml_outcome_backfill():
             .filter(MLPrediction.created_at >= _dt.utcnow() - _td(days=30))
             .all()
         )
+        # r47 fix #T0d-3: window widened from ±10min to ±24h to match
+        # auto_trader._backfill_ml_outcome (r46 widened that path to ±24h).
+        # Prior mismatch: a slow-fill trade or any trade whose close path
+        # crashed during outcome backfill was permanently NULL because
+        # the scheduler-driven backfill had a much narrower window.
         n = 0
         for p in rows:
-            window_start = p.created_at - _td(minutes=10)
-            window_end = p.created_at + _td(minutes=10)
-            t = (
-                db.query(AutoTrade)
-                .filter(AutoTrade.ticker == p.ticker,
-                        AutoTrade.opened_at >= window_start,
-                        AutoTrade.opened_at <= window_end,
-                        AutoTrade.status.like("closed%"))
-                .order_by(AutoTrade.closed_at.desc())
-                .first()
-            )
+            window_start = p.created_at - _td(hours=24)
+            window_end = p.created_at + _td(hours=24)
+            # Prefer trade_id-tracked rows (deterministic match) when set.
+            t = None
+            if getattr(p, "trade_id", None):
+                t = db.query(AutoTrade).filter(AutoTrade.id == p.trade_id).first()
+            if not t:
+                t = (
+                    db.query(AutoTrade)
+                    .filter(AutoTrade.ticker == p.ticker,
+                            AutoTrade.opened_at >= window_start,
+                            AutoTrade.opened_at <= window_end,
+                            AutoTrade.status.like("closed%"))
+                    .order_by(AutoTrade.closed_at.desc())
+                    .first()
+                )
             if t and t.realized_pl is not None:
                 p.trade_id = t.id
                 p.realized_pl = t.realized_pl
@@ -615,9 +670,16 @@ async def lifespan(app: FastAPI):
     try:
         from services.risk_manager import record_equity_snapshot
         from apscheduler.triggers.cron import CronTrigger as _CronES
+        # r47 fix #T0d-4: prior cron used UTC `hour="13-20"` (= 9-16 ET in
+        # EDT, but 8-15 ET in EST). For ~4 months/year (Nov-Mar) the recorder
+        # stopped firing at 15:00 ET — missing the 15:00-16:00 close window
+        # entirely. account_drawdown_multiplier read truncated equity series.
+        # Pin the cron to America/New_York so it tracks the trading session
+        # regardless of DST.
         scheduler.add_job(
             record_equity_snapshot,
-            trigger=_CronES(day_of_week="mon-fri", hour="13-20", minute="*/5"),
+            trigger=_CronES(day_of_week="mon-fri", hour="9-16", minute="*/5",
+                            timezone="America/New_York"),
             id="equity_snapshot",
             max_instances=1, coalesce=True, misfire_grace_time=120,
         )

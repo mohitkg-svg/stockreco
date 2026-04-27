@@ -77,22 +77,31 @@ def _technical_features(daily: pd.DataFrame, as_of: datetime) -> Dict[str, Optio
     if row is None:
         return out
     close = _safe(row.get("Close"))
-    out["tech_rsi"] = _safe(row.get("RSI"))
-    out["tech_adx"] = _safe(row.get("ADX"))
-    macd = _safe(row.get("MACD"))
-    macd_sig = _safe(row.get("MACD_signal"))
+    # r47 fix #T0a-5: indicators.py emits RSI_14 / ADX_14 / MACD_12_26 /
+    # MACDs_12_26 / BBU_20 / BBL_20 / SMA_20 / SMA_50 / SMA_200; legacy
+    # short names returned None silently → ALL technical features were
+    # missing on every train + inference sample, AUC reported was off
+    # technical-data-free features only (ret_*, macro, regime). Keep
+    # legacy fallbacks for backward compatibility with old saved frames.
+    out["tech_rsi"] = _safe(row.get("RSI_14")) or _safe(row.get("RSI"))
+    out["tech_adx"] = _safe(row.get("ADX_14")) or _safe(row.get("ADX"))
+    macd = _safe(row.get("MACD_12_26")) or _safe(row.get("MACD"))
+    macd_sig = _safe(row.get("MACDs_12_26")) or _safe(row.get("MACD_signal"))
     if macd is not None and macd_sig is not None:
         out["tech_macd_diff"] = macd - macd_sig
     atr = _safe(row.get("ATR_14"))
     if atr is not None and close:
         out["tech_atr_pct"] = atr / close
-    bbu = _safe(row.get("BB_upper"))
-    bbl = _safe(row.get("BB_lower"))
+    bbu = _safe(row.get("BBU_20")) or _safe(row.get("BB_upper"))
+    bbl = _safe(row.get("BBL_20")) or _safe(row.get("BB_lower"))
     if bbu is not None and bbl is not None and bbu > bbl and close is not None:
         out["tech_bb_pos"] = (close - bbl) / (bbu - bbl)
-    out["tech_dist_sma20_pct"] = _pct_change(close, _safe(row.get("SMA20")))
-    out["tech_dist_sma50_pct"] = _pct_change(close, _safe(row.get("SMA50")))
-    out["tech_dist_sma200_pct"] = _pct_change(close, _safe(row.get("SMA200")))
+    sma20 = _safe(row.get("SMA_20")) or _safe(row.get("SMA20"))
+    sma50 = _safe(row.get("SMA_50")) or _safe(row.get("SMA50"))
+    sma200 = _safe(row.get("SMA_200")) or _safe(row.get("SMA200"))
+    out["tech_dist_sma20_pct"] = _pct_change(close, sma20)
+    out["tech_dist_sma50_pct"] = _pct_change(close, sma50)
+    out["tech_dist_sma200_pct"] = _pct_change(close, sma200)
     vol = _safe(row.get("Volume"))
     vavg = _safe(row.get("VOL_SMA20"))
     if vol is not None and vavg and vavg > 0:

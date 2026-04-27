@@ -606,19 +606,55 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
     finally:
         db.close()
 
+    # r47 fix #T0b-5: prior code called cancel_all_orders() with NO symbol
+    # filter, wiping every working order in the Alpaca account — including
+    # operator/IRA/manual hedges. Now we cancel ONLY bot-owned order ids
+    # tracked on AutoTrade rows (parent_order_id, stop_order_id, tp_order_id).
     if cancel_orders and paper_trader.is_enabled():
         try:
-            r = paper_trader.cancel_all_orders()
-            cancelled = int(r.get("cancelled") or 0)
+            db_c = SessionLocal()
+            try:
+                _bot_order_ids = set()
+                for r in db_c.query(AutoTrade).filter(
+                    AutoTrade.status.in_(["pending", "open", "adopted"])
+                ).all():
+                    for oid in (r.parent_order_id, r.stop_order_id, r.tp_order_id):
+                        if oid:
+                            _bot_order_ids.add(oid)
+                for oid in _bot_order_ids:
+                    try:
+                        paper_trader.cancel_order(oid)
+                        cancelled += 1
+                    except Exception as ce:
+                        logger.warning(f"kill(): cancel order {oid} failed: {ce}")
+            finally:
+                db_c.close()
         except Exception as e:
-            logger.error(f"kill(): cancel_all_orders failed: {e}")
+            logger.error(f"kill(): cancel_bot_orders failed: {e}")
 
     if flatten and paper_trader.is_enabled():
         try:
-            r = paper_trader.close_all_positions(cancel_orders=False)
-            flattened = list(r.get("closed") or [])
+            # Only flatten POSITIONS that map to a bot AutoTrade row;
+            # operator-side positions (manual scalps, hedges) are not ours
+            # to flatten.
+            db_p = SessionLocal()
+            try:
+                bot_tickers = set(
+                    r.ticker for r in db_p.query(AutoTrade).filter(
+                        AutoTrade.status.in_(["pending", "open", "adopted"])
+                    ).all()
+                )
+            finally:
+                db_p.close()
+            for tk in bot_tickers:
+                try:
+                    res = paper_trader.close_position(tk)
+                    if "error" not in res:
+                        flattened.append(tk)
+                except Exception as fe:
+                    logger.warning(f"kill(): close {tk} failed: {fe}")
         except Exception as e:
-            logger.error(f"kill(): close_all_positions failed: {e}")
+            logger.error(f"kill(): bot-only flatten failed: {e}")
 
     # r39 audit fix #23: previously kill() flattened the broker but did NOT
     # update DB AutoTrade.status for open rows. Combined with the manage
@@ -634,6 +670,13 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
         open_rows = db2.query(AutoTrade).filter(
             AutoTrade.status.in_(["pending", "open", "adopted"])
         ).all()
+        # r47 fix #T0b-2: release accumulated BP reservation. Without this,
+        # the in-flight reservation persisted across the kill and the next
+        # post-unkill entry sized against a phantom reservation.
+        try:
+            from services.risk_manager import _release_bp
+        except Exception:
+            _release_bp = None
         for row in open_rows:
             row.status = "closed_kill"
             row.closed_at = _dt_kill.utcnow()
@@ -641,7 +684,19 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
             row.target_touch_count = 0
             _target_touch_counts.pop(row.id, None)
             db_closed += 1
+            try:
+                if _release_bp and (row.asset_type or "stock") == "stock":
+                    _release_bp(float(row.entry_price or row.requested_entry or 0)
+                                * float(row.original_qty or row.qty or 0))
+            except Exception:
+                pass
         db2.commit()
+        # Hard-reset to defend against any pending callers still in flight.
+        try:
+            from services.risk_manager import _reset_in_flight_bp
+            _reset_in_flight_bp()
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"kill(): DB status update failed: {e}")
     finally:
@@ -803,29 +858,33 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
             avg_entry = float(pos.get("avg_entry_price") or 0)
             if avg_entry <= 0:
                 continue
+            # r47 fix #T0f-3: prior placeholder stop was 0.95×entry regardless
+            # of side; for short positions (qty<0) the stop should be ABOVE
+            # entry (1.05×). The wrong-direction stop polluted heat math
+            # (current_portfolio_heat returned 0 for shorts via max(0,...)).
+            _is_short = qty < 0
+            _stop = round(avg_entry * (1.05 if _is_short else 0.95), 2)
+            _t1 = round(avg_entry * (0.95 if _is_short else 1.05), 2)
             row = AutoTrade(
                 ticker=sym,
                 symbol=sym,
                 asset_type="stock",
-                side="buy" if qty > 0 else "sell",
+                side="buy" if not _is_short else "sell",
                 qty=abs(qty),
                 original_qty=abs(qty),
                 requested_entry=avg_entry,
                 entry_price=avg_entry,
-                # Placeholder stop/target — bot won't manage these (status=adopted
-                # is excluded from the manage loop). Set to 5% below entry just
-                # so heat math has a number to work with; reflects "no specific
-                # stop, just bound the worst case" semantics.
-                stop_loss=round(avg_entry * 0.95, 2),
-                current_stop=round(avg_entry * 0.95, 2),
-                target1=round(avg_entry * 1.05, 2),
+                stop_loss=_stop,
+                current_stop=_stop,
+                target1=_t1,
                 level_index=0,
                 status="adopted",
                 opened_at=datetime.utcnow(),
                 filled_at=datetime.utcnow(),
                 note=(
                     f"ADOPTED from Alpaca {datetime.utcnow().isoformat()}: "
-                    f"external position (qty={qty}, avg_entry=${avg_entry:.2f}). "
+                    f"external {'SHORT' if _is_short else 'LONG'} position "
+                    f"(qty={qty}, avg_entry=${avg_entry:.2f}). "
                     f"Bot will NOT trail/exit this position — operator manages externally."
                 ),
             )
@@ -835,16 +894,38 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
             })
 
         # 2) CLOSE-EXTERNAL: open DB row has no Alpaca position → mark closed
-        # Skip pending — those may be in flight at the broker.
+        # r47 fix #T0b-3: pending rows whose parent order is terminal at the
+        # broker (filled/cancelled/rejected) and have NO Alpaca position
+        # should be reconciled too — prior code just skipped, leaving
+        # phantom-pending rows after a crash mid-submit.
         for r in open_rows:
-            if r.status == "pending":
-                continue
             if r.status == "adopted" and r.ticker in alpaca_stocks:
                 continue
             if r.status == "open" and r.ticker in alpaca_stocks:
                 continue
+            if r.status == "pending":
+                # Decide: still in flight, or terminal-with-no-position?
+                _terminal = False
+                try:
+                    if r.parent_order_id:
+                        c = paper_trader._get_client()
+                        po = c.get_order_by_id(r.parent_order_id)
+                        ps = str(getattr(po, "status", "") or "").lower()
+                        if any(s in ps for s in ("rejected", "canceled", "cancelled", "expired")):
+                            _terminal = True
+                        if "filled" in ps and r.ticker not in alpaca_stocks:
+                            # filled but flat at broker now → closed externally
+                            _terminal = True
+                except Exception:
+                    # Conservative: leave pending alone if broker query failed
+                    continue
+                if not _terminal:
+                    continue
+                if r.ticker in alpaca_stocks:
+                    continue
             # adopted-but-no-longer-on-alpaca → closed externally
             # open-but-no-longer-on-alpaca → closed externally
+            # pending+terminal+no-broker-position → closed externally
             if r.ticker not in alpaca_stocks:
                 r.status = "closed_external"
                 r.closed_at = datetime.utcnow()
@@ -862,6 +943,22 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
     logger.warning(
         f"sync_positions_from_alpaca: adopted={len(adopted)} closed_external={len(closed_external)}"
     )
+    # r47 T1 obs P1-10: surface divergence as an alert so operators don't have
+    # to manually poll the sync endpoint to discover broker-vs-bot drift.
+    try:
+        if adopted or closed_external:
+            from services.alerts import alert as _raise_alert
+            n = len(adopted) + len(closed_external)
+            sev = "warning" if n <= 2 else "error"
+            tickers = sorted({a["ticker"] for a in adopted} |
+                             {c["ticker"] for c in closed_external})
+            _raise_alert(
+                sev, "position_divergence",
+                f"reconcile drift: adopted={len(adopted)} closed_external={len(closed_external)} "
+                f"tickers={tickers}",
+            )
+    except Exception:
+        pass
     return {"adopted": adopted, "closed_external": closed_external}
 
 
@@ -1837,7 +1934,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 os_ = ot.current_stop or ot.stop_loss or 0.0
                 raw = 0.0
                 if ot.asset_type == "stock" and oe > 0 and os_ > 0:
-                    raw = max(0.0, (oe - os_)) * (ot.qty or 0)
+                    # r47 fix #T0f-1: prior `max(0, oe - os_)` returned 0 for
+                    # SHORTS (stop sits ABOVE entry on shorts) — adopted shorts
+                    # passed the 10% portfolio-heat cap with $0 contribution.
+                    # abs() makes heat direction-agnostic.
+                    raw = abs(float(oe) - float(os_)) * (ot.qty or 0)
                 elif ot.asset_type == "option" and oe > 0:
                     # For long options, max-loss = premium paid (contract × 100).
                     raw = float(oe) * 100 * (ot.qty or 0)
@@ -2224,7 +2325,8 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                         se = sr.entry_price or sr.requested_entry or 0.0
                         ss_ = sr.current_stop or sr.stop_loss or 0.0
                         if sr.asset_type == "stock" and se > 0 and ss_ > 0:
-                            sector_heat += max(0.0, (se - ss_)) * (sr.qty or 0)
+                            # r47 fix #T0f-1 (sector heat companion): same short-side fix
+                            sector_heat += abs(float(se) - float(ss_)) * (sr.qty or 0)
                         elif sr.asset_type == "option" and se > 0:
                             sector_heat += float(se) * 100 * (sr.qty or 0)
                     new_heat = max(0.0, risk_per_share) * 1  # conservative — single-share for the gate
@@ -2388,9 +2490,37 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             _cal_mult *= _ie_m()
         except Exception:
             pass
+        # r47 Tier P: composite r47 overlay (VIX9D/VIX3M term-regime, SKEW bias,
+        # VVIX anxiety, VRP, SPX 200d gate, HYG/LQD circuit breaker). Each
+        # overlay is gated by its own cfg flag; combined is clamped [0.4, 1.5].
+        # When the credit-spread CB is active, BUY direction returns 0.0 — we
+        # treat that as a veto on the entry below the sizing block.
+        try:
+            from services.r47_overlays import r47_sizing_overlay as _r47_ov
+            _direction = (signal.get("signal_type") or "BUY").upper()
+            _r47_mult, _r47_parts = _r47_ov(
+                _direction,
+                term_enabled=True,
+                skew_enabled=True,
+                vvix_enabled=True,
+                vrp_enabled=True,
+                spx_gate_enabled=bool(getattr(cfg, "spx_trend_gate_enabled", True)),
+                credit_cb_enabled=bool(getattr(cfg, "credit_spread_circuit_breaker_enabled", True)),
+            )
+            if _r47_mult <= 0.001:
+                # Hard veto from credit-spread circuit breaker on long side.
+                logger.info(
+                    f"AutoTrader skip {ticker}: r47 credit-spread circuit breaker active "
+                    f"(parts={_r47_parts})"
+                )
+                metrics.inc("autotrade_skip", reason="r47_credit_cb")
+                return None
+        except Exception as _r47_e:
+            logger.debug(f"r47 overlay skipped: {_r47_e}")
+            _r47_mult = 1.0
         risk_budget = (equity * cfg.max_risk_per_trade_pct
                        * _adapt * _dd_mult * _vt_mult
-                       * _regime_xa * _cal_mult) / _beta
+                       * _regime_xa * _cal_mult * _r47_mult) / _beta
         # Profit-max: scale risk budget with confidence headroom above threshold.
         # Signals that clear the gate by a wide margin deserve a bigger bet.
         conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
@@ -2593,6 +2723,52 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             db.commit()
             logger.info(f"AutoTrader DRY-RUN {ticker} qty={qty} entry≈{entry} (no broker submit)")
             return None
+
+        # ════════════════════════════════════════════════════════════════════
+        # § PRE-FOMC QUIET HOUR DEFER (r47 #TP-flow)
+        # ════════════════════════════════════════════════════════════════════
+        # Liquidity + slippage spike in the last 60 min before an FOMC
+        # release (Lucca-Moench 2015 + post-pub microstructure work). The
+        # alpha is in HOLDING through the event, not in entering at the
+        # widest spread of the day. Defer non-urgent entries.
+        try:
+            from services.r47_overlays import in_pre_fomc_quiet_hour as _pfqh
+            if _pfqh(60):
+                logger.info(f"AutoTrader skip {ticker}: pre-FOMC quiet hour")
+                metrics.inc("autotrade_skip", reason="pre_fomc_quiet_hour")
+                return None
+        except Exception:
+            pass
+
+        # ════════════════════════════════════════════════════════════════════
+        # § HALT / LULD GUARD (r47 #T0d-5)
+        # ════════════════════════════════════════════════════════════════════
+        # Limit-at-mid orders submitted during a halt sit at the pre-halt
+        # price. When the halt resolves at a different price (LULD limit-up
+        # auction can clear 10-20% from pre-halt), our resting limit fills
+        # against the new market — instant deep underwater.
+        # Free heuristic without an Alpaca halt feed: stale stock quote in RTH.
+        # If WS hasn't ticked in >30s during open hours for a previously-active
+        # ticker, treat as halt-suspect and skip entry. The 30s threshold is
+        # conservative — well above the typical 1-5s tick interval but well
+        # below the 1m halt minimum.
+        try:
+            if (bool(getattr(cfg, "halt_detect_enabled", True))
+                    and paper_trader.is_market_open()):
+                _q = live_quotes.get_stock_quote(ticker) or {}
+                _qts = float(_q.get("ts") or 0)
+                import time as _t_halt
+                if _qts > 0:
+                    _stale_s = _t_halt.time() - _qts
+                    if _stale_s > 30:
+                        logger.warning(
+                            f"AutoTrader skip {ticker}: quote stale {_stale_s:.0f}s "
+                            f"during RTH (halt-suspect)"
+                        )
+                        metrics.inc("autotrade_skip", reason="halt_suspect")
+                        return None
+        except Exception:
+            pass
 
         # ════════════════════════════════════════════════════════════════════
         # § ORDER SUBMIT — bracket submission, AutoTrade row, broadcast
@@ -2923,15 +3099,32 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # lines; the first ignored heat-mult and was silently overwritten.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
         from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
+        # r47 Tier P (A5): graded IV-rank sizing factor on long-premium puts.
+        try:
+            from services.r47_overlays import iv_rank_size_factor as _ivf
+            _iv_pct_p = top.get("iv_rank_pct")
+            _iv_factor_p = _ivf(_iv_pct_p) if bool(getattr(cfg, "iv_rank_graded_sizing", True)) else 1.0
+        except Exception:
+            _iv_factor_p = 1.0
+        if _iv_factor_p <= 0.001:
+            logger.info(f"AutoTrader skip PUT {ticker}: IV-rank graded factor = 0 (vol expensive veto)")
+            metrics.inc("autotrade_skip", reason="iv_rank_graded_veto")
+            return None
+        # B6: Earnings IV-crush sidestep — high IV + earnings within 24h.
+        try:
+            from services.r47_overlays import earnings_iv_crush_sidestep as _eics
+            if _eics(ticker, top.get("iv_rank_pct")):
+                logger.info(f"AutoTrader skip PUT {ticker}: B6 IV-crush sidestep active")
+                metrics.inc("autotrade_skip", reason="iv_crush_sidestep")
+                return None
+        except Exception:
+            pass
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity) * _iv_factor_p
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_cash = int(cash / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_bp = int(buying_power / notional_per_contract) if notional_per_contract > 0 else 0
-        # Per-contract $ cap — hard ceiling on position size independent of
-        # the bucket fractions. Catches the cheap-far-OTM case where
-        # max_qty_by_per_ticker could hit 200+ contracts on a $0.30 option.
         max_qty_by_dollar_cap = int(per_contract_dollar_cap / notional_per_contract) if notional_per_contract > 0 else 0
         qty = min(
             max_qty_by_risk, max_qty_by_remaining,
@@ -2991,30 +3184,37 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             logger.warning(f"AutoTrader put submit failed for {occ}: {res['error']}")
             return None
 
+        # r47 fix #T0c-1: option entries had NO idempotency_key, so multi-
+        # instance Cloud Run could double-buy the same put on the same ticker.
+        # Build a deterministic key tying together ticker + side + strike +
+        # expiry + DTE bucket so retries / multi-instance are de-duped.
+        try:
+            from datetime import date as _today_d
+            _occ_idem = (
+                f"opt|put|{ticker}|{top.get('strike')}|"
+                f"{top.get('expiration')}|{int(top.get('dte') or 0)//7}|"
+                f"{_today_d.today().isoformat()}"
+            )
+        except Exception:
+            _occ_idem = None
         trade = AutoTrade(
             ticker=ticker,
             symbol=occ,
             asset_type="option",
             side="buy",
             qty=qty,
-            original_qty=qty,   # critical-audit fix #11: freeze entry qty
-            requested_entry=float(top["premium"]),       # premium per share
-            # r41 review fix C: store underlying price at entry so the
-            # premium-stop spread-artifact guard can do a meaningful
-            # underlying-vs-thesis comparison (the old code compared
-            # underlying $500 to premium $2 — always "against us").
+            original_qty=qty,
+            requested_entry=float(top["premium"]),
             underlying_entry_price=float(thesis.get("entry") or 0) or None,
-            # NOTE: for option trades the broker has no SL leg. We track the
-            # UNDERLYING stop level here (initialised to the bear-thesis stop) so
-            # the state-machine trail in _manage_option_trade can mutate it.
             stop_loss=float(thesis["stop_loss"]),
             current_stop=float(thesis["stop_loss"]),
-            target1=float(thesis["target1"]),            # underlying levels — manage loop
-            target2=float(thesis["target2"]),            # uses these to trail stops
+            target1=float(thesis["target1"]),
+            target2=float(thesis["target2"]),
             target3=float(thesis["target3"]) if thesis.get("target3") else None,
             level_index=0,
             parent_order_id=res.get("id"),
             status="pending",
+            idempotency_key=_occ_idem,
             note=(
                 f"PUT play: bear-conf {thesis['confidence']} | strike {top['strike']} "
                 f"exp {top['expiration']} ({top['dte']}d) | underlying stop "
@@ -3022,7 +3222,16 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             ),
         )
         db.add(trade)
-        db.commit()
+        try:
+            db.commit()
+        except Exception as _ie:
+            db.rollback()
+            from sqlalchemy.exc import IntegrityError as _IE
+            if isinstance(_ie, _IE):
+                logger.warning(f"PUT idempotency_conflict {ticker} {occ}: {_occ_idem}")
+                metrics.inc("autotrade_skip", reason="idempotency_conflict")
+                return None
+            raise
         db.refresh(trade)
         # Postmortem fix M1: reserve BP for option premium too.
         _reserve_bp(qty * float(top["premium"]) * 100.0)
@@ -3255,17 +3464,31 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # lines; the first ignored heat-mult and was silently overwritten.
         from services.risk_manager import adaptive_risk_multiplier as _adapt_risk
         from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity)
+        # r47 Tier P (A5): graded IV-rank sizing on long-premium calls.
+        try:
+            from services.r47_overlays import iv_rank_size_factor as _ivf
+            _iv_pct_c = top.get("iv_rank_pct")
+            _iv_factor_c = _ivf(_iv_pct_c) if bool(getattr(cfg, "iv_rank_graded_sizing", True)) else 1.0
+        except Exception:
+            _iv_factor_c = 1.0
+        if _iv_factor_c <= 0.001:
+            logger.info(f"AutoTrader skip CALL {ticker}: IV-rank graded factor = 0 (vol expensive veto)")
+            metrics.inc("autotrade_skip", reason="iv_rank_graded_veto")
+            return None
+        try:
+            from services.r47_overlays import earnings_iv_crush_sidestep as _eics
+            if _eics(ticker, top.get("iv_rank_pct")):
+                logger.info(f"AutoTrader skip CALL {ticker}: B6 IV-crush sidestep active")
+                metrics.inc("autotrade_skip", reason="iv_crush_sidestep")
+                return None
+        except Exception:
+            pass
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity) * _iv_factor_c
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_cash = int(cash / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_bp = int(buying_power / notional_per_contract) if notional_per_contract > 0 else 0
-        # r39 audit critical-3: cheap-options gamma cap was computed but
-        # NEVER USED in the call_play qty calculation (compare put_play
-        # which DOES include max_qty_by_dollar_cap in min()). The CNTA
-        # -$2440 case was a $0.30 CALL with 122 contracts — exactly what
-        # this cap was supposed to prevent. Now wired in.
         max_qty_by_dollar_cap = int(per_contract_dollar_cap / notional_per_contract) if notional_per_contract > 0 else 0
         qty = min(
             max_qty_by_risk, max_qty_by_remaining,
@@ -3320,22 +3543,25 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             logger.warning(f"AutoTrader call submit failed for {occ}: {res['error']}")
             return None
 
+        # r47 fix #T0c-1: idempotency_key for CALL plays — see PUT for rationale.
+        try:
+            from datetime import date as _today_d
+            _occ_idem = (
+                f"opt|call|{ticker}|{top.get('strike')}|"
+                f"{top.get('expiration')}|{int(top.get('dte') or 0)//7}|"
+                f"{_today_d.today().isoformat()}"
+            )
+        except Exception:
+            _occ_idem = None
         trade = AutoTrade(
             ticker=ticker,
             symbol=occ,
             asset_type="option",
             side="buy",
             qty=qty,
-            original_qty=qty,   # r39 audit critical-2: stock+put paths set this; calls were missing it, causing T1 trim to fall back to current qty (exponential decay risk)
+            original_qty=qty,
             requested_entry=float(top["premium"]),
-            # r41 review fix C: store underlying price at entry (see PUT path
-            # above for rationale).
             underlying_entry_price=float(thesis.get("entry") or 0) or None,
-            # For calls: underlying stop sits BELOW price. The option
-            # manage loop (`_manage_option_trade`) already supports puts;
-            # we reuse it for calls by parsing direction from the OCC
-            # symbol — the `is_put` check there also handles calls via
-            # its else branch (added in this change).
             stop_loss=float(thesis["stop_loss"]),
             current_stop=float(thesis["stop_loss"]),
             target1=float(thesis["target1"]),
@@ -3344,6 +3570,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             level_index=0,
             parent_order_id=res.get("id"),
             status="pending",
+            idempotency_key=_occ_idem,
             note=(
                 f"CALL play: bull-conf {thesis['confidence']} | strike {top['strike']} "
                 f"exp {top['expiration']} ({top['dte']}d) | underlying stop "
@@ -3351,7 +3578,16 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             ),
         )
         db.add(trade)
-        db.commit()
+        try:
+            db.commit()
+        except Exception as _ie:
+            db.rollback()
+            from sqlalchemy.exc import IntegrityError as _IE
+            if isinstance(_ie, _IE):
+                logger.warning(f"CALL idempotency_conflict {ticker} {occ}: {_occ_idem}")
+                metrics.inc("autotrade_skip", reason="idempotency_conflict")
+                return None
+            raise
         db.refresh(trade)
         _reserve_bp(qty * float(top["premium"]) * 100.0)
         metrics.inc("autotrade_event", event="opened_call")
@@ -3465,6 +3701,43 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
 
     if t.status != "open":
         return
+
+    # r47 fix #T0g-3: DTE≤0 force-flatten. Long options held into the
+    # final hour of expiry have a near-zero theta floor: OTM contracts
+    # decay to 0; ITM contracts auto-exercise (Alpaca paper assigns 100
+    # shares per call → bot ends Monday with an unexpected stock leg
+    # blowing the stock budget and PDT counter). Detect by parsing the
+    # OCC symbol's expiry and force-close before close on expiry day.
+    try:
+        from datetime import datetime as _dt_dte0
+        from zoneinfo import ZoneInfo as _ZI_dte0
+        _occ_dte = (t.symbol or "")
+        if len(_occ_dte) >= 16:
+            yymmdd = _occ_dte[-15:-9]
+            exp = _dt_dte0.strptime(yymmdd, "%y%m%d")
+            now_et = _dt_dte0.now(_ZI_dte0("America/New_York"))
+            # Same calendar day as expiry, after the configured cutoff hour
+            try:
+                _cfg_dte0 = get_config(db)
+                cutoff_hr = int(getattr(_cfg_dte0, "option_dte0_flatten_hour_et", 15) or 15)
+            except Exception:
+                cutoff_hr = 15
+            if (exp.date() == now_et.date() and now_et.hour >= cutoff_hr):
+                from services.execution_engine import force_close_trade as _fct_dte0
+                logger.warning(
+                    f"AutoTrader DTE0-flatten {t.ticker} {t.symbol}: expiry today, "
+                    f"now {now_et.strftime('%H:%M')} ET ≥ {cutoff_hr}:00 — force-close"
+                )
+                _fct_dte0(
+                    t, db,
+                    reason=f"DTE0 force-flatten before expiry close",
+                    summary=summary,
+                    status_override="closed_dte0",
+                )
+                summary["closed"] += 1
+                return
+    except Exception as _dte_e:
+        logger.debug(f"DTE0 check {t.symbol}: {_dte_e}")
 
     # 2) Pull underlying & current option price
     px = _current_price(t.ticker)
@@ -4146,6 +4419,23 @@ def manage_open_positions() -> Dict[str, Any]:
                             req_entry = float(t.requested_entry or 0)
                             if req_entry > 0 and t.asset_type == "stock":
                                 slip = float(t.entry_price) - req_entry
+                                # r47 fix #T1-2 / observability P0-1: track every
+                                # fill's slippage in bps and alert on outliers.
+                                # Without aggregation, slippage was the #1 silent
+                                # leakage vector during prior live testing.
+                                try:
+                                    slip_bps = abs(slip) / req_entry * 10_000.0
+                                    metrics.observe("autotrade_slippage_bps", slip_bps,
+                                                    asset_type="stock")
+                                    if slip_bps > 50.0:
+                                        _raise_alert(
+                                            "warning", "slippage_outlier",
+                                            f"{t.ticker} slip {slip_bps:.0f}bps "
+                                            f"({slip:+.2f}) on fill",
+                                            ticker=t.ticker, trade_id=t.id,
+                                        )
+                                except Exception:
+                                    pass
                                 atr = _chandelier_atr(t.ticker)
                                 if atr and atr > 0:
                                     atr_units = abs(slip) / atr
@@ -4254,7 +4544,45 @@ def manage_open_positions() -> Dict[str, Any]:
                             sl_status = str(getattr(sl_ord, "status", "")).lower()
                             if sl_status in ("canceled", "filled", "rejected", "expired", "replaced"):
                                 if sl_status == "filled":
-                                    pass  # stop actually fired — reconcile block below will close
+                                    # r47 fix #T0b-6: prior code `pass`'d here and
+                                    # relied on the parent.legs reconcile block to
+                                    # close the row. When parent.legs returns empty
+                                    # (terminal bracket), the reconcile silently
+                                    # skipped → row stayed `open` forever, blocking
+                                    # re-entries on the ticker. Close immediately
+                                    # using the SL fill data.
+                                    try:
+                                        _fill_px = float(getattr(sl_ord, "filled_avg_price", 0) or 0)
+                                        _fill_qty = float(getattr(sl_ord, "filled_qty", 0) or t.qty or 0)
+                                        if _fill_px > 0 and t.entry_price:
+                                            _existing = float(t.realized_pl or 0.0)
+                                            t.realized_pl = round(
+                                                _existing + (_fill_px - float(t.entry_price)) * _fill_qty, 2
+                                            )
+                                        t.status = "closed_stop"
+                                        t.closed_at = datetime.utcnow()
+                                        t.note = (t.note or "") + f" | SL filled @ {_fill_px:.2f} (manage-tick reconcile)"
+                                        t.target_touch_count = 0
+                                        _target_touch_counts.pop(t.id, None)
+                                        # Release BP and clean replace_stop cache.
+                                        try:
+                                            from services.risk_manager import _release_bp as _rb
+                                            from services.execution_engine import _replace_stop_cache as _rsc
+                                            _rb(float(t.entry_price or 0) * float(t.original_qty or t.qty or 0))
+                                            _rsc.pop(t.stop_order_id, None)
+                                            _rsc.pop(t.tp_order_id, None)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _backfill_ml_outcome(t, db)
+                                        except Exception:
+                                            pass
+                                        db.commit()
+                                        summary["closed"] += 1
+                                        metrics.inc("autotrade_event", event="closed_stop")
+                                        continue
+                                    except Exception as _slf:
+                                        logger.warning(f"SL-filled close path {t.ticker}: {_slf}")
                                 else:
                                     # Gone but not filled → we're naked-long.
                                     logger.error(
@@ -4533,12 +4861,19 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     # ADX≥30 AND src_tf in {1h,4h,1d}. Gated behind
                                                     # cfg.pyramid_enabled (default False) — needs
                                                     # config + telemetry rollout.
+                                                    # r47 fix #T0a-7: prior code referenced `signal`
+                                                    # which doesn't exist in manage scope → silent
+                                                    # NameError → pyramid never executed since r44.
+                                                    # Now uses live ADX + persisted source TF.
                                                     try:
+                                                        _adx_now = _chandelier_adx(t.ticker) or 0.0
+                                                        _src_tf_p = _trade_source_timeframe(t, db) or ""
                                                         if (
                                                             bool(getattr(cfg, "pyramid_enabled", False))
-                                                            and (signal.get("adx") or 0) >= 30
-                                                            and (signal.get("timeframe") or "") in ("1h", "4h", "1d")
+                                                            and _adx_now >= 30
+                                                            and _src_tf_p in ("1h", "4h", "1d")
                                                             and t.original_qty
+                                                            and (t.asset_type or "stock") == "stock"
                                                         ):
                                                             _add = max(1, int(0.25 * float(t.original_qty)))
                                                             from alpaca.trading.requests import MarketOrderRequest as _MOR_p
@@ -4548,7 +4883,14 @@ def manage_open_positions() -> Dict[str, Any]:
                                                                 side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
                                                             ))
                                                             t.qty = (t.qty or 0) + _add
-                                                            t.note = (t.note or "") + f" | PYRAMID: +{_add} at T1 (soft-BE)"
+                                                            # r47 fix #T0f (P1-8): resize SL leg to match new qty
+                                                            # so the added shares aren't naked until next manage tick.
+                                                            try:
+                                                                if t.stop_order_id:
+                                                                    paper_trader.replace_order_by_id(t.stop_order_id, qty=int(t.qty))
+                                                            except Exception as _resize_e:
+                                                                logger.warning(f"pyramid SL resize {t.ticker} failed: {_resize_e}")
+                                                            t.note = (t.note or "") + f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})"
                                                             metrics.inc("autotrade_event", event="pyramid_t1")
                                                     except Exception as _py_e:
                                                         logger.warning(f"pyramid {t.ticker} failed: {_py_e}")
@@ -4820,6 +5162,23 @@ def manage_open_positions() -> Dict[str, Any]:
             pass
         try:
             _manage_lock.release()
+        except Exception:
+            pass
+        # r47 fix #T0e-4 / #T0h: prune stale OCC subscriptions for option
+        # contracts that no longer have an open AutoTrade row.
+        try:
+            db_p = SessionLocal()
+            try:
+                active_occ = [
+                    r.symbol for r in db_p.query(AutoTrade).filter(
+                        AutoTrade.status.in_(["pending", "open"]),
+                        AutoTrade.asset_type == "option",
+                    ).all()
+                    if r.symbol
+                ]
+            finally:
+                db_p.close()
+            live_quotes.prune_option_symbols(active_occ)
         except Exception:
             pass
     return summary

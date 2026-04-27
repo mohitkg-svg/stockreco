@@ -169,21 +169,30 @@ Conservative first-month profile. JSON to send:
   "rr_min": 1.3,                             // r43: net post-cost R:R floor
 
   // ── r46: NEW per-trade structural ──
-  "bracket_tif": "gtc",                      // ⚠️ "day" caps weekend-gap exposure
-                                             //    but positions are uncovered after RTH;
-                                             //    the manage tick re-arms at 9:30 next day.
-                                             //    Recommended: "day" for first month.
-  "pyramid_enabled": false                   // r44: scale-in at T1 in strong trends.
-                                             //      Leave OFF until you've watched
-                                             //      ≥50 closed trades.
+  "bracket_tif": "day",                      // r47: default flipped from "gtc" to "day"
+                                             //      (closes weekend-gap exposure).
+                                             //      Manage tick re-arms next session.
+  "pyramid_enabled": false,                  // r44/r47: now actually working — was
+                                             //      silently dead since r44 due to
+                                             //      `signal` NameError. Leave OFF
+                                             //      until ≥50 closed trades.
+
+  // ── r47: NEW Tier P overlays (all on by default; toggle individually) ──
+  "halt_detect_enabled": true,               // skip entries when WS quote stale >30s in RTH
+  "iv_rank_graded_sizing": true,             // graded vs binary IV-rank veto
+  "vix_spike_strategy_enabled": true,        // VIX 5σ spike → SPY long
+  "spx_trend_gate_enabled": true,            // SPY < 200dSMA cuts long sizing 50%
+  "credit_spread_circuit_breaker_enabled": true,  // HYG/LQD z<-2σ → veto longs
+  "wash_sale_cooldown_days": 0,              // raise if running tax-sensitive account
+  "option_dte0_flatten_hour_et": 15          // force-close options at 15:00 ET on expiry
 }
 ```
 
 ---
 
-## r43-r46 post-deploy verification (do FIRST after the env vars deploy, before flipping `enabled=true`)
+## r43-r47 post-deploy verification (do FIRST after the env vars deploy, before flipping `enabled=true`)
 
-Several r43-r46 systems are silent on day 1 — they activate only after
+Several r43-r47 systems are silent on day 1 — they activate only after
 data accumulates. Verify each is working:
 
 | System | Activation requirement | Verification |
@@ -193,11 +202,27 @@ data accumulates. Verify each is working:
 | `crisis_mode` (r46) | Always live; True only when ≥5% multi-day DD or ≥4% session DD | `GET /api/health` shows `crisis_mode` present (False on healthy day) |
 | Calibration GATE (r46) | ≥30 closed trades in any conf bucket | First days: gate is no-op (insufficient sample) |
 | Per-ticker overrides (r46) | First weekly `recompute_all_profiles` run | `SELECT * FROM ticker_profiles` returns ≥1 row after weekly job |
-| `MLPrediction.outcome` backfill (r45/r46) | First trade closes after model trained | `SELECT count(*) FROM ml_predictions WHERE outcome IS NOT NULL` > 0 |
+| `MLPrediction.outcome` backfill (r45/r46/r47) | First trade closes after model trained | `SELECT count(*) FROM ml_predictions WHERE outcome IS NOT NULL` > 0 |
 | ML calibrator (r45) | Train fold w/ ≥50 OOF samples | `GET /api/ml/status` shows `calibrator_loaded: true` |
 | News severity gate (r46) | News article on open position | `autotrade_event{event=news_exit}` counter increments (was always 0 pre-r46) |
 | AI news-blind bug fixed (r46) | AI judge call with recent news on ticker | `prompt_summary` in AIDecisionLog includes `recent_news` array (was always `[]`) |
 | Stop-LIMIT (r46) | First trade with `STOP_LIMIT_OFFSET_PCT=0.005` | Alpaca dashboard shows SL leg as STOP_LIMIT, not STOP |
+| **r47** Calibration multiplier (was dead, fixed) | ≥20 closed trades in a conf bucket | `services.risk_manager.calibration_multiplier(75)` returns ≠ 1.0 once a bucket has n≥20 |
+| **r47** Strategy multiplier (was dead, fixed) | ≥20 closed trades on a strategy | Inspect `auto_trader.strategy_scorecard` output for any strat with `n>=20` |
+| **r47** ML technical features (were silently None) | First inference call | Inspect `MLPrediction` rows: `features_json` should now contain non-null `tech_rsi` etc. |
+| **r47** confidence_boost direction-match | Persisted best-strategy row in BUY direction | Manually call `services.best_strategy.confidence_boost(ticker, None, "BUY")` — returns 1.06 when row exists |
+| **r47** EquitySnapshot UNIQUE on ts | Multi-instance Cloud Run | `SELECT ts, count(*) FROM equity_snapshots GROUP BY ts HAVING count(*) > 1` returns 0 rows |
+| **r47** Slippage histogram + alert | First non-trivial fill slip | `metrics_observe('autotrade_slippage_bps')` histogram has buckets populated; alerts panel shows `slippage_outlier` if any fill >50bps |
+| **r47** Scheduler EVENT_JOB_ERROR listener | Any scheduled job exception | `scheduler_job_failed` alert appears in `/api/admin/alerts` for the failing job |
+| **r47** Position divergence alert | Operator manually flatten in Alpaca dashboard | Next reconcile fires `position_divergence` alert |
+| **r47** SPX 200d trend gate | SPY closes below 200dSMA | `r47_overlays.spx_trend_size_factor("BUY")` returns 0.5; long sizing reduced |
+| **r47** HYG/LQD credit-spread circuit breaker | HYG/LQD 60d z < -2 | New BUY entries skipped with `autotrade_skip{reason=r47_credit_cb}` |
+| **r47** VIX 5σ spike strategy | Daily VIX +5σ change AND VIX≥25 | `r47_overlays.vix_spike_signal()` returns dict instead of None |
+| **r47** Halt detection | WS quote stale >30s in RTH | New entries skipped with `autotrade_skip{reason=halt_suspect}` |
+| **r47** News AI rate-limit (now per-hour) | 5+ articles in same hour on same ticker | Only first 3 fire AI judge; rest skipped (visible in AIDecisionLog) |
+| **r47** Pyramid feature (now actually working) | T1 hit + ADX≥30 + cfg.pyramid_enabled=true | `autotrade_event{event=pyramid_t1}` increments |
+| **r47** Inside-bar breakout (now correct logic) | Inside bar + parent-range break | Strategy fires only on parent-range break, not on every up-day |
+| **r47** Idempotency on options | Multi-instance scan on same ticker | UNIQUE constraint blocks duplicate; `autotrade_skip{reason=idempotency_conflict}` increments |
 
 If any of these don't activate within 1 RTH session of expected
 conditions, that's a "stop the line" event — kill the bot and investigate.

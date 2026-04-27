@@ -14,6 +14,8 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import threading
+
 from sqlalchemy.orm import Session
 
 from services import paper_trader, metrics
@@ -21,7 +23,37 @@ from services import paper_trader, metrics
 logger = logging.getLogger(__name__)
 
 # Idempotency cache for stop-replacements. See `replace_stop` docstring.
+# r47 fix #T0e-2 / T0h: bounded LRU + threading.Lock — multi-thread
+# (manage tick + WS fast-path + AI exit) all reach this dict; without a
+# lock concurrent reads/writes can produce torn cache entries and double
+# broker-replace calls. A bounded cap prevents unbounded growth on close
+# paths that don't pop (force_close_trade etc.).
+_replace_stop_cache_lock = threading.Lock()
 _replace_stop_cache: Dict[str, float] = {}
+_REPLACE_STOP_CACHE_MAX = 10000
+
+
+def _rsc_get(key: str) -> Optional[float]:
+    with _replace_stop_cache_lock:
+        return _replace_stop_cache.get(key)
+
+
+def _rsc_set(key: str, val: float) -> None:
+    with _replace_stop_cache_lock:
+        _replace_stop_cache[key] = val
+        if len(_replace_stop_cache) > _REPLACE_STOP_CACHE_MAX:
+            # Drop oldest 10% by insertion order
+            drop = max(1, _REPLACE_STOP_CACHE_MAX // 10)
+            for _ in range(drop):
+                try:
+                    _replace_stop_cache.pop(next(iter(_replace_stop_cache)))
+                except StopIteration:
+                    break
+
+
+def _rsc_pop(key: str) -> None:
+    with _replace_stop_cache_lock:
+        _replace_stop_cache.pop(key, None)
 
 
 def get_legs(parent_id: str) -> List[Any]:
@@ -66,7 +98,7 @@ def replace_stop(stop_order_id: str, new_stop: float) -> Optional[str]:
     rounded = round(float(new_stop), 2)
     # Idempotency: if we already sent this exact stop price for this order
     # (and Alpaca accepted it), skip the round-trip and return the same id.
-    last = _replace_stop_cache.get(stop_order_id)
+    last = _rsc_get(stop_order_id)
     if last is not None and abs(last - rounded) < 0.005:
         return stop_order_id
     c = paper_trader._get_client()
@@ -80,18 +112,13 @@ def replace_stop(stop_order_id: str, new_stop: float) -> Optional[str]:
             order_data=ReplaceOrderRequest(stop_price=rounded),
         )
         new_id = str(getattr(new_order, "id", "") or stop_order_id)
-        _replace_stop_cache[stop_order_id] = rounded
-        # Mirror the cache entry under the new id so a follow-up no-op
-        # replace is still recognized as idempotent.
-        _replace_stop_cache[new_id] = rounded
+        _rsc_set(stop_order_id, rounded)
+        _rsc_set(new_id, rounded)
         return new_id
     except Exception as e:
         err_lower = str(e).lower()
-        # Alpaca briefly reports "order already replaced" when our previous
-        # replace is still settling. Our intent is accepted — record it and
-        # treat as success so the DB advances.
         if "already replaced" in err_lower:
-            _replace_stop_cache[stop_order_id] = rounded
+            _rsc_set(stop_order_id, rounded)
             logger.debug(
                 f"replace_stop {stop_order_id}: already-replaced (racing prior tick), "
                 f"caching intent {rounded}"
@@ -115,7 +142,7 @@ def replace_tp(tp_order_id: str, new_limit: float) -> Optional[str]:
     silently was not what the broker actually held.
     """
     rounded = round(float(new_limit), 2)
-    last = _replace_stop_cache.get(tp_order_id)
+    last = _rsc_get(tp_order_id)
     if last is not None and abs(last - rounded) < 0.005:
         return tp_order_id
     c = paper_trader._get_client()
@@ -129,13 +156,13 @@ def replace_tp(tp_order_id: str, new_limit: float) -> Optional[str]:
             order_data=ReplaceOrderRequest(limit_price=rounded),
         )
         new_id = str(getattr(new_order, "id", "") or tp_order_id)
-        _replace_stop_cache[tp_order_id] = rounded
-        _replace_stop_cache[new_id] = rounded
+        _rsc_set(tp_order_id, rounded)
+        _rsc_set(new_id, rounded)
         return new_id
     except Exception as e:
         err_lower = str(e).lower()
         if "already replaced" in err_lower:
-            _replace_stop_cache[tp_order_id] = rounded
+            _rsc_set(tp_order_id, rounded)
             return tp_order_id
         logger.error(f"replace_tp FAILED {tp_order_id} → {new_limit}: {e}")
         return None

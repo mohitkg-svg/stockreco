@@ -1545,5 +1545,184 @@ class TestSeasonalityHelpers(unittest.TestCase):
         self.assertFalse(pre_fomc_drift_buy_qualifying_ticker("RANDOM"))
 
 
+class TestR47DeadMultipliers(unittest.TestCase):
+    """r47 T0a: pipeline-broken multipliers + missed string matches.
+    Each of these silently returned 1.0 / never fired in production.
+    """
+
+    def test_calibration_multiplier_uses_n_column(self):
+        """r47 #T0a-1: prior code read getattr(row, 'n_trades', 0) but the
+        ConfidenceCalibration column is named `n` — gate never fired."""
+        from database import SessionLocal, ConfidenceCalibration, create_tables
+        from services.risk_manager import calibration_multiplier, _calibration_cache
+        create_tables()
+        _calibration_cache.clear()
+        db = SessionLocal()
+        try:
+            existing = db.query(ConfidenceCalibration).filter(
+                ConfidenceCalibration.bucket == "70-79"
+            ).first()
+            if existing:
+                db.delete(existing); db.commit()
+            row = ConfidenceCalibration(bucket="70-79", n=30,
+                                        win_rate=0.62, avg_pl=0.5, multiplier=1.20)
+            db.add(row); db.commit()
+        finally:
+            db.close()
+        _calibration_cache.clear()
+        m = calibration_multiplier(75.0)
+        self.assertAlmostEqual(m, 1.20, places=4)
+
+    def test_strategy_multiplier_uses_n_key(self):
+        """r47 #T0a-2: prior code read entry.get('trades') but scorecard
+        emits 'n' — gate never fired."""
+        from services.risk_manager import strategy_multiplier, _strategy_mult_cache
+        from unittest.mock import patch
+        _strategy_mult_cache.clear()
+        fake_card = {"X-Strategy": {"n": 25, "multiplier": 0.80, "win_rate": 0.30}}
+        with patch("services.auto_trader.strategy_scorecard", return_value=fake_card):
+            m = strategy_multiplier("X-Strategy")
+        self.assertAlmostEqual(m, 0.80, places=4)
+
+    def test_inside_bar_breakout_uses_parent_bar_range(self):
+        """r47 #T0c-4: prior code's `inside` mask was indexed wrong AND the
+        trigger compared today's close to YESTERDAY's high (the inside bar's
+        own high) instead of the PARENT bar (i-2). Verify the new code
+        triggers ONLY on a real inside-bar followed by parent-range break."""
+        import pandas as pd
+        from services.strategies import _inside_bar_breakout
+        # i-2: H=10 L=5 (parent range 5..10)
+        # i-1: H=8 L=6   (inside the parent — narrow range)
+        # i:   close=11  (broke ABOVE parent high = 10)
+        df = pd.DataFrame({
+            "High":  [10, 8, 11.5],
+            "Low":   [5,  6, 9],
+            "Close": [9,  7, 11],
+        })
+        out = _inside_bar_breakout(df)
+        # Last bar should signal long entry
+        self.assertTrue(bool(out["entry_long"].iloc[-1]))
+        self.assertFalse(bool(out["entry_short"].iloc[-1]))
+        # First two bars must be False (not enough history)
+        self.assertFalse(bool(out["entry_long"].iloc[0]))
+
+
+class TestR47PortfolioHeatShorts(unittest.TestCase):
+    """r47 T0f-1: heat math for SHORTS used max(0, entry-stop) which is 0
+    (stop is ABOVE entry on a short) — silent zero-contribution to heat cap."""
+    def test_short_position_contributes_to_heat(self):
+        from database import SessionLocal, AutoTrade, create_tables
+        from services.risk_manager import current_portfolio_heat
+        create_tables()
+        db = SessionLocal()
+        try:
+            db.query(AutoTrade).delete()
+            db.add(AutoTrade(
+                ticker="ZZZSHORT", symbol="ZZZSHORT", asset_type="stock",
+                side="sell", qty=100,
+                entry_price=100.0, requested_entry=100.0,
+                stop_loss=110.0, current_stop=110.0,  # stop ABOVE entry → SHORT
+                target1=90.0, level_index=0, status="open",
+                opened_at=datetime.utcnow(),
+            ))
+            db.commit()
+        finally:
+            db.close()
+        h = current_portfolio_heat()
+        self.assertGreaterEqual(h, 900.0)
+
+
+class TestR47SchemaDrift(unittest.TestCase):
+    """r47 T0a-8: cfg attrs that prior code read via getattr but were never
+    columns. Verify they're now persisted and the ORM exposes them."""
+    def test_new_config_columns_present(self):
+        from database import AutoTraderConfig
+        cols = set(AutoTraderConfig.__table__.columns.keys())
+        for required in [
+            "pyramid_enabled", "max_correlated_open", "vol_target_annual",
+            "leverage_cap", "book_var_99_cap_pct", "bracket_tif", "rr_min",
+            "halt_detect_enabled", "iv_rank_graded_sizing",
+            "vix_spike_strategy_enabled", "spx_trend_gate_enabled",
+            "credit_spread_circuit_breaker_enabled",
+        ]:
+            self.assertIn(required, cols, f"missing config column: {required}")
+
+
+class TestR47Overlays(unittest.TestCase):
+    """r47 Tier P: regime-overlay sizing + clamps."""
+    def test_iv_rank_size_factor_curve(self):
+        from services.r47_overlays import iv_rank_size_factor as f
+        # cheap vol → boost
+        self.assertGreater(f(0.20), 1.0)
+        # mid → unity
+        self.assertAlmostEqual(f(0.50), 1.0, places=4)
+        # rich → discount
+        self.assertLess(f(0.85), 1.0)
+        # extreme → veto (0.0)
+        self.assertEqual(f(0.95), 0.0)
+        # None → safe default
+        self.assertAlmostEqual(f(None), 1.0, places=4)
+
+    def test_overlay_combined_clamp(self):
+        from services.r47_overlays import r47_sizing_overlay
+        m, parts = r47_sizing_overlay("BUY")
+        self.assertGreaterEqual(m, 0.0)  # may be 0 if CB is active
+        self.assertLessEqual(m, 1.5)
+        self.assertIsInstance(parts, dict)
+
+
+class TestR47NewStrategiesPresent(unittest.TestCase):
+    def test_vix_spike_in_registry(self):
+        from services.strategies import STRATEGY_FUNCS
+        names = {f.__name__ for f in STRATEGY_FUNCS}
+        self.assertIn("_vix_spike_reversion", names)
+
+
+class TestR47AccountBlockedFields(unittest.TestCase):
+    """r47 T0d-1: account_blocked / transfers_blocked must appear in the
+    paper_trader.get_account() dict — r46 added gates on these but the
+    keys were never populated."""
+    def test_get_account_keys_when_no_client(self):
+        from services import paper_trader
+        # no Alpaca creds in test → returns None; ensure surface is documented
+        # by inspecting the dict assembly path via lambda eval (no live call).
+        import inspect
+        src = inspect.getsource(paper_trader.get_account)
+        self.assertIn("account_blocked", src)
+        self.assertIn("transfers_blocked", src)
+
+
+class TestR47NewsAIRateModuleLevel(unittest.TestCase):
+    """r47 T0d-2: per-(ticker, hour) AI exit-judge rate limit must persist
+    across batches; prior local-dict implementation reset every poll."""
+    def test_ai_rate_inc_persists_across_calls(self):
+        from services.news import _ai_rate_inc, _ai_rate_get, _AI_RATE
+        _AI_RATE.clear()
+        n1 = _ai_rate_inc("AAPL")
+        n2 = _ai_rate_inc("AAPL")
+        n3 = _ai_rate_inc("AAPL")
+        self.assertEqual(n1, 1)
+        self.assertEqual(n2, 2)
+        self.assertEqual(n3, 3)
+        self.assertEqual(_ai_rate_get("AAPL"), 3)
+
+
+class TestR47ConfidenceBoostFiresOnDirectionMatch(unittest.TestCase):
+    """r47 T0a-6: prior code required strategy-name string match (and the
+    caller passed 'Composite (multi-factor)' which never matched persisted
+    strategy names like 'Trend Following') — boost never fired."""
+    def test_boost_fires_on_direction_match_alone(self):
+        from services.best_strategy import confidence_boost
+        from unittest.mock import patch
+        fake = {
+            "ticker": "AAPL", "strategy": "Trend Following",
+            "direction": "BUY", "confidence": 70, "oos_trades": 5,
+        }
+        with patch("services.best_strategy.get_for_ticker", return_value=fake):
+            # caller passes generic composite → still gets the base boost
+            mult = confidence_boost("AAPL", "Composite (multi-factor)", "BUY")
+        self.assertGreaterEqual(mult, 1.05)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

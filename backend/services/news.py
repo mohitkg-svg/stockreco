@@ -35,6 +35,40 @@ logger = logging.getLogger(__name__)
 # WAL writer lock — see DESIGN.md scan-vs-manage contention design).
 _NEWS_AI_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="news-ai")
 
+# r47 fix #T0d-2: r46 added a "per-ticker AI rate limit (3/hr)" to keep
+# earnings-day spam from firing 50 AI judges. The implementation made
+# `_ai_rate` LOCAL to ingest(), so every poll call reset it — the cap
+# was effectively per-batch (typically 1 batch/poll), not per-hour.
+# Now: module-level keyed by (ticker, hour_bucket_int) and pruned on each
+# ingest pass to keep memory bounded.
+import threading as _ai_th
+_AI_RATE_LOCK = _ai_th.Lock()
+_AI_RATE: Dict[tuple, int] = {}
+_AI_RATE_PER_TICKER_HOUR = 3
+
+
+def _ai_rate_inc(ticker: str) -> int:
+    """Atomically increment the per-(ticker, hour) AI exit-judge counter.
+    Returns the post-increment count. Caller checks < cap before incrementing."""
+    from datetime import datetime as _dt_air
+    bucket = (ticker.upper(), int(_dt_air.utcnow().timestamp() // 3600))
+    with _AI_RATE_LOCK:
+        n = _AI_RATE.get(bucket, 0) + 1
+        _AI_RATE[bucket] = n
+        # Prune entries older than 2h (keep current + previous hour for grace).
+        cur_h = bucket[1]
+        for k in list(_AI_RATE.keys()):
+            if k[1] < cur_h - 1:
+                _AI_RATE.pop(k, None)
+        return n
+
+
+def _ai_rate_get(ticker: str) -> int:
+    from datetime import datetime as _dt_air
+    bucket = (ticker.upper(), int(_dt_air.utcnow().timestamp() // 3600))
+    with _AI_RATE_LOCK:
+        return _AI_RATE.get(bucket, 0)
+
 _ALPACA_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
 _POSITIVE_THRESHOLD = 0.35   # VADER compound ≥ this → "positive"
 _NEGATIVE_THRESHOLD = -0.35  # VADER compound ≤ this → "negative"
@@ -184,11 +218,8 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
             seen_headline_keys.add(key)
     except Exception:
         pass
-    # r46 Tier 1: per-(ticker, hour) AI-judge rate limit. Earnings day on
-    # AAPL produces 50+ articles in 30 min; without this each fires its
-    # own AI judge → races itself to close the position 50×.
-    _ai_rate: Dict[str, int] = {}
-    _AI_RATE_PER_TICKER_HOUR = 3
+    # r47 fix #T0d-2: see module-level _ai_rate_inc / _ai_rate_get.
+    # The local-dict pattern below is gone; we delegate to the shared store.
 
     try:
         # Batch the existence check — one query vs N per-article selects.
@@ -254,13 +285,10 @@ def ingest(items: List[Dict[str, Any]]) -> Dict[str, int]:
                     for s in symbols:
                         s_up = s.upper()
                         if s_up in _open_pos_tickers:
-                            # r46 Tier 1: per-ticker AI-judge rate limit
-                            # (earnings day = 50+ articles per ticker;
-                            # without this every article fires its own AI
-                            # judge against the same open position).
-                            if _ai_rate.get(s_up, 0) >= _AI_RATE_PER_TICKER_HOUR:
+                            # r47 fix #T0d-2: shared per-(ticker, hour) cap.
+                            if _ai_rate_get(s_up) >= _AI_RATE_PER_TICKER_HOUR:
                                 break
-                            _ai_rate[s_up] = _ai_rate.get(s_up, 0) + 1
+                            _ai_rate_inc(s_up)
                             _new_for_open.append({
                                 "ticker": s_up,
                                 "title": headline,
@@ -317,6 +345,15 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
     if ai_judge.news_exit_mode() == "off":
         return
     from database import AutoTrade
+    # r47 fix #T0e-1: prior code held one DB session across all (item, trade)
+    # iterations + multi-second Claude round-trips → lost-update races
+    # against the manage tick mutating the same AutoTrade rows. Acquire
+    # the manage lock around each close so we serialize state mutations
+    # cleanly with the manage tick. Also use a fresh session per trade.
+    try:
+        from services.auto_trader import _manage_lock as _ai_news_lock
+    except Exception:
+        _ai_news_lock = None
     db = SessionLocal()
     try:
         for item in news_for_open:
@@ -359,21 +396,44 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
                     continue
                 action = res.get("action", "hold")
                 if action == "close":
+                    # r47 fix #T0e-3: serialize against the manage tick so the
+                    # AI thread doesn't lost-update mid-T1-trim or mid-stop-replace.
+                    _got_lock = False
                     try:
-                        from services.execution_engine import force_close_trade
-                        # r39 audit fix #21: pass touch-count cleanup callback
-                        # so closed-trade state doesn't leak in the in-memory
-                        # cache. Mirrors auto_trader._force_close_trade pattern.
-                        from services.auto_trader import _touch_clear as _tc
-                        force_close_trade(
-                            t, db,
-                            reason=f"AI news_exit: {res.get('reason', '')}",
-                            summary={},
-                            status_override="closed_news_ai",
-                            on_close=lambda closed_t: _tc(closed_t, db),
-                        )
+                        if _ai_news_lock is not None:
+                            _got_lock = _ai_news_lock.acquire(timeout=10.0)
+                            if not _got_lock:
+                                logger.warning(
+                                    f"news: AI-close skipped for {ticker} #{t.id}: "
+                                    f"could not acquire manage lock in 10s"
+                                )
+                                continue
+                        # Use a fresh session for the close so a single bad
+                        # row can't taint the rest of the dispatch loop.
+                        ldb = SessionLocal()
+                        try:
+                            t_local = ldb.query(AutoTrade).filter(AutoTrade.id == t.id).first()
+                            if not t_local or t_local.status not in ("pending", "open"):
+                                continue
+                            from services.execution_engine import force_close_trade
+                            from services.auto_trader import _touch_clear as _tc
+                            force_close_trade(
+                                t_local, ldb,
+                                reason=f"AI news_exit: {res.get('reason', '')}",
+                                summary={},
+                                status_override="closed_news_ai",
+                                on_close=lambda closed_t: _tc(closed_t, ldb),
+                            )
+                        finally:
+                            ldb.close()
                     except Exception as e:
                         logger.warning(f"news: AI-driven close failed for {ticker} #{t.id}: {e}")
+                    finally:
+                        if _got_lock and _ai_news_lock is not None:
+                            try:
+                                _ai_news_lock.release()
+                            except Exception:
+                                pass
                 elif action == "trim":
                     # Trim half of remaining qty at market.
                     try:

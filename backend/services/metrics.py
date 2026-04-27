@@ -58,6 +58,14 @@ if _ENABLED:
         "manage_loop_seconds",
         "Wall time per manage_open_positions tick",
     )
+    # r47 fix #T1-2: per-fill slippage histogram for live execution-quality
+    # monitoring. Buckets cover sub-bp through ~3% slip.
+    SLIPPAGE_BPS = Histogram(
+        "autotrade_slippage_bps",
+        "|filled - intent| / intent in basis points, per fill",
+        ["asset_type"],
+        buckets=(1, 3, 5, 10, 20, 40, 80, 160, 320),
+    )
 
 
 def inc(name: str, **labels) -> None:
@@ -75,6 +83,27 @@ def inc(name: str, **labels) -> None:
         counter.labels(**labels).inc()
     except Exception as e:
         logger.debug(f"metrics inc({name}) failed: {e}")
+
+
+def observe(name: str, value: float, **labels) -> None:
+    """Record an observation on a histogram by name. Silent no-op when
+    prometheus isn't installed or the name doesn't map. r47 #T1-2."""
+    if not _ENABLED:
+        return
+    hist = {
+        "autotrade_slippage_bps": SLIPPAGE_BPS,
+        "manage_loop_seconds": MANAGE_LATENCY,
+        "signal_generation_seconds": SIGNAL_LATENCY,
+    }.get(name)
+    if hist is None:
+        return
+    try:
+        if labels:
+            hist.labels(**labels).observe(float(value))
+        else:
+            hist.observe(float(value))
+    except Exception as e:
+        logger.debug(f"metrics observe({name}) failed: {e}")
 
 
 @contextmanager

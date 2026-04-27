@@ -109,10 +109,19 @@ def fetch_full_day(ticker: str, day: datetime) -> Optional[pd.DataFrame]:
     return df
 
 
+_LIVE_CACHE_MAX = 100  # r47 fix #T0h: cap to bound RSS during 500-ticker scans
+
+
 def fetch_live_window(ticker: str, lookback_minutes: int = 30) -> Optional[pd.DataFrame]:
-    """Last N minutes of trades for the live inference path. 60s TTL."""
+    """Last N minutes of trades for the live inference path. 60s TTL.
+
+    r47 fix #T0h: bounded LRU. Without a cap, a 500-ticker universe scan
+    × 100KB DataFrame each = 50MB RSS just for tape cache; stale entries
+    past TTL still occupy memory until overwritten.
+    """
     now_ts = time.time()
-    cached = _LIVE_CACHE.get(ticker.upper())
+    key = ticker.upper()
+    cached = _LIVE_CACHE.get(key)
     if cached and (now_ts - cached[1]) < _LIVE_TTL_SEC:
         return cached[0]
     end = datetime.now(timezone.utc)
@@ -120,7 +129,14 @@ def fetch_live_window(ticker: str, lookback_minutes: int = 30) -> Optional[pd.Da
     df = _fetch_window(ticker, start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z"))
     if df is None:
         return None
-    _LIVE_CACHE[ticker.upper()] = (df, now_ts)
+    _LIVE_CACHE[key] = (df, now_ts)
+    if len(_LIVE_CACHE) > _LIVE_CACHE_MAX:
+        # Drop oldest 10% by insertion order
+        for _ in range(max(1, _LIVE_CACHE_MAX // 10)):
+            try:
+                _LIVE_CACHE.pop(next(iter(_LIVE_CACHE)))
+            except StopIteration:
+                break
     return df
 
 

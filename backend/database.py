@@ -237,6 +237,29 @@ class AutoTraderConfig(Base):
     # contained during the initial live-trading phase. Flip to False after
     # calibration is solid and gap risk has been stress-tested.
     flatten_by_eod = Column(Boolean, default=True)
+    # r47 schema-drift fixes (T0a-8): config knobs read via getattr but never
+    # persisted as columns — features silently ran on hardcoded defaults.
+    pyramid_enabled = Column(Boolean, default=False)
+    max_correlated_open = Column(Integer, default=4)
+    vol_target_annual = Column(Float, default=0.12)
+    leverage_cap = Column(Float, default=1.5)
+    book_var_99_cap_pct = Column(Float, default=0.05)
+    bracket_tif = Column(String, default="day")  # r47: was 'gtc' default → uncovered weekend gap
+    rr_min = Column(Float, default=1.3)
+    # r47 — safety/halt detection
+    halt_detect_enabled = Column(Boolean, default=True)
+    # r47 — graded IV-rank sizing factor (vs binary veto)
+    iv_rank_graded_sizing = Column(Boolean, default=True)
+    # r47 — wash-sale guard cooldown after a stop-out loss
+    wash_sale_cooldown_days = Column(Integer, default=0)
+    # r47 — DTE-zero force-flatten on options
+    option_dte0_flatten_hour_et = Column(Integer, default=15)
+    # r47 — VIX 5σ spike → SPY long
+    vix_spike_strategy_enabled = Column(Boolean, default=True)
+    # r47 — SPX 200d global trend gate
+    spx_trend_gate_enabled = Column(Boolean, default=True)
+    # r47 — HYG/LQD credit-spread circuit breaker
+    credit_spread_circuit_breaker_enabled = Column(Boolean, default=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -698,7 +721,10 @@ class EquitySnapshot(Base):
     """
     __tablename__ = "equity_snapshots"
     id = Column(Integer, primary_key=True)
-    ts = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)
+    # r47 fix #T0c-2: ts UNIQUE so multi-instance Cloud Run can't write N
+    # duplicate rows per 5-min bucket. Recorder rounds to 5-min bucket
+    # and uses upsert semantics.
+    ts = Column(DateTime, index=True, unique=True, nullable=False, default=datetime.utcnow)
     equity = Column(Float, nullable=False)
     cash = Column(Float, nullable=True)
     buying_power = Column(Float, nullable=True)
@@ -837,6 +863,21 @@ def create_tables():
     _ensure_column("auto_trades", "original_qty", "DOUBLE PRECISION")
     _ensure_column("auto_trades", "target_touch_count", "INTEGER DEFAULT 0")
     _ensure_column("auto_trades", "underlying_entry_price", "DOUBLE PRECISION")
+    # r47 schema-drift fixes — these knobs were read via getattr but never columns
+    _ensure_column("auto_trader_config", "pyramid_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "max_correlated_open", "INTEGER DEFAULT 4")
+    _ensure_column("auto_trader_config", "vol_target_annual", "DOUBLE PRECISION DEFAULT 0.12")
+    _ensure_column("auto_trader_config", "leverage_cap", "DOUBLE PRECISION DEFAULT 1.5")
+    _ensure_column("auto_trader_config", "book_var_99_cap_pct", "DOUBLE PRECISION DEFAULT 0.05")
+    _ensure_column("auto_trader_config", "bracket_tif", "VARCHAR DEFAULT 'day'")
+    _ensure_column("auto_trader_config", "rr_min", "DOUBLE PRECISION DEFAULT 1.3")
+    _ensure_column("auto_trader_config", "halt_detect_enabled", "BOOLEAN DEFAULT TRUE")
+    _ensure_column("auto_trader_config", "iv_rank_graded_sizing", "BOOLEAN DEFAULT TRUE")
+    _ensure_column("auto_trader_config", "wash_sale_cooldown_days", "INTEGER DEFAULT 0")
+    _ensure_column("auto_trader_config", "option_dte0_flatten_hour_et", "INTEGER DEFAULT 15")
+    _ensure_column("auto_trader_config", "vix_spike_strategy_enabled", "BOOLEAN DEFAULT TRUE")
+    _ensure_column("auto_trader_config", "spx_trend_gate_enabled", "BOOLEAN DEFAULT TRUE")
+    _ensure_column("auto_trader_config", "credit_spread_circuit_breaker_enabled", "BOOLEAN DEFAULT TRUE")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:

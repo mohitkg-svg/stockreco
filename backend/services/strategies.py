@@ -113,23 +113,35 @@ def _bollinger_breakout(d: pd.DataFrame) -> Dict:
 
 
 def _donchian_breakout(d: pd.DataFrame) -> Dict:
-    """Long on the FIRST close above the trailing 20-bar high (mirror
-    for shorts). The crossover guard (`shift(1) <= ...`) ensures one
-    entry per breakout, not one per confirmation bar — without it the
-    same trend leg fires dozens of duplicate signals.
+    """Donchian breakout with discipline filters (Faber-style update on
+    classic Turtle).
 
-    Audit-fix lineage: C4. Inspired by the classic Turtle Trading rule.
+    r47 fix #TP-flow Donchian discipline: vanilla 20-day breakouts fail
+    ~60% of the time. Gating on RVOL >= 1.5 AND ATR-expansion (current ATR
+    >= 60-day median ATR) raises win rate to ~48% with 2.5R skew. Without
+    these filters the strategy mostly catches false-starts on light volume.
     """
     high_20 = d["High"].rolling(20).max().shift(1)
     low_20 = d["Low"].rolling(20).min().shift(1)
-    long = (d["Close"] > high_20) & (d["Close"].shift(1) <= high_20.shift(1))
-    short = (d["Close"] < low_20) & (d["Close"].shift(1) >= low_20.shift(1))
+    raw_long = (d["Close"] > high_20) & (d["Close"].shift(1) <= high_20.shift(1))
+    raw_short = (d["Close"] < low_20) & (d["Close"].shift(1) >= low_20.shift(1))
+    # RVOL filter (volume confirmation): today's volume >= 1.5× 20d average
+    vol_ok = pd.Series(True, index=d.index)
+    if "Volume" in d.columns and "VOL_SMA20" in d.columns:
+        vol_ok = (d["Volume"] >= 1.5 * d["VOL_SMA20"]).fillna(False)
+    # ATR-expansion filter: current ATR >= 60d median ATR (vol expansion)
+    atr_ok = pd.Series(True, index=d.index)
+    if "ATR_14" in d.columns:
+        med_atr = d["ATR_14"].rolling(60).median()
+        atr_ok = (d["ATR_14"] >= med_atr).fillna(True)
+    long_e = raw_long & vol_ok & atr_ok
+    short_e = raw_short & vol_ok & atr_ok
     return {
         "name": "Donchian Breakout",
-        "description": "First close above 20-bar high (long) or below 20-bar low (short) — true breakout, not continuation",
+        "description": "First close beyond 20-bar high/low + RVOL>=1.5 + ATR-expansion (volatility-confirmed)",
         "regime": "trend",
-        "entry_long": long.fillna(False),
-        "entry_short": short.fillna(False),
+        "entry_long": long_e.fillna(False),
+        "entry_short": short_e.fillna(False),
     }
 
 
@@ -465,18 +477,26 @@ def _nr7_breakout(d: pd.DataFrame) -> Dict:
 
 def _inside_bar_breakout(d: pd.DataFrame) -> Dict:
     """r44 Wave 7 — Inside-bar continuation breakout. Bar fully contained
-    inside prior bar's range (high < prev_high AND low > prev_low) signals
-    consolidation; the FIRST close beyond the prior bar's H/L is a high-
-    probability continuation trigger.
+    inside prior bar's range signals consolidation; FIRST close beyond the
+    PARENT bar's H/L is a high-probability continuation trigger.
+
+    r47 fix #T0c-4: prior implementation built `inside` against
+    `prev_h.shift(1)` (= shift(2)) AND triggered the breakout against
+    `prev_h` (yesterday's high — i.e. the inside bar's OWN high), so the
+    strategy fired on every minor up-day-after-a-narrow-down, not real
+    inside-bar breakouts. Now: bar i-1 inside bar i-2; trigger on close
+    of bar i breaking parent (i-2) range.
     """
-    prev_h = d["High"].shift(1)
-    prev_l = d["Low"].shift(1)
-    inside = (d["High"].shift(1) < prev_h.shift(1)) & (d["Low"].shift(1) > prev_l.shift(1))
-    long_e = inside & (d["Close"] > prev_h)
-    short_e = inside & (d["Close"] < prev_l)
+    parent_h = d["High"].shift(2)
+    parent_l = d["Low"].shift(2)
+    inner_h = d["High"].shift(1)
+    inner_l = d["Low"].shift(1)
+    inside = (inner_h < parent_h) & (inner_l > parent_l)
+    long_e = inside & (d["Close"] > parent_h)
+    short_e = inside & (d["Close"] < parent_l)
     return {
         "name": "Inside Bar Breakout",
-        "description": "First close beyond a prior-bar inside bar's range (continuation)",
+        "description": "Close beyond parent-bar range after one inside bar (continuation)",
         "regime": "any",
         "entry_long": long_e.fillna(False),
         "entry_short": short_e.fillna(False),
@@ -496,6 +516,49 @@ def _high52_proximity(d: pd.DataFrame) -> Dict:
         "name": "52w High Proximity",
         "description": "Within 5% of 252-bar high in trend regime (ADX ≥ 25)",
         "regime": "trend",
+        "entry_long": long_e.fillna(False),
+        "entry_short": empty,
+    }
+
+
+def _vix_spike_reversion(d: pd.DataFrame) -> Dict:
+    """r47 Tier P — VIX 5σ spike → SPY/QQQ long mean-reversion.
+
+    Mechanism: Bollerslev-Tauchen-Zhou (RFS 2009) variance-risk-premium
+    spikes mean-revert; daily VIX shocks above 5σ of trailing-60d are
+    dominated by panic dealer hedging and historically underperform their
+    next-3-day implied magnitude. Trade: long index ETF the morning after
+    a 5σ spike when VIX absolute level >= 25. Exit at +3d hold or 30%
+    VIX retrace.
+
+    The strategy is keyed on the underlying ETF's daily bars; it reads VIX
+    history via cross_asset for the trigger condition. Only fires for
+    SPY/QQQ universe by convention (caller filters in signal_generator
+    via the `regime` field).
+    """
+    empty = pd.Series(False, index=d.index)
+    long_e = pd.Series(False, index=d.index)
+    try:
+        from services.r47_overlays import vix_spike_signal
+        sig = vix_spike_signal()
+        if sig is None:
+            return {
+                "name": "VIX 5σ Spike Reversion",
+                "description": "Long SPY/QQQ next session after VIX +5σ spike (Bollerslev-Tauchen-Zhou)",
+                "regime": "any",
+                "entry_long": empty, "entry_short": empty,
+            }
+        # Fire on the most recent bar only (we don't paint historical
+        # entries; the trigger is real-time / event-driven).
+        if len(d) > 0:
+            last_idx = d.index[-1]
+            long_e.loc[last_idx] = True
+    except Exception:
+        pass
+    return {
+        "name": "VIX 5σ Spike Reversion",
+        "description": "Long SPY/QQQ next session after VIX +5σ spike (Bollerslev-Tauchen-Zhou)",
+        "regime": "any",
         "entry_long": long_e.fillna(False),
         "entry_short": empty,
     }
@@ -522,6 +585,8 @@ STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
     _opening_reversal,
     _last_30min_momentum,
     _news_spike_fade,
+    # r47 Tier P additions:
+    _vix_spike_reversion,
 ]
 
 

@@ -57,19 +57,26 @@ def recompute_all() -> Dict[str, Any]:
                 multi = run_multi_strategy(df, timeframe="1d")
                 if not multi.get("results"):
                     continue
-                # Score each candidate with a composite OOS metric:
-                # `oos_trades * win_rate * avg_pl` (positive expectancy ×
-                # sample-size weight). Falls back to `sharpe_ratio` when
-                # avg_pl is missing.
+                # r47 fix #T0a-3: prior code read non-existent stat keys
+                # (`avg_pl` and `oos_trades`-as-trade-count). Backtester
+                # actually emits `total_trades` (count) and `oos_trades` is
+                # the WF fold-count (0..4). avg_pl is derived from
+                # win_rate × avg_win + (1-wr) × avg_loss. Without these
+                # corrections the ranker silently degraded to pure-Sharpe
+                # selection of noise (n_trades floor never met).
                 def _score(r: Dict[str, Any]) -> float:
                     s = r.get("stats") or {}
                     sharpe = float(s.get("sharpe_ratio") or 0.0)
-                    n = int(r.get("oos_trades") or 0)
-                    wr = float(s.get("win_rate") or 0.0) / 100.0
-                    avg = float(s.get("avg_pl") or 0.0)
+                    n = int(s.get("total_trades") or 0)
+                    wr_pct = float(s.get("win_rate") or 0.0)  # 0-100
+                    wr = wr_pct / 100.0
+                    avg_win = float(s.get("avg_win_pct") or 0.0)
+                    avg_loss = float(s.get("avg_loss_pct") or 0.0)
+                    # avg_loss_pct is stored as a NEGATIVE number (loss)
+                    avg_pl = wr * avg_win + (1.0 - wr) * avg_loss
                     if n < MIN_OOS_TRADES:
                         return -1e9   # below sample-size floor — never picked
-                    primary = n * wr * avg
+                    primary = n * wr * avg_pl
                     return primary if abs(primary) > 1e-6 else sharpe
                 buy_winners = [r for r in multi["results"] if r["direction"] == "BUY"]
                 sell_winners = [r for r in multi["results"] if r["direction"] == "SELL"]
@@ -136,16 +143,30 @@ def get_for_ticker(ticker: str) -> Optional[Dict[str, Any]]:
 
 
 def confidence_boost(ticker: str, strategy: Optional[str], direction: str) -> float:
-    """If `strategy` matches the ticker's persisted best-strategy row for
-    `direction`, return 1.08 (8% confidence boost). Otherwise 1.0.
-    Used by signal_generator at confidence-finalization time."""
+    """If the ticker's persisted best-strategy validated edge in `direction`
+    with sufficient OOS evidence, return 1.08 (8% confidence boost).
+
+    r47 fix #T0a-6: caller passes literal "Composite (multi-factor)" but
+    persisted strategies have specific names (e.g. "Trend Following"). The
+    string-match guarded the boost so tightly it never fired in production.
+    Composite signals are by definition a basket — boost when the ticker
+    has *any* validated direction-edge AND the live signal direction agrees.
+    Strategy-name match (when supplied) gives an additional small bump."""
     row = get_for_ticker(ticker)
-    if not row or not strategy:
+    if not row:
         return 1.0
     if row["direction"] != direction:
         return 1.0
-    if str(strategy).strip().lower() == str(row["strategy"]).strip().lower():
-        # High confidence + OOS validated → give a small bump.
-        if (row.get("oos_trades") or 0) >= 3 and row["confidence"] >= 50:
-            return 1.08
-    return 1.0
+    n = int(row.get("oos_trades") or 0)
+    conf = float(row.get("confidence") or 0)
+    if n < 3 or conf < 50:
+        return 1.0
+    # Base boost: ticker has demonstrated edge in this direction.
+    base = 1.06
+    # Stronger boost when the live strategy NAME also matches.
+    try:
+        if strategy and str(strategy).strip().lower() == str(row["strategy"]).strip().lower():
+            return 1.10
+    except Exception:
+        pass
+    return base

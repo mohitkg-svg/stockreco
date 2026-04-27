@@ -85,6 +85,16 @@ def get_in_flight_bp() -> float:
         return _in_flight_bp_reserved
 
 
+def _reset_in_flight_bp() -> None:
+    """Hard-reset the BP reservation. r47 fix #T0b-2: called by kill() so
+    the post-unkill instance starts from zero rather than a stale carry."""
+    global _in_flight_bp_reserved, _in_flight_bp_last_seen_broker_bp, _in_flight_bp_last_check_ts
+    with _in_flight_bp_lock:
+        _in_flight_bp_reserved = 0.0
+        _in_flight_bp_last_seen_broker_bp = None
+        _in_flight_bp_last_check_ts = 0.0
+
+
 def decay_in_flight_bp_if_stale() -> None:
     """Re-read Alpaca's BP every 60s. Decay reservation only when the broker
     BP has dropped by AT LEAST our last reservation amount — meaning our
@@ -532,17 +542,39 @@ def record_equity_snapshot() -> None:
             pass
         db = _SL_es()
         try:
-            db.add(_ES_es(
-                ts=_dt_es.utcnow(),
-                equity=equity,
-                cash=cash,
-                buying_power=bp,
-                realized_pl_today=rpnl,
-                unrealized_pl=unr,
-                open_positions=n_open,
-                spy_close=spy_close,
-            ))
-            db.commit()
+            # r47 fix #T0c-2: round timestamp to the 5-min bucket so multi-
+            # instance Cloud Run deployments don't write N rows per cron tick.
+            # Pre-existing bucket → skip (idempotent under multi-instance).
+            now_dt = _dt_es.utcnow()
+            bucket_dt = now_dt.replace(second=0, microsecond=0,
+                                       minute=(now_dt.minute // 5) * 5)
+            existing = db.query(_ES_es).filter(_ES_es.ts == bucket_dt).first()
+            if existing is not None:
+                # Refresh the row in-place — a later instance may have a
+                # slightly more accurate snapshot (later within the bucket).
+                existing.equity = equity
+                existing.cash = cash
+                existing.buying_power = bp
+                existing.realized_pl_today = rpnl
+                existing.unrealized_pl = unr
+                existing.open_positions = n_open
+                existing.spy_close = spy_close
+                db.commit()
+            else:
+                db.add(_ES_es(
+                    ts=bucket_dt,
+                    equity=equity,
+                    cash=cash,
+                    buying_power=bp,
+                    realized_pl_today=rpnl,
+                    unrealized_pl=unr,
+                    open_positions=n_open,
+                    spy_close=spy_close,
+                ))
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()  # multi-instance race: another inserted same ts
         finally:
             db.close()
     except Exception as e:
@@ -551,11 +583,13 @@ def record_equity_snapshot() -> None:
 
 def slippage_aware_risk_per_share(entry: float, stop: float, atr: float, spread: float = 0.0) -> float:
     """r44 fix #1.3: risk-per-share with stop-fill slippage budget.
-    Real fills slip 0.10-0.40 ATR on chandelier stops; theoretical
-    `entry - stop` understates by 5-10% on 5-10% of trades.
-    Returns the gross stop distance + a slippage buffer.
+
+    r47 fix #T0f-2: prior `max(0.0, entry - stop)` returned 0 for SHORT
+    setups (where stop > entry), and the qty calc divided by the residual
+    slippage buffer alone — over-sizing shorts 10-20×. Use abs(...) so the
+    function is direction-agnostic.
     """
-    base = max(0.0, entry - stop)
+    base = abs(float(entry) - float(stop))
     slip_atr = 0.10 * (atr or 0.0)
     slip_spread = 0.5 * (spread or 0.0)
     return base + max(slip_atr, slip_spread, 0.01)
@@ -1050,7 +1084,10 @@ def current_portfolio_heat() -> float:
                 os_ = ot.current_stop or ot.stop_loss or 0.0
                 raw = 0.0
                 if ot.asset_type == "stock" and oe > 0 and os_ > 0:
-                    raw = max(0.0, (oe - os_)) * (ot.qty or 0)
+                    # r47 fix #T0f-1: shorts have stop ABOVE entry; max(0,...)
+                    # was zeroing them out and letting adopted shorts pass the
+                    # 10% portfolio-heat cap with $0 contribution.
+                    raw = abs(float(oe) - float(os_)) * (ot.qty or 0)
                 elif ot.asset_type == "option" and oe > 0:
                     raw = float(oe) * 100 * (ot.qty or 0)
                 total += raw * beta_weight(ot.ticker)
@@ -1167,7 +1204,7 @@ def strategy_multiplier(strategy_name: Optional[str]) -> float:
         from services.auto_trader import strategy_scorecard
         card = strategy_scorecard(days=60, min_trades=5)
         entry = card.get(strategy_name)
-        if entry and (entry.get("trades") or 0) >= 20:
+        if entry and (entry.get("n") or entry.get("trades") or 0) >= 20:
             m = float(entry["multiplier"])
         else:
             m = 1.0
@@ -1196,7 +1233,7 @@ def calibration_multiplier(confidence: float) -> float:
             # r43 fix #1.6: require ≥20 trades in the bucket before deviating
             # from 1.0; below that, a single big winner can permanently
             # 1.5× every signal in that bucket for 60 days.
-            if row and (getattr(row, "n_trades", 0) or 0) >= 20:
+            if row and (getattr(row, "n", 0) or 0) >= 20:
                 m = float(row.multiplier)
                 _calibration_cache[bucket] = (m, now + _CALIBRATION_CACHE_TTL)
                 return m

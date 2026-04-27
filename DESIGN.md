@@ -1087,6 +1087,207 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 47 — 14-agent maximum-rigor audit + Tier 0/1/P implementation
+
+13 successful + 1 partial parallel agents (concurrency, failure-mode, DB-
+integrity, lifecycle/reconciliation, memory/perf, backtest-validity,
+edge-quantification, microstructure-execution, options-pricing/Greeks,
+volatility-strategy, macro-strategy, microstructure-flow, numerical, and
+observability auditors). ~250 findings, including ~60 P0-class issues —
+many of them silently-broken pipelines that have been no-ops since their
+revisions shipped.
+
+**Tier 0 — pipeline-broken multipliers (silently dead since launch)**:
+- `calibration_multiplier` read `getattr(row, "n_trades", 0)` — column is
+  `n` → always returned 1.0 since r45.
+- `strategy_multiplier` read `entry.get("trades")` — key is `n` → always
+  returned 1.0 since r43.
+- `best_strategy._score()` read non-existent stat keys (`avg_pl` and
+  `oos_trades`-as-trade-count). `oos_trades` is the WF fold count (0..4),
+  not trade count; `avg_pl` was never emitted. `MIN_OOS_TRADES=10` floor
+  was never met → ranker silently degraded to selecting on pure-Sharpe
+  noise across 26 strategies × N tickers (0.5-0.8 Sharpe inflation by
+  selection).
+- `ml_features._technical_features()` read `RSI`/`MACD`/`SMA20`/`BB_upper`
+  but indicators emit `RSI_14`/`MACD_12_26`/`SMA_20`/`BBU_20` →
+  ALL technical ML features were silently None on every train + inference
+  sample.
+- `confidence_boost` required strategy-name string match against literal
+  "Composite (multi-factor)" but persisted strategies are named "Trend
+  Following"/"Donchian Breakout"/etc → boost has never fired in
+  production. Now: base 1.06 boost on direction-match alone, 1.10 when
+  strategy name also matches.
+- `manage_open_positions` pyramid block referenced `signal.get(...)`
+  but `signal` isn't in scope → silent NameError every tick → r44
+  pyramid feature has never executed. Now reads ADX from
+  `_chandelier_adx(t.ticker)` and TF from `_trade_source_timeframe`,
+  AND resizes the SL leg after the pyramid add (P1-8).
+- `_inside_bar_breakout` strategy: `inside` mask was indexed wrong AND
+  trigger compared today's close to the inside bar's OWN high, not the
+  parent bar's high → fired on noise. Fixed to canonical inside-bar
+  continuation logic.
+- Schema drift: `cfg.pyramid_enabled`, `max_correlated_open`,
+  `vol_target_annual`, `leverage_cap`, `book_var_99_cap_pct`,
+  `bracket_tif`, `rr_min` were read via `getattr` but were never
+  columns → all features silently used hardcoded defaults. Now
+  persisted with `_ensure_column` migrations + ORM defaults.
+
+**Tier 0 — position lifecycle (real-money cutover blockers)**:
+- `/api/trading/close/{symbol}` and `/close-all` only called the broker
+  and never updated the AutoTrade row → manage tick detected the
+  missing SL, entered a resubmit storm, paged the operator with
+  `sl_resubmit_storm`. Now both routes route through
+  `force_close_trade` so the row + BP reservation + touch counts are
+  reconciled.
+- `kill()` called `paper_trader.cancel_all_orders()` with NO symbol
+  filter, wiping every working order in the Alpaca account including
+  operator hedges/IRA orders. Now cancels only bot-owned order ids
+  tracked on AutoTrade rows; flatten only touches bot-owned tickers.
+- `kill()` did not release the in-flight BP reservation, so the
+  post-unkill instance sized against a phantom $10K+ reservation.
+  Per-row release + global `_reset_in_flight_bp()` now run on kill.
+- `sync_positions_from_alpaca` skipped `pending` rows → permanent
+  phantom-pending after a crash mid-submit. Now reconciles pending
+  whose parent order is terminal at the broker.
+- SL-filled branch was a no-op `pass` (relied on `parent.legs` reconcile
+  block which silently skipped when broker returned empty legs on a
+  terminal bracket). Row stayed `open` forever. Now closes immediately
+  using SL fill data, releases BP, cleans replace-stop cache,
+  backfills MLPrediction outcome.
+- `position_divergence` alert added to `sync_positions_from_alpaca` so
+  drift surfaces without operator polling.
+
+**Tier 0 — DB integrity**:
+- `consider_put_play` / `consider_call_play` had NO idempotency_key —
+  multi-instance Cloud Run could double-buy options on the same
+  ticker. Now build a deterministic key from
+  `(ticker, side, strike, expiration, dte_bucket, day)` and rely on
+  `UNIQUE(idempotency_key)` for cross-instance dedup.
+- `EquitySnapshot` has no `UNIQUE` on `ts` — multi-instance recorders
+  wrote N rows per 5-min bucket → drawdown math read noise. Now
+  `ts UNIQUE`, recorder rounds to 5-min bucket and uses upsert on
+  conflict (idempotent under multi-instance).
+- `MLPrediction.outcome` ticker+signal_type fallback (±24h) stamped
+  trade #1's outcome onto trade #2's predictions when both were
+  same-direction-same-ticker within 24h. Backfill now prefers
+  trade_id-tracked rows; main.py scheduler-driven backfill widened
+  from ±10min to ±24h to match auto_trader's path.
+- Options chain cache (`_chain_cache`) had TTL but no size cap — up
+  to 300MB RSS in 7-14d on a 500-ticker scan. Now bounded
+  LRU-ish at 256 entries with move-to-end on hit.
+
+**Tier 0 — failure modes**:
+- r46 `account_blocked` / `transfers_blocked` pre-flight gates were
+  silent no-ops because `paper_trader.get_account()` only populated
+  `trading_blocked`. Now exposes all three plus `day_trade_count`.
+- News `_ai_rate` per-ticker AI-judge cap was a per-batch dict (reset
+  every poll) → r46's "3 articles/hr cap" effectively didn't work
+  during earnings-day storms. Now module-level keyed by
+  `(ticker, hour_bucket)` with auto-prune.
+- `equity_snapshot` cron used UTC `hour="13-20"` (= 9-16 ET in EDT
+  but 8-15 ET in EST, dropping the 15:00-16:00 close window for ~4
+  months/year). Now pinned to America/New_York with `hour="9-16"`.
+- `main.py::_ml_outcome_backfill` window mismatched
+  `auto_trader._backfill_ml_outcome` (10min vs 24h post-r46). Aligned
+  to ±24h + trade_id-tracked match preference.
+- Halt / LULD detection: stale-quote-during-RTH heuristic in
+  `consider_signal` blocks new entries when WS hasn't ticked >30s on
+  a previously-active ticker. Free signal; no data feed needed.
+- `bracket_tif` default flipped from `"gtc"` to `"day"` (closes the
+  weekend-gap exposure documented in P0-5).
+
+**Tier 0 — concurrency**:
+- `_replace_stop_cache` is now thread-locked + bounded LRU (10K cap).
+  Prior unsynchronized read-then-write across manage tick + WS
+  fast-path + AI exit thread caused double broker-replace calls and
+  unbounded growth in long-running deployments.
+- `_dispatch_ai_news_exit`'s close path now (a) acquires
+  `_manage_lock` to serialize against the manage tick, (b) opens a
+  fresh `SessionLocal` per closed trade to prevent lost-update on
+  `realized_pl` / `level_index` / `target_touch_count` mutations
+  from the in-flight manage tick.
+- New `prune_option_symbols(active)` called from manage_open_positions
+  drops OCC subscriptions for closed/expired contracts so reconnect
+  doesn't re-subscribe weeks of stale weeklies (P0.1).
+
+**Tier 0 — numerical**:
+- `current_portfolio_heat` and `sector_heat` used `max(0, entry-stop)`
+  which returned 0 for SHORTS (stop is ABOVE entry on a short) —
+  adopted shorts passed every cap. Now `abs(entry-stop)` so heat is
+  direction-agnostic.
+- `slippage_aware_risk_per_share` had the same shape — over-sized
+  shorts 10-20× when the function fed into qty calc. Same fix.
+- Adopted-position placeholder stop was `0.95×entry` regardless of
+  side; for shorts the correct placeholder is `1.05×entry`. Now
+  branches on `qty<0`.
+
+**Tier 0 — options**:
+- R:R reward used intrinsic-value-at-EXPIRATION (`max(0, target-strike)
+  - premium`), severely understating reward on near-ATM contracts and
+  biasing selection toward deep-ITM low-leverage strikes (CNTA
+  "172 found, 10 qualifying deep-ITM" pattern). Now estimates
+  `premium_at_target` via delta + gamma curvature with intrinsic floor.
+- DTE≤0 force-flatten on option positions: same calendar day as expiry
+  + after configurable hour ET → force-close to avoid pin/assignment
+  risk.
+
+**Tier 0 — memory caps**:
+- `_LIVE_CACHE` (alpaca_tape) bounded to 100 entries with LRU drop.
+- `_chain_cache` (options_fetcher) bounded to 256.
+- `_replace_stop_cache` (execution_engine) bounded to 10K.
+- `_option_subscribed` (live_quotes) prune-on-tick.
+
+**Tier 1 — observability**:
+- New `slippage_outlier` alert (>50bps per fill) + `SLIPPAGE_BPS`
+  prometheus histogram.
+- APScheduler `EVENT_JOB_ERROR` and `EVENT_JOB_MISSED` listeners emit
+  `scheduler_job_failed` / `scheduler_misfire` alerts so silent
+  job-drop is no longer invisible.
+- `position_divergence` alert from sync_positions_from_alpaca.
+- `metrics.observe(name, value, **labels)` helper added.
+
+**Tier P — new strategies / overlay layer**:
+New module `services/r47_overlays.py` with composite sizing overlay
+keyed by `r47_sizing_overlay(direction)`:
+- **A1 VIX9D/VIX3M term-regime sizing** — Whaley 2009; backwardation
+  → mean-reversion long bias; complacency → put bias; clamped
+  [0.75, 1.25].
+- **A2 SKEW reversal bias** — Bali-Hovakimian 2009; SKEW > 145 →
+  put bias 1.10; SKEW < 115 → call bias 1.10.
+- **A4 VIX 5σ spike → SPY long** — Bollerslev-Tauchen-Zhou 2009; new
+  `_vix_spike_reversion` strategy in `strategies.py` registry.
+- **A5 IV-rank graded sizing** — Goyal-Saretto 2009; replaces binary
+  veto with graded factor (1.15 / 1.0 / 0.7 / 0.4 / 0 across IV-rank
+  buckets). Persisted on contract dict as `iv_rank_pct`.
+- **B2 VRP filter** — Bollerslev-Tauchen-Zhou; `vrp_score = VIX² −
+  RV20²` mapped to long-premium sizing factor.
+- **B3 VVIX anxiety gate** — Park 2015; VVIX > 130 → 0.80×;
+  VVIX > 115 → 0.90×.
+- **B6 Earnings IV-crush sidestep** — Gao-Xing-Zhang 2018 (reverse);
+  IV-rank > 80% AND earnings within 24h → veto long-premium entry.
+- **Macro A1 SPX 200d trend gate** — Faber 2007; SPY < 200dSMA cuts
+  long sizing 50%, leaves shorts at full size.
+- **Macro A6 HYG/LQD credit-spread circuit breaker** —
+  Gilchrist-Zakrajšek 2012; z<-2σ on 60d HYG/LQD → veto new longs.
+- **Pre-FOMC quiet-hour defer** — defer non-urgent entries within
+  60min before FOMC to avoid widest-spreads-of-day.
+- **Donchian discipline** — existing `_donchian_breakout` now gates
+  on RVOL ≥ 1.5 + ATR-expansion (current vs 60d-median).
+
+**Tests**: 11 new r47 regression tests
+(`TestR47DeadMultipliers::test_calibration_multiplier_uses_n_column`,
+`...test_strategy_multiplier_uses_n_key`,
+`...test_inside_bar_breakout_uses_parent_bar_range`,
+`TestR47PortfolioHeatShorts::test_short_position_contributes_to_heat`,
+`TestR47SchemaDrift::test_new_config_columns_present`,
+`TestR47Overlays::test_iv_rank_size_factor_curve`,
+`...test_overlay_combined_clamp`,
+`TestR47NewStrategiesPresent::test_vix_spike_in_registry`,
+`TestR47AccountBlockedFields::test_get_account_keys_when_no_client`,
+`TestR47NewsAIRateModuleLevel::test_ai_rate_inc_persists_across_calls`,
+`TestR47ConfidenceBoostFiresOnDirectionMatch::test_boost_fires_on_direction_match_alone`).
+Full suite: 174 passed (was 163 in r46).
+
 ### Revision 46 — 13-agent maximum-spread audit + Tier 0/1/P implementation
 
 13 parallel deep-dive agents on angles never previously audited. ~250

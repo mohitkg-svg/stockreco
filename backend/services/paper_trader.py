@@ -144,6 +144,14 @@ def get_account() -> Optional[Dict[str, Any]]:
             "currency": a.currency,
             "pattern_day_trader": bool(a.pattern_day_trader),
             "trading_blocked": bool(a.trading_blocked),
+            # r47 fix #T0d-1: r46 added consider_signal pre-flight checks for
+            # `account_blocked` and `transfers_blocked` — but this dict never
+            # populated those keys. The .get(...) fallback always returned
+            # None / False so the gate was a silent no-op. Fix: surface the
+            # actual Alpaca fields.
+            "account_blocked": bool(getattr(a, "account_blocked", False)),
+            "transfers_blocked": bool(getattr(a, "transfers_blocked", False)),
+            "day_trade_count": int(getattr(a, "daytrade_count", 0) or 0),
             "paper": os.getenv("ALPACA_LIVE", "0") != "1",
         }
     except Exception as e:

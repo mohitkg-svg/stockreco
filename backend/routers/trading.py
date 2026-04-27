@@ -222,18 +222,73 @@ def cancel_all_orders(symbol: Optional[str] = None):
 
 @router.post("/close/{symbol}")
 def close_position(symbol: str):
-    res = paper_trader.close_position(symbol)
-    if "error" in res:
-        raise HTTPException(status_code=400, detail=res["error"])
-    return res
+    """Close a position; if the bot has an open AutoTrade row for this
+    ticker, route through `force_close_trade` so the row + BP reservation
+    + touch-count are properly reconciled. r47 fix #T0b-1: prior code only
+    called paper_trader.close_position(), leaving the AutoTrade row stuck
+    in `open` state — manage tick then detected the missing SL and entered
+    a resubmit storm."""
+    if not _TICKER_RE.match(symbol):
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    from database import SessionLocal, AutoTrade
+    from services.execution_engine import force_close_trade
+    db = SessionLocal()
+    try:
+        rows = db.query(AutoTrade).filter(
+            AutoTrade.ticker == symbol.upper(),
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
+        ).all()
+        if rows:
+            summary: dict = {}
+            for t in rows:
+                try:
+                    force_close_trade(t, db, "manual close via /close", summary,
+                                      status_override="closed_manual")
+                except Exception as e:
+                    raise HTTPException(status_code=502, detail=f"force_close failed: {e}")
+            return {"status": "closed", "count": len(rows), "summary": summary}
+        # No bot-managed row: fall back to broker-only close.
+        res = paper_trader.close_position(symbol)
+        if "error" in res:
+            raise HTTPException(status_code=400, detail=res["error"])
+        return res
+    finally:
+        db.close()
 
 
 @router.post("/close-all")
 def close_all():
-    res = paper_trader.close_all_positions()
-    if "error" in res:
-        raise HTTPException(status_code=400, detail=res["error"])
-    return res
+    """Close every open position; reconciles AutoTrade rows for bot-managed
+    positions. r47 fix #T0b-1: prior code only called paper_trader."""
+    from database import SessionLocal, AutoTrade
+    from services.execution_engine import force_close_trade
+    db = SessionLocal()
+    try:
+        rows = db.query(AutoTrade).filter(
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
+        ).all()
+        managed_tickers = {r.ticker for r in rows}
+        summary: dict = {}
+        closed = 0
+        for t in rows:
+            try:
+                force_close_trade(t, db, "manual close-all", summary,
+                                  status_override="closed_manual")
+                closed += 1
+            except Exception as e:
+                summary.setdefault("errors", []).append(f"{t.ticker}: {e}")
+        # Catch any non-bot positions that exist at the broker (manual /
+        # adopted-untracked) — flatten them too.
+        try:
+            res = paper_trader.close_all_positions()
+            if isinstance(res, dict) and res.get("error"):
+                summary.setdefault("broker_errors", []).append(res["error"])
+        except Exception as e:
+            summary.setdefault("broker_errors", []).append(str(e))
+        return {"status": "ok", "closed_managed": closed,
+                "managed_tickers": sorted(managed_tickers), "summary": summary}
+    finally:
+        db.close()
 
 
 # -------- Auto-trader --------

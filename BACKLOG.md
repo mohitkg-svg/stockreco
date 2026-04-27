@@ -15,6 +15,89 @@ inclusion / continued-deferral rationale. Deferred items whose rationale
 has gone stale should either move to ✅ done or be re-categorized as
 ❌ rejected — don't let the list rot into "we'll get to it eventually".
 
+## r47 14-agent maximum-rigor audit (2026-04-27)
+
+13 successful + 1 partial parallel agents on angles never previously
+audited (concurrency-races, failure-modes, DB-integrity, lifecycle/
+reconciliation, memory/perf, deep backtest-validity, edge-quantification
+under realistic costs, microstructure-execution, options-pricing/Greeks,
+volatility-strategy research, macro-strategy research, microstructure-flow
+research, numerical edge cases, observability gaps).
+
+**Headline pipeline-broken multipliers (all silently no-op since launch)**:
+- `calibration_multiplier` read non-existent `n_trades` (col is `n`)
+- `strategy_multiplier` read non-existent `trades` (key is `n`)
+- `best_strategy._score()` read non-existent `avg_pl`/`oos_trades`
+  (`oos_trades` is fold count, NOT trade count); MIN_OOS_TRADES floor
+  never met → ranker selecting on pure-Sharpe noise of 26 strategies
+- `ml_features` read wrong indicator column names (`RSI` vs `RSI_14`)
+  → ALL technical features silently None
+- `confidence_boost` string-matched against literal "Composite (multi-
+  factor)" but persisted strategies are named "Trend Following" etc
+  → boost never fired
+- `manage_open_positions` pyramid block referenced `signal` (not in
+  scope) → silent NameError → r44 pyramid feature has never executed
+- Schema drift: pyramid_enabled, max_correlated_open, vol_target_annual,
+  leverage_cap, book_var_99_cap_pct, bracket_tif, rr_min were never
+  columns
+
+**Position lifecycle blockers**:
+- `/api/trading/close{,-all}` only called broker, never updated AutoTrade row
+- `kill()` cancelled foreign Alpaca orders + leaked BP reservation
+- `sync_positions_from_alpaca` skipped pending → permanent phantom-pending
+- SL-filled `pass`-branch never closed DB row
+
+**DB integrity**:
+- Option idempotency_key never set → multi-instance double-buy
+- EquitySnapshot no UNIQUE on ts → multi-instance dupe rows
+- MLPrediction outcome backfill stamped wrong trade's outcome via
+  ticker+signal_type fallback
+- Options chain cache no size cap → 300MB OOM in 7-14d
+
+**Failure modes**:
+- account_blocked / transfers_blocked never populated (r46 gate dead)
+- News AI rate-limit was per-batch not per-hour (r46 cap dead)
+- equity_snapshot UTC cron dropped close window 4 months/yr in EST
+- main.py outcome backfill window mismatched auto_trader (10min vs 24h)
+- No halt/LULD detection (added stale-quote heuristic)
+- bracket_tif default flipped from "gtc" to "day" (weekend gap)
+
+**Concurrency**:
+- _replace_stop_cache unsynchronized + unbounded
+- AI news exit thread didn't acquire _manage_lock → lost-update
+- _option_subscribed never pruned on close
+
+**Numerical**:
+- Heat/sector-heat `max(0, entry-stop)` returned 0 for shorts
+- slippage_aware_risk_per_share same shape → over-sized shorts 10-20×
+- Adopted-short placeholder stop was 0.95×entry (wrong direction)
+- Inside-bar breakout strategy was firing on noise (wrong indexing)
+
+**Options**:
+- R:R reward used intrinsic-at-EXPIRATION → biased to deep-ITM low-leverage
+- DTE≤0 force-flatten added (pin-risk + assignment risk)
+
+**Tier P new strategies (services/r47_overlays.py)**:
+- A1 VIX9D/VIX3M term-regime sizing (Whaley 2009)
+- A2 SKEW reversal bias (Bali-Hovakimian 2009)
+- A4 VIX 5σ spike → SPY long (BTZ 2009) — new strategy in registry
+- A5 IV-rank graded sizing (Goyal-Saretto 2009)
+- B2 VRP filter (BTZ 2009)
+- B3 VVIX anxiety gate (Park 2015)
+- B6 Earnings IV-crush sidestep (Gao-Xing-Zhang 2018)
+- Macro A1 SPX 200d trend gate (Faber 2007)
+- Macro A6 HYG/LQD credit-spread circuit breaker (Gilchrist-Zakrajšek 2012)
+- Pre-FOMC quiet-hour defer
+- Donchian discipline (RVOL + ATR expansion gates)
+
+**Tier 1 observability**:
+- Per-fill slippage histogram + outlier alert (>50bps)
+- APScheduler EVENT_JOB_ERROR + EVENT_JOB_MISSED listeners
+- position_divergence alert from sync_positions
+- AI news rate-limit fixed (was per-batch, now per-hour)
+
+174 tests pass (was 163; 11 new r47 regression tests).
+
 ## r46 13-agent maximum-spread audit (2026-04-27)
 
 13 parallel agents on angles never previously audited. ALL Tier 0/1/P

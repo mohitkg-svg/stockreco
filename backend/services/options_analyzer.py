@@ -96,6 +96,31 @@ def _iv_rank_too_high(ticker: str, iv: float, threshold: float = 0.90) -> bool:
         return False
 
 
+def _iv_rank_pct(ticker: str, iv: float) -> Optional[float]:
+    """r47 Tier P (A5): graded IV-rank in [0,1] for graded-sizing usage.
+    Returns the percentile of `iv` against the trailing 252d realized-vol
+    distribution (same proxy as `_iv_rank_too_high`). None when not enough
+    data."""
+    if not iv or iv <= 0:
+        return None
+    try:
+        from services.data_fetcher import fetch_ohlcv as _fo
+        import numpy as _np
+        df = _fo(ticker, "1d")
+        if df is None or df.empty or len(df) < 252:
+            return None
+        closes = df["Close"].astype(float).tail(252)
+        rets = _np.log(closes / closes.shift(1)).dropna()
+        rv = (rets.rolling(20).std() * (252 ** 0.5)).dropna()
+        if len(rv) < 50:
+            return None
+        # Pct-rank of iv vs the 1y-RV distribution
+        cnt = (rv <= iv).sum()
+        return float(cnt) / float(len(rv))
+    except Exception:
+        return None
+
+
 MIN_RR = 2.0  # Lowered from 3.0 — intraday SELL signals (5m/15m/30m) have
               # tight T1-T3 bands (3-7% moves) that rarely clear 3:1 against
               # realistic put premiums, so PUTS tabs stayed empty even when
@@ -352,6 +377,15 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
                 continue
             if _iv_rank_too_high(ticker, iv, threshold=0.90):
                 continue
+            # r47 Tier P (A5): graded IV-rank sizing factor. We compute
+            # the IV-rank pct here and stash it on the contract dict so
+            # downstream sizing in auto_trader can apply a graded
+            # multiplier (1.15× for IV<30pct, 1.0× mid, 0.7×/0.4× for
+            # rich IV) instead of treating the gate as binary.
+            try:
+                _iv_pct = _iv_rank_pct(ticker, iv)
+            except Exception:
+                _iv_pct = None
 
             # r43 fix #1.25: ATR-anchored strike-width gate. The previous
             # hardcoded 25% gate was reasonable for $500 stocks, useless for
@@ -377,15 +411,35 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             if abs(strike - spot) > atr_band:
                 continue
 
-            # Reward at each target (intrinsic value at target minus premium paid)
-            if is_call:
-                reward_t1 = max(0.0, t1 - strike) - premium
-                reward_t2 = max(0.0, t2 - strike) - premium
-                reward_t3 = max(0.0, t3 - strike) - premium
-            else:
-                reward_t1 = max(0.0, strike - t1) - premium
-                reward_t2 = max(0.0, strike - t2) - premium
-                reward_t3 = max(0.0, strike - t3) - premium
+            # r47 fix #T0g-1: prior code used INTRINSIC-AT-EXPIRATION for the
+            # reward (max(0, target - strike) - premium for calls). That
+            # underestimates reward by 25-50% on near-ATM contracts because
+            # actual exit on a T-hit happens with material DTE remaining and
+            # significant time value still in the contract. The understatement
+            # forced the R:R gate to reject every OTM-near-ATM contract,
+            # biasing selection toward deep-ITM low-leverage strikes (matches
+            # the "172 found, qualifying 10 deep-ITM" CNTA pattern).
+            #
+            # New: estimate premium-at-target via first-order delta + gamma
+            # curvature, fall back to BSM-rough proxy when Greeks missing.
+            real_delta_h = o.get("delta")
+            real_gamma_h = o.get("gamma")
+            d_eff_h = (real_delta_h if real_delta_h is not None
+                       else _delta_proxy(spot, strike, is_call))
+            g_eff_h = real_gamma_h if real_gamma_h is not None else 0.0
+            def _premium_at_target(target_px: float) -> float:
+                ds = float(target_px) - float(spot)
+                # Premium move ≈ delta*Δs + 0.5*gamma*Δs²; intrinsic at target
+                # is the floor (price can't go below intrinsic for an OTM->ITM).
+                est = float(premium) + float(d_eff_h) * ds + 0.5 * float(g_eff_h) * ds * ds
+                if is_call:
+                    intrinsic = max(0.0, float(target_px) - float(strike))
+                else:
+                    intrinsic = max(0.0, float(strike) - float(target_px))
+                return max(0.05, max(est, intrinsic))
+            reward_t1 = _premium_at_target(t1) - premium
+            reward_t2 = _premium_at_target(t2) - premium
+            reward_t3 = _premium_at_target(t3) - premium
 
             risk = premium  # absolute max loss per share on a long option
             rr_t1 = reward_t1 / risk if risk > 0 else 0
@@ -500,6 +554,8 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
                 "rr_t3": round(rr_t3, 2),
                 "score": score,
                 "in_the_money": bool(o.get("inTheMoney")),
+                # r47 Tier P (A5): graded IV-rank for downstream sizing.
+                "iv_rank_pct": _iv_pct,
             })
 
     # Sort by score, return top picks

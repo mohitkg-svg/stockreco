@@ -610,6 +610,32 @@ def ensure_option_symbols(occ_symbols: List[str]) -> None:
             logger.warning(f"option-stream dynamic subscribe {new} failed: {e}")
 
 
+def prune_option_symbols(active_symbols: List[str]) -> None:
+    """r47 fix #T0e-4 / #T0h: drop OCC subscriptions for closed/expired contracts.
+    Called from manage_open_positions with the set of currently-open OCC
+    symbols. Without this, every weekly-expiry contract ever traded stayed
+    in `_option_subscribed` forever; reconnect re-subscribed the entire pile,
+    eventually triggering Alpaca subscribe-rate limits and reconnect storms."""
+    global _option_stream_client
+    active = {s.upper() for s in active_symbols if s}
+    stale = _option_subscribed - active
+    if not stale:
+        return
+    _option_subscribed.difference_update(stale)
+    if _option_stream_client:
+        try:
+            _option_stream_client.unsubscribe_quotes(*stale)
+            logger.info(f"option-stream: unsubscribed {len(stale)} stale OCCs")
+        except Exception as e:
+            logger.warning(f"option-stream unsubscribe failed: {e}")
+    # Also drop cached quotes so memory follows the subscription set.
+    try:
+        for s in stale:
+            _option_quotes.pop(s, None)
+    except Exception:
+        pass
+
+
 async def start(initial_tickers: List[str]) -> None:
     global _stream_task, _recompute_task, _loop, _recompute_queue
     global _news_stream_task, _option_stream_task
