@@ -31,6 +31,10 @@ _MODEL_DIR = os.environ.get("ML_MODEL_DIR", "/tmp/ml_models")
 _MODEL_PATH = os.path.join(_MODEL_DIR, "model.txt")
 _META_PATH = os.path.join(_MODEL_DIR, "meta.json")
 _STATUS_PATH = os.path.join(_MODEL_DIR, "status.json")
+# r45: isotonic calibrator persisted alongside the booster so inference-time
+# P(win) is properly calibrated to actual win-rate (LightGBM tree outputs
+# are systematically over-confident at the tails — well-known result).
+_CALIB_PATH = os.path.join(_MODEL_DIR, "calibrator.pkl")
 
 
 def _db_put(name: str, content: str, is_binary: bool = False) -> None:
@@ -241,6 +245,10 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             fold_iter.append((train_mask, test_mask, k))
 
     fold_metrics: List[Dict[str, Any]] = []
+    # r45: collect out-of-fold (preds, labels) across every fold so we
+    # can fit a single isotonic calibrator on truly held-out predictions.
+    oof_preds: List[float] = []
+    oof_labels: List[int] = []
     for tr_idx, te_idx, k in fold_iter:
         X_tr = X[tr_idx]
         y_tr = y[tr_idx]
@@ -281,6 +289,8 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             "pos_rate_train": round(float(np.mean(y_tr)), 3),
             "pos_rate_test": round(float(np.mean(y_te)), 3),
         })
+        oof_preds.extend(pred.tolist())
+        oof_labels.extend(y_te.tolist())
     if not fold_metrics:
         return {"trained": False, "reason": "no usable folds"}
     aucs = [m["auc"] for m in fold_metrics if m.get("auc") is not None]
@@ -312,6 +322,73 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
             _db_put("model", f.read(), is_binary=False)
     except Exception as e:
         logger.warning(f"ml_trainer: db model persist failed: {e}")
+
+    # r45 ML calibration: fit an isotonic regression on the out-of-fold
+    # predictions vs realized labels. LightGBM tree outputs are systematically
+    # over-confident at the tails — predicted P(win)=0.85 corresponds to an
+    # ACTUAL win-rate around 0.65-0.70 on small samples. Isotonic learns the
+    # monotonic mapping from raw output to calibrated probability without
+    # assuming a parametric shape. Persist the fitted calibrator next to the
+    # booster; ml_scorer applies it at inference time.
+    calib_meta: Dict[str, Any] = {
+        "fitted": False,
+        "n_oof_samples": len(oof_preds),
+    }
+    if len(oof_preds) >= 50 and len(set(oof_labels)) >= 2:
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            import pickle as _pickle
+            calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+            calibrator.fit(np.array(oof_preds), np.array(oof_labels))
+            # Sanity-check the calibrator on the OOF set itself.
+            try:
+                from sklearn.metrics import brier_score_loss as _brier
+                raw_brier = _brier(oof_labels, oof_preds)
+                calib_brier = _brier(oof_labels, calibrator.transform(oof_preds))
+                calib_meta["raw_brier"] = round(float(raw_brier), 4)
+                calib_meta["calibrated_brier"] = round(float(calib_brier), 4)
+                calib_meta["brier_improvement"] = round(float(raw_brier - calib_brier), 4)
+            except Exception:
+                pass
+            with open(_CALIB_PATH, "wb") as f:
+                _pickle.dump(calibrator, f)
+            try:
+                # DB mirror — pickle bytes hex-encoded (MLArtifact.content is
+                # a String column, not BLOB; hex keeps it text-safe).
+                with open(_CALIB_PATH, "rb") as f:
+                    _db_put("calibrator", f.read().hex(), is_binary=True)
+            except Exception as e:
+                logger.warning(f"ml_trainer: db calibrator persist failed: {e}")
+            calib_meta["fitted"] = True
+            logger.info(
+                f"ml_trainer: isotonic calibrator fitted on {len(oof_preds)} OOF samples "
+                f"(brier raw={calib_meta.get('raw_brier')}, calibrated={calib_meta.get('calibrated_brier')})"
+            )
+        except Exception as e:
+            logger.warning(f"ml_trainer: calibrator fit failed: {e}")
+            calib_meta["error"] = str(e)[:200]
+    else:
+        calib_meta["reason"] = "too few OOF samples or single-class"
+        # Remove any stale calibrator file/DB entry so old calibrators don't
+        # silently apply to a freshly-trained model with insufficient data.
+        try:
+            if os.path.exists(_CALIB_PATH):
+                os.remove(_CALIB_PATH)
+        except Exception:
+            pass
+        try:
+            from database import SessionLocal as _SL_calib, MLArtifact as _MA_calib
+            _db = _SL_calib()
+            try:
+                row = _db.query(_MA_calib).filter(_MA_calib.name == "calibrator").first()
+                if row:
+                    _db.delete(row)
+                    _db.commit()
+            finally:
+                _db.close()
+        except Exception:
+            pass
+
     importance = dict(zip(cols, [int(v) for v in final_booster.feature_importance(importance_type="gain")]))
     importance_sorted = sorted(importance.items(), key=lambda kv: -kv[1])
     meta = {
@@ -325,6 +402,7 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         "tickers": int(samples["__ticker"].nunique()),
         "horizon_bars": _LABEL_HORIZON_BARS,
         "stride": _SAMPLE_STRIDE,
+        "calibrator": calib_meta,
     }
     with open(_META_PATH, "w") as f:
         json.dump(meta, f, indent=2)

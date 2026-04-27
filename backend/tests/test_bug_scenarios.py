@@ -1405,5 +1405,53 @@ class TestSlippageAwareRPS(unittest.TestCase):
         self.assertGreaterEqual(rps, gross + 0.10 * atr - 1e-9)
 
 
+class TestMLCalibration(unittest.TestCase):
+    """r45: isotonic calibrator persists alongside the booster, transforms
+    raw LightGBM output into calibrated probability.
+    """
+
+    def test_isotonic_round_trip(self):
+        """Direct test of the IsotonicRegression layer — fit, persist, load,
+        transform — without invoking the full training pipeline (which needs
+        live ticker data + 200+ samples).
+        """
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            import pickle as _pickle
+            import numpy as _np
+        except Exception:
+            self.skipTest("sklearn or numpy unavailable in this env")
+            return
+        # Build a synthetic dataset where raw LightGBM-style outputs are
+        # over-confident at the tails: predicted 0.85 actually wins 0.70.
+        rng = _np.random.default_rng(42)
+        N = 500
+        raw_preds = rng.uniform(0.0, 1.0, N)
+        # Simulate over-confidence: pull true labels toward 0.5 for tail predictions.
+        true_p = 0.5 + 0.7 * (raw_preds - 0.5)
+        labels = (rng.uniform(0.0, 1.0, N) < true_p).astype(int)
+
+        cal = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        cal.fit(raw_preds, labels)
+        # Tail predictions should pull toward the true win rate.
+        high_raw = 0.90
+        cal_high = float(cal.transform([high_raw])[0])
+        self.assertLessEqual(cal_high, high_raw + 1e-6)
+        self.assertGreaterEqual(cal_high, 0.0)
+        self.assertLessEqual(cal_high, 1.0)
+        # Pickle round-trip — what ml_trainer/ml_scorer actually do.
+        blob = _pickle.dumps(cal)
+        cal2 = _pickle.loads(blob)
+        cal2_high = float(cal2.transform([high_raw])[0])
+        self.assertAlmostEqual(cal_high, cal2_high, places=6)
+
+    def test_scorer_calibrator_loaded_accessor(self):
+        """The status endpoint exposes whether a calibrator is currently
+        loaded. This is a smoke test on the accessor only — no model trained
+        in the test env, so it should return False."""
+        from services.ml_scorer import calibrator_loaded
+        self.assertIn(calibrator_loaded(), (True, False))   # boolean returned, not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

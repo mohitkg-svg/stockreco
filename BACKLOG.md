@@ -15,6 +15,16 @@ inclusion / continued-deferral rationale. Deferred items whose rationale
 has gone stale should either move to ✅ done or be re-categorized as
 ❌ rejected — don't let the list rot into "we'll get to it eventually".
 
+## r45 ML calibration (2026-04-27)
+
+Closes the largest deferred item from r44: isotonic calibration on top
+of the LightGBM scorer. ml_trainer fits IsotonicRegression on the
+out-of-fold preds + labels (≥50 samples required) and persists the
+calibrator alongside the booster. ml_scorer lazy-loads it and applies
+at inference time; falls back to raw output when calibrator missing.
+Brier-score raw-vs-calibrated improvement recorded in meta.json.
+153 tests pass (2 new).
+
 ## r44 audit pickup (2026-04-27) — 7-agent ML/risk/regime/strategy deep-dive
 
 Seven parallel agents on different angles than r42/r43. ALL Tier 0/1/2/3

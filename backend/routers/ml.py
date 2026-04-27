@@ -25,8 +25,19 @@ def train(max_tickers: int = Query(40, ge=5, le=200)):
 
 @router.get("/status")
 def status():
-    """Current training state (queued|collecting|training|done|error)."""
-    return ml_trainer.get_status()
+    """Current training state (queued|collecting|training|done|error).
+
+    r45: also surfaces whether the isotonic calibrator is loaded — when
+    True, predictions are calibrated; when False, raw booster output is
+    served (typically because OOF sample count was below the 50-row
+    threshold at last train, or no model has been trained yet).
+    """
+    out = ml_trainer.get_status()
+    try:
+        out["calibrator_loaded"] = ml_scorer.calibrator_loaded()
+    except Exception:
+        out["calibrator_loaded"] = False
+    return out
 
 
 @router.get("/scorecard")

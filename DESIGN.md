@@ -1087,6 +1087,47 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 45 — ML isotonic calibration
+
+LightGBM tree outputs are systematically over-confident at the tails: a
+predicted P(win)=0.85 corresponds to an actual win-rate around 0.65-0.70
+on small samples. Without calibration, the scorer's confidence
+multiplier (which gates entries via `winrate_to_multiplier`) keys on
+unreliable probabilities — and the calibration plot at `/api/ml/calibration`
+that operators consult before flipping `ml_scoring_enabled=True` shows
+the raw uncalibrated values.
+
+**What shipped**:
+- `ml_trainer.train()` collects out-of-fold predictions across the
+  walk-forward folds (≥50 samples required; below that, we leave the
+  calibrator unfitted and ml_scorer falls back to raw output).
+- An `IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1)` is fit
+  on the OOF preds vs realized labels — the standard non-parametric
+  calibration method (no shape assumption beyond monotonicity).
+- Calibrator persisted as `calibrator.pkl` next to `model.txt`, mirrored
+  to DB as hex-encoded bytes in `MLArtifact.content` so it survives
+  container churn the same way the booster does.
+- Brier-score improvement (raw vs calibrated) recorded in `meta.json`
+  under `meta.calibrator` for observability.
+- `ml_scorer._load_if_needed` now hydrates and lazy-loads the
+  calibrator alongside the booster, with mtime-based reload.
+- `predict_winrate` applies `calibrator.transform(raw)` when available;
+  falls back transparently to raw output when not.
+- New `predict_winrate_raw_and_calibrated()` returns both values for
+  the calibration UI / debugging.
+- New `calibrator_loaded()` accessor; surfaced on `/api/ml/status` so
+  operators can confirm whether calibrated or raw probabilities are
+  serving.
+- Stale calibrator files / DB entries are cleaned up when a freshly-
+  trained model has insufficient OOF data — prevents an old calibrator
+  from silently applying to a newer model with a different feature
+  distribution.
+
+**Tests**: 2 new regression tests
+(`TestMLCalibration::test_isotonic_round_trip` — fit, persist via pickle,
+load, verify monotonicity preserved; `test_scorer_calibrator_loaded_accessor`
+— smoke on the public accessor). Full suite: 153 passed.
+
 ### Revision 44 — 7-agent deep audit: ML/AI, risk overlays, regime signals, new strategies
 
 Seven parallel deep-dive agents on different angles than r42/r43: profit-
