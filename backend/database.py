@@ -34,7 +34,7 @@ Public surface:
     in the consuming services.
 """
 import os
-from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, Boolean, Text
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, Boolean, Text, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -756,6 +756,34 @@ class EquitySnapshot(Base):
     unrealized_pl = Column(Float, nullable=True)
     open_positions = Column(Integer, nullable=True)
     spy_close = Column(Float, nullable=True)             # SPY price for benchmark overlay
+
+
+class IVHistory(Base):
+    """r52f: per-ticker daily ATM-IV snapshot.
+
+    Background: the option-entry IV-percentile gate (deferred since r41)
+    needs ≥252 trading days of historical ATM IV per ticker to compute a
+    real percentile rank. yfinance options chains provide ATM IV daily
+    for free; this table captures one row per ticker per day. Once the
+    history accumulates, `_iv_percentile(ticker)` can replace the
+    realized-vol proxy currently used in `_iv_is_expensive`.
+
+    Schema is intentionally minimal: just (ticker, ts, atm_iv30,
+    atm_iv60). The 30/60-day terms are the most commonly used; longer-
+    dated terms can be added later if a strategy needs them. `term_iv_skew`
+    (atm_iv60 / atm_iv30 - 1) gives a quick term-structure read.
+    """
+    __tablename__ = "iv_history"
+    id = Column(Integer, primary_key=True)
+    ticker = Column(String, index=True, nullable=False)
+    ts = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)
+    atm_iv30 = Column(Float, nullable=True)   # 30-day ATM call/put avg IV
+    atm_iv60 = Column(Float, nullable=True)   # 60-day ATM call/put avg IV
+    term_iv_skew = Column(Float, nullable=True)  # iv60/iv30 - 1 (positive = contango)
+    underlying_close = Column(Float, nullable=True)
+    __table_args__ = (
+        UniqueConstraint("ticker", "ts", name="uq_iv_history_ticker_ts"),
+    )
 
 
 class AIDecisionLog(Base):

@@ -10,7 +10,9 @@ POST   /api/trading/close/{symbol}       -> market-close a single position
 POST   /api/trading/close-all            -> close every position + cancel orders
 """
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, List
+
+from models import PositionResponse
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from services import paper_trader, auto_trader
@@ -246,7 +248,7 @@ def pnl_reconciliation():
     }
 
 
-@router.get("/positions")
+@router.get("/positions", response_model=List[PositionResponse])
 def positions():
     """Broker positions enriched with bot-managed exit fields (current_stop,
     target1/2/3, stop_loss, opened_at, level_index, hit_t1, asset_type,

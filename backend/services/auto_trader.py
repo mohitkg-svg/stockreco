@@ -344,10 +344,15 @@ logger = logging.getLogger(__name__)
 _corr_cache: Dict[str, "Any"] = {}  # ticker → pd.Series of daily log-returns
 _corr_cache_ts: Dict[str, float] = {}
 _CORR_CACHE_TTL_SEC = 6 * 3600  # refresh twice/day
+_CORR_CACHE_MAX = 256  # r52f: was unbounded; over weeks of universe scans the
+                       # cache grew with every ticker ever analyzed (500+ in
+                       # universe_scanner). Each entry holds a pandas Series
+                       # (~30 floats); aggregate is small but contributes to
+                       # the slow memory-creep that triggered r52 OOM-loop.
 
 
 def _get_returns_series(ticker: str):
-    """30-day daily log-returns Series for `ticker`. Cached 6h."""
+    """30-day daily log-returns Series for `ticker`. Cached 6h, bounded LRU."""
     import time as _tt
     now = _tt.time()
     cached = _corr_cache.get(ticker)
@@ -363,6 +368,14 @@ def _get_returns_series(ticker: str):
         rets = _np.log(closes / closes.shift(1)).dropna().tail(30)
         if len(rets) < 15:
             return None
+        # r52f: LRU eviction on overflow. Drop the oldest by ts before insert.
+        if len(_corr_cache) >= _CORR_CACHE_MAX:
+            try:
+                oldest = min(_corr_cache_ts, key=_corr_cache_ts.get)
+                _corr_cache.pop(oldest, None)
+                _corr_cache_ts.pop(oldest, None)
+            except (ValueError, KeyError):
+                pass
         _corr_cache[ticker] = rets
         _corr_cache_ts[ticker] = now
         return rets

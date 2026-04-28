@@ -180,6 +180,92 @@ def sync_positions():
     return sync_positions_from_alpaca()
 
 
+@router.post("/backfill-realized-pl")
+def backfill_realized_pl():
+    """Patch `realized_pl` on `closed_reconciled` / `closed_external` rows
+    by pulling actual fill prices from Alpaca. r52f: surfaced by the new
+    P/L reconciliation widget showing ~$2,100 of unattributed loss in
+    rows where the bot's `realized_pl` field stayed at $0 because the
+    position closed via a path the manage-loop didn't observe (manual
+    flatten, missed bracket-leg fill, adoption-then-close).
+
+    Algorithm per row: pull last N=50 FILLED orders for the symbol from
+    Alpaca, find a SELL order with qty matching `t.qty` and submitted_at
+    before `t.closed_at` + 24h. realized_pl = (filled_avg_price -
+    entry_price) × qty × multiplier.
+
+    Idempotent: only patches rows where realized_pl is None or 0.
+    """
+    logger.warning("ADMIN backfill_realized_pl invoked")
+    from database import SessionLocal as _SL_b, AutoTrade as _AT_b
+    from services import paper_trader as _pt_b
+    db = _SL_b()
+    patched = []
+    skipped = []
+    try:
+        rows = (db.query(_AT_b)
+                .filter(_AT_b.status.in_(["closed_reconciled", "closed_external"]))
+                .filter((_AT_b.realized_pl.is_(None)) | (_AT_b.realized_pl == 0))
+                .all())
+        if not rows:
+            return {"patched": [], "skipped": [], "note": "no rows need backfill"}
+        # Pull a generous window of recent closed orders once
+        all_orders = _pt_b.get_orders(status="closed", limit=500) or []
+        for t in rows:
+            try:
+                if not t.entry_price:
+                    skipped.append({"id": t.id, "ticker": t.ticker, "reason": "no entry_price"})
+                    continue
+                # Match Alpaca's symbol — for stocks t.ticker, for options t.symbol (OCC)
+                want_sym = (t.symbol or t.ticker or "").upper()
+                multiplier = 100.0 if (t.asset_type or "stock").lower() == "option" else 1.0
+                # Find a SELL fill matching qty before close+1d
+                close_ceiling = t.closed_at
+                cands = []
+                for o in all_orders:
+                    if (o.get("symbol") or "").upper() != want_sym:
+                        continue
+                    side = (o.get("side") or "").lower().split(".")[-1]
+                    if "sell" not in side:
+                        continue
+                    if not o.get("filled_avg_price"):
+                        continue
+                    # Tolerate small qty mismatch (partial fills, trim legs)
+                    oqty = float(o.get("filled_qty") or o.get("qty") or 0)
+                    if oqty <= 0 or abs(oqty - float(t.qty or 0)) > max(1.0, float(t.qty or 0) * 0.1):
+                        continue
+                    cands.append(o)
+                if not cands:
+                    skipped.append({"id": t.id, "ticker": t.ticker, "reason": "no matching sell fill"})
+                    continue
+                # Prefer the most recent fill before close+24h
+                cands.sort(key=lambda x: x.get("filled_at") or "", reverse=True)
+                fill = cands[0]
+                exit_px = float(fill.get("filled_avg_price") or 0)
+                if exit_px <= 0:
+                    skipped.append({"id": t.id, "ticker": t.ticker, "reason": "fill price 0"})
+                    continue
+                pl = (exit_px - float(t.entry_price)) * float(t.qty or 0) * multiplier
+                t.realized_pl = round(pl, 2)
+                t.note = (t.note or "") + f" | BACKFILL_REALIZED_PL: exit ${exit_px:.2f} (fill {str(fill.get('id'))[:8]})"
+                patched.append({
+                    "id": t.id, "ticker": t.ticker, "asset_type": t.asset_type,
+                    "entry_price": float(t.entry_price), "exit_price": exit_px,
+                    "realized_pl": t.realized_pl, "fill_id": str(fill.get("id"))[:8],
+                })
+            except Exception as e:
+                skipped.append({"id": t.id, "ticker": t.ticker, "reason": f"err: {str(e)[:120]}"})
+        db.commit()
+        return {
+            "patched": patched,
+            "skipped": skipped,
+            "patched_count": len(patched),
+            "patched_total_pl": round(sum(p["realized_pl"] for p in patched), 2),
+        }
+    finally:
+        db.close()
+
+
 @router.post("/record-equity-snapshot")
 def record_equity_snapshot_now():
     """Manually fire `record_equity_snapshot` once. Idempotent — the

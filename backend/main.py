@@ -686,6 +686,22 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.warning(f"equity_snapshot job not scheduled: {_e}")
 
+    # r52f: ATM IV history capture — daily 04:30 UTC (after option close,
+    # before universe scan). Builds the 252-day rolling history that the
+    # IV-percentile option-entry gate (deferred since r41) reads.
+    try:
+        from services import iv_history as _ivh
+        from apscheduler.triggers.cron import CronTrigger as _CronIVH
+        scheduler.add_job(
+            _ivh.capture_all_watchlist,
+            trigger=_CronIVH(hour=4, minute=30),
+            id="iv_history_capture",
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+            executor="heavy",  # yfinance per-ticker is slow; don't block default pool
+        )
+    except Exception as _e:
+        logger.warning(f"iv_history job not scheduled: {_e}")
+
     # Institutional holdings (13F proxy via yfinance) — weekly Sunday 05:15
     # UTC. 13F cadence is quarterly-with-lag so weekly is plenty.
     try:
@@ -757,13 +773,19 @@ async def lifespan(app: FastAPI):
         logger.warning(f"option-stream boot resubscribe skipped: {e}")
 
     yield
+    # r52f fix: live_quotes.stop() FIRST so the Alpaca WS releases before
+    # scheduler-drain can eat into the 10s SIGTERM grace window. Without
+    # this ordering, a slow APScheduler shutdown can block long enough
+    # that the new instance gets "connection limit exceeded" because the
+    # broker still sees the old WS open. Ran into this during the r52
+    # OOM-loop incident.
+    try:
+        await live_quotes.stop()
+    except Exception:
+        pass
     # r44 fix #0.15: wait=True for clean shutdown (see manager-mode comment).
     try:
         scheduler.shutdown(wait=True)
-    except Exception:
-        pass
-    try:
-        await live_quotes.stop()
     except Exception:
         pass
     # Audit fix L1: cleanly shut the post-mortem worker pool so daemon
@@ -1113,7 +1135,55 @@ def health():
         # r48 BACKLOG #failure-mode P1-7 / lifecycle P1-13: surface breakers
         "pdt_locked": _pdt_locked(),
         "db_down": _db_down_flag(),
+        # r52f: memory observability — surfaced after the OOM-loop incident
+        # so memory creep is visible BEFORE the next 1Gi → 2Gi bump.
+        "memory": _memory_stats(),
     }
+
+
+def _memory_stats() -> dict:
+    """RSS + key-cache sizes. Lets ops see memory creep without shelling
+    into the Cloud Run container. Skip psutil if unavailable; fall back
+    to /proc/self/status on Linux."""
+    out = {}
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    out["rss_mb"] = round(int(line.split()[1]) / 1024, 1)
+                    break
+    except Exception:
+        pass
+    try:
+        from services.data_fetcher import _cache as _df_cache, _latest_trade_cache
+        out["data_cache_entries"] = len(_df_cache)
+        out["latest_trade_cache_entries"] = len(_latest_trade_cache._cache)
+    except Exception:
+        pass
+    try:
+        from services import auto_trader as _at_mem
+        out["corr_cache_entries"] = len(_at_mem._corr_cache)
+        out["target_touch_entries"] = len(_at_mem._target_touch_counts)
+    except Exception:
+        pass
+    try:
+        from services import live_quotes as _lq_mem
+        out["stock_quotes_entries"] = len(_lq_mem._stock_quotes)
+        out["subscribed_symbols"] = len(_lq_mem._subscribed_symbols)
+        out["option_subscribed"] = len(_lq_mem._option_subscribed)
+    except Exception:
+        pass
+    try:
+        from services.alerts import _dedup as _al_dedup
+        out["alerts_dedup_entries"] = len(_al_dedup)
+    except Exception:
+        pass
+    try:
+        from services.options_fetcher import _chain_cache as _opt_cache
+        out["options_chain_cache_entries"] = len(_opt_cache)
+    except Exception:
+        pass
+    return out
 
 
 def _ai_cost_today() -> dict:

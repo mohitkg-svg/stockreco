@@ -243,3 +243,45 @@ class SignalPayload(BaseModel):
             and self.stop_loss is not None and self.stop_loss > 0
             and self.target1 is not None and self.target1 > 0
         )
+
+
+# r52f: typed response for /api/trading/positions. The endpoint enriches
+# Alpaca's native position fields with bot-managed exit fields (current_stop,
+# target1/2/3, level_index, opened_at) by joining to AutoTrade. For options
+# it also returns underlying_symbol/price/entry so the UI can compute
+# distance-to-stop in correct units. Codifying the shape here makes the
+# contract explicit between the backend join logic and the frontend
+# PositionCard component.
+class PositionResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    # Alpaca native fields (always present)
+    symbol: str
+    qty: float
+    side: str
+    avg_entry_price: float
+    current_price: Optional[float] = None
+    market_value: float
+    cost_basis: float
+    unrealized_pl: float
+    unrealized_plpc: float
+    asset_class: str
+
+    # Bot-managed enrichment (present only when an AutoTrade row matches)
+    trade_id: Optional[int] = None
+    asset_type: Optional[Literal["stock", "option"]] = None
+    ticker: Optional[str] = None
+    current_stop: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target1: Optional[float] = None
+    target2: Optional[float] = None
+    target3: Optional[float] = None
+    level_index: Optional[int] = None
+    hit_t1: Optional[bool] = None
+    opened_at: Optional[str] = None
+    managed_status: Optional[str] = None
+
+    # Option-specific (when asset_type == "option")
+    underlying_symbol: Optional[str] = None
+    underlying_price: Optional[float] = None
+    underlying_entry_price: Optional[float] = None

@@ -5,6 +5,49 @@ five external review passes (2026-04-25). The chronological per-pass
 sections below capture the original context; the **Master deferral
 register** below is the canonical short-form view used for scoping.
 
+## r52f — backlog batch: reconciliation backfill, lifespan reorder, mem observability, IV history, typed positions (2026-04-28)
+
+Five user-requested follow-ups from the post-r52e backlog audit, all
+shipped together:
+
+1. **`POST /api/admin/backfill-realized-pl`** — pulls actual SELL fill
+   prices from Alpaca's order history, patches `realized_pl` on
+   `closed_reconciled` / `closed_external` rows where the bot's field
+   stayed at $0. Idempotent. First run captured -$294 across 6 of 9
+   rows (3 skipped due to null `entry_price` from pre-r41 schema).
+   Reconciliation gap visible in the P/L widget dropped accordingly.
+
+2. **Lifespan teardown reorder** — `live_quotes.stop()` now runs
+   FIRST, ahead of `scheduler.shutdown(wait=True)`. Prior order risked
+   the scheduler-drain eating into Cloud Run's 10s SIGTERM grace before
+   the Alpaca WS released, which is what cascaded into "connection
+   limit exceeded" errors at the new instance during the r52 OOM loop.
+
+3. **Memory observability** — `/api/health` now returns a `memory: {…}`
+   block: RSS in MB, plus entry counts for `_cache` (data_fetcher),
+   `_corr_cache` (auto_trader), `_target_touch_counts`, `_stock_quotes`,
+   `_subscribed_symbols`, `_option_subscribed`, `alerts._dedup`,
+   `options_fetcher._chain_cache`. Lets ops watch creep without
+   shelling into the container. Also bounded `_corr_cache` to 256
+   entries (was unbounded; LRU-by-ts eviction on overflow).
+
+4. **`IVHistory` table + nightly capture cron** — new
+   `services/iv_history.py` writes per-ticker ATM IV30/IV60 daily at
+   04:30 UTC via yfinance options chain. Schema:
+   `(ticker, ts, atm_iv30, atm_iv60, term_iv_skew, underlying_close)`
+   with `UNIQUE(ticker, ts)`. `iv_percentile(ticker, lookback_days=252)`
+   read helper returns 0-100 rank when ≥30 history points exist.
+   Starts the 252-day clock NOW so the IV-percentile option-entry
+   gate (deferred since r41) becomes usable independent of when we
+   revisit it.
+
+5. **Typed `PositionResponse` model** — `/api/trading/positions` now
+   has `response_model=List[PositionResponse]`. Codifies the
+   contract between the backend join logic (Alpaca position +
+   AutoTrade enrichment + option underlying lookup) and the frontend
+   `PositionCard` component. Representative slice of the multi-week
+   "migrate auto_trader internal dicts to Pydantic" track.
+
 ## r52e — P/L reconciliation widget (2026-04-28)
 
 Operator asked "I started at $100k and now at $80k — where did the $20k
