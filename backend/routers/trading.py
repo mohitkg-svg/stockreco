@@ -10,9 +10,12 @@ POST   /api/trading/close/{symbol}       -> market-close a single position
 POST   /api/trading/close-all            -> close every position + cancel orders
 """
 from __future__ import annotations
+import logging
 from typing import Optional, List
 
 from models import PositionResponse, PnLReconciliationResponse
+
+logger = logging.getLogger(__name__)
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from services import paper_trader, auto_trader
@@ -64,6 +67,15 @@ class KillSwitchRequest(BaseModel):
 
 class UnkillRequest(BaseModel):
     reason: Optional[str] = None
+
+
+class MoveStopRequest(BaseModel):
+    """r53f: explicit move-stop endpoint. Replaces the prior pattern of
+    POSTing `{action: "move_stop_be", new_stop: X}` to /api/trading/order
+    which silently failed because OrderRequest's schema rejected the
+    extra fields."""
+    symbol: str
+    new_stop: float = Field(..., gt=0)
 
 
 class OrderRequest(BaseModel):
@@ -421,6 +433,108 @@ def orders(status: str = "all", limit: int = 50):
             "pl_basis_entry": pl_basis,
         })
     return out
+
+
+@router.post("/move-stop")
+def move_stop(req: MoveStopRequest):
+    """r53f: move the trailing-stop on a bot-managed open position to a
+    new level. For stocks: also replaces the broker-side STOP order so
+    the protection actually moves. For options: updates the underlying
+    stop tracked by the manage tick (no broker-side leg for options).
+
+    Validates the move is in the protective direction (long → up only,
+    short → down only) so a typo can't widen the stop. Operator should
+    use POST /api/admin/* paths if they really need to widen.
+    """
+    sym = (req.symbol or "").upper()
+    if not _TICKER_RE.match(sym) and not (len(sym) >= 13 and sym[:6].rstrip("0123456789").isalpha()):
+        # Allow either ticker or OCC option symbol.
+        raise HTTPException(status_code=400, detail="Invalid symbol")
+    from database import SessionLocal as _SL_ms, AutoTrade as _AT_ms
+    db = _SL_ms()
+    try:
+        # Match by ticker for stocks, by symbol (OCC) for options.
+        row = (db.query(_AT_ms)
+               .filter(_AT_ms.status.in_(["open", "adopted"]))
+               .filter((_AT_ms.ticker == sym) | (_AT_ms.symbol == sym))
+               .order_by(_AT_ms.opened_at.desc())
+               .first())
+        if not row:
+            raise HTTPException(status_code=404, detail=f"No open trade for {sym}")
+        new_stop = float(req.new_stop)
+        cur_stop = float(row.current_stop or 0)
+        side = (row.side or "buy").lower()
+        is_long = "buy" in side
+        # Direction check — long stops move up only; short stops move down only.
+        if cur_stop > 0:
+            if is_long and new_stop < cur_stop:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Refusing to widen long stop {cur_stop} → {new_stop} (use admin endpoint)",
+                )
+            if (not is_long) and new_stop > cur_stop:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Refusing to widen short stop {cur_stop} → {new_stop} (use admin endpoint)",
+                )
+        prev_stop = cur_stop
+        row.current_stop = round(new_stop, 4)
+        row.note = (row.note or "") + f" | MOVE_STOP: {prev_stop:.2f} → {new_stop:.2f} (operator)"
+        db.commit()
+
+        # Stock side: replace the broker SL order. Options are managed
+        # via underlying-stop in the manage tick; nothing to update at
+        # the broker.
+        broker_result = None
+        if (row.asset_type or "stock").lower() == "stock" and row.stop_order_id:
+            try:
+                from alpaca.trading.requests import ReplaceOrderRequest
+                c = paper_trader._get_client()
+                if c:
+                    replaced = c.replace_order_by_id(
+                        row.stop_order_id,
+                        order_data=ReplaceOrderRequest(stop_price=round(new_stop, 2)),
+                    )
+                    broker_result = {"replaced_id": str(getattr(replaced, "id", row.stop_order_id))}
+                    if replaced and getattr(replaced, "id", None):
+                        row.stop_order_id = str(replaced.id)
+                        db.commit()
+            except Exception as e:
+                logger.warning(f"move_stop {sym}: broker replace failed: {e}; submitting fresh STOP")
+                # Fallback: submit a new STOP order at the new level
+                try:
+                    from alpaca.trading.requests import StopOrderRequest
+                    from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+                    c = paper_trader._get_client()
+                    if c and row.qty:
+                        # Cancel any working stops first
+                        try:
+                            paper_trader.cancel_all_orders(symbol=sym)
+                        except Exception:
+                            pass
+                        new_o = c.submit_order(order_data=StopOrderRequest(
+                            symbol=sym, qty=int(row.qty),
+                            side=_OS.SELL if is_long else _OS.BUY,
+                            time_in_force=_TIF.GTC,
+                            stop_price=round(new_stop, 2),
+                        ))
+                        if new_o and getattr(new_o, "id", None):
+                            row.stop_order_id = str(new_o.id)
+                            db.commit()
+                            broker_result = {"resubmitted_id": str(new_o.id)}
+                except Exception as e2:
+                    broker_result = {"error": f"replace + resubmit both failed: {e2}"}
+        return {
+            "ok": True,
+            "trade_id": row.id,
+            "symbol": sym,
+            "asset_type": row.asset_type,
+            "previous_stop": prev_stop,
+            "new_stop": new_stop,
+            "broker": broker_result or {"note": "no broker SL leg to update"},
+        }
+    finally:
+        db.close()
 
 
 @router.post("/order")

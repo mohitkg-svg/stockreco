@@ -1355,12 +1355,24 @@ function MyPositionBanner({ ticker, position, currentPrice, signal }) {
   const moveStopBE = async () => {
     if (!entry) return;
     try {
-      await api.post('/api/trading/order', {
+      // r53f: was POSTing {action:'move_stop_be',...} to /api/trading/order
+      // which silently 422'd because OrderRequest's schema rejected the
+      // extra fields. Now uses the dedicated /move-stop endpoint and
+      // surfaces the actual server response.
+      const res = await api.post('/api/trading/move-stop', {
         symbol: ticker,
-        action: 'move_stop_be',
         new_stop: entry,
       });
-      toast({ msg: 'Move-stop request sent', kind: 'success', duration: 3000 });
+      const broker = res?.broker || {};
+      const note = broker.replaced_id ? `replaced broker SL ${String(broker.replaced_id).slice(0,8)}`
+        : broker.resubmitted_id ? `resubmitted broker SL ${String(broker.resubmitted_id).slice(0,8)}`
+        : broker.note || 'updated';
+      toast({
+        msg: `Stop → BE @ $${Number(res?.new_stop ?? entry).toFixed(2)} (${note})`,
+        kind: 'success',
+        duration: 4000,
+      });
+      window.dispatchEvent(new CustomEvent('app:trade_closed'));  // refresh positions
     } catch (e) {
       toast({ msg: `Move stop failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
     }
@@ -4563,6 +4575,22 @@ function PositionCard({ p, ticker, busy, closePos }) {
   const direction = isLong ? 'BUY' : 'SELL';
   const stop = p.current_stop || p.stop_loss;
   const t1 = p.target1, t2 = p.target2, t3 = p.target3;
+  // r53f: ticker for the chart-open button. Stocks: position symbol IS
+  // the ticker. Options: extract underlying from the OCC symbol — the
+  // first run of A-Z letters (e.g. "RMBS260515C00150000" → "RMBS"). The
+  // backend also surfaces `p.underlying_symbol` / `p.ticker` for
+  // bot-managed options; prefer those when present.
+  const chartTicker = (() => {
+    if (!isOption) return p.symbol;
+    const fromBackend = p.underlying_symbol || p.ticker;
+    if (fromBackend) return String(fromBackend).toUpperCase();
+    const m = String(p.symbol || '').match(/^[A-Z]+/);
+    return m ? m[0] : null;
+  })();
+  const openChart = () => {
+    if (!chartTicker) return;
+    window.dispatchEvent(new CustomEvent('app:open-chart', { detail: { ticker: chartTicker } }));
+  };
   // For options, stop/targets are denominated in UNDERLYING price, so we
   // must compute distance-to-stop and R against the underlying spot —
   // NOT against the option premium.
@@ -4602,13 +4630,24 @@ function PositionCard({ p, ticker, busy, closePos }) {
             Qty {Math.abs(p.qty)} @ ${p.avg_entry_price?.toFixed(2)} · held {heldFmt}
           </div>
         </div>
-        <button
-          disabled={!!busy[`close:${p.symbol}`]}
-          aria-label={`Close ${p.symbol} position`}
-          onClick={() => closePos(p.symbol, p)}
-          className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold shrink-0">
-          {busy[`close:${p.symbol}`] ? 'Closing…' : 'Close'}
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {chartTicker && (
+            <button
+              aria-label={`Open ${chartTicker} chart`}
+              onClick={openChart}
+              title={isOption ? `Open chart for underlying ${chartTicker}` : 'Open chart'}
+              className="text-[10px] px-2 py-1 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/30 font-semibold">
+              📈 Chart
+            </button>
+          )}
+          <button
+            disabled={!!busy[`close:${p.symbol}`]}
+            aria-label={`Close ${p.symbol} position`}
+            onClick={() => closePos(p.symbol, p)}
+            className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold">
+            {busy[`close:${p.symbol}`] ? 'Closing…' : 'Close'}
+          </button>
+        </div>
       </div>
       <div className="flex items-baseline justify-between mb-2">
         <div>
@@ -5119,7 +5158,25 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
     }
     return (
       <tr key={o.id} className={`border-b app-border-soft last:border-0 hover:bg-white/3 ${isChild ? 'app-text-muted' : ''}`}>
-        <td className="py-2 px-3 font-semibold font-mono">{isChild && <span className="opacity-50">↳ </span>}{o.symbol}</td>
+        <td className="py-2 px-3 font-semibold font-mono">
+          {isChild && <span className="opacity-50">↳ </span>}
+          {/* r53f: click symbol → open underlying chart. Stocks: symbol
+              IS the ticker. Options: extract leading letters from OCC. */}
+          {(() => {
+            const s = o.symbol || '';
+            const m = String(s).match(/^[A-Z]+/);
+            const isOcc = s.length >= 13 && /\d/.test(s);
+            const ticker = isOcc ? (m ? m[0] : null) : s;
+            if (!ticker) return s;
+            return (
+              <button
+                onClick={() => window.dispatchEvent(new CustomEvent('app:open-chart', { detail: { ticker } }))}
+                title={isOcc ? `Open chart for underlying ${ticker}` : 'Open chart'}
+                className="hover:text-blue-300 hover:underline cursor-pointer text-left"
+              >{s}</button>
+            );
+          })()}
+        </td>
         <td className={`text-right py-2 px-3 font-semibold ${isBuy ? 'text-emerald-400' : 'text-red-400'}`}>
           <DirIcon dir={side} className="text-xs mr-0.5" />{side || '—'}
         </td>
@@ -6068,6 +6125,25 @@ function AuthedApp({ onLogout }) {
       document.removeEventListener('visibilitychange', onVis);
     };
   }, [loadOverview]);
+
+  // r53f: open-chart navigation via window event. Fired by Position
+  // cards (Stocks + Options sections) and Recent Orders rows. The
+  // option flow extracts the underlying ticker from the OCC symbol
+  // ("RMBS260515C00150000" → "RMBS") so a click on an option card
+  // opens the underlying's chart, same view the watchlist would.
+  React.useEffect(() => {
+    const onOpenChart = (e) => {
+      const t = (e?.detail?.ticker || '').toUpperCase();
+      if (!t) return;
+      setSelected(t);
+      setView('charts');
+      // If the ticker isn't in the watchlist yet, the analysis endpoint
+      // will fetch it on-demand; the watchlist sidebar simply won't
+      // highlight a row, which is fine.
+    };
+    window.addEventListener('app:open-chart', onOpenChart);
+    return () => window.removeEventListener('app:open-chart', onOpenChart);
+  }, [setSelected, setView]);
 
   // r42 fix #2.19: in-flight guard so a fast double-click doesn't fire two
   // POSTs / DELETEs against the watchlist API.
