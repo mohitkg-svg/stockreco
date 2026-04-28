@@ -445,11 +445,17 @@ def get_overview(db: Session = Depends(get_db)):
 
 @router.get("/{ticker}", response_model=AnalysisResponse)
 def get_analysis(ticker: str, refresh: bool = False, db: Session = Depends(get_db)):
-    """Full TA analysis for a ticker. Refreshes if requested or no data."""
+    """Full TA analysis for a ticker. Refreshes if requested or no data.
+
+    r53h: removed the hard "ticker must be in watchlist" gate. Operator
+    workflow now opens charts directly from position cards / orders for
+    tickers they hold but never explicitly added to the watchlist —
+    most commonly the underlying of an option position. The analysis
+    is bounded compute (one OHLCV fetch + indicators per timeframe) and
+    auth-gated by the X-API-Key middleware, so off-watchlist requests
+    aren't a meaningful abuse vector for a single-user app.
+    """
     ticker = ticker.upper()
-    existing = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first()
-    if not existing:
-        raise HTTPException(status_code=404, detail=f"{ticker} not in watchlist")
 
     # Check if we have recent signals
     recent_signals = db.query(Signal).filter(Signal.ticker == ticker).order_by(
