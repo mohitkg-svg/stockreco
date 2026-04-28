@@ -324,9 +324,103 @@ def positions():
 
 @router.get("/orders")
 def orders(status: str = "all", limit: int = 50):
+    """r53e: enriched with `notional_usd` (cost-to-buy / size-of-sell)
+    and `pl_usd` (realized P/L on filled sells, expected P/L on working
+    sells when the entry side can be matched). For BUYs, notional uses
+    the actual fill price when filled, else the limit/stop price as an
+    estimate, else null. For SELLs, P/L is computed against the matching
+    AutoTrade row's entry_price (for bot-managed trades) or against the
+    current open position's avg_entry_price (for adopted/manual rows).
+    """
     if not paper_trader.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
-    return paper_trader.get_orders(status=status, limit=limit)
+    raw = paper_trader.get_orders(status=status, limit=limit) or []
+    if not raw:
+        return raw
+
+    # Build a (symbol → entry_price) lookup from open + recently-closed
+    # AutoTrade rows. For options, key on the OCC symbol. For stocks,
+    # key on the ticker.
+    from database import SessionLocal as _SL_o, AutoTrade as _AT_o
+    from datetime import datetime as _dt_o, timedelta as _td_o
+    db = _SL_o()
+    entry_by_key: dict = {}
+    asset_type_by_key: dict = {}
+    try:
+        # Open / adopted rows take priority (most recent fill).
+        cutoff = _dt_o.utcnow() - _td_o(days=14)
+        rows = (db.query(_AT_o)
+                .filter((_AT_o.status.in_(["open", "adopted", "pending"]))
+                        | (_AT_o.closed_at >= cutoff))
+                .order_by(_AT_o.opened_at.desc())
+                .all())
+        for r in rows:
+            for k in {(r.ticker or "").upper(), (r.symbol or "").upper()}:
+                if k and k not in entry_by_key and r.entry_price:
+                    entry_by_key[k] = float(r.entry_price)
+                    asset_type_by_key[k] = (r.asset_type or "stock").lower()
+    finally:
+        db.close()
+
+    # Fallback: open Alpaca positions cover adopted positions where the
+    # AutoTrade row has no entry_price.
+    try:
+        for p in (paper_trader.get_positions() or []):
+            sym = (p.get("symbol") or "").upper()
+            if sym and sym not in entry_by_key and p.get("avg_entry_price"):
+                entry_by_key[sym] = float(p["avg_entry_price"])
+                ac = (p.get("asset_class") or "").upper()
+                asset_type_by_key[sym] = "option" if "OPTION" in ac else "stock"
+    except Exception:
+        pass
+
+    out = []
+    for o in raw:
+        sym = (o.get("symbol") or "").upper()
+        side_raw = (o.get("side") or "").lower().split(".")[-1]
+        is_buy = "buy" in side_raw
+        is_sell = "sell" in side_raw
+        atype = asset_type_by_key.get(sym, "stock")
+        multiplier = 100.0 if atype == "option" else 1.0
+
+        # Choose effective fill / working price for notional math.
+        fill_px = o.get("filled_avg_price")
+        limit_px = o.get("limit_price")
+        stop_px = o.get("stop_price")
+        eff_px = None
+        for cand in (fill_px, limit_px, stop_px):
+            if cand is not None:
+                try:
+                    eff_px = float(cand)
+                    break
+                except Exception:
+                    continue
+        # Quantity: prefer filled_qty when populated, else qty.
+        qty_n = None
+        try:
+            qty_n = float(o.get("filled_qty") or o.get("qty") or 0)
+        except Exception:
+            qty_n = None
+
+        notional = None
+        if eff_px is not None and qty_n and qty_n > 0:
+            notional = round(eff_px * qty_n * multiplier, 2)
+
+        pl = None
+        pl_basis = None  # the entry price we used
+        if is_sell and eff_px is not None and qty_n and qty_n > 0:
+            entry_lookup = entry_by_key.get(sym)
+            if entry_lookup and entry_lookup > 0:
+                pl = round((eff_px - entry_lookup) * qty_n * multiplier, 2)
+                pl_basis = round(entry_lookup, 4)
+
+        out.append({
+            **o,
+            "notional_usd": notional,
+            "pl_usd": pl,
+            "pl_basis_entry": pl_basis,
+        })
+    return out
 
 
 @router.post("/order")

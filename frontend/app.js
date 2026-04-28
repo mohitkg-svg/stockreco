@@ -5126,6 +5126,36 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
         <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
         <td className="text-right py-2 px-3 app-text-muted">{typeUpper}</td>
         <td className="text-right py-2 px-3 font-mono app-text-primary">{priceCell}</td>
+        <td className="text-right py-2 px-3 font-mono app-text-secondary">
+          {/* r53e: BUY → cost-to-buy ($notional). SELL → realized P/L
+              (or expected P/L on working bracket legs). */}
+          {(() => {
+            const notional = o.notional_usd;
+            const pl = o.pl_usd;
+            const filled = isFilled(status);
+            if (isBuy) {
+              if (notional == null) return '—';
+              return (
+                <span className={filled ? 'app-text-primary' : 'app-text-muted'}>
+                  {filled ? '' : '~'}${Math.round(notional).toLocaleString()}
+                </span>
+              );
+            }
+            // SELL
+            if (pl == null) {
+              return notional != null
+                ? <span className="app-text-muted">~${Math.round(notional).toLocaleString()}</span>
+                : '—';
+            }
+            const cls = pl >= 0 ? 'text-emerald-400' : 'text-red-400';
+            const sign = pl >= 0 ? '+' : '−';
+            return (
+              <span className={cls} title={o.pl_basis_entry ? `entry $${o.pl_basis_entry}` : ''}>
+                {filled ? '' : '~'}{sign}${Math.abs(pl).toFixed(2)}
+              </span>
+            );
+          })()}
+        </td>
         <td className="text-right py-2 px-3 app-text-secondary">{status.replace(/_/g, ' ')}</td>
         <td className="text-right py-2 px-3 app-text-muted font-mono" title={submitted ? submitted.toLocaleString() : ''}>{submittedLabel}</td>
         <td className="text-right py-2 px-3">
@@ -5197,6 +5227,7 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Price</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]" title="BUY: cost (qty × price). SELL: realized P/L (or expected on working)">Cost / P&amp;L</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
                 <th className="py-2 px-3"></th>
