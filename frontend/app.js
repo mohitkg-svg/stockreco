@@ -364,6 +364,34 @@ function DirIcon({ dir, className = '' }) {
   return <span className={`inline-block ${className}`} aria-hidden="true">●</span>;
 }
 
+// r53i: clickable ticker that opens the chart page on click. For OCC
+// option symbols, navigates to the underlying root. Stays an anchor-
+// like styled <button> so it inherits surrounding text styling and
+// preserves keyboard focus for a11y. Pass `display` to render text
+// different from the underlying-resolution ticker (e.g., showing the
+// full OCC symbol but linking to "RMBS").
+function TickerLink({ ticker, display, className = '', children, title }) {
+  const t = String(ticker || '').toUpperCase();
+  if (!t) return <>{children || display || ticker || ''}</>;
+  // Extract underlying for OCC-shaped symbols (≥13 chars, contains digits).
+  const isOcc = t.length >= 13 && /\d/.test(t);
+  const m = t.match(/^[A-Z]+/);
+  const navigateTicker = isOcc ? (m ? m[0] : null) : t;
+  if (!navigateTicker) return <>{children || display || t}</>;
+  const onClick = (e) => {
+    e.stopPropagation();
+    window.dispatchEvent(new CustomEvent('app:open-chart', { detail: { ticker: navigateTicker } }));
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title || (isOcc ? `Open chart for underlying ${navigateTicker}` : `Open chart for ${navigateTicker}`)}
+      className={`hover:text-blue-300 hover:underline cursor-pointer ${className}`}
+    >{children || display || t}</button>
+  );
+}
+
 // ============================================================================
 // r49: GLOBAL ERROR BOUNDARY
 // ============================================================================
@@ -3614,7 +3642,9 @@ function CandidatePoolPanel() {
                 {rows.map((r, i) => (
                   <tr key={r.ticker} className="border-b app-border-soft last:border-0 hover:bg-white/3">
                     <td className="py-1.5 px-2 app-text-muted font-mono">{i + 1}</td>
-                    <td className="py-1.5 px-2 font-semibold font-mono">{r.ticker}</td>
+                    <td className="py-1.5 px-2 font-semibold font-mono">
+                      <TickerLink ticker={r.ticker} />
+                    </td>
                     <td className="text-right py-1.5 px-2 font-mono font-semibold">{r.score?.toFixed(1)}</td>
                     <td className="text-right py-1.5 px-2 font-mono">${r.price?.toFixed(2)}</td>
                     <td className={`text-right py-1.5 px-2 font-mono ${r.rvol >= 1.5 ? 'text-emerald-400' : r.rvol < 0.7 ? 'text-red-400' : ''}`}>
@@ -4032,7 +4062,7 @@ function AutoTraderPanel({ reloadToken }) {
                   {/* Top row: ticker + pills + P/L */}
                   <div className="flex items-start justify-between gap-3 mb-2 flex-wrap">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-bold text-base font-mono">{t.ticker}</span>
+                      <TickerLink ticker={t.ticker} className="font-bold text-base font-mono" />
                       <span className="text-[10px] app-text-muted uppercase">{t.asset_type}</span>
                       <span className={`pill ${statusPill.cls}`}>{statusPill.label}</span>
                       {(t.level_index ?? 0) > 0 && (
@@ -4516,8 +4546,9 @@ function PnLReconciliationPanel() {
                 <div className="space-y-1">
                   {data.top_losers.map(t => (
                     <div key={t.id} className="text-[11px] font-mono flex items-center justify-between">
-                      <span className="truncate" title={`${t.ticker} ${t.asset_type} · ${t.status} · ${t.closed_at?.slice(0,10)}`}>
-                        {t.ticker} <span className="app-text-muted">{t.asset_type}</span>
+                      <span className="truncate flex items-center gap-1.5" title={`${t.ticker} ${t.asset_type} · ${t.status} · ${t.closed_at?.slice(0,10)}`}>
+                        <TickerLink ticker={t.ticker} />
+                        <span className="app-text-muted">{t.asset_type}</span>
                       </span>
                       <span className="text-red-400">{fmt$(t.realized_pl)}</span>
                     </div>
@@ -4531,8 +4562,9 @@ function PnLReconciliationPanel() {
                 <div className="space-y-1">
                   {data.top_winners.map(t => (
                     <div key={t.id} className="text-[11px] font-mono flex items-center justify-between">
-                      <span className="truncate" title={`${t.ticker} ${t.asset_type} · ${t.status} · ${t.closed_at?.slice(0,10)}`}>
-                        {t.ticker} <span className="app-text-muted">{t.asset_type}</span>
+                      <span className="truncate flex items-center gap-1.5" title={`${t.ticker} ${t.asset_type} · ${t.status} · ${t.closed_at?.slice(0,10)}`}>
+                        <TickerLink ticker={t.ticker} />
+                        <span className="app-text-muted">{t.asset_type}</span>
                       </span>
                       <span className="text-emerald-400">{fmt$(t.realized_pl)}</span>
                     </div>
@@ -6067,7 +6099,9 @@ function AdoptedPanel() {
           {trades.map(t => (
             <div key={t.id} className="flex items-center justify-between rounded-lg border app-border-soft px-3 py-2 surface-soft">
               <div className="min-w-0">
-                <div className="font-semibold text-sm">{t.ticker}</div>
+                <div className="font-semibold text-sm">
+                  <TickerLink ticker={t.ticker} />
+                </div>
                 <div className="text-[11px] app-text-muted">
                   qty {t.qty} @ ${(t.entry_price ?? 0).toFixed(2)}
                 </div>
