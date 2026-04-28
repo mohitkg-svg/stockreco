@@ -136,9 +136,59 @@ def account():
 
 @router.get("/positions")
 def positions():
+    """Broker positions enriched with bot-managed exit fields (current_stop,
+    target1/2/3, stop_loss, opened_at, level_index, hit_t1, asset_type,
+    trade_id) by joining each Alpaca position to the latest open/adopted
+    AutoTrade row. r52 fix: prior code returned only Alpaca's native
+    fields, so the UI position cards rendered blank Stop / Targets cells
+    even though the bot tracked them."""
     if not paper_trader.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
-    return paper_trader.get_positions()
+    rows = paper_trader.get_positions() or []
+    if not rows:
+        return rows
+    from database import SessionLocal as _SL_pos, AutoTrade as _AT_pos
+    db = _SL_pos()
+    try:
+        # Build a map: alpaca-symbol → AutoTrade row. Stocks: position.symbol
+        # matches AutoTrade.ticker. Options: position.symbol is the OCC
+        # symbol matching AutoTrade.symbol.
+        syms = {(r.get("symbol") or "").upper() for r in rows}
+        ats = (db.query(_AT_pos)
+               .filter(_AT_pos.status.in_(["open", "adopted", "pending"]))
+               .filter((_AT_pos.ticker.in_(syms)) | (_AT_pos.symbol.in_(syms)))
+               .order_by(_AT_pos.opened_at.desc())
+               .all())
+        # Prefer the most recent row when multiple match (e.g. adopted +
+        # error duplicates from prior FORCE_CLOSE_FAILED).
+        by_key: dict = {}
+        for a in ats:
+            for k in {(a.ticker or "").upper(), (a.symbol or "").upper()}:
+                if k and k not in by_key:
+                    by_key[k] = a
+        out = []
+        for r in rows:
+            sym = (r.get("symbol") or "").upper()
+            a = by_key.get(sym)
+            if a:
+                r = {
+                    **r,
+                    "trade_id": a.id,
+                    "asset_type": a.asset_type,
+                    "current_stop": float(a.current_stop) if a.current_stop is not None else None,
+                    "stop_loss": float(a.stop_loss) if a.stop_loss is not None else None,
+                    "target1": float(a.target1) if a.target1 is not None else None,
+                    "target2": float(a.target2) if a.target2 is not None else None,
+                    "target3": float(a.target3) if a.target3 is not None else None,
+                    "level_index": a.level_index,
+                    "hit_t1": a.hit_t1,
+                    "opened_at": a.opened_at.isoformat() if a.opened_at else None,
+                    "managed_status": a.status,
+                }
+            out.append(r)
+        return out
+    finally:
+        db.close()
 
 
 @router.get("/orders")

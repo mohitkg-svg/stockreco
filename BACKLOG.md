@@ -5,6 +5,29 @@ five external review passes (2026-04-25). The chronological per-pass
 sections below capture the original context; the **Master deferral
 register** below is the canonical short-form view used for scoping.
 
+## r52b — manual-close fix + positions endpoint enrichment (2026-04-28)
+
+Two operator-reported regressions surfaced after the r52 deploy:
+
+1. **"insufficient qty available for order (requested: N, available: 0)"
+   on manual close from UI** — `force_close_trade` (stock path) only
+   cancelled `t.parent_order_id`. For ADOPTED positions
+   `parent_order_id` is None, so any working stop order at the broker
+   left the qty `held_for_orders` and Alpaca rejected the close. Reproed
+   on AAPL trade #35 (ADOPTED, qty=35, held_for_orders=35).
+   Fix in `services/execution_engine.py:259-280`: cancel
+   `paper_trader.cancel_all_orders(symbol=t.ticker)` (idempotent,
+   covers parent / bracket legs / operator-placed orders), then
+   500ms settle before submitting close.
+
+2. **Stop / Targets cells blank on every position card** —
+   `/api/trading/positions` returned only Alpaca's native fields
+   (symbol, qty, avg_entry_price, current_price, etc.). The UI position
+   cards read `p.current_stop`, `p.target1/2/3` which were always
+   undefined. Fix in `routers/trading.py:positions()`: join each Alpaca
+   position to the latest open/adopted AutoTrade row by ticker (stocks)
+   or OCC symbol (options) and merge the bot-managed fields.
+
 ## r52 — Cloud Run OOM-loop hotfix + UI null/filter polish (2026-04-28)
 
 **Live incident**: api Cloud Run service (1Gi limit) was OOM-killing every

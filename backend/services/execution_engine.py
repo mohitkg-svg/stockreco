@@ -257,11 +257,29 @@ def force_close_trade(
     # fails. The position is still naked until the operator intervenes,
     # but at least the operator is loudly informed.
     if t.asset_type == "stock":
+        # r52 fix: cancel ALL open orders for the symbol, not just
+        # parent_order_id. Adopted positions have no parent_order_id, but
+        # the user (or a prior bracket leg) may have left a working stop
+        # order that holds the qty `held_for_orders` — Alpaca then rejects
+        # the close with "insufficient qty available for order
+        # (requested: N, available: 0)". This blocks manual close from
+        # the UI, force-stop-out, etc. Cancelling by symbol is idempotent
+        # and covers parent-order-id, bracket legs, and operator orders.
         try:
-            if t.parent_order_id:
-                paper_trader.cancel_order(t.parent_order_id)
+            cancel_res = paper_trader.cancel_all_orders(symbol=t.ticker)
+            if isinstance(cancel_res, dict) and cancel_res.get("error"):
+                logger.warning(f"reverse-close cancel_all_orders {t.ticker}: {cancel_res['error']}")
         except Exception as e:
-            logger.warning(f"reverse-close cancel parent failed: {e}")
+            logger.warning(f"reverse-close cancel_all_orders {t.ticker} failed: {e}")
+        # r52 fix: brief settle so the broker's qty-availability bookkeeping
+        # picks up the cancellations before we submit the close. Without
+        # this, Alpaca's API can still report the qty as held_for_orders
+        # for a few hundred ms after cancel.
+        try:
+            import time as _t_settle
+            _t_settle.sleep(0.5)
+        except Exception:
+            pass
         res = paper_trader.close_position(t.ticker)
         if "error" in res:
             from services.alerts import alert as _raise_alert
