@@ -180,6 +180,97 @@ def sync_positions():
     return sync_positions_from_alpaca()
 
 
+@router.post("/reconcile-pending")
+def reconcile_pending_trades():
+    """r53d: heal AutoTrade rows stuck in `status=pending` whose Alpaca
+    parent order has actually filled. Surfaced by IREN trade #28 — sat
+    in pending for 6 days because of a serialization bug where
+    `str(OrderStatus.FILLED).lower() != "filled"`. The bug is now fixed
+    in the manage tick, but pre-existing stuck rows still need a one-off
+    sweep — and a defensive recurring sweep helps catch any future
+    similar transition holes.
+
+    For each pending row:
+      1. Fetch the bracket parent at Alpaca.
+      2. If parent is FILLED, transition row → status=open with
+         entry_price = filled_avg_price, filled_at = now.
+      3. If parent is canceled/rejected/expired, transition row →
+         status=closed_unfilled.
+      4. Otherwise leave it alone (still actually working).
+
+    Returns a per-row report so the operator can see what changed.
+    """
+    logger.warning("ADMIN reconcile_pending_trades invoked")
+    from database import SessionLocal as _SL_rp, AutoTrade as _AT_rp
+    from services import paper_trader as _pt_rp
+    from datetime import datetime as _dt_rp
+    db = _SL_rp()
+    promoted: list = []
+    closed: list = []
+    unchanged: list = []
+    skipped: list = []
+    try:
+        rows = (db.query(_AT_rp)
+                .filter(_AT_rp.status == "pending")
+                .all())
+        if not rows:
+            return {"note": "no pending rows", "promoted": [], "closed": [], "unchanged": []}
+        c = _pt_rp._get_client()
+        if not c:
+            return {"error": "Alpaca client not initialized"}
+        for t in rows:
+            if not t.parent_order_id:
+                skipped.append({"id": t.id, "ticker": t.ticker, "reason": "no parent_order_id"})
+                continue
+            try:
+                parent = c.get_order_by_id(t.parent_order_id)
+            except Exception as e:
+                skipped.append({"id": t.id, "ticker": t.ticker, "reason": f"parent fetch fail: {str(e)[:120]}"})
+                continue
+            raw = parent.status
+            pstatus = (getattr(raw, "value", None) or str(raw).split(".")[-1] or "").lower()
+            if pstatus == "filled":
+                fill_px = float(parent.filled_avg_price) if parent.filled_avg_price else float(t.requested_entry or 0)
+                if fill_px <= 0:
+                    skipped.append({"id": t.id, "ticker": t.ticker, "reason": "filled but no fill price"})
+                    continue
+                # Reconcile qty with broker
+                try:
+                    bf = float(getattr(parent, "filled_qty", 0) or 0)
+                    if bf > 0 and abs(bf - float(t.qty or 0)) >= 0.5:
+                        t.qty = int(bf)
+                except Exception:
+                    pass
+                t.entry_price = round(fill_px, 4)
+                t.filled_at = parent.filled_at if parent.filled_at else _dt_rp.utcnow()
+                t.status = "open"
+                t.note = (t.note or "") + f" | RECONCILE_PENDING: promoted to open @ ${fill_px:.2f}"
+                db.commit()
+                promoted.append({"id": t.id, "ticker": t.ticker, "entry_price": fill_px})
+            elif pstatus in ("canceled", "cancelled", "rejected", "expired", "done_for_day"):
+                t.status = "closed_unfilled"
+                t.closed_at = _dt_rp.utcnow()
+                t.note = (t.note or "") + f" | RECONCILE_PENDING: parent {pstatus}, freeing slot"
+                db.commit()
+                closed.append({"id": t.id, "ticker": t.ticker, "parent_status": pstatus})
+            else:
+                unchanged.append({"id": t.id, "ticker": t.ticker, "parent_status": pstatus})
+        return {
+            "promoted": promoted,
+            "closed": closed,
+            "unchanged": unchanged,
+            "skipped": skipped,
+            "summary": {
+                "promoted": len(promoted),
+                "closed": len(closed),
+                "unchanged": len(unchanged),
+                "skipped": len(skipped),
+            },
+        }
+    finally:
+        db.close()
+
+
 @router.get("/loss-patterns")
 def loss_patterns_summary():
     """r53 Tier-3 A: aggregated post-mortem fingerprints + which ones the

@@ -4106,7 +4106,14 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
       • Reconcile if the option position has gone to zero (already exited).
     """
     parent = c.get_order_by_id(t.parent_order_id)
-    pstatus = str(parent.status).lower()
+    # r53d fix: see stock-side comment in manage_open_positions — strict
+    # `pstatus == "filled"` never matched alpaca-py's "OrderStatus.FILLED".
+    _raw = parent.status
+    pstatus = (
+        getattr(_raw, "value", None)
+        or str(_raw).split(".")[-1]
+    )
+    pstatus = (pstatus or "").lower()
 
     # 1) Pending → open
     if t.status == "pending":
@@ -4801,7 +4808,21 @@ def manage_open_positions() -> Dict[str, Any]:
                         continue
 
                     parent = c.get_order_by_id(t.parent_order_id)
-                    pstatus = str(parent.status).lower()
+                    # r53d fix: alpaca-py 0.21.1 serializes OrderStatus.FILLED
+                    # as "OrderStatus.FILLED" (str()), not "filled". The strict
+                    # equality at line ~4886 (`pstatus == "filled"`) was
+                    # silently FALSE for every fill — pending→open transitions
+                    # never fired via this path. Trades only made it to "open"
+                    # via promote_adopted / force_close paths. IREN trade #28
+                    # spent 6 days stuck in `pending` because the parent IS
+                    # filled but the bot never noticed. Use .value (canonical
+                    # lowercase) when present; fall back to splitting the dot.
+                    _raw = parent.status
+                    pstatus = (
+                        getattr(_raw, "value", None)
+                        or str(_raw).split(".")[-1]
+                    )
+                    pstatus = (pstatus or "").lower()
 
                     # 1) Promote pending → open once parent filled.
                     # B5: strict "filled" match. Previous `"filled" in pstatus`
