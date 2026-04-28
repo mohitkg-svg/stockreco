@@ -86,6 +86,40 @@ def atomic_accumulate_realized_pl(db: Session, trade_id: int, delta: float) -> N
             db.commit()
 
 
+def atomic_append_note(db: Session, trade_id: int, suffix: str) -> None:
+    """r53 fix (Tier-2 #11): atomic SQL append for `AutoTrade.note`.
+
+    Replaces the read-modify-write pattern `t.note = (t.note or "") +
+    suffix; db.commit()` used at 20+ sites. Two workers (manage tick,
+    WS fast-path, AI exit) writing notes for the same trade no longer
+    stomp each other's audit-trail lines.
+
+    The suffix is appended verbatim (caller controls the separator,
+    typically " | EVENT: ..."). On failure, falls through to the
+    read-modify-write path.
+    """
+    from database import AutoTrade as _AT_n
+    from sqlalchemy import update as _sql_update_n
+    if not suffix:
+        return
+    try:
+        # Use SQL string concatenation. Postgres uses ||; SQLite supports
+        # both || and concat().
+        from sqlalchemy import func as _func
+        db.execute(
+            _sql_update_n(_AT_n)
+            .where(_AT_n.id == trade_id)
+            .values(note=_func.coalesce(_AT_n.__table__.c.note, "") + suffix)
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        t = db.query(_AT_n).filter(_AT_n.id == trade_id).first()
+        if t is not None:
+            t.note = (t.note or "") + suffix
+            db.commit()
+
+
 def atomic_increment_target_touch(db: Session, trade_id: int) -> int:
     """r48 BACKLOG #concurrency-P1-1: atomic increment of target_touch_count.
     Returns the post-increment count."""

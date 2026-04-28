@@ -1248,26 +1248,36 @@ def reset_for_tests() -> None:
 
 # ---------- Empirical multipliers ------------------------------------------
 
-def strategy_multiplier(strategy_name: Optional[str]) -> float:
+def strategy_multiplier(
+    strategy_name: Optional[str],
+    asset_type: Optional[str] = None,
+) -> float:
     """Empirical risk multiplier for a strategy, 1.0 when not enough data.
 
     Derived from `strategy_scorecard()` which live-reads closed trades in
     the last 60 days. Cached 1h (nightly job refreshes upstream).
+
+    r53 fix (Tier-0 #3): added optional `asset_type` filter so option
+    entries don't get sized with stock-flow data. The backtester only
+    models stocks; live option trades have ~0% WR vs stock ~36% WR on
+    the same strategies. Mixing them dilutes the option penalty.
+    Callers (consider_call_play, consider_put_play) should pass
+    asset_type="option" so the multiplier reads ONLY past option
+    realized stats.
     """
     if not strategy_name:
         return 1.0
+    cache_key = f"{strategy_name}|{asset_type or 'any'}"
     now = time.time()
-    cached = _strategy_mult_cache.get(strategy_name)
+    cached = _strategy_mult_cache.get(cache_key)
     if cached and now < cached[1]:
         return cached[0]
     try:
         # r43 fix #1.6: enforce min-bucket-N at the call site. With <20
         # closed trades the multiplier (which can swing 0.5×→1.5×) is
-        # noise; we return 1.0 until we have a meaningful sample. The
-        # underlying scorecard `min_trades=5` is too low to trust at the
-        # call site where it directly multiplies risk.
+        # noise; we return 1.0 until we have a meaningful sample.
         from services.auto_trader import strategy_scorecard
-        card = strategy_scorecard(days=60, min_trades=5)
+        card = strategy_scorecard(days=60, min_trades=5, asset_type=asset_type)
         entry = card.get(strategy_name)
         if entry and (entry.get("n") or entry.get("trades") or 0) >= 20:
             m = float(entry["multiplier"])
@@ -1275,7 +1285,7 @@ def strategy_multiplier(strategy_name: Optional[str]) -> float:
             m = 1.0
     except Exception:
         m = 1.0
-    _strategy_mult_cache[strategy_name] = (m, now + _STRATEGY_CACHE_TTL)
+    _strategy_mult_cache[cache_key] = (m, now + _STRATEGY_CACHE_TTL)
     return m
 
 

@@ -24,6 +24,7 @@ This service is invoked from two places:
 """
 from __future__ import annotations
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -49,7 +50,73 @@ from concurrent.futures import ThreadPoolExecutor
 # entry on a *different* ticker (e.g. two tickers refreshed simultaneously,
 # both seeing 2 open trades in the same sector and both opening a 3rd). The
 # manage loop does NOT take this lock — exits are independent of caps.
+#
+# r53 NOTE (Tier-1 #6): this lock is per-instance (threading.Lock). Cloud
+# Run runs the api service with min=1, max=3 instances; each instance has
+# its own lock object. Two instances can pass the budget+cap check
+# simultaneously and both submit. The new `_pg_advisory_entry_lock`
+# context manager below adds a Postgres-level advisory lock keyed on the
+# ticker that serializes concurrent same-ticker entries across instances.
+# On SQLite (test environment) it's a no-op since SQLite is single-writer.
 _entry_lock = threading.Lock()
+
+
+@contextmanager
+def _pg_advisory_entry_lock(ticker: str, timeout_sec: float = 5.0):
+    """r53 fix (Tier-1 #6): cross-instance entry lock via Postgres
+    `pg_try_advisory_xact_lock`. Hashes ticker → 64-bit lock key; the
+    lock is released on transaction commit/rollback.
+
+    Yields True if the lock was acquired (caller proceeds), False if
+    another instance currently holds it (caller skips the entry).
+    On SQLite or any non-Postgres backend, yields True (no-op) since
+    only one writer can be active at a time anyway.
+
+    Use as: `with _pg_advisory_entry_lock(ticker) as acquired: ...`
+    """
+    db = SessionLocal()
+    acquired = True  # default for non-Postgres
+    try:
+        try:
+            dialect = db.bind.dialect.name
+        except Exception:
+            dialect = "unknown"
+        if dialect == "postgresql":
+            # 64-bit signed int from sha1 of ticker (stable across processes)
+            h = hashlib.sha1(ticker.upper().encode()).digest()
+            # Take the high 8 bytes, big-endian, mask to 63 bits to keep
+            # within Postgres's signed bigint range.
+            key = int.from_bytes(h[:8], "big") & ((1 << 63) - 1)
+            try:
+                from sqlalchemy import text as _sql_text
+                # Try-style: returns True if acquired, False if another holder.
+                got = db.execute(
+                    _sql_text("SELECT pg_try_advisory_xact_lock(:k)"),
+                    {"k": key},
+                ).scalar()
+                acquired = bool(got)
+                if not acquired:
+                    logger.info(
+                        f"_pg_advisory_entry_lock: {ticker} held by another instance — skipping entry"
+                    )
+                    metrics.inc("autotrade_skip", reason="advisory_lock_held")
+            except Exception as e:
+                logger.warning(f"_pg_advisory_entry_lock {ticker} failed ({e}); proceeding without")
+                acquired = True
+        yield acquired
+    finally:
+        try:
+            # Commit closes the txn, releasing pg_try_advisory_xact_lock
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        try:
+            db.close()
+        except Exception:
+            pass
 
 # BP reservation, circuit breakers, and SL-resubmit tracking now live in
 # services.risk_manager. The aliases below preserve the public API used
@@ -611,7 +678,22 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
     restart does NOT silently re-arm the bot. unkill() clears the flag but
     deliberately does NOT re-enable — re-arming requires a separate
     /auto/config {enabled:true} step.
+
+    r53 fix (Tier-2 #12): acquire `_entry_lock` for the duration so a
+    consider_signal in flight cannot pass the killed-flag check, then
+    proceed past kill() into bracket-submit. Without this, the operator
+    could click kill, kill flattens, and a NEW position opens because
+    the in-flight signal already passed the killed check before kill()
+    flipped the flag.
     """
+    # r53: hold the entry lock so no in-flight consider_signal can race
+    # past the killed-flag check while we're flattening. Block up to 10s
+    # for in-flight to complete; if it doesn't, proceed anyway (kill
+    # priority > entry).
+    _kill_holds_entry_lock = _entry_lock.acquire(timeout=10.0)
+    if not _kill_holds_entry_lock:
+        logger.warning("kill(): entry lock not acquired in 10s; proceeding anyway")
+
     db = SessionLocal()
     flattened: List[str] = []
     cancelled = 0
@@ -726,6 +808,13 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
         f"cancelled={cancelled} db_rows_closed={db_closed}"
     )
     metrics.inc("autotrade_event", event="killed")
+    # r53 (Tier-2 #12): release the entry lock so future unkill+enable
+    # cycles can proceed cleanly.
+    if _kill_holds_entry_lock:
+        try:
+            _entry_lock.release()
+        except Exception:
+            pass
     return {
         "killed": True,
         "flattened": flattened,
@@ -1316,12 +1405,25 @@ def compute_confidence_calibration(min_bucket_n: int = 5) -> Dict[str, Any]:
 # Calibration cache moved to services.risk_manager.
 
 
-def strategy_scorecard(days: int = 60, min_trades: int = 5) -> Dict[str, Dict[str, Any]]:
+def strategy_scorecard(
+    days: int = 60,
+    min_trades: int = 5,
+    asset_type: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
     """Profit-audit #8: per-strategy realized P&L over the last N days.
 
     Joins closed AutoTrade rows with their originating Signal to bucket by
     `Signal.strategy`. Returns {strategy_name: {n, wins, win_rate, avg_pl,
-    total_pl, multiplier}}.
+    total_pl, multiplier, asset_type_split}}.
+
+    r53 fix (Tier-0 #3): added `asset_type` filter so the scorecard can
+    return stock-only or option-only stats. The unified WR was misleading
+    because the backtester only models stocks while the live engine
+    routes ~half of high-confidence signals to options. Aggregate stats
+    no longer assume the two paths share an edge.
+
+    When `asset_type` is None (default), returns the unified view but
+    with a per-strategy `asset_type_split` showing the stock/option mix.
 
     `multiplier` is a 0.5-1.3 risk-budget factor: strategies with >=55% WR
     get boosted, <40% get shrunk. Fed into consider_signal when the signal
@@ -1335,19 +1437,36 @@ def strategy_scorecard(days: int = 60, min_trades: int = 5) -> Dict[str, Dict[st
         ).filter(AutoTrade.status.in_(["closed_target", "closed_stop", "closed_reverse", "closed_stale"]))
         if cutoff:
             q = q.filter(AutoTrade.closed_at >= cutoff)
+        if asset_type:
+            q = q.filter(AutoTrade.asset_type == asset_type)
         rows = q.all()
     finally:
         db.close()
 
-    buckets: Dict[str, Dict[str, float]] = {}
+    buckets: Dict[str, Dict[str, Any]] = {}
     for t, s in rows:
         name = (s.strategy if s and s.strategy else "unknown")
-        b = buckets.setdefault(name, {"n": 0, "wins": 0, "total_pl": 0.0})
+        b = buckets.setdefault(
+            name,
+            {"n": 0, "wins": 0, "total_pl": 0.0, "n_stock": 0, "n_option": 0,
+             "stock_pl": 0.0, "option_pl": 0.0, "stock_wins": 0, "option_wins": 0},
+        )
         b["n"] += 1
         pl = t.realized_pl or 0.0
         if pl > 0:
             b["wins"] += 1
         b["total_pl"] += pl
+        atype = (t.asset_type or "stock").lower()
+        if atype == "option":
+            b["n_option"] += 1
+            b["option_pl"] += pl
+            if pl > 0:
+                b["option_wins"] += 1
+        else:
+            b["n_stock"] += 1
+            b["stock_pl"] += pl
+            if pl > 0:
+                b["stock_wins"] += 1
 
     out: Dict[str, Dict[str, Any]] = {}
     for name, b in buckets.items():
@@ -1363,6 +1482,23 @@ def strategy_scorecard(days: int = 60, min_trades: int = 5) -> Dict[str, Dict[st
             "avg_pl": round(avg_pl, 2),
             "total_pl": round(b["total_pl"], 2),
             "multiplier": round(mult, 3),
+            # r53: stock vs option split, since the backtester only models
+            # stocks. Option WR diverging significantly from stock WR is a
+            # signal that the strategy doesn't transfer to options.
+            "asset_type_split": {
+                "stock": {
+                    "n": int(b["n_stock"]),
+                    "wins": int(b["stock_wins"]),
+                    "win_rate": round(b["stock_wins"] / b["n_stock"], 3) if b["n_stock"] else None,
+                    "total_pl": round(b["stock_pl"], 2),
+                },
+                "option": {
+                    "n": int(b["n_option"]),
+                    "wins": int(b["option_wins"]),
+                    "win_rate": round(b["option_wins"] / b["n_option"], 3) if b["n_option"] else None,
+                    "total_pl": round(b["option_pl"], 2),
+                },
+            },
         }
     return out
 
@@ -1813,6 +1949,23 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         metrics.inc("autotrade_skip", reason="entry_lock_timeout")
         return None
 
+    # r53 fix (Tier-1 #6): acquire cross-instance Postgres advisory lock
+    # AFTER the per-instance threading lock. The threading lock protects
+    # against same-instance races; the advisory lock against cross-
+    # instance races (Cloud Run runs up to 3 api instances). On SQLite
+    # this is a no-op.
+    _adv_lock_ctx = _pg_advisory_entry_lock(ticker)
+    _adv_acquired = _adv_lock_ctx.__enter__()
+    if not _adv_acquired:
+        # Another instance is already evaluating this ticker — release
+        # the threading lock and skip cleanly.
+        try:
+            _adv_lock_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        _entry_lock.release()
+        return None
+
     db = SessionLocal()
     try:
         # `ticker` already bound pre-lock above (r41 review fix A —
@@ -1828,6 +1981,19 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.warning(f"AutoTrader skip {ticker}: trading frozen — {_freeze_reason}")
             metrics.inc("autotrade_skip", reason="trading_frozen")
             return None
+        # r53 fix (Tier-2 #13): in_crisis_mode is now a HARD ENTRY GATE.
+        # Previously it only tightened chandelier and trim fractions but
+        # didn't block new entries. With account at 19% multi-day DD the
+        # bot was still entering new trades at full sizing.
+        # Triggers: account DD ≥5%, session DD ≥4%, or VIX>30 + SPY 5d <-5%.
+        try:
+            from services.risk_manager import in_crisis_mode as _in_crisis
+            if _in_crisis():
+                logger.warning(f"AutoTrader skip {ticker}: in_crisis_mode — entries halted")
+                metrics.inc("autotrade_skip", reason="crisis_mode")
+                return None
+        except Exception as _ce:
+            logger.debug(f"in_crisis_mode check failed: {_ce}")
         cfg = get_config(db)
         if not cfg.enabled:
             metrics.inc("autotrade_skip", reason="disabled")
@@ -3016,6 +3182,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         return None
     finally:
         db.close()
+        # r53 (Tier-1 #6): release advisory lock + threading lock in
+        # reverse acquisition order.
+        try:
+            _adv_lock_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
         _entry_lock.release()
 
 
@@ -3030,10 +3202,20 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
 
     Thread-safety: shares `_entry_lock` with consider_signal so option budget
     checks don't race against stock-side entries draining the same equity.
+    r53 (Tier-1 #6): also acquires Postgres advisory lock for cross-instance.
     """
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_put_play({ticker}): entry lock busy >30s, skipping")
         metrics.inc("autotrade_event", event="entry_lock_timeout")
+        return None
+    _adv_lock_ctx_pp = _pg_advisory_entry_lock(ticker)
+    _adv_acq_pp = _adv_lock_ctx_pp.__enter__()
+    if not _adv_acq_pp:
+        try:
+            _adv_lock_ctx_pp.__exit__(None, None, None)
+        except Exception:
+            pass
+        _entry_lock.release()
         return None
     db = SessionLocal()
     try:
@@ -3394,6 +3576,10 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         return None
     finally:
         db.close()
+        try:
+            _adv_lock_ctx_pp.__exit__(None, None, None)
+        except Exception:
+            pass
         _entry_lock.release()
 
 
@@ -3418,6 +3604,15 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_call_play({ticker}): entry lock busy >30s, skipping")
         metrics.inc("autotrade_event", event="entry_lock_timeout")
+        return None
+    _adv_lock_ctx_cp = _pg_advisory_entry_lock(ticker)
+    _adv_acq_cp = _adv_lock_ctx_cp.__enter__()
+    if not _adv_acq_cp:
+        try:
+            _adv_lock_ctx_cp.__exit__(None, None, None)
+        except Exception:
+            pass
+        _entry_lock.release()
         return None
     db = SessionLocal()
     try:
@@ -3780,6 +3975,10 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         return None
     finally:
         db.close()
+        try:
+            _adv_lock_ctx_cp.__exit__(None, None, None)
+        except Exception:
+            pass
         _entry_lock.release()
 
 
