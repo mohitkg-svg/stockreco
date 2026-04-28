@@ -1733,6 +1733,15 @@ def _open_allocations(db: Session) -> Dict[str, float]:
     return out
 
 
+def _safe_crisis_mode() -> bool:
+    """r53m: defensive read for the SafetyBanner — never raises."""
+    try:
+        from services.risk_manager import in_crisis_mode as _icm
+        return bool(_icm())
+    except Exception:
+        return False
+
+
 def status_snapshot() -> Dict[str, Any]:
     """Return current budget state — used by the UI status pill.
 
@@ -1803,6 +1812,12 @@ def status_snapshot() -> Dict[str, Any]:
             "pdt_would_block": bool(pdt.get("would_block_under_pdt", False)),
             "kill_switch": bool(getattr(cfg, "killed", False)),
             "kill_reason": getattr(cfg, "killed_reason", None),
+            # r53m: surface crisis_mode here too. r53 made it a hard
+            # entry gate but the SafetyBanner only read this endpoint —
+            # operator could see the freeze clear but not realize the
+            # bot was still blocked by crisis_mode. Now the banner
+            # picks it up automatically.
+            "crisis_mode": _safe_crisis_mode(),
         }
     finally:
         db.close()

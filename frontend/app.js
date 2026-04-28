@@ -5838,6 +5838,15 @@ function SafetyBanner() {
   const banners = [];
   if (s.kill_switch) banners.push({ kind: 'critical', label: 'KILL SWITCH ENGAGED', detail: s.kill_reason || 'auto-trader manually killed; positions flattened' });
   if (s.freeze_reason) banners.push({ kind: 'critical', label: 'TRADING FROZEN', detail: s.freeze_reason });
+  // r53m: crisis_mode is a HARD ENTRY GATE since r53 (account DD ≥ 5%
+  // OR session DD ≥ 4% OR VIX>30+SPY-5d<-5%) but the banner didn't
+  // surface it — operator could see "TRADING FROZEN" clear but the bot
+  // would still refuse entries because crisis_mode was on. Now visible.
+  if (s.crisis_mode) banners.push({
+    kind: 'critical',
+    label: 'CRISIS MODE ACTIVE',
+    detail: 'Account drawdown ≥ 5% / session DD ≥ 4% / or VIX>30 with SPY 5d<-5%. New entries are blocked. Stops and trims tightened on existing positions. Auto-clears when DD recovers.',
+  });
   if (s.broker_down) banners.push({ kind: 'critical', label: 'BROKER UNAVAILABLE', detail: `Alpaca returned 5xx; new entries paused${s.broker_down_until ? ` until ${parseServerDate(s.broker_down_until)?.toLocaleTimeString() || s.broker_down_until}` : ''}` });
   if (s.bp_breaker_active) banners.push({ kind: 'warning', label: 'BUYING POWER EXHAUSTED', detail: `BP circuit breaker tripped${s.bp_breaker_until ? ` until ${parseServerDate(s.bp_breaker_until)?.toLocaleTimeString() || s.bp_breaker_until}` : ''}` });
   // PDT — only flag for live margin <$25k, where it actually blocks entries.
