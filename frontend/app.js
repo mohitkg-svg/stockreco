@@ -4438,7 +4438,7 @@ function TradingPanel({ ticker, reloadToken }) {
     const results = await Promise.allSettled([
       api.get('/api/trading/account'),
       api.get('/api/trading/positions'),
-      api.get('/api/trading/orders?status=all&limit=20'),
+      api.get('/api/trading/orders?status=all&limit=100'),
     ]);
     const [a, p, o] = results;
     if (a.status === 'fulfilled') setAccount(a.value);
@@ -4708,7 +4708,10 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
   const [tickerFilter, setTickerFilter] = useState('');
 
   const normStatus = (s) => String(s || '').replace(/^OrderStatus\./, '').toLowerCase();
-  const isWorking = (s) => ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced'].includes(s);
+  // r52c: pending_cancel is in-flight (still holds qty as held_for_orders),
+  // so it belongs in "Working" — not Cancelled. Same for held / done_for_day
+  // / accepted_for_bidding (rare states that still tie up qty).
+  const isWorking = (s) => ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced', 'pending_cancel', 'held', 'done_for_day', 'accepted_for_bidding'].includes(s);
   const isFilled = (s) => s === 'filled' || s === 'partially_filled';
   const isCancelled = (s) => ['canceled', 'cancelled', 'rejected', 'expired'].includes(s);
 

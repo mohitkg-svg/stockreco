@@ -5,6 +5,29 @@ five external review passes (2026-04-25). The chronological per-pass
 sections below capture the original context; the **Master deferral
 register** below is the canonical short-form view used for scoping.
 
+## r52c — orders panel: surface PENDING_CANCEL state (2026-04-28)
+
+Operator reported "open sell orders in Alpaca aren't showing up in the
+app". Root cause: `OrdersTable` (frontend) classifies orders into
+Working / Filled / Cancelled chips, but `pending_cancel` was in NONE of
+those buckets — so any order in that state was invisible regardless of
+which tab was selected.
+
+This matters because PENDING_CANCEL is in-flight, not terminal: the
+order still ties up qty as `held_for_orders`. Hiding it makes the bot's
+position state unobservable to the operator.
+
+Surfaced by a real Alpaca paper bug: 5 take-profit limit orders (AAPL,
+TSLA, NVDA, MSFT, IREN) stuck in PENDING_CANCEL — Alpaca returns
+`42210000 "order pending cancel"` for every cancel attempt (per-order
+and global). The orders don't move to terminal state via API; only the
+Alpaca dashboard or a market-open clearing pass can resolve them.
+
+Fix: extend `isWorking` to include `pending_cancel`, `held`,
+`done_for_day`, `accepted_for_bidding` (all in-flight states that tie
+up qty). Bumped recent-orders fetch from limit=20 to 100 so older
+stuck orders aren't trimmed out.
+
 ## r52b — manual-close fix + positions endpoint enrichment (2026-04-28)
 
 Two operator-reported regressions surfaced after the r52 deploy:
