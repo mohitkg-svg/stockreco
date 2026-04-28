@@ -390,6 +390,18 @@ class CandidatePool(Base):
     reason = Column(String, nullable=True)        # human-readable setup tag
     generated_at = Column(DateTime, default=datetime.utcnow, index=True)
 
+    # r53l: per-candidate decision tracking. Filled by consider_signal /
+    # consider_put_play / consider_call_play on each evaluation pass so
+    # the operator can see — for every ticker in the pool — what the
+    # bot's most recent verdict was and why. Without this, the candidate
+    # pool reads as a static ranking without any feedback on whether
+    # the bot acted on each name.
+    last_evaluated_at = Column(DateTime, nullable=True)
+    last_stock_decision = Column(String, nullable=True)   # "entered" | "skipped" | "no_signal" | "neutral"
+    last_stock_reason = Column(String, nullable=True)     # e.g. "regime_chop", "sector_cap", "ai_veto", "loss_pattern"
+    last_option_decision = Column(String, nullable=True)  # "entered_call" | "entered_put" | "skipped" | "no_thesis"
+    last_option_reason = Column(String, nullable=True)
+
 
 class BestStrategyPerTicker(Base):
     """Cached winner of the per-ticker walk-forward backtest.
@@ -958,6 +970,12 @@ def create_tables():
     _ensure_column("auto_trader_config", "index_inclusion_tickers", "VARCHAR DEFAULT ''")
     _ensure_column("auto_trader_config", "ml_drift_brier_alert_threshold", "DOUBLE PRECISION DEFAULT 0.05")
     # r53 Tier-3 config knobs
+    # r53l: candidate-pool last-evaluation tracking
+    _ensure_column("candidate_pool", "last_evaluated_at", "TIMESTAMP")
+    _ensure_column("candidate_pool", "last_stock_decision", "VARCHAR")
+    _ensure_column("candidate_pool", "last_stock_reason", "VARCHAR")
+    _ensure_column("candidate_pool", "last_option_decision", "VARCHAR")
+    _ensure_column("candidate_pool", "last_option_reason", "VARCHAR")
     _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")

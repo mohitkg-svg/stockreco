@@ -3636,6 +3636,7 @@ function CandidatePoolPanel() {
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">ADX</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">% 52wH</th>
                   <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Setup</th>
+                  <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]" title="Last auto-trader scan verdict — was the ticker entered, skipped, or did no signal fire?">Last Scan</th>
                 </tr>
               </thead>
               <tbody>
@@ -3658,6 +3659,51 @@ function CandidatePoolPanel() {
                       {((r.pct_from_52w_high || 0) * 100).toFixed(1)}%
                     </td>
                     <td className="py-1.5 px-2 text-[11px] app-text-secondary">{r.reason}</td>
+                    <td className="py-1.5 px-2 text-[11px]">
+                      {/* r53l: per-candidate last-scan verdict (stock + option). */}
+                      {(() => {
+                        const fmt = (decision, reason) => {
+                          if (!decision) return null;
+                          const isEntered = decision.startsWith('entered');
+                          const cls = isEntered
+                            ? 'text-emerald-300'
+                            : decision === 'skipped'
+                            ? 'text-amber-300'
+                            : 'app-text-muted';
+                          const label = isEntered
+                            ? `✓ ${decision.replace('entered_', 'opened ').replace('entered', 'opened')}`
+                            : decision === 'skipped'
+                            ? `skipped${reason ? `: ${reason}` : ''}`
+                            : decision === 'no_signal'
+                            ? 'no signal'
+                            : decision;
+                          return <span className={cls} title={reason || ''}>{label}</span>;
+                        };
+                        const stockNode = fmt(r.last_stock_decision, r.last_stock_reason);
+                        const optNode = fmt(r.last_option_decision, r.last_option_reason);
+                        const evaluatedRel = r.last_evaluated_at ? (() => {
+                          try {
+                            const d = parseServerDate(r.last_evaluated_at);
+                            if (!d) return null;
+                            const min = (Date.now() - d.getTime()) / 60000;
+                            if (min < 1) return 'now';
+                            if (min < 60) return `${Math.round(min)}m ago`;
+                            if (min < 1440) return `${(min/60).toFixed(1)}h ago`;
+                            return `${(min/1440).toFixed(1)}d ago`;
+                          } catch (_) { return null; }
+                        })() : null;
+                        if (!stockNode && !optNode) {
+                          return <span className="app-text-muted italic">—</span>;
+                        }
+                        return (
+                          <div className="flex flex-col gap-0.5">
+                            {stockNode && <div><span className="app-text-muted text-[9px] uppercase mr-1">stk</span>{stockNode}</div>}
+                            {optNode && <div><span className="app-text-muted text-[9px] uppercase mr-1">opt</span>{optNode}</div>}
+                            {evaluatedRel && <div className="text-[9px] app-text-muted">{evaluatedRel}</div>}
+                          </div>
+                        );
+                      })()}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -5159,13 +5205,16 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
   // r52c: pending_cancel is in-flight (still holds qty as held_for_orders),
   // so it belongs in "Working" — not Cancelled. Same for held / done_for_day
   // / accepted_for_bidding (rare states that still tie up qty).
-  // r53 fix (Tier-1 #9): include `stopped`, `suspended`, `calculated` —
-  // Alpaca surfaces these and they all tie up qty as held_for_orders. Prior
-  // version classified them as neither working/filled/cancelled, so the
-  // orders silently disappeared from every tab.
-  const isWorking = (s) => ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced', 'pending_cancel', 'held', 'done_for_day', 'accepted_for_bidding', 'stopped', 'suspended', 'calculated'].includes(s);
+  // r53k fix: `replaced` is TERMINAL (the old order was superseded by
+  // a new one with a different id) — not working. Only `pending_replace`
+  // is in-flight. Earlier r52c put `replaced` in `isWorking`, which made
+  // every stop-replace stale row stay in the Working tab forever (the
+  // replaced stop order from a successful trail isn't going anywhere —
+  // a new stop with a fresh id took its place). Move `replaced` to
+  // Cancelled bucket where terminal-non-fill states belong.
+  const isWorking = (s) => ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'pending_cancel', 'held', 'done_for_day', 'accepted_for_bidding', 'stopped', 'suspended', 'calculated'].includes(s);
   const isFilled = (s) => s === 'filled' || s === 'partially_filled';
-  const isCancelled = (s) => ['canceled', 'cancelled', 'rejected', 'expired'].includes(s);
+  const isCancelled = (s) => ['canceled', 'cancelled', 'rejected', 'expired', 'replaced'].includes(s);
 
   const filteredOrders = useMemo(() => {
     let arr = orders || [];

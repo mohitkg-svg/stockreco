@@ -388,6 +388,92 @@ from database import SessionLocal, AutoTrade, AutoTraderConfig, Signal, Watchlis
 from services import paper_trader, live_quotes
 from services import post_mortem as post_mortem_svc
 from services import metrics
+
+# r53l: per-thread capture of the most recent autotrade_skip reason so
+# consider_signal / consider_put_play / consider_call_play can persist
+# their final verdict to CandidatePool.last_*_reason without rewriting
+# the 58 existing `metrics.inc("autotrade_skip", ...)` call sites. The
+# wrapping is non-invasive: existing call sites keep using `metrics.inc`
+# unchanged.
+_DECISION_TLS = __import__("threading").local()
+_orig_metrics_inc = metrics.inc
+
+
+def _patched_metrics_inc(name, **labels):
+    if name == "autotrade_skip":
+        try:
+            _DECISION_TLS.last_skip_reason = labels.get("reason")
+        except Exception:
+            pass
+    return _orig_metrics_inc(name, **labels)
+
+
+metrics.inc = _patched_metrics_inc
+
+
+def _begin_decision(ticker: str, kind: str) -> None:
+    """Reset the thread-local capture state for a new evaluation."""
+    _DECISION_TLS.ticker = (ticker or "").upper()
+    _DECISION_TLS.kind = kind  # "stock" | "option"
+    _DECISION_TLS.last_skip_reason = None
+    _DECISION_TLS.entered = False
+    _DECISION_TLS.entered_kind = None  # "call" | "put" | None
+
+
+def _mark_entered(option_kind: Optional[str] = None) -> None:
+    _DECISION_TLS.entered = True
+    if option_kind:
+        _DECISION_TLS.entered_kind = option_kind
+
+
+def _persist_decision() -> None:
+    """Write the captured verdict to CandidatePool. No-op when the row
+    isn't present (i.e., the ticker isn't in the candidate pool — most
+    watchlist tickers won't be, and that's fine; the metric counter
+    still tracked the skip aggregate)."""
+    try:
+        ticker = getattr(_DECISION_TLS, "ticker", None)
+        kind = getattr(_DECISION_TLS, "kind", None)
+        if not ticker or not kind:
+            return
+        entered = bool(getattr(_DECISION_TLS, "entered", False))
+        last_reason = getattr(_DECISION_TLS, "last_skip_reason", None)
+        entered_kind = getattr(_DECISION_TLS, "entered_kind", None)
+        if entered:
+            if kind == "option":
+                decision = f"entered_{entered_kind or 'call'}"
+            else:
+                decision = "entered"
+            reason = None
+        elif last_reason:
+            decision = "skipped"
+            reason = str(last_reason)[:80]
+        else:
+            decision = "no_signal"
+            reason = None
+        # Write iff the ticker IS in the candidate pool. Use a short
+        # transaction; failures are silently swallowed (this is
+        # observability, not load-bearing).
+        try:
+            from database import SessionLocal as _SL_d, CandidatePool as _CP_d
+            _db_d = _SL_d()
+            try:
+                row = _db_d.query(_CP_d).filter(_CP_d.ticker == ticker).first()
+                if row is not None:
+                    row.last_evaluated_at = datetime.utcnow()
+                    if kind == "option":
+                        row.last_option_decision = decision
+                        row.last_option_reason = reason
+                    else:
+                        row.last_stock_decision = decision
+                        row.last_stock_reason = reason
+                    _db_d.commit()
+            finally:
+                _db_d.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
 from services.bear_thesis import build_bear_thesis
 from services.bull_thesis import build_bull_thesis
 from services.options_analyzer import suggest_options_for_signal
@@ -1821,11 +1907,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     # ════════════════════════════════════════════════════════════════════
     # § PRE-FLIGHT — circuit breakers, kill flag, freeze, signal validation
     # ════════════════════════════════════════════════════════════════════
-    # Validate the signal shape at the boundary. Failed validation is a
-    # malformed signal — log + skip cleanly rather than letting `signal.get`
-    # downstream silently coerce missing fields to 0. We don't pass the
-    # validated model further (consumers still take dicts) — this is a
-    # parsing layer, not a refactor target.
+    # r53l: capture per-thread skip-reason for the candidate pool. Begin
+    # decision tracking AFTER signal validation so a malformed signal
+    # doesn't poison the pool row.
     try:
         from models import SignalPayload
         SignalPayload.model_validate(signal)
@@ -1836,6 +1920,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         )
         metrics.inc("autotrade_skip", reason="malformed_signal")
         return None
+    _begin_decision(signal.get("ticker") or "", "stock")
     # Short-circuit if the buying-power breaker tripped recently.
     if bp_breaker_active():
         metrics.inc("autotrade_skip", reason="bp_breaker")
@@ -3234,6 +3319,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # same scan loop sees a smaller available BP figure.
         _reserve_bp(qty * float(entry))
         metrics.inc("autotrade_event", event="opened")
+        _mark_entered()  # r53l: candidate pool decision tracker
         # r42 fix #1.12: broadcast a trade_opened event so the UI can add
         # the new row immediately instead of waiting for the next 15s poll.
         try:
@@ -3264,6 +3350,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         return None
     finally:
         db.close()
+        # r53l: persist the captured verdict to CandidatePool for
+        # operator visibility. No-op when the ticker isn't in the pool.
+        try:
+            _persist_decision()
+        except Exception:
+            pass
         # r53 (Tier-1 #6): release advisory lock + threading lock in
         # reverse acquisition order.
         try:
@@ -3299,6 +3391,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             pass
         _entry_lock.release()
         return None
+    _begin_decision(ticker, "option")  # r53l
     db = SessionLocal()
     try:
         cfg = get_config(db)
@@ -3635,6 +3728,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Postmortem fix M1: reserve BP for option premium too.
         _reserve_bp(qty * float(top["premium"]) * 100.0)
         metrics.inc("autotrade_event", event="opened_put")
+        _mark_entered("put")  # r53l
         try:
             live_quotes.ensure_option_symbols([occ])
         except Exception:
@@ -3658,6 +3752,10 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         return None
     finally:
         db.close()
+        try:
+            _persist_decision()  # r53l
+        except Exception:
+            pass
         try:
             _adv_lock_ctx_pp.__exit__(None, None, None)
         except Exception:
@@ -3696,6 +3794,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             pass
         _entry_lock.release()
         return None
+    _begin_decision(ticker, "option")  # r53l
     db = SessionLocal()
     try:
         cfg = get_config(db)
@@ -4034,6 +4133,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         db.refresh(trade)
         _reserve_bp(qty * float(top["premium"]) * 100.0)
         metrics.inc("autotrade_event", event="opened_call")
+        _mark_entered("call")  # r53l
         try:
             live_quotes.ensure_option_symbols([occ])
         except Exception:
@@ -4057,6 +4157,10 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         return None
     finally:
         db.close()
+        try:
+            _persist_decision()  # r53l
+        except Exception:
+            pass
         try:
             _adv_lock_ctx_cp.__exit__(None, None, None)
         except Exception:
