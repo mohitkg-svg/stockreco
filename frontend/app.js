@@ -4168,9 +4168,17 @@ function AutoTraderPanel({ reloadToken }) {
         </CollapsibleSection>
       </div>
 
-      {/* Options watch — both sides, lazy-loaded on expand */}
-      <CallsWatchSection canTrade={!!cfg.trade_calls} />
-      <PutsWatchSection canTrade={!!cfg.trade_options} />
+      {/* r53j: Call-Play / Put-Play Watch sections removed.
+          They were read-only display layers running the same option-
+          contract scoring logic that consider_call_play / consider_put_play
+          already run automatically per-ticker during the 5-min scan
+          (against the watchlist) and against the candidate_pool when
+          use_universe_scanner=True. The bot already evaluates and acts
+          on these setups; the manual-browse panels added cost (each
+          expand fired a watchlist × timeframe × build-thesis ×
+          chain-fetch run, ~3-5s per refresh) without providing
+          additional alpha. The OptionsWatchSection component is still
+          defined for any future reuse but is no longer mounted. */}
     </div>
   );
 }
