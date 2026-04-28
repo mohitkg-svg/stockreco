@@ -5,6 +5,41 @@ five external review passes (2026-04-25). The chronological per-pass
 sections below capture the original context; the **Master deferral
 register** below is the canonical short-form view used for scoping.
 
+## r52 — Cloud Run OOM-loop hotfix + UI null/filter polish (2026-04-28)
+
+**Live incident**: api Cloud Run service (1Gi limit) was OOM-killing every
+2-5 min during RTH (live_quotes WS subs + scanner DataFrames + APScheduler
+peaked at ~1.1 GiB). Symptoms: `equity_snapshot` cron registered on every
+restart but never fired (instance died before its first 5-min fire), so
+`EquitySnapshot` table stayed empty → equity-curve UI blank, `session_dd_pct`
+returned `null`, `account_drawdown_multiplier` had no baseline.
+
+Fixes shipped:
+- `deploy.sh:122` 1Gi → 2Gi memory; live `gcloud run services update` applied
+  to revision `stockrecs-00101-dvn` (later 00102-qlk after backend redeploy)
+- `backend/routers/admin.py` POST `/api/admin/record-equity-snapshot` —
+  manual one-shot trigger to bootstrap the table after fresh deploys / OOM
+  outages, instead of waiting for the next 5-min cron boundary
+- `frontend/app.js` `AlertsPanel`: default to `?only_unacked=true` with
+  "Show acked" toggle (root cause of "100s of alerts but ack-all disabled"
+  — historical acked rows were dominating the list while unacked=0)
+- `frontend/app.js` `DailyLossProgress` + `CommandBar`: render `—` and
+  "Awaiting equity baseline" when `health.session_dd_pct` is null/undefined
+  (was collapsing to `0.00%` via `|| 0`, mis-implying healthy state)
+- `frontend/app.js` `EquityCurvePanel`: empty-state message when the
+  snapshots array is `[]` (was rendering an empty chart with no explanation)
+
+Follow-ups still open:
+- Investigate the actual memory growth pattern — 1Gi was the original sizing
+  and the bot is not obviously heavier than r44/r45. Possible leak in
+  `live_quotes` WS subscriber set or scanner DataFrame retention. If 2Gi
+  also climbs unboundedly, the leak needs root-cause work.
+- WebSocket "connection limit exceeded" errors continued during the OOM
+  loop — Alpaca's single-stream-per-API-key limit means a dying instance's
+  WS stays open at the broker side until TCP timeout, blocking the new
+  instance. With instances stable now this should self-resolve, but if
+  it persists, add an explicit close-on-shutdown handler for `live_quotes`.
+
 ## Working principle (2026-04-25)
 
 **With every new revision, scan this file's ⏸️ Deferred section before

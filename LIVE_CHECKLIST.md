@@ -302,6 +302,7 @@ conditions, that's a "stop the line" event — kill the bot and investigate.
 | `RISK_MULT_CEILING` | Hard-coded 2.0× in services/config.py for a reason — the multiplier stack will compound past 5× without it |
 | `auto_promote_adopted=false` | First month: every external position must be manually reviewed before bot management |
 | `pyramid_enabled=false` | r44 scale-in is gated; review trend-detection accuracy on 50+ live trades first |
+| `--memory 2Gi` (api Cloud Run) | r51 fix: 1Gi triggered OOM-kill loop every 2-5 min during RTH (live_quotes WS subs + scanner DataFrames + APScheduler peaked at ~1.1 GiB). Cron jobs registered but never fired because instance died before next 5-min boundary. Set in `deploy.sh:122`. |
 
 ---
 
@@ -321,6 +322,15 @@ conditions, that's a "stop the line" event — kill the bot and investigate.
 **During RTH**: 
 - Phone push notifications handle target hits / trade closes
 - Spot-check `last_manage_at` if the manager service hasn't pinged in 5+ min
+
+**Equity-curve bootstrap** (after fresh deploy or OOM/outage):
+```bash
+# Manually fire one snapshot so the chart and account_drawdown_multiplier
+# have data to read instead of waiting for the cron's next 5-min boundary
+curl -X POST -H "X-API-Key: $APP_API_KEY" \
+  https://stockrecs-zcm5tboivq-uc.a.run.app/api/admin/record-equity-snapshot
+# Returns {ok, latest_ts, latest_equity, total_rows}
+```
 
 **Post-close (16:30 ET)**:
 - Review the day's closed trades for any with `closed_news_ai`,

@@ -942,6 +942,11 @@ function EquityCurvePanel({ lookbackDays = 30 }) {
       {error && <div role="alert" className="text-xs text-red-300 mb-2">{friendlyError(error)}</div>}
       <div ref={containerRef} className="w-full" style={{ height: 200 }} />
       {!data && !error && <div className="skel h-8 w-full mt-2" />}
+      {data && !data?.snapshots?.length && (
+        <div className="text-[11px] app-text-muted italic mt-2 text-center">
+          No equity snapshots yet. Recorder fires every 5 min during RTH; data will appear after the first market session.
+        </div>
+      )}
     </div>
   );
 }
@@ -958,7 +963,9 @@ function DailyLossProgress() {
   // Pull today's P/L from auto-trader trades — naively use status fields if present
   const todayLoss = Math.max(0, -(status.realized_today || 0));
   const usedPct = dailyLossLimitDollar > 0 ? (todayLoss / dailyLossLimitDollar) * 100 : 0;
-  const sessionDd = (health?.session_dd_pct || 0) * 100;
+  const ddRaw = health?.session_dd_pct;
+  const ddAvail = ddRaw != null && Number.isFinite(ddRaw);
+  const sessionDd = ddAvail ? ddRaw * 100 : 0;
   return (
     <div className="surface rounded-2xl p-4 shadow-xl" data-r49-card>
       <div className="grid grid-cols-2 gap-3 text-xs">
@@ -973,11 +980,11 @@ function DailyLossProgress() {
         <div>
           <div className="flex items-center justify-between mb-1">
             <span className="app-text-secondary uppercase tracking-wider text-[10px] font-semibold">Session DD</span>
-            <span className="font-mono">{sessionDd.toFixed(2)}%</span>
+            <span className="font-mono">{ddAvail ? `${sessionDd.toFixed(2)}%` : '—'}</span>
           </div>
-          <ProgressBar pct={Math.min(100, (sessionDd / 5) * 100)} danger={sessionDd >= 4} warn={sessionDd >= 2.5} />
+          <ProgressBar pct={ddAvail ? Math.min(100, (sessionDd / 5) * 100) : 0} danger={ddAvail && sessionDd >= 4} warn={ddAvail && sessionDd >= 2.5} />
           <div className="text-[10px] app-text-muted mt-1">
-            {health?.crisis_mode ? <span className="text-red-400 font-semibold">⚠ CRISIS MODE</span> : 'Healthy'}
+            {health?.crisis_mode ? <span className="text-red-400 font-semibold">⚠ CRISIS MODE</span> : (ddAvail ? 'Healthy' : 'Awaiting equity baseline')}
           </div>
         </div>
       </div>
@@ -1039,13 +1046,15 @@ function CommandBar() {
   const equity = account?.equity || status?.equity || 0;
   const bp = account?.buying_power || 0;
   const today = status?.realized_today || 0;
-  const dd = (health?.session_dd_pct || 0) * 100;
+  const ddRaw = health?.session_dd_pct;
+  const ddAvail = ddRaw != null && Number.isFinite(ddRaw);
+  const dd = ddAvail ? ddRaw * 100 : 0;
   const heat = status?.current_heat_pct ?? null;
   const heatCap = (status?.config?.max_pct_of_equity || 0.5) * 100;
   const cells = [
     { label: 'Equity', value: `$${equity.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, kind: '' },
     { label: 'Today P/L', value: `${today >= 0 ? '+' : ''}$${today.toFixed(0)}`, kind: today >= 0 ? 'good' : 'bad', icon: today >= 0 ? 'up' : 'down' },
-    { label: 'DD', value: `${dd.toFixed(2)}%`, kind: dd >= 4 ? 'bad' : dd >= 2 ? 'warn' : '' },
+    { label: 'DD', value: ddAvail ? `${dd.toFixed(2)}%` : '—', kind: ddAvail ? (dd >= 4 ? 'bad' : dd >= 2 ? 'warn' : '') : '' },
     { label: 'BP', value: `$${bp.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, kind: '' },
     { label: 'Heat', value: heat != null ? `${heat.toFixed(1)}%/${heatCap.toFixed(0)}%` : '—', kind: heat != null && heat >= heatCap * 0.85 ? 'warn' : '' },
     { label: 'Mode', value: health?.crisis_mode ? 'CRISIS' : (status?.enabled ? 'ARMED' : 'PAUSED'), kind: health?.crisis_mode ? 'bad' : (status?.enabled ? 'good' : 'warn') },
@@ -5297,11 +5306,15 @@ function AlertsPanel() {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
   const [open, setOpen] = useState(false);
+  const [showAcked, setShowAcked] = useState(false);
   const refresh = useCallback(async () => {
     setLoading(true); setErr(null);
     try {
+      const listUrl = showAcked
+        ? '/api/alerts?limit=100'
+        : '/api/alerts?limit=100&only_unacked=true';
       const [list, count] = await Promise.all([
-        api.get('/api/alerts?limit=100'),
+        api.get(listUrl),
         api.get('/api/alerts/count?since_hours=24'),
       ]);
       setAlerts(Array.isArray(list) ? list : []);
@@ -5309,7 +5322,7 @@ function AlertsPanel() {
     } catch (e) {
       setErr(e?.detail || e?.message || 'Failed to load alerts');
     } finally { setLoading(false); }
-  }, []);
+  }, [showAcked]);
   useEffect(() => {
     refresh();
     const iv = setInterval(refresh, 30000);
@@ -5345,13 +5358,19 @@ function AlertsPanel() {
               {unacked}
             </span>
           )}
-          <span className="text-[10px] app-text-muted uppercase tracking-wider">{alerts.length} recent</span>
+          <span className="text-[10px] app-text-muted uppercase tracking-wider">
+            {showAcked ? `${alerts.length} recent` : `${unacked} unacked`}
+          </span>
         </div>
         <span className="text-xs app-text-muted">{open ? '▾' : '▸'}</span>
       </button>
       {open && (
         <div className="px-4 pb-4">
           <div className="flex items-center justify-end gap-2 mb-2">
+            <label className="text-[10px] app-text-muted flex items-center gap-1 cursor-pointer mr-auto">
+              <input type="checkbox" checked={showAcked} onChange={e => setShowAcked(e.target.checked)} className="accent-blue-500" />
+              Show acked
+            </label>
             <button onClick={refresh} className="text-[10px] px-2 py-1 rounded surface-soft app-text-secondary">Refresh</button>
             <button onClick={ackAll} disabled={unacked === 0} className="text-[10px] px-2 py-1 rounded bg-blue-500/20 border border-blue-500/40 text-blue-300 disabled:opacity-40">Ack all</button>
           </div>

@@ -178,3 +178,31 @@ def sync_positions():
         pass
     from services.auto_trader import sync_positions_from_alpaca
     return sync_positions_from_alpaca()
+
+
+@router.post("/record-equity-snapshot")
+def record_equity_snapshot_now():
+    """Manually fire `record_equity_snapshot` once. Idempotent — the
+    function buckets timestamps to the 5-min boundary and updates the
+    existing row if one exists.
+
+    Use case: bootstrap the EquitySnapshot table after a fresh deploy
+    (or after a long outage, e.g. OOM-restart loop) so the equity-curve
+    UI and `account_drawdown_multiplier` have data to read instead of
+    waiting for the cron's next 5-min boundary.
+    """
+    logger.warning("ADMIN record_equity_snapshot invoked")
+    from services.risk_manager import record_equity_snapshot as _rec
+    from database import SessionLocal as _SL, EquitySnapshot as _ES
+    _rec()
+    db = _SL()
+    try:
+        latest = db.query(_ES).order_by(_ES.ts.desc()).first()
+        return {
+            "ok": True,
+            "latest_ts": latest.ts.isoformat() if latest else None,
+            "latest_equity": float(latest.equity) if latest else None,
+            "total_rows": db.query(_ES).count(),
+        }
+    finally:
+        db.close()

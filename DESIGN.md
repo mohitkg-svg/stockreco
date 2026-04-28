@@ -1087,6 +1087,59 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 52 — Cloud Run OOM-loop hotfix + UI null/filter polish
+
+**Live incident** (2026-04-28 ~17:00 UTC onward): api Cloud Run service
+1Gi memory limit was being exceeded every 2-5 min during RTH, causing
+constant instance restarts. Workload at peak:
+- live_quotes WebSocket subscriber set (~150 tickers)
+- universe_scanner DataFrames (~500 tickers, OHLCV + indicators)
+- APScheduler in-memory job store + active triggers
+- AI judge call buffers (Anthropic SDK retry queues during 429 storms)
+…added up to ~1.0-1.1 GiB resident.
+
+The OOM loop had a non-obvious second-order failure: the equity_snapshot
+cron (5-min during RTH) was being added to the job store on every restart
+("Added job record_equity_snapshot to job store default" appeared 22+
+times in 1h of logs) but never actually fired ("Running job
+record_equity_snapshot" appeared **zero** times). Reason: APScheduler
+fires jobs at next-fire-time relative to the running scheduler instance,
+so a process that lives <5 min between OOM kills never reaches the next
+5-min boundary. EquitySnapshot table stayed empty → equity-curve UI
+blank → `account_drawdown_multiplier` had no baseline → `session_dd_pct`
+returned None.
+
+**Fixes**:
+- `deploy.sh:122` 1Gi → 2Gi. Live applied via `gcloud run services
+  update stockrecs --memory=2Gi`. Locked in `LIVE_CHECKLIST.md` "Settings
+  to NEVER change without checklist" — 1Gi is now known to be too tight.
+- New `POST /api/admin/record-equity-snapshot` (admin.py): manually fire
+  one snapshot. Used to bootstrap the table after the OOM outage so the
+  UI had data instead of a 5-min wait for the next cron boundary.
+  Idempotent (the function buckets ts to 5-min boundary and updates in
+  place if a row exists).
+- AlertsPanel: default to `?only_unacked=true` with "Show acked" toggle.
+  Root cause of the "100s of alerts but ack-all disabled" UX confusion —
+  the historical acked rows were dominating the list while unacked=0
+  (correct). Cleaner default + explicit toggle.
+- DailyLossProgress + CommandBar: render `—` and "Awaiting equity
+  baseline" when health.session_dd_pct is null. Prior code coalesced
+  null → 0 via `|| 0`, falsely implying a healthy 0% drawdown when in
+  reality there was no baseline data at all.
+- EquityCurvePanel: explicit empty-state message when snapshots is [].
+  Prior code rendered a 200px empty chart with no explanation.
+
+**Open follow-ups**:
+- Memory leak investigation. 2Gi gives ~2× headroom but the workload
+  shouldn't be growing — historical sizing was 1Gi for similar load. If
+  utilisation creeps over 1.5 GiB on stable RTH days, investigate
+  live_quotes subscriber retention and scanner DataFrame caches.
+- WebSocket "connection limit exceeded" cascade — when an OOM-killed
+  instance dies, its Alpaca WS stays open broker-side until TCP timeout
+  (~30s). New instance can't open a fresh WS. Self-resolves with
+  instances stable, but a deliberate close-on-shutdown handler in
+  `live_quotes` would tighten the cycle.
+
 ### Revision 48 — implement EVERY r47-deferred backlog item
 
 r47 closed ~60 P0 cutover blockers + shipped Tier P new strategies but
