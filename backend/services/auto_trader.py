@@ -3918,6 +3918,25 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                     half = max(1, int(orig * _t1_frac))
                     half = min(half, int(t.qty))   # can't trim more than we hold
                 if half >= 1:
+                    # r51 fix: gate on RTH. Alpaca rejects option market orders
+                    # outside RTH ("options market orders are only allowed during
+                    # market hours"). Prior code submitted regardless and fired a
+                    # noisy `option_trim_failed` alert every manage tick during
+                    # extended hours — also blocking T1-confirmation state from
+                    # advancing. Defer the trim to the first manage tick after
+                    # the open; retry next loop. This is normal flow, not an
+                    # error, so we DON'T raise an alert and we DON'T advance
+                    # state — letting the runner ride past T1 with no trim
+                    # until RTH resumes.
+                    if not paper_trader.is_market_open():
+                        logger.info(
+                            f"AutoTrader {'PUT' if is_put else 'CALL'} {t.ticker} T1 hit @ "
+                            f"underlying {px:.2f} but OUTSIDE RTH — deferring option trim "
+                            f"to next manage tick at market open"
+                        )
+                        # Skip the trim block, fall through to stop-trail below.
+                        half = 0
+                if half >= 1:
                     # r42 fix #2.2: marketable limit on option trim — saves
                     # ~5-15% of premium vs the prior market order.
                     trim = paper_trader.submit_option_exit_marketable_limit(
@@ -3945,12 +3964,25 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                         )
                     else:
                         err = trim.get("error") if isinstance(trim, dict) else "unknown"
-                        logger.error(f"option partial-trim submit FAILED for {t.symbol}: {err}; leaving full qty open")
-                        _raise_alert(
-                            "error", "option_trim_failed",
-                            f"T1 partial-trim rejected on {t.ticker} {t.symbol} ({err}); position unchanged",
-                            ticker=t.ticker, trade_id=t.id,
+                        # r51 fix: classify "outside-RTH" rejects as a deferred
+                        # condition (no alert), other failures as real errors.
+                        err_str = str(err).lower()
+                        is_rth_reject = (
+                            "market hours" in err_str
+                            or "only allowed during market" in err_str
+                            or "42210000" in err_str
                         )
+                        if is_rth_reject:
+                            logger.info(
+                                f"option partial-trim deferred for {t.symbol}: outside RTH; will retry next tick"
+                            )
+                        else:
+                            logger.error(f"option partial-trim submit FAILED for {t.symbol}: {err}; leaving full qty open")
+                            _raise_alert(
+                                "error", "option_trim_failed",
+                                f"T1 partial-trim rejected on {t.ticker} {t.symbol} ({err}); position unchanged",
+                                ticker=t.ticker, trade_id=t.id,
+                            )
                         # Do NOT mutate t.qty or t.hit_t1 — will retry next tick.
             # Compute new u-stop level.
             if target_idx == 0:
