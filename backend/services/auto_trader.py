@@ -426,11 +426,35 @@ def _mark_entered(option_kind: Optional[str] = None) -> None:
         _DECISION_TLS.entered_kind = option_kind
 
 
+# r53r: low-information skip reasons. The bot calls consider_signal once
+# per timeframe (5m, 15m, 30m, 1h, 4h, 1d, 1mo); most timeframes
+# auto-skip with one of these reasons. Without filtering, the LAST
+# timeframe processed (1mo) always wins the verdict, hiding more
+# meaningful gate-rejections from the configured timeframes (1h/4h/1d).
+_LOW_INFO_SKIPS = {
+    "tf_not_allowed",
+    "below_confidence_threshold",
+    "non_buy_signal",
+    "missing_levels",
+    "neutral_signal",
+}
+
+
 def _persist_decision() -> None:
     """Write the captured verdict to CandidatePool. No-op when the row
     isn't present (i.e., the ticker isn't in the candidate pool — most
     watchlist tickers won't be, and that's fine; the metric counter
-    still tracked the skip aggregate)."""
+    still tracked the skip aggregate).
+
+    r53r: prioritization. consider_signal runs per-timeframe; this
+    helper compares new vs existing verdict and:
+      - never overwrites an "entered" verdict with anything except
+        another "entered"
+      - never overwrites a meaningful skip with a low-info skip
+        (tf_not_allowed / below_confidence_threshold / non_buy_signal /
+        missing_levels / neutral_signal)
+      - otherwise writes through (latest meaningful verdict wins)
+    """
     try:
         ticker = getattr(_DECISION_TLS, "ticker", None)
         kind = getattr(_DECISION_TLS, "kind", None)
@@ -460,14 +484,49 @@ def _persist_decision() -> None:
             try:
                 row = _db_d.query(_CP_d).filter(_CP_d.ticker == ticker).first()
                 if row is not None:
-                    row.last_evaluated_at = datetime.utcnow()
-                    if kind == "option":
-                        row.last_option_decision = decision
-                        row.last_option_reason = reason
-                    else:
-                        row.last_stock_decision = decision
-                        row.last_stock_reason = reason
-                    _db_d.commit()
+                    # r53r: prioritized merge. Don't overwrite meaningful
+                    # verdicts with low-info skips from a different
+                    # timeframe's evaluation of the same ticker.
+                    existing_decision = (
+                        row.last_option_decision if kind == "option"
+                        else row.last_stock_decision
+                    )
+                    existing_reason = (
+                        row.last_option_reason if kind == "option"
+                        else row.last_stock_reason
+                    )
+                    should_write = True
+                    new_is_low_info = (
+                        decision == "skipped"
+                        and (reason or "").split(" ")[0] in _LOW_INFO_SKIPS
+                    )
+                    new_is_no_signal = (decision == "no_signal")
+                    existing_is_entered = (
+                        existing_decision and existing_decision.startswith("entered")
+                    )
+                    existing_is_meaningful_skip = (
+                        existing_decision == "skipped"
+                        and existing_reason
+                        and existing_reason.split(" ")[0] not in _LOW_INFO_SKIPS
+                    )
+                    # Never demote "entered" → anything other than entered.
+                    if existing_is_entered and not (decision or "").startswith("entered"):
+                        should_write = False
+                    # Never demote a meaningful skip → low-info skip / no_signal.
+                    elif existing_is_meaningful_skip and (new_is_low_info or new_is_no_signal):
+                        should_write = False
+                    # Never demote ANY skip → no_signal.
+                    elif existing_decision == "skipped" and new_is_no_signal:
+                        should_write = False
+                    if should_write:
+                        row.last_evaluated_at = datetime.utcnow()
+                        if kind == "option":
+                            row.last_option_decision = decision
+                            row.last_option_reason = reason
+                        else:
+                            row.last_stock_decision = decision
+                            row.last_stock_reason = reason
+                        _db_d.commit()
             finally:
                 _db_d.close()
         except Exception:
@@ -2006,7 +2065,13 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             f"AutoTrader skip {ticker}: 1-min bar disagrees with BUY direction "
             f"(pre-lock confirmation check)"
         )
+        # r53s: this gate previously only fired `autotrade_event` — invisible
+        # in /auto/skip-counts AND in the candidate-pool decision tracker.
+        # Operator was puzzled why high-conf signals never resulted in entries.
+        # Now it logs against `autotrade_skip` too so the aggregate counter
+        # reflects reality.
         metrics.inc("autotrade_event", event="one_min_disagree")
+        metrics.inc("autotrade_skip", reason="one_min_bar_disagrees")
         return None
 
     # r42 fix #1.5: prefetch the AI veto verdict OUTSIDE the entry lock so a
