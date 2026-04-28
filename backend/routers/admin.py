@@ -237,10 +237,30 @@ def backfill_realized_pl():
                     if not buy_cands:
                         skipped.append({"id": t.id, "ticker": t.ticker, "reason": "no entry_price + no matching buy fill"})
                         continue
-                    # Prefer the BUY fill closest to opened_at
+                    # r53: prior code used `abs(((x.get("filled_at") or "") > target) - 0.5)` which
+                    # always evaluated to 0.5 for any string comparison (bool→int minus float)
+                    # — the sort was effectively a no-op and the API insertion-order
+                    # candidate won. Switch to proper datetime delta.
+                    from datetime import datetime as _dt_bf
+                    def _parse_iso(s):
+                        try:
+                            return _dt_bf.fromisoformat((s or "").replace("Z", "+00:00").rstrip("+00:00")) if s else None
+                        except Exception:
+                            return None
                     if t.opened_at:
-                        target = t.opened_at.isoformat()
-                        buy_cands.sort(key=lambda x: abs(((x.get("filled_at") or "") > target) - 0.5))
+                        target_dt = t.opened_at
+                        def _delta(o):
+                            f = _parse_iso(o.get("filled_at"))
+                            if not f:
+                                return 9_999_999.0
+                            try:
+                                # Strip tz to match naive opened_at
+                                if f.tzinfo is not None:
+                                    f = f.replace(tzinfo=None)
+                                return abs((f - target_dt).total_seconds())
+                            except Exception:
+                                return 9_999_999.0
+                        buy_cands.sort(key=_delta)
                     else:
                         buy_cands.sort(key=lambda x: x.get("filled_at") or "", reverse=True)
                     entry_px = float(buy_cands[0].get("filled_avg_price") or 0)
@@ -268,8 +288,30 @@ def backfill_realized_pl():
                 if not cands:
                     skipped.append({"id": t.id, "ticker": t.ticker, "reason": "no matching sell fill"})
                     continue
-                # Prefer the most recent fill before close+24h
-                cands.sort(key=lambda x: x.get("filled_at") or "", reverse=True)
+                # r53: prefer the SELL fill closest to t.closed_at (was: most
+                # recent overall — wrong on partial-fill closes where the bot
+                # might have multiple matching SELL fills hours apart).
+                if t.closed_at:
+                    from datetime import datetime as _dt_sf
+                    def _parse_iso_s(s):
+                        try:
+                            return _dt_sf.fromisoformat((s or "").replace("Z", "+00:00")) if s else None
+                        except Exception:
+                            return None
+                    target_close = t.closed_at
+                    def _sdelta(o):
+                        f = _parse_iso_s(o.get("filled_at"))
+                        if not f:
+                            return 9_999_999.0
+                        try:
+                            if f.tzinfo is not None:
+                                f = f.replace(tzinfo=None)
+                            return abs((f - target_close).total_seconds())
+                        except Exception:
+                            return 9_999_999.0
+                    cands.sort(key=_sdelta)
+                else:
+                    cands.sort(key=lambda x: x.get("filled_at") or "", reverse=True)
                 fill = cands[0]
                 exit_px = float(fill.get("filled_avg_price") or 0)
                 if exit_px <= 0:

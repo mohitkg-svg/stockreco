@@ -525,17 +525,22 @@ def get_config_dict() -> Dict[str, Any]:
 # ---------- Kill switch + daily loss bookkeeping --------------------------
 
 def _session_start_utc() -> datetime:
-    """Start of the current US market session in UTC.
+    """Start of the current trading day in UTC, anchored to MIDNIGHT ET.
 
-    r42 fix #1.8: replaced the month-of-year DST guess (which was wrong by
-    1h for the first half of March and last few days of October every year)
-    with a proper IANA-zone computation via zoneinfo. The old logic also
-    had subtle errors at the November boundary; trusting zoneinfo means
-    DST is exactly right every day.
+    r53 fix (Tier-0 #4): previously anchored to 9:30 ET, the regular
+    session open. That meant a trade that closed during pre-market
+    (e.g., 8:00 AM ET on a gap-down force-close) counted toward
+    YESTERDAY's daily-loss gate. After-hours and pre-market losses then
+    became momentarily invisible at 9:30 ET when the counter reset —
+    the operator could absorb a -3% overnight loss and still take a
+    fresh -3% in the regular session before the gate fired.
 
-    Anchor: the most recent 9:30 America/New_York boundary, returned as a
-    naive UTC datetime (matches the rest of the codebase, which uses
-    datetime.utcnow()).
+    New anchor: the most recent 00:00 America/New_York boundary. Pre-
+    market, regular-session, and after-hours closes all count toward
+    "today" the way a trader naturally thinks about it.
+
+    Returned as a naive UTC datetime (matches the rest of the codebase,
+    which uses datetime.utcnow()).
     """
     from datetime import timedelta as _td
     try:
@@ -544,27 +549,28 @@ def _session_start_utc() -> datetime:
         ZoneInfo = None
     now_utc = datetime.utcnow()
     if ZoneInfo is None:
-        # Fallback to the legacy guess only if zoneinfo is unavailable.
+        # Fallback if zoneinfo is unavailable.
         is_edt = 3 <= now_utc.month <= 10 or (now_utc.month == 11 and now_utc.day <= 7)
-        open_hour_utc = 13 if is_edt else 14
-        anchor = now_utc.replace(hour=open_hour_utc, minute=30, second=0, microsecond=0)
+        midnight_et_utc_hour = 4 if is_edt else 5  # 00:00 EDT = 04:00 UTC, 00:00 EST = 05:00 UTC
+        anchor = now_utc.replace(hour=midnight_et_utc_hour, minute=0, second=0, microsecond=0)
         if now_utc < anchor:
             anchor = anchor - _td(days=1)
         return anchor
     et = ZoneInfo("America/New_York")
-    # Today's 9:30 ET in ET coordinates → convert to UTC.
+    # Today's 00:00 ET in ET coordinates → convert to UTC.
     now_et = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(et)
-    today_open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    if now_et < today_open_et:
-        today_open_et = today_open_et - _td(days=1)
-    anchor_utc = today_open_et.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    today_midnight_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    if now_et < today_midnight_et:
+        today_midnight_et = today_midnight_et - _td(days=1)
+    anchor_utc = today_midnight_et.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
     return anchor_utc
 
 
 def realized_pnl_today() -> float:
-    """Sum of realized_pl on auto-trades closed since the current market
-    session's 9:30 ET open. Used by the daily-loss gate and surfaced on
-    /api/health for observability."""
+    """Sum of realized_pl on auto-trades closed since 00:00 ET today
+    (r53 — was 9:30 ET session-start, which let after-hours and
+    pre-market losses momentarily evade the daily-loss gate). Used by
+    the daily-loss gate and surfaced on /api/health for observability."""
     db = SessionLocal()
     try:
         rows = db.query(AutoTrade).filter(
@@ -3257,12 +3263,13 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             metrics.inc("autotrade_event", event="eod_guard_put")
             return None
 
-        # Opening-bell guard: refuse new option entries in the first 15 min of
-        # the session. Bid-ask spreads are at their widest right after the bell
-        # (paper VTWO -$6,500 in 24s where the "decay" was entirely the spread
-        # cross at 13:48 UTC = 9:48 ET, only 18 min after open).
+        # Opening-bell guard: refuse new option entries in the first 30 min of
+        # the session (r53: extended from 15→30 min). VTWO at 9:48 ET (18 min
+        # post-open) and AMKR / CNTA at minute 17–18 all blew up on entry
+        # slippage; the 15-min guard wasn't enough. OPRA spreads stay 200%+
+        # wide for ~30 minutes post-bell on most names.
         _mso = paper_trader.minutes_since_open()
-        if _mso is not None and _mso < 15.0:
+        if _mso is not None and _mso < 30.0:
             logger.info(f"AutoTrader skip PUT {ticker} {occ}: only {_mso:.0f}m since open (opening-bell guard)")
             metrics.inc("autotrade_event", event="opening_guard_put")
             return None
@@ -3273,10 +3280,25 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         )
 
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
+        # r53 fix: pass requested_premium so the slippage-abandon gate can
+        # reject fills > 1.25× requested.
         res = paper_trader.submit_option_entry_with_cross_fallback(
             occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
+            requested_premium=float(top["premium"]),
         )
         if "error" in res:
+            # r53: slippage_abandon is a deliberate skip, not a failure —
+            # the entry path proactively cancelled rather than crossing
+            # past 1.25× requested premium. Don't pollute the trade
+            # ledger with an "error" row; just log + skip-counter.
+            if res.get("error") == "slippage_abandon":
+                metrics.inc("autotrade_skip", reason="option_slippage_abandon")
+                logger.info(
+                    f"AutoTrader put {ticker} {occ} ABANDONED on slippage: "
+                    f"requested ${res.get('requested_premium','?')} "
+                    f"ask ${res.get('ask','?')} max ${res.get('max_allowed','?')}"
+                )
+                return None
             db.add(AutoTrade(
                 ticker=ticker, symbol=occ, asset_type="option", side="buy",
                 qty=qty, requested_entry=top["premium"],
@@ -3637,10 +3659,11 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             metrics.inc("autotrade_event", event="eod_guard_call")
             return None
 
-        # Opening-bell guard — mirror of put-side. First 15 min has the widest
-        # spreads of the day; cost VTWO/CNTA/AMKR ~$10K combined on 2026-04-24.
+        # Opening-bell guard — mirror of put-side. r53: extended 15 → 30 min.
+        # First 30 min has the widest spreads; VTWO/CNTA/AMKR all blew up on
+        # entry slippage at minute 17–18 post-open.
         _mso = paper_trader.minutes_since_open()
-        if _mso is not None and _mso < 15.0:
+        if _mso is not None and _mso < 30.0:
             logger.info(f"AutoTrader skip CALL {ticker} {occ}: only {_mso:.0f}m since open (opening-bell guard)")
             metrics.inc("autotrade_event", event="opening_guard_call")
             return None
@@ -3651,10 +3674,21 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         )
 
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
+        # r53 fix: pass requested_premium so the slippage-abandon gate can
+        # reject fills > 1.25× requested.
         res = paper_trader.submit_option_entry_with_cross_fallback(
             occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
+            requested_premium=float(top["premium"]),
         )
         if "error" in res:
+            if res.get("error") == "slippage_abandon":
+                metrics.inc("autotrade_skip", reason="option_slippage_abandon")
+                logger.info(
+                    f"AutoTrader call {ticker} {occ} ABANDONED on slippage: "
+                    f"requested ${res.get('requested_premium','?')} "
+                    f"ask ${res.get('ask','?')} max ${res.get('max_allowed','?')}"
+                )
+                return None
             db.add(AutoTrade(
                 ticker=ticker, symbol=occ, asset_type="option", side="buy",
                 qty=qty, requested_entry=top["premium"],
@@ -4061,15 +4095,22 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             final_status = "closed_stop"
 
     # 5) Premium decay safety — still exit if the option has lost ≥ 50% of premium.
-    # Two anti-spread-artifact guards:
-    #  (a) Don't fire within 5 minutes of opening — paper VTWO -$6,500 in 24s
-    #      where the "decay" was ~entirely the bid-ask cross at market open
-    #      (entered at ask $4.90, valuation went to bid $2.30 instantly).
-    #      Real theta-driven 50% decay over 22 DTE takes hours, not seconds.
-    #  (b) Require the underlying to be moving against the thesis — if we're
-    #      a long CALL and underlying is FLAT or UP vs entry, a "50% decay"
-    #      reading is almost certainly a stale/wide quote. Don't exit on
-    #      premium alone; let the underlying-stop in step 4 handle real losses.
+    # r53 fix (Tier-0 #2): the 50% decay threshold + spread-artifact guard
+    # was firing on entry-spread reversion when the underlying had not yet
+    # broken the thesis. VTWO closed -$6,500 after a +0.88% favorable
+    # underlying move because t.entry_price was inflated by 216% slippage
+    # (Tier-0 #1), and the premium just reverted to the bid. Two changes:
+    #
+    #   (a) Spread-artifact skip extended from <5min → ENTIRE <24h window.
+    #       The original 5-min guard assumed real theta-driven 50% decay
+    #       takes "hours, not seconds"; in practice it takes >24h on
+    #       17+ DTE long options. If the underlying isn't broken, decay
+    #       is virtually always spread/IV reversion, not thesis failure.
+    #   (b) Add a progress-to-stop confirmation: even when underlying
+    #       IS moving against us, require ≥40% of the way to the
+    #       underlying stop before letting the premium-stop fire. This
+    #       prevents a +0.5% adverse blip from triggering a 50% premium
+    #       loss exit on a slippage-inflated entry.
     if not exit_reason and cur_premium is not None and t.entry_price:
         # r39 audit fix #12: previously a flat 50% decay threshold across all
         # hold times. A 6-min 50% decay is much more likely to be a quote-cross
@@ -4090,32 +4131,64 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             decay_threshold_pct = 0.55
         decay_trigger_price = t.entry_price * decay_threshold_pct
         if cur_premium <= decay_trigger_price:
-            spread_artifact_window = held_secs < 300  # 5 min
+            # r53: extend spread-artifact window from <5min to <24h.
+            # Real thesis-failure decay rarely happens within the first
+            # day on 17+ DTE contracts; what we typically see in <24h
+            # is spread/IV reversion of the entry premium.
+            spread_artifact_window = held_secs < 86400  # 24h
             # Check underlying direction against thesis
-            # r41 review fix C: previously compared underlying price `px`
-            # ($500-ish) against `t.requested_entry` ($2.00 — option
-            # PREMIUM, not underlying entry). The check was effectively
-            # `500 > 2.0 * 1.001 = True` for every put, meaning every
-            # option in the 5-min window incorrectly evaluated to
-            # "underlying against us". Now uses `underlying_entry_price`
-            # which is set at trade-open from `thesis["entry"]`.
             underlying_against_us = False
             _u_entry = getattr(t, "underlying_entry_price", None)
             if px is not None and _u_entry and _u_entry > 0:
-                # For CALL: against = price < entry; for PUT: against = price > entry
                 if is_put:
                     underlying_against_us = px > float(_u_entry) * 1.001
                 else:
                     underlying_against_us = px < float(_u_entry) * 0.999
-            # If `underlying_entry_price` is missing (rows from before r41
-            # migration), fall back to NOT skipping the premium-stop —
-            # safer to fire on a real decay than skip on a stale guard.
+            # r53 (b): even when the underlying IS against us, require
+            # meaningful progress toward the underlying stop before
+            # firing the premium-stop. 0.4R (40% of the entry→stop
+            # distance) is the floor.
+            progress_to_stop_ok = False
+            if (
+                px is not None
+                and _u_entry
+                and _u_entry > 0
+                and t.current_stop is not None
+                and t.current_stop > 0
+            ):
+                stop_distance = abs(float(_u_entry) - float(t.current_stop))
+                if stop_distance > 0:
+                    move_against = (
+                        max(0.0, px - float(_u_entry))
+                        if is_put
+                        else max(0.0, float(_u_entry) - px)
+                    )
+                    progress_to_stop_ok = (move_against / stop_distance) >= 0.4
 
-            if spread_artifact_window and not underlying_against_us:
-                logger.info(
-                    f"AutoTrader skip premium-stop {t.ticker} {t.symbol}: held {held_secs:.0f}s, "
-                    f"underlying not against us (px={px} entry={t.requested_entry}) — likely spread artifact"
-                )
+            # Final firing rule: in the spread-artifact window (now <24h),
+            # we only fire when BOTH (i) underlying is against us AND
+            # (ii) we're ≥40% to the underlying stop. Outside the window
+            # (≥24h held), the time-scaled threshold itself is enough —
+            # real theta decay is not a spread artifact.
+            should_fire = True
+            if spread_artifact_window:
+                if not underlying_against_us:
+                    should_fire = False
+                    logger.info(
+                        f"AutoTrader skip premium-stop {t.ticker} {t.symbol}: "
+                        f"held {held_secs:.0f}s, underlying not against us "
+                        f"(px={px} u_entry={_u_entry}) — likely spread/IV reversion"
+                    )
+                elif not progress_to_stop_ok:
+                    should_fire = False
+                    logger.info(
+                        f"AutoTrader skip premium-stop {t.ticker} {t.symbol}: "
+                        f"held {held_secs:.0f}s, underlying against us but "
+                        f"<0.4R progress to u-stop {t.current_stop} — likely "
+                        f"slippage-inflated entry, not thesis failure"
+                    )
+
+            if not should_fire:
                 metrics.inc("autotrade_event", event="premium_stop_spread_skip")
             else:
                 pct_lost = (1 - cur_premium / t.entry_price) * 100

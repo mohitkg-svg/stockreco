@@ -1034,14 +1034,16 @@ class TestRealizedPlAccumulation(unittest.TestCase):
 class TestZoneInfoSessionStart(unittest.TestCase):
 
     def test_session_start_uses_zoneinfo(self):
-        """`_session_start_utc` must round-trip through zoneinfo so DST is
-        exact, not month/day-of-month guessed."""
+        """r53: `_session_start_utc` is now anchored to 00:00 ET (was
+        9:30 ET, which let after-hours / pre-market losses momentarily
+        evade the daily-loss gate). Must still round-trip through
+        zoneinfo so DST is exact."""
         from services.auto_trader import _session_start_utc
         anchor = _session_start_utc()
-        # Anchor is a naive UTC datetime; minute should always be 30 (9:30 ET).
-        self.assertEqual(anchor.minute, 30)
-        # Hour should be 13 (EDT) or 14 (EST) — never anything else.
-        self.assertIn(anchor.hour, (13, 14))
+        # Naive UTC representing 00:00 ET.
+        # 00:00 EDT = 04:00 UTC, 00:00 EST = 05:00 UTC.
+        self.assertEqual(anchor.minute, 0)
+        self.assertIn(anchor.hour, (4, 5))
 
 
 class TestKellyFractional(unittest.TestCase):

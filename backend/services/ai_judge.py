@@ -382,6 +382,33 @@ def _call_with_tool(
 
 # ---------- Public call: entry veto ----------------------------------------
 
+# r53 fix (Tier-1 #8): per-(ticker, signal-hash) call dedup. Without it,
+# the same signal re-emitting from the scanner caused 20-28 redundant
+# Claude calls for the SAME ticker in 21 minutes (CPRX 28×, SPY 25× in
+# observed shadow logs). Wasted spend + drowns the prompt cache.
+_AI_VETO_DEDUP: Dict[str, tuple] = {}  # cache_key → (verdict_dict, expiry_ts)
+_AI_VETO_DEDUP_TTL_SEC = 300  # 5-min cache per (ticker, signal-shape)
+_AI_VETO_DEDUP_MAX = 1024
+
+
+def _entry_veto_cache_key(signal: Dict[str, Any]) -> str:
+    """Hash the signal's *decision-relevant* fields. Fields that bounce
+    (timestamp, current_price down to a cent) are excluded; anything that
+    would meaningfully change Claude's verdict is included."""
+    import hashlib
+    payload = (
+        f"{(signal.get('ticker') or '').upper()}|"
+        f"{signal.get('signal_type','')}|"
+        f"{signal.get('timeframe','')}|"
+        f"{signal.get('strategy','')}|"
+        f"{round(float(signal.get('confidence') or 0), 0)}|"
+        f"{round(float(signal.get('entry') or 0), 1)}|"
+        f"{round(float(signal.get('stop_loss') or 0), 1)}|"
+        f"{round(float(signal.get('target1') or 0), 1)}"
+    )
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
 def entry_veto(signal: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     """Ask Claude whether to proceed with this entry.
 
@@ -391,10 +418,22 @@ def entry_veto(signal: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any
 
     Caller invariant: a network/API/schema failure here NEVER blocks the
     trade. The `verdict` is always "proceed" on the abstain path.
+
+    r53 fix (Tier-1 #8): 5-min dedup on (ticker, signal-hash). Same signal
+    re-emitting from the scanner returned the cached verdict instead of
+    burning another Anthropic call.
     """
     mode = entry_veto_mode()
     if mode == "off":
         return {"verdict": "proceed", "reason": "off", "honored": False, "mode": "off"}
+
+    # r53: dedup check
+    cache_key = _entry_veto_cache_key(signal)
+    now_ts = time.time()
+    cached = _AI_VETO_DEDUP.get(cache_key)
+    if cached and now_ts < cached[1]:
+        result = {**cached[0], "from_cache": True}
+        return result
 
     from services.config import AI_JUDGE_TIMEOUT_SEC
     started = time.time()
@@ -436,6 +475,14 @@ def entry_veto(signal: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any
             f"ai_judge entry_veto {signal.get('ticker')}: SKIP ({reason}) "
             f"[mode={mode}, honored={honored}, latency={latency_ms}ms]"
         )
+    # r53: cache this verdict for 5min so same-ticker re-emits don't burn
+    # additional calls.
+    if len(_AI_VETO_DEDUP) >= _AI_VETO_DEDUP_MAX:
+        try:
+            _AI_VETO_DEDUP.pop(next(iter(_AI_VETO_DEDUP)))
+        except StopIteration:
+            pass
+    _AI_VETO_DEDUP[cache_key] = (result, now_ts + _AI_VETO_DEDUP_TTL_SEC)
     return result
 
 

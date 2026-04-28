@@ -90,7 +90,10 @@ AI_JUDGE_MODEL = "claude-haiku-4-5-20251001"
 AI_JUDGE_MAX_TOKENS = 512
 # Latency budget per call. Trade is held in `consider_signal` for at most
 # this long; on timeout we abstain (proceed without veto).
-AI_JUDGE_TIMEOUT_SEC = 5.0
+# r53 fix (Tier-1 #8): bumped 5.0s → 12.0s. Live measurement showed Haiku
+# p95 latency at 13.7s (Anthropic API spikes), causing 11% silent abstain
+# rate. 12s catches p95 without holding the entry path too long.
+AI_JUDGE_TIMEOUT_SEC = 12.0
 # AI confidence multiplier is a downward-bias range — symmetric envelope
 # would let "AI loves it" double the bet; not what we want from an LLM.
 # Stack ceiling RISK_MULT_CEILING already caps everything at 2.0×.

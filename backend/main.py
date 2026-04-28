@@ -1203,8 +1203,13 @@ def _memory_stats() -> dict:
 
 def _ai_cost_today() -> dict:
     try:
+        # r53 fix (Tier-1 #7): pass actual model from config instead of
+        # defaulting to Opus pricing. AI_JUDGE_MODEL is Haiku ($1/$5 per M
+        # tokens); using Opus pricing ($15/$75) made reported cost ~15× too
+        # high in the UI.
         from services.ai_judge import ai_cost_today_usd
-        return ai_cost_today_usd()
+        from services.config import AI_JUDGE_MODEL
+        return ai_cost_today_usd(model_hint=AI_JUDGE_MODEL)
     except Exception:
         return {}
 

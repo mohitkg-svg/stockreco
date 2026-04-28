@@ -4375,6 +4375,18 @@ function PnLReconciliationPanel() {
   if (!data) {
     return <div className="surface rounded-2xl p-4 shadow-xl skel h-32" />;
   }
+  // r53 fix (Tier-1 #9): guard against null/missing starting_equity (empty
+  // Alpaca portfolio_history). Prior code crashed inside `.toLocaleString()`
+  // on null and unmounted the panel without a banner — operator saw blank
+  // space and assumed P/L was healthy.
+  if (data.starting_equity == null || !Number.isFinite(data.starting_equity)) {
+    return (
+      <div className="surface rounded-2xl p-4 shadow-xl text-xs app-text-muted">
+        P/L reconciliation unavailable: no `starting_equity` baseline from
+        Alpaca (portfolio_history may be empty for fresh accounts).
+      </div>
+    );
+  }
   const totalDriftPct = data.starting_equity > 0
     ? (data.total_drift / data.starting_equity) * 100
     : 0;
@@ -4539,6 +4551,10 @@ function PositionCard({ p, ticker, busy, closePos }) {
   // NOT against the option premium.
   const refPrice = isOption ? p.underlying_price : p.current_price;
   const refEntry = isOption ? p.underlying_entry_price : p.avg_entry_price;
+  // r53 fix (Tier-1 #9): explicit "data unavailable" signal when refPrice
+  // is missing — prior code rendered "—" in the R/Δ cells, indistinguishable
+  // from "trade is at break-even".
+  const refPriceMissing = isOption && (refPrice == null || !Number.isFinite(refPrice));
   const r = (stop && refEntry && refPrice)
     ? (refPrice - refEntry) / Math.max(1e-9, Math.abs(refEntry - stop)) * (isLong ? 1 : -1)
     : null;
@@ -4583,6 +4599,11 @@ function PositionCard({ p, ticker, busy, closePos }) {
           <div className="font-mono text-base font-bold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
           {isOption && p.underlying_price != null && (
             <div className="text-[9px] app-text-muted font-mono">underlying ${p.underlying_price.toFixed(2)}</div>
+          )}
+          {refPriceMissing && (
+            <div className="text-[9px] text-amber-400 font-semibold mt-0.5">
+              ⚠ underlying price unavailable
+            </div>
           )}
         </div>
         <div className="text-right">
@@ -4961,7 +4982,11 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
   // r52c: pending_cancel is in-flight (still holds qty as held_for_orders),
   // so it belongs in "Working" — not Cancelled. Same for held / done_for_day
   // / accepted_for_bidding (rare states that still tie up qty).
-  const isWorking = (s) => ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced', 'pending_cancel', 'held', 'done_for_day', 'accepted_for_bidding'].includes(s);
+  // r53 fix (Tier-1 #9): include `stopped`, `suspended`, `calculated` —
+  // Alpaca surfaces these and they all tie up qty as held_for_orders. Prior
+  // version classified them as neither working/filled/cancelled, so the
+  // orders silently disappeared from every tab.
+  const isWorking = (s) => ['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace', 'replaced', 'pending_cancel', 'held', 'done_for_day', 'accepted_for_bidding', 'stopped', 'suspended', 'calculated'].includes(s);
   const isFilled = (s) => s === 'filled' || s === 'partially_filled';
   const isCancelled = (s) => ['canceled', 'cancelled', 'rejected', 'expired'].includes(s);
 
