@@ -852,6 +852,48 @@ auth is a no-op (local dev).
 
 ## 11. Safety & Risk Controls
 
+### 11.0 Operational state machine — every mode the bot can be in
+
+The bot's runtime state is the conjunction of multiple flags. The table
+below is the canonical list of every mode/state, where it's set, what
+it blocks, and how to clear it. Surfaced uniformly via `SafetyBanner`
+(red for critical, amber for warning) at the top of the SPA when any
+non-default flag fires.
+
+| Flag | Type | Set by | What it blocks | How to clear |
+|---|---|---|---|---|
+| `enabled` | operator config | `POST /api/trading/auto/config` | All new entries when `false` | Same endpoint with `enabled=true` |
+| `killed` | persistent operator | `POST /api/trading/kill` | All entries; survives restart so a process bounce can't silently re-arm | `POST /api/trading/unkill` (clears `killed` only — does NOT re-enable; explicit `enabled=true` required) |
+| `kill_switch` (UI banner) | derived from `killed` | — | UI display | (auto when `killed` clears) |
+| `freeze_reason` ("trading frozen") | derived | `risk_manager.should_freeze_trading` — fires when (a) trailing-30d WR < 35% with n ≥ 5, (b) trailing-30d expectancy ≤ $0/trade not concentrated in one fat-tail loss, OR (c) 5 consecutive realized losses | All new entries via `consider_signal` | Wait for losers to age out of the 30-day window OR `POST /api/admin/age-out-trades` to backdate specific known-bug-driven losers |
+| `crisis_mode` (`in_crisis_mode()`) | derived | account DD ≥ 5% (multi-day from `EquitySnapshot`) OR session DD ≥ 4% OR (VIX > 30 AND SPY 5d return < −5%) | r53: HARD ENTRY GATE in `consider_signal`; also tightens chandelier multiplier 0.67× and T1 trim fraction to 50% | Auto-clears when DD recovers / VIX drops / SPY 5d turns positive |
+| `bp_breaker_active` | derived | `risk_manager.bp_breaker` — trips on Alpaca buying-power exhaustion | New entries (5-min lockout) | Auto-clears after lockout window OR a successful margin top-up |
+| `broker_down` | derived | `risk_manager.broker_breaker` — Alpaca returns 5xx | New entries (10-min lockout) | Auto-clears when next probe succeeds |
+| `db_down` | derived | DB connection failures (60s breaker) | Manage tick + entry path | Auto-clears when DB connects |
+| `pdt_locked` | derived | 24h breaker after Alpaca returns PDT/wash 403 | All entries for 24h | Wait or `POST /api/admin/clear-pdt-breaker` (admin only, with operator confirmation) |
+| `pdt_would_block` | derived warning | trailing-5-day day-trade count ≥ 4 | UI banner only — actual block requires `cfg.pdt_enforce=true` AND live margin <$25k | (auto, decays as old day-trades age out) |
+| `account_blocked` / `trading_blocked` / `transfers_blocked` | derived | Alpaca account flags surfaced via `get_account` | All entries; raises critical alert | Operator must contact Alpaca |
+| `loss_pattern_mode` | operator config | `cfg.loss_pattern_mode = off / shadow / active` | When `active`, vetoes signals matching high-lift fingerprints from past losers (see `services/loss_patterns.py`) | Set to `shadow` for observe-only or `off` to disable |
+| `source_mute_enabled` | operator config | `cfg.source_mute_enabled` | When `true`, hard-skips strategies with rolling 60d WR<45% & n≥10 | (default false pending `Signal.strategy` backfill) |
+| `portfolio_kelly_enabled` | operator config | `cfg.portfolio_kelly_enabled` | When `true` AND 60d expectancy ≤ 0 OR Sharpe < 0.5 → throttles entire book to 40-70% of nominal sizing | Set to `false` to disable book-level throttle |
+| `theta_adjusted_rr_enabled` | operator config | `cfg.theta_adjusted_rr_enabled` | When `true`, option entries must clear MIN_RR after subtracting theta×days_to_T1 from reward | Set to `false` to use raw R:R |
+| `AI_ENTRY_VETO_MODE` | env var | `off / shadow / active` | Active: Claude can SKIP an entry after all rule-based gates pass | Set env var |
+| `AI_NEWS_EXIT_MODE` | env var | `off / shadow / active` | Active: Claude can trim/close on news during open positions | Set env var |
+| `AI_CONFIDENCE_MULT_MODE` | env var | `off / shadow / active` | Active: Claude's [0.85, 1.15] multiplier joins the sizing stack | Set env var |
+| `daily_loss_hit` | derived | realized P/L since 00:00 ET ≤ −`daily_loss_limit_pct` × equity | New entries until next trading day | Auto-clears at 00:00 ET (r53 fix — was 9:30 ET, allowed pre-market evasion) |
+| `adopted_count > 0` (with `auto_promote_adopted=false`) | derived warning | external positions exist as `status="adopted"` but not promoted | UI banner only — bot SKIPS managing adopted rows | Promote via `POST /api/admin/promote-adopted/{ticker}` or set `cfg.auto_promote_adopted=true` |
+
+The `SafetyBanner` component on the SPA shows a red strip at the top of
+the page for every active critical flag and an amber strip for every
+warning. Flags are inspected on page load + every 30s + on
+`app:resync` / `app:alert` events. `/api/trading/auto/status` is the
+canonical read endpoint that aggregates all of them.
+
+**Independence**: these flags compose; multiple can fire at once. The
+auto-trader treats them as ANDed barriers — every flag must permit the
+trade for it to proceed. There is NO override path that bypasses
+`killed` or `freeze_reason` short of explicit operator action.
+
 ### Entry-side gates (~30 total — expanded since r19)
 **Hard freeze (r40)**: trailing-30d WR < 35% with ≥ 5 trades → no entries at all (`autotrade_skip{reason=trading_frozen}`). Confidence threshold, **raw-evidence floor (r40, ≥ 30 raw bull/bear points)**, timeframe allow-list, signal freshness (1× TF cap 90m), 9:30-9:45 ET filter, geometry (stop < entry, T1 > entry × 1.004, **T1 R:R ≥ 1.3 r40**, risk-per-share 0.1-10%), stop-vs-ATR ≥ 0.8×, gap-open ≤ 2%, **liquidity gate** (median 20-day $-volume ≥ $10M, r34), **ticker-ADX ≥ 18 (r40)** unless mean-reversion strategy, earnings < 48h window, idempotency dedup, per-ticker cap, sector cap (max 5), concurrent cap (15), **regime-tightened concurrent cap** (cap÷3 in VIX>25 or SPY<200EMA; cap×2/3 in VIX>20, r34), beta-weighted portfolio-heat cap (10% of equity), daily-loss cap (3% of equity), fat-finger guard, BP circuit breaker, broker-down circuit breaker, **macro release blackout** (CPI/NFP/FOMC/etc.; pre+post window with options 1.5× wider), **opening-bell options blackout** (15 min after open), **EOD options blackout** (45 min before close), **MIN_DTE=10** filter on options chains, **option spread filter (r40, ≤ 5% of strike)**, **adaptive risk size** (compound multiplier r40: 0.5× per trigger, floor 0.25×; triggers = VIX > 25, recent WR < 55%, SPY daily ADX_14 < 20, 30d strategy drawdown ≥ 10% of equity), **VIX-scaled options bucket** (×0.3-0.75 at VIX > 20-30), **cheap-options gamma cap** (sub-$0.50 premium → 0.5% equity cap; **now applied to CALL paths too, r40**), **AI judge entry-veto** (r36, off/shadow by default; when active, Claude can skip after every other gate has passed), ticker blacklist.
 
