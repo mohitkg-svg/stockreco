@@ -3716,6 +3716,147 @@ function CandidatePoolPanel() {
 }
 
 // ---------- Auto-Trader Panel: enable, configure, monitor automated trades ----------
+// r53p: Scheduler panel — surface every cron's next-fire time + manual
+// trigger buttons (scan-now / manage-now / universe-scan). Replaces the
+// "operator must shell into Cloud Run logs to know when the bot will
+// next act" gap.
+function SchedulerPanel() {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState({});
+  const load = useCallback(async () => {
+    try {
+      const r = await api.get('/api/trading/auto/schedule');
+      setData(r); setErr(null);
+    } catch (e) { setErr(friendlyError(e)); }
+  }, []);
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 60000);
+    return () => clearInterval(iv);
+  }, [load]);
+
+  const fire = async (label, path, ack) => {
+    if (busy[label]) return;
+    setBusy(b => ({ ...b, [label]: true }));
+    try {
+      const res = await api.post(path);
+      const elapsed = res?.elapsed_sec != null ? ` (${res.elapsed_sec}s)` : '';
+      toast({ msg: `${ack || label} fired${elapsed}`, kind: 'success', duration: 3500 });
+      load();
+    } catch (e) {
+      toast({ msg: `${label} failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
+    } finally {
+      setBusy(b => ({ ...b, [label]: false }));
+    }
+  };
+
+  // Friendly translation of APScheduler trigger strings → human label.
+  const translateTrigger = (t) => {
+    if (!t) return '—';
+    const s = String(t);
+    if (s.includes("interval") && s.includes("seconds=")) {
+      const m = s.match(/seconds=(\d+)/);
+      return m ? `every ${m[1]}s` : s;
+    }
+    if (s.includes("interval") && s.includes("minutes=")) {
+      const m = s.match(/minutes=(\d+)/);
+      return m ? `every ${m[1]}min` : s;
+    }
+    if (s.includes("cron")) {
+      // Extract day_of_week / hour / minute
+      const dow = (s.match(/day_of_week='([^']+)'/) || [])[1];
+      const h = (s.match(/hour='([^']+)'/) || [])[1] || (s.match(/hour=(\d+)/) || [])[1];
+      const m = (s.match(/minute='([^']+)'/) || [])[1] || (s.match(/minute=(\d+)/) || [])[1];
+      const tz = (s.match(/timezone='([^']+)'/) || [])[1];
+      const parts = [];
+      if (dow) parts.push(dow);
+      if (h !== undefined) parts.push(`hour ${h}`);
+      if (m !== undefined) parts.push(`min ${m}`);
+      const tail = tz ? ` (${tz})` : ' UTC';
+      return parts.join(', ') + tail;
+    }
+    return s.length > 60 ? s.slice(0, 60) + '…' : s;
+  };
+
+  const fmtNext = (iso) => {
+    if (!iso) return '—';
+    const d = parseServerDate(iso);
+    if (!d) return iso;
+    const now = Date.now();
+    const diff = (d.getTime() - now) / 1000;
+    if (diff < 0) return 'now';
+    if (diff < 60) return `in ${Math.round(diff)}s`;
+    if (diff < 3600) return `in ${Math.round(diff/60)}m`;
+    if (diff < 86400) return `in ${(diff/3600).toFixed(1)}h`;
+    return d.toLocaleString();
+  };
+
+  return (
+    <div className="surface rounded-2xl p-4 shadow-xl mb-4" data-r49-card>
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 className="text-sm font-bold uppercase tracking-wider app-text-secondary flex items-center gap-2">
+          <span>⏰</span><span>Scheduler & Manual Triggers</span>
+        </h3>
+        <button onClick={load} className="text-[10px] app-text-muted hover:app-text-primary">↻ Refresh</button>
+      </div>
+
+      <div className="flex flex-wrap gap-2 mb-3">
+        <button
+          disabled={!!busy.scan}
+          onClick={() => fire('scan', '/api/trading/auto/scan-now', '5-min watchlist scan')}
+          title="Re-run the per-ticker scan + entry-decision loop (same code path as the 5-min cron). Fires consider_signal / consider_put_play / consider_call_play across the watchlist + candidate pool."
+          className="text-xs px-3 py-1.5 rounded-md bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 font-semibold disabled:opacity-50">
+          {busy.scan ? 'Scanning…' : '🔍 Scan now'}
+        </button>
+        <button
+          disabled={!!busy.manage}
+          onClick={() => fire('manage', '/api/trading/auto/manage-now', '20-sec manage tick')}
+          title="Re-run the manage-open-positions tick (trail stops, T1/T2/T3 trims, reverse-thesis exits, premium-decay safety)."
+          className="text-xs px-3 py-1.5 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-200 border border-blue-500/40 font-semibold disabled:opacity-50">
+          {busy.manage ? 'Managing…' : '⚙️ Manage now'}
+        </button>
+        <button
+          disabled={!!busy.universe}
+          onClick={() => fire('universe', '/api/trading/auto/universe-scan', 'universe scan')}
+          title="Rebuild the candidate pool (~500 liquid US equities, ranked by RVOL/ADX/RS/52w-high)."
+          className="text-xs px-3 py-1.5 rounded-md bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 border border-purple-500/40 font-semibold disabled:opacity-50">
+          {busy.universe ? 'Scanning…' : '🌐 Universe scan'}
+        </button>
+      </div>
+
+      {err && <div role="alert" className="text-xs text-red-400 mb-2">{err}</div>}
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="app-text-muted border-b app-border">
+              <th className="text-left py-1.5 px-2 font-semibold uppercase tracking-wider text-[10px]">Job</th>
+              <th className="text-left py-1.5 px-2 font-semibold uppercase tracking-wider text-[10px]">Schedule</th>
+              <th className="text-right py-1.5 px-2 font-semibold uppercase tracking-wider text-[10px]">Next run</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(data?.jobs || []).map(j => (
+              <tr key={j.id} className="border-b app-border-soft last:border-0">
+                <td className="py-1 px-2 font-mono">{j.id}</td>
+                <td className="py-1 px-2 app-text-secondary">{translateTrigger(j.trigger)}</td>
+                <td className="text-right py-1 px-2 font-mono app-text-muted" title={j.next_run || ''}>{fmtNext(j.next_run)}</td>
+              </tr>
+            ))}
+            {!data && !err && (
+              <tr><td colSpan={3} className="py-2 app-text-muted italic text-center">Loading…</td></tr>
+            )}
+            {data && (data.jobs || []).length === 0 && (
+              <tr><td colSpan={3} className="py-2 app-text-muted italic text-center">No jobs registered (manager-mode service?)</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function AutoTraderPanel({ reloadToken }) {
   const [status, setStatus] = useState(null);
   const [trades, setTrades] = useState([]);
@@ -3930,6 +4071,9 @@ function AutoTraderPanel({ reloadToken }) {
           );
         })()}
       </div>
+
+      {/* r53p: scheduler + manual triggers */}
+      <SchedulerPanel />
 
       {/* Budget gauges */}
       <div className="space-y-3 mb-4">

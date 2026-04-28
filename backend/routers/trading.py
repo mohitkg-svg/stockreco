@@ -803,6 +803,61 @@ def auto_manage_now():
     return auto_trader.manage_open_positions()
 
 
+@router.post("/auto/scan-now")
+def auto_scan_now():
+    """r53p: manually fire the full watchlist + candidate-pool scan
+    (same code path as the 5-minute `scheduled_scan` cron). Runs
+    consider_signal / consider_put_play / consider_call_play across
+    every ticker. Operator-driven; cron continues independently.
+
+    Returns the scheduled_scan summary (tickers scanned, entries opened,
+    skip-counter deltas).
+    """
+    logger.warning("ADMIN /auto/scan-now invoked")
+    import time as _t_sn
+    from main import scheduled_scan as _ss, _app_health as _ah
+    started = _t_sn.time()
+    try:
+        _ss()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"scan failed: {e}")
+    elapsed = round(_t_sn.time() - started, 2)
+    return {
+        "ok": True,
+        "elapsed_sec": elapsed,
+        "last_scan_at": _ah.get("last_scan_at"),
+    }
+
+
+@router.get("/auto/schedule")
+def auto_schedule():
+    """r53p: report the scheduler's job inventory + next-fire times so
+    operators can see when each cron next runs without shelling into
+    the container.
+    """
+    try:
+        from main import scheduler as _sched
+        jobs = []
+        for j in _sched.get_jobs():
+            try:
+                nxt = j.next_run_time
+                jobs.append({
+                    "id": j.id,
+                    "name": j.name or j.id,
+                    "next_run": nxt.isoformat() if nxt else None,
+                    "trigger": str(j.trigger),
+                    "max_instances": j.max_instances,
+                    "coalesce": j.coalesce,
+                })
+            except Exception:
+                pass
+        # Sort by next_run for readability
+        jobs.sort(key=lambda x: x.get("next_run") or "9")
+        return {"jobs": jobs, "n": len(jobs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"schedule introspection failed: {e}")
+
+
 @router.post("/auto/postmortem/{trade_id}")
 def auto_regen_postmortem(trade_id: int):
     """Re-run the loss post-mortem for a closed trade (useful after editing rules)."""
