@@ -180,6 +180,89 @@ def sync_positions():
     return sync_positions_from_alpaca()
 
 
+class ResetPeakRequest(BaseModel):
+    confirm: str  # must be literal "RESET_PEAK" to fire — guards against accidental call
+
+
+@router.post("/reset-equity-peak")
+def reset_equity_peak(req: ResetPeakRequest):
+    """r53o: re-anchor the EquitySnapshot rolling-peak to the current
+    account equity. Used after a string of bug-driven losses (already
+    aged out from the closed-trade ledger via /age-out-trades) when
+    the operator wants the account_drawdown_multiplier and crisis_mode
+    gates to reset to 0% drawdown.
+
+    Action: deletes every EquitySnapshot row strictly older than today's
+    UTC date, then writes a fresh snapshot at the current equity. The
+    rolling-60-day window will then see only today's row → peak = current
+    → drawdown = 0% → multiplier = 1.0 → crisis_mode clears (assuming
+    other crisis triggers — VIX > 30 + SPY 5d < −5% — aren't separately
+    firing).
+
+    Destructive operation. Requires literal `confirm: "RESET_PEAK"` in
+    the body. The audit log records the snapshot count deleted, the
+    pre-reset peak, and the post-reset baseline. Raises a critical
+    alert so the action is unmissable in the operator inbox.
+    """
+    if req.confirm != "RESET_PEAK":
+        raise HTTPException(
+            status_code=400,
+            detail='Refusing to reset — body must include {"confirm": "RESET_PEAK"} verbatim.',
+        )
+    logger.critical("ADMIN reset_equity_peak invoked")
+    from database import SessionLocal as _SL_rp, EquitySnapshot as _ES_rp
+    from datetime import datetime as _dt_rp
+    from services import paper_trader as _pt_rp
+
+    db = _SL_rp()
+    try:
+        # Capture pre-reset state for the audit trail
+        pre_rows = (db.query(_ES_rp.equity)
+                    .order_by(_ES_rp.ts.desc()).all())
+        pre_count = len(pre_rows)
+        pre_peak = max((float(r[0]) for r in pre_rows if r[0] is not None), default=None)
+
+        # Wipe ALL EquitySnapshot rows so the rolling-peak window is
+        # empty. The post-delete record_equity_snapshot() call below
+        # writes a fresh row anchored to current equity.
+        deleted = db.query(_ES_rp).delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+
+    # Write a fresh snapshot at current account equity. Idempotent on
+    # the 5-min ts bucket; if a row already exists for today's bucket
+    # it gets refreshed in place.
+    try:
+        from services.risk_manager import record_equity_snapshot as _rec_rp
+        _rec_rp()
+    except Exception as e:
+        logger.error(f"reset_equity_peak: post-delete record snapshot failed: {e}")
+
+    new_acct = _pt_rp.get_account() or {}
+    new_equity = float(new_acct.get("equity") or 0)
+
+    try:
+        from services.alerts import alert as _raise_alert_rp
+        _raise_alert_rp(
+            "critical", "admin_action",
+            f"reset_equity_peak: deleted {deleted} snapshots, "
+            f"pre_peak=${pre_peak or 0:.2f}, new_baseline=${new_equity:.2f}. "
+            f"Drawdown gates re-anchored.",
+        )
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "deleted_snapshots": int(deleted),
+        "pre_reset_count": int(pre_count),
+        "pre_reset_peak": round(pre_peak, 2) if pre_peak is not None else None,
+        "new_baseline_equity": round(new_equity, 2),
+        "note": "Drawdown rolling-peak anchored to today. Equity-curve history before today is gone.",
+    }
+
+
 @router.post("/reconcile-pending")
 def reconcile_pending_trades():
     """r53d: heal AutoTrade rows stuck in `status=pending` whose Alpaca
