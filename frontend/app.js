@@ -51,6 +51,9 @@ const ls = {
       localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value));
     } catch (_) {}
   },
+  remove(key) {
+    try { localStorage.removeItem(key); } catch (_) {}
+  },
 };
 
 // r49: persistent state hook backed by localStorage. Survives reload.
@@ -2959,7 +2962,21 @@ function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeCh
   const [overlay, setOverlay] = usePersistentState('chartOverlay', {
     mas: true, bb: true, sr: true, zones: true, fibs: true, news: true,
   });
-  const [hideIndicators, setHideIndicators] = usePersistentState('hideIndicators', false);
+  // r53b fix: `hideIndicators` was retired in r49 in favor of layered
+  // overlay toggles, but the read sites in StockChart stayed in place
+  // AND the value was still being read from localStorage. Anyone whose
+  // localStorage cached `hideIndicators: true` from a pre-r49 build had
+  // ALL indicators hidden forever with no UI to flip it back. Bypass
+  // the persistent read entirely and force it to false; the global
+  // toggle is now a no-op preserved only to keep the StockChart prop
+  // signature stable.
+  const hideIndicators = false;
+  const setHideIndicators = () => {};
+  // Defensive: clear the stale localStorage key on first mount so it
+  // never returns even after a hard refresh.
+  React.useEffect(() => {
+    ls.remove('hideIndicators');
+  }, []);
   // r49: compact mode (smaller chart + collapsed defaults)
   const [compactMode, setCompactMode] = usePersistentState('analysisCompact', false);
 
