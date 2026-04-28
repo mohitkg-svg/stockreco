@@ -54,10 +54,25 @@ const ls = {
 };
 
 // r49: persistent state hook backed by localStorage. Survives reload.
+//
+// r50 fix: treat `null` as "no value", same as `undefined`. A previous build
+// (or a manual ls.set(key, null) anywhere) could persist literal null which
+// then defeats the default fallback — code reading `state.field` then throws
+// "Cannot read properties of null". Also: when the persisted shape doesn't
+// match the default's shape (e.g. defaults is an object but stored is a
+// scalar), prefer the default. This is the cheapest crash-prevention layer
+// for cross-version localStorage compatibility.
 function usePersistentState(key, initial) {
   const [v, setV] = useState(() => {
     const stored = ls.get(key, undefined);
-    return stored !== undefined ? stored : (typeof initial === 'function' ? initial() : initial);
+    const initVal = (typeof initial === 'function' ? initial() : initial);
+    if (stored === undefined || stored === null) return initVal;
+    // If default is a plain object but stored is a primitive (or vice versa),
+    // discard the stored value — schema drifted between releases.
+    const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+    if (isObj(initVal) && !isObj(stored)) return initVal;
+    if (Array.isArray(initVal) && !Array.isArray(stored)) return initVal;
+    return stored;
   });
   useEffect(() => { ls.set(key, v); }, [key, v]);
   return [v, setV];
@@ -3095,12 +3110,12 @@ function AnalysisView({ ticker, reloadToken = 0, liveQuote = null, onAutoTradeCh
             liveQuote={liveQuote}
             theme={theme}
             hideIndicators={hideIndicators}
-            showMAs={overlay.mas}
-            showBB={overlay.bb}
-            showSR={overlay.sr}
-            showZones={overlay.zones}
-            showFibs={overlay.fibs}
-            showNews={overlay.news}
+            showMAs={overlay?.mas ?? true}
+            showBB={overlay?.bb ?? true}
+            showSR={overlay?.sr ?? true}
+            showZones={overlay?.zones ?? true}
+            showFibs={overlay?.fibs ?? true}
+            showNews={overlay?.news ?? true}
             signal={timeframeSignal || analysis?.primary_signal}
             position={myPosition}
             newsEvents={newsEvents}
