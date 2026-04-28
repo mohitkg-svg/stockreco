@@ -224,6 +224,14 @@
         html[data-theme="light"] .safety-banner.text-amber-200,
         html[data-theme="light"] .safety-banner .text-amber-200 { color: #92400e !important; }
 
+        /* r53q: Scheduler-trigger button text contrast in light mode. Same
+           failure mode as r53n — `text-purple-300/blue-300/emerald-300` are
+           still pale on a light tint background (purple-500/20 over white
+           = lavender wash). Force saturated mid-tones in light mode. */
+        html[data-theme="light"] .sched-trigger-row .text-emerald-300 { color: #047857 !important; }  /* emerald-700 */
+        html[data-theme="light"] .sched-trigger-row .text-blue-300 { color: #1d4ed8 !important; }    /* blue-700 */
+        html[data-theme="light"] .sched-trigger-row .text-purple-300 { color: #7e22ce !important; }  /* purple-700 */
+
         /* Hover tints */
         html[data-theme="light"] .hover\:bg-white\/5:hover { background-color: rgba(15, 23, 42, 0.04) !important; }
         html[data-theme="light"] .hover\:bg-white\/10:hover { background-color: rgba(15, 23, 42, 0.07) !important; }

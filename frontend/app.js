@@ -3801,26 +3801,26 @@ function SchedulerPanel() {
         <button onClick={load} className="text-[10px] app-text-muted hover:app-text-primary">↻ Refresh</button>
       </div>
 
-      <div className="flex flex-wrap gap-2 mb-3">
+      <div className="flex flex-wrap gap-2 mb-3 sched-trigger-row">
         <button
           disabled={!!busy.scan}
           onClick={() => fire('scan', '/api/trading/auto/scan-now', '5-min watchlist scan')}
           title="Re-run the per-ticker scan + entry-decision loop (same code path as the 5-min cron). Fires consider_signal / consider_put_play / consider_call_play across the watchlist + candidate pool."
-          className="text-xs px-3 py-1.5 rounded-md bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 font-semibold disabled:opacity-50">
+          className="text-xs px-3 py-1.5 rounded-md bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-semibold disabled:opacity-50">
           {busy.scan ? 'Scanning…' : '🔍 Scan now'}
         </button>
         <button
           disabled={!!busy.manage}
           onClick={() => fire('manage', '/api/trading/auto/manage-now', '20-sec manage tick')}
           title="Re-run the manage-open-positions tick (trail stops, T1/T2/T3 trims, reverse-thesis exits, premium-decay safety)."
-          className="text-xs px-3 py-1.5 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-200 border border-blue-500/40 font-semibold disabled:opacity-50">
+          className="text-xs px-3 py-1.5 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/40 font-semibold disabled:opacity-50">
           {busy.manage ? 'Managing…' : '⚙️ Manage now'}
         </button>
         <button
           disabled={!!busy.universe}
           onClick={() => fire('universe', '/api/trading/auto/universe-scan', 'universe scan')}
           title="Rebuild the candidate pool (~500 liquid US equities, ranked by RVOL/ADX/RS/52w-high)."
-          className="text-xs px-3 py-1.5 rounded-md bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 border border-purple-500/40 font-semibold disabled:opacity-50">
+          className="text-xs px-3 py-1.5 rounded-md bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 font-semibold disabled:opacity-50">
           {busy.universe ? 'Scanning…' : '🌐 Universe scan'}
         </button>
       </div>
