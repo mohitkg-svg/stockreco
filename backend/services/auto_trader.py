@@ -3528,12 +3528,16 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
 
         thesis = build_bear_thesis(ticker, "1d")
         if not thesis:
+            # r53t: surface "no bear thesis" so the candidate pool shows
+            # WHY put-play didn't fire instead of muting it as no_signal.
+            metrics.inc("autotrade_skip", reason="no_bear_thesis")
             return None
         # Floor: aggressive 60, non-aggressive 0.85×threshold. Previously 45 /
         # 0.7× let a conf-53 GFS put through that lost $360 on weak volume.
         aggressive = bool(getattr(cfg, "aggressive_options_mode", False))
         min_bear_conf = 60.0 if aggressive else (cfg.confidence_threshold * 0.85)
         if thesis["confidence"] < min_bear_conf:
+            metrics.inc("autotrade_skip", reason=f"bear_conf_{int(thesis['confidence'])}_below_{int(min_bear_conf)}")
             return None
 
         # Postmortem fix H4: bear-thesis is computed off cached daily data
@@ -3957,11 +3961,13 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
 
         thesis = build_bull_thesis(ticker, "1d")
         if not thesis:
+            metrics.inc("autotrade_skip", reason="no_bull_thesis")
             return None
         # Floor: aggressive 60, non-aggressive 0.85×threshold. Mirrors put gate
         # tightening after GFS conf-53 loss.
         min_bull_conf = 60.0 if aggressive else (cfg.confidence_threshold * 0.85)
         if thesis["confidence"] < min_bull_conf:
+            metrics.inc("autotrade_skip", reason=f"bull_conf_{int(thesis['confidence'])}_below_{int(min_bull_conf)}")
             return None
 
         # Live-price gap: bull-thesis stop sits BELOW price. If live price
