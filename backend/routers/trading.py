@@ -134,6 +134,118 @@ def account():
     return a
 
 
+@router.get("/pnl-reconciliation")
+def pnl_reconciliation():
+    """One-stop P/L accounting: shows where every dollar of equity drift
+    came from. Alpaca account equity is the truth; the bot's per-trade
+    realized_pl is the bot's view; the difference is reconciliation gap
+    (typically Alpaca-side closes the bot didn't observe — adopted /
+    external / unmatched bracket fills).
+
+    r52e: ops needed a single panel to answer "where did my $20k go?"
+    instead of cross-referencing the position cards, the closed-trades
+    ledger, and Alpaca's portfolio history.
+    """
+    if not paper_trader.is_enabled():
+        raise HTTPException(status_code=503, detail="Paper trading not configured")
+    import os
+    import requests
+    a = paper_trader.get_account()
+    if not a:
+        raise HTTPException(status_code=502, detail="Could not fetch account")
+    equity = float(a.get("equity") or 0)
+    last_equity = float(a.get("last_equity") or 0)
+
+    # Starting equity from Alpaca portfolio_history.base_value (the
+    # account's lifetime starting point — usually $100k for paper).
+    base_value = None
+    try:
+        key = os.getenv("APCA_API_KEY_ID")
+        sec = os.getenv("APCA_API_SECRET_KEY")
+        if key and sec:
+            r = requests.get(
+                "https://paper-api.alpaca.markets/v2/account/portfolio/history?period=1A&timeframe=1D",
+                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+                timeout=8,
+            )
+            if r.ok:
+                ph = r.json()
+                base_value = float(ph.get("base_value") or 0) or None
+    except Exception:
+        pass
+    if not base_value:
+        base_value = 100000.0  # paper default
+
+    total_drift = equity - base_value
+    today_drift = equity - last_equity if last_equity else None
+
+    # Bot DB: realized + unrealized
+    from database import SessionLocal as _SL_pnl, AutoTrade as _AT_pnl
+    db = _SL_pnl()
+    try:
+        closed = (db.query(_AT_pnl)
+                  .filter(_AT_pnl.closed_at.isnot(None))
+                  .all())
+        realized_total = sum(float(r.realized_pl or 0) for r in closed)
+        from collections import Counter
+        by_status = Counter(r.status for r in closed)
+        realized_by_status = {}
+        for st, _ in by_status.items():
+            realized_by_status[st] = {
+                "count": int(by_status[st]),
+                "pl": round(sum(float(r.realized_pl or 0) for r in closed if r.status == st), 2),
+            }
+        # Top losers / winners
+        ranked = sorted(closed, key=lambda r: float(r.realized_pl or 0))
+        def _row(r):
+            return {
+                "id": r.id, "ticker": r.ticker, "asset_type": r.asset_type,
+                "symbol": r.symbol, "status": r.status,
+                "realized_pl": round(float(r.realized_pl or 0), 2),
+                "closed_at": r.closed_at.isoformat() if r.closed_at else None,
+            }
+        top_losers = [_row(r) for r in ranked[:5] if float(r.realized_pl or 0) < 0]
+        top_winners = [_row(r) for r in reversed(ranked[-5:]) if float(r.realized_pl or 0) > 0]
+    finally:
+        db.close()
+
+    positions = paper_trader.get_positions() or []
+    unrealized_total = sum(float(p.get("unrealized_pl") or 0) for p in positions)
+    unrealized_stocks = sum(
+        float(p.get("unrealized_pl") or 0)
+        for p in positions
+        if "OPTION" not in (p.get("asset_class") or "").upper()
+    )
+    unrealized_options = sum(
+        float(p.get("unrealized_pl") or 0)
+        for p in positions
+        if "OPTION" in (p.get("asset_class") or "").upper()
+    )
+
+    # Reconciliation gap: account drift NOT explained by bot's realized +
+    # currently-open unrealized. Caused by Alpaca-side closes the bot
+    # didn't capture (closed_reconciled / closed_external / pre-adoption
+    # P/L on positions that came in via sync-positions).
+    gap = total_drift - realized_total - unrealized_total
+
+    return {
+        "starting_equity": round(base_value, 2),
+        "current_equity": round(equity, 2),
+        "total_drift": round(total_drift, 2),
+        "today_drift": round(today_drift, 2) if today_drift is not None else None,
+        "realized_total": round(realized_total, 2),
+        "realized_by_status": realized_by_status,
+        "unrealized_total": round(unrealized_total, 2),
+        "unrealized_stocks": round(unrealized_stocks, 2),
+        "unrealized_options": round(unrealized_options, 2),
+        "reconciliation_gap": round(gap, 2),
+        "n_closed": len(closed),
+        "n_open": len(positions),
+        "top_losers": top_losers,
+        "top_winners": top_winners,
+    }
+
+
 @router.get("/positions")
 def positions():
     """Broker positions enriched with bot-managed exit fields (current_stop,

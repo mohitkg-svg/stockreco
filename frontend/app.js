@@ -4355,6 +4355,169 @@ function PostMortem({ trade, onRegen }) {
   );
 }
 
+// r52e: P/L reconciliation widget — single-source-of-truth accounting.
+// Hits /api/trading/pnl-reconciliation which does the math server-side
+// (Alpaca account equity + portfolio_history.base_value + bot's
+// closed-trade ledger + open unrealized + reconciliation gap).
+function PnLReconciliationPanel() {
+  const { data, error, refresh } = useSWR(
+    '/api/trading/pnl-reconciliation',
+    () => api.get('/api/trading/pnl-reconciliation'),
+    { intervalMs: 60000 }
+  );
+  if (error && !data) {
+    return (
+      <div className="surface rounded-2xl p-4 shadow-xl text-xs text-amber-300">
+        P/L reconciliation unavailable: {friendlyError(error)}
+      </div>
+    );
+  }
+  if (!data) {
+    return <div className="surface rounded-2xl p-4 shadow-xl skel h-32" />;
+  }
+  const totalDriftPct = data.starting_equity > 0
+    ? (data.total_drift / data.starting_equity) * 100
+    : 0;
+  const todayDrift = data.today_drift;
+  const fmt$ = (n) => `${n >= 0 ? '+' : ''}$${Math.abs(n).toLocaleString(undefined, {maximumFractionDigits: 2})}${n < 0 ? '' : ''}`.replace('$-', '−$').replace('+$', '+$');
+  const driftClass = (n) => n > 0 ? 'text-emerald-400' : n < 0 ? 'text-red-400' : 'app-text-muted';
+  return (
+    <div className="surface rounded-2xl p-4 shadow-xl mb-4" data-r49-card>
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 className="text-sm font-bold uppercase tracking-wider app-text-secondary flex items-center gap-2">
+          <span>📊</span><span>P/L Reconciliation</span>
+        </h3>
+        <button onClick={refresh} className="text-[10px] app-text-muted hover:app-text-primary">↻ Refresh</button>
+      </div>
+
+      {/* Top row: account-level truth (Alpaca equity) */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+        <div className="surface-soft rounded-lg p-2.5">
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Starting</div>
+          <div className="font-mono text-base font-bold">${data.starting_equity.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        </div>
+        <div className="surface-soft rounded-lg p-2.5">
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Current Equity</div>
+          <div className="font-mono text-base font-bold">${data.current_equity.toLocaleString(undefined,{maximumFractionDigits:0})}</div>
+        </div>
+        <div className="surface-soft rounded-lg p-2.5">
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Total Drift</div>
+          <div className={`font-mono text-base font-bold ${driftClass(data.total_drift)}`}>
+            {fmt$(data.total_drift)} <span className="text-[10px]">({totalDriftPct.toFixed(2)}%)</span>
+          </div>
+        </div>
+        <div className="surface-soft rounded-lg p-2.5">
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">Today</div>
+          <div className={`font-mono text-base font-bold ${driftClass(todayDrift || 0)}`}>
+            {todayDrift != null ? fmt$(todayDrift) : '—'}
+          </div>
+        </div>
+      </div>
+
+      {/* Breakdown of total drift */}
+      <div className="mb-2 text-[10px] uppercase tracking-wider app-text-muted">
+        Where did the {data.total_drift >= 0 ? 'gain' : 'loss'} come from?
+      </div>
+      <div className="space-y-1.5 mb-3">
+        <ReconRow
+          label="Realized (closed trades)"
+          value={data.realized_total}
+          hint={`${data.n_closed} closed`}
+          fmt={fmt$}
+          driftClass={driftClass}
+        />
+        <ReconRow
+          label="Unrealized (open positions)"
+          value={data.unrealized_total}
+          hint={`${data.n_open} open  ·  stocks ${fmt$(data.unrealized_stocks)}  ·  options ${fmt$(data.unrealized_options)}`}
+          fmt={fmt$}
+          driftClass={driftClass}
+        />
+        <ReconRow
+          label="Reconciliation gap"
+          value={data.reconciliation_gap}
+          hint="Alpaca-side closes the bot didn't capture (closed_reconciled / closed_external / pre-adoption fills)"
+          fmt={fmt$}
+          driftClass={driftClass}
+          warn={Math.abs(data.reconciliation_gap) > 100}
+        />
+      </div>
+
+      {/* Realized by status */}
+      {data.realized_by_status && Object.keys(data.realized_by_status).length > 0 && (
+        <details className="mb-2">
+          <summary className="text-[10px] uppercase tracking-wider app-text-muted cursor-pointer hover:app-text-primary">
+            Realized P/L by close status
+          </summary>
+          <div className="mt-2 space-y-1">
+            {Object.entries(data.realized_by_status)
+              .sort((a, b) => a[1].pl - b[1].pl)
+              .map(([st, info]) => (
+                <div key={st} className="flex items-center justify-between text-[11px] font-mono">
+                  <span className="app-text-secondary">{st} <span className="app-text-muted">({info.count})</span></span>
+                  <span className={driftClass(info.pl)}>{fmt$(info.pl)}</span>
+                </div>
+              ))}
+          </div>
+        </details>
+      )}
+
+      {/* Top losers / winners */}
+      {(data.top_losers?.length > 0 || data.top_winners?.length > 0) && (
+        <details>
+          <summary className="text-[10px] uppercase tracking-wider app-text-muted cursor-pointer hover:app-text-primary">
+            Top losers / winners (closed)
+          </summary>
+          <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+            {data.top_losers?.length > 0 && (
+              <div>
+                <div className="text-[10px] text-red-400 uppercase tracking-wider mb-1">Losers</div>
+                <div className="space-y-1">
+                  {data.top_losers.map(t => (
+                    <div key={t.id} className="text-[11px] font-mono flex items-center justify-between">
+                      <span className="truncate" title={`${t.ticker} ${t.asset_type} · ${t.status} · ${t.closed_at?.slice(0,10)}`}>
+                        {t.ticker} <span className="app-text-muted">{t.asset_type}</span>
+                      </span>
+                      <span className="text-red-400">{fmt$(t.realized_pl)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {data.top_winners?.length > 0 && (
+              <div>
+                <div className="text-[10px] text-emerald-400 uppercase tracking-wider mb-1">Winners</div>
+                <div className="space-y-1">
+                  {data.top_winners.map(t => (
+                    <div key={t.id} className="text-[11px] font-mono flex items-center justify-between">
+                      <span className="truncate" title={`${t.ticker} ${t.asset_type} · ${t.status} · ${t.closed_at?.slice(0,10)}`}>
+                        {t.ticker} <span className="app-text-muted">{t.asset_type}</span>
+                      </span>
+                      <span className="text-emerald-400">{fmt$(t.realized_pl)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function ReconRow({ label, value, hint, fmt, driftClass, warn }) {
+  return (
+    <div className={`flex items-baseline justify-between gap-3 text-xs py-1 ${warn ? 'text-amber-300' : ''}`}>
+      <div className="min-w-0">
+        <div className="font-semibold">{label}</div>
+        {hint && <div className="text-[10px] app-text-muted">{hint}</div>}
+      </div>
+      <div className={`font-mono text-sm font-bold shrink-0 ${driftClass(value)}`}>{fmt(value)}</div>
+    </div>
+  );
+}
+
 // ---------- Position card (r52d split: stock vs option) ----------
 // Renders one position with R-progress / distance-to-stop / time-held.
 // For options, all underlying-vs-stop calcs use `underlying_price` from
@@ -4756,6 +4919,9 @@ function TradingPanel({ ticker, reloadToken }) {
           />
         </div>
       </div>
+
+      {/* r52e: P/L reconciliation — single-source-of-truth accounting */}
+      <PnLReconciliationPanel />
 
       {/* r49 UX-P0: Sector exposure widget when N≥2 positions */}
       <SectorExposureWidget positions={positions} />

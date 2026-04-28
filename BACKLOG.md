@@ -5,6 +5,30 @@ five external review passes (2026-04-25). The chronological per-pass
 sections below capture the original context; the **Master deferral
 register** below is the canonical short-form view used for scoping.
 
+## r52e — P/L reconciliation widget (2026-04-28)
+
+Operator asked "I started at $100k and now at $80k — where did the $20k
+go?" Previously you had to cross-reference three views: Paper Trading
+panel (account equity), the closed-trades ledger (sum realized_pl),
+and Alpaca's portfolio history (truth source). The numbers also didn't
+fully reconcile because of `closed_reconciled` / `closed_external` rows
+where the bot's `realized_pl` field stayed at $0 even though Alpaca
+took the hit.
+
+Fix: new `GET /api/trading/pnl-reconciliation` and `PnLReconciliationPanel`
+component on the Paper Trading panel. Single-source-of-truth accounting
+that surfaces:
+- Starting equity (from Alpaca portfolio_history.base_value)
+- Current equity (Alpaca truth)
+- Total drift (current − starting), with %
+- Today's drift (current − last_equity)
+- Realized total (sum of bot's closed-trade realized_pl) + breakdown by
+  close status (closed_stop / closed_reverse / closed_reconciled / etc.)
+- Unrealized total (sum of open-position unrealized_pl) + stocks/options split
+- **Reconciliation gap** = total_drift − realized − unrealized (the
+  Alpaca-side P/L the bot never captured; warns when |gap| > $100)
+- Top 5 realized losers + winners (collapsible)
+
 ## r52d — split position cards: stocks vs options + fix mixed-units bug (2026-04-28)
 
 Operator reported: position card on long-call options was showing
