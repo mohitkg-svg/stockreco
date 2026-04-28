@@ -5,6 +5,36 @@ five external review passes (2026-04-25). The chronological per-pass
 sections below capture the original context; the **Master deferral
 register** below is the canonical short-form view used for scoping.
 
+## r52d — split position cards: stocks vs options + fix mixed-units bug (2026-04-28)
+
+Operator reported: position card on long-call options was showing
+"-30.7% premium · -1237% distance to stop" — the percentage / R-multiple
+/ distance-to-stop calcs were comparing the option PREMIUM ($10.40)
+against the UNDERLYING stop ($139.01), mixing units.
+
+Also: a single combined positions section made it hard to scan a mixed
+portfolio of stocks + options.
+
+Fixes:
+- Backend: `/api/trading/positions` now joins each option position to
+  its UNDERLYING ticker spot (via `data_fetcher.get_current_price`) and
+  returns `underlying_symbol`, `underlying_price`, `underlying_entry_price`
+  alongside the option premium fields.
+- Frontend: replaced inline position-card render with new
+  `PositionCard` + `PositionsSections` components. For options, the
+  R-multiple / distance-to-stop / RProgressBar use `underlying_price`
+  (not premium); the option premium % is shown separately, labeled
+  "premium".
+- Frontend: positions now render in two collapsible sections
+  ("Stock Positions" / "Option Positions"), each with count + total
+  unrealized P/L badge in the header. Within each section the analyzed
+  ticker's positions sort first.
+
+The "small triangle" in each card is the up/down DirIcon — it just
+indicates whether the position is winning (▲ green) or losing
+(▼ red). Not actually a bug, but the user noticed it because the
+percentage next to it was wrong on options.
+
 ## r52c — orders panel: surface PENDING_CANCEL state (2026-04-28)
 
 Operator reported "open sell orders in Alpaca aren't showing up in the

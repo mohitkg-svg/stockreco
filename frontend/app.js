@@ -4355,6 +4355,169 @@ function PostMortem({ trade, onRegen }) {
   );
 }
 
+// ---------- Position card (r52d split: stock vs option) ----------
+// Renders one position with R-progress / distance-to-stop / time-held.
+// For options, all underlying-vs-stop calcs use `underlying_price` from
+// the backend join (not the option premium) — prevents the mixed-units
+// "1237% distance" bug. The premium % (Alpaca's unrealized_plpc) is
+// shown alongside, clearly labeled.
+function PositionCard({ p, ticker, busy, closePos }) {
+  const isOption = (p.asset_type || '').toLowerCase() === 'option'
+    || (p.asset_class || '').toUpperCase().includes('OPTION');
+  const isWin = p.unrealized_pl >= 0;
+  const rowHighlight = (p.symbol === ticker || p.ticker === ticker) ? 'ring-1 ring-blue-500/50' : '';
+  const side = (p.side || (p.qty < 0 ? 'sell' : 'buy')).toLowerCase().replace(/^positionside\./, '');
+  const isLong = side === 'buy' || side === 'long';
+  const direction = isLong ? 'BUY' : 'SELL';
+  const stop = p.current_stop || p.stop_loss;
+  const t1 = p.target1, t2 = p.target2, t3 = p.target3;
+  // For options, stop/targets are denominated in UNDERLYING price, so we
+  // must compute distance-to-stop and R against the underlying spot —
+  // NOT against the option premium.
+  const refPrice = isOption ? p.underlying_price : p.current_price;
+  const refEntry = isOption ? p.underlying_entry_price : p.avg_entry_price;
+  const r = (stop && refEntry && refPrice)
+    ? (refPrice - refEntry) / Math.max(1e-9, Math.abs(refEntry - stop)) * (isLong ? 1 : -1)
+    : null;
+  const distToStop = (stop && refPrice) ? Math.abs(refPrice - stop) : null;
+  const distToStopPct = (distToStop && refPrice) ? (distToStop / refPrice) * 100 : null;
+  const opened = parseServerDate(p.opened_at) || parseServerDate(p.created_at);
+  const heldMin = opened ? Math.max(0, (Date.now() - opened.getTime()) / 60000) : null;
+  const heldFmt = heldMin == null ? '—' :
+    heldMin < 60 ? `${heldMin.toFixed(0)}m` :
+    heldMin < 1440 ? `${(heldMin / 60).toFixed(1)}h` :
+    `${(heldMin / 1440).toFixed(1)}d`;
+  // Display label: stocks show ticker; options show ticker + strike/exp short form
+  const displaySym = p.symbol;
+  return (
+    <div data-r49-card className={`app-bg-surface-solid rounded-xl p-3 lift border app-border-soft ${rowHighlight}`}>
+      <div className="flex items-start justify-between mb-2">
+        <div className="min-w-0">
+          <div className="font-bold text-base flex items-center gap-2 flex-wrap">
+            <span className="truncate" title={displaySym}>{displaySym}</span>
+            <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider ${isLong ? 'bg-emerald-500/20 text-emerald-300' : 'bg-red-500/20 text-red-300'}`}>
+              <DirIcon dir={direction} /> {direction}
+            </span>
+            {isOption && p.underlying_symbol && (
+              <span className="text-[10px] app-text-muted font-mono">on {p.underlying_symbol}</span>
+            )}
+          </div>
+          <div className="text-[10px] app-text-muted font-mono">
+            Qty {Math.abs(p.qty)} @ ${p.avg_entry_price?.toFixed(2)} · held {heldFmt}
+          </div>
+        </div>
+        <button
+          disabled={!!busy[`close:${p.symbol}`]}
+          aria-label={`Close ${p.symbol} position`}
+          onClick={() => closePos(p.symbol, p)}
+          className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold shrink-0">
+          {busy[`close:${p.symbol}`] ? 'Closing…' : 'Close'}
+        </button>
+      </div>
+      <div className="flex items-baseline justify-between mb-2">
+        <div>
+          <div className="text-[9px] uppercase tracking-wider app-text-muted">{isOption ? 'Premium' : 'Last'}</div>
+          <div className="font-mono text-base font-bold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
+          {isOption && p.underlying_price != null && (
+            <div className="text-[9px] app-text-muted font-mono">underlying ${p.underlying_price.toFixed(2)}</div>
+          )}
+        </div>
+        <div className="text-right">
+          <div className={`font-mono text-lg font-bold ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+            <DirIcon dir={isWin ? 'up' : 'down'} className="text-xs mr-1" />
+            {isWin ? '+' : ''}${p.unrealized_pl?.toFixed(2)}
+          </div>
+          <div className={`text-[10px] font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
+            {isWin ? '+' : ''}{p.unrealized_plpc?.toFixed(2)}%
+            {isOption ? <span className="app-text-muted"> premium</span> : null}
+            {r != null ? ` · ${r >= 0 ? '+' : ''}${r.toFixed(2)}R` : ''}
+          </div>
+        </div>
+      </div>
+      {refEntry && stop && (
+        <RProgressBar
+          entry={refEntry} stop={stop}
+          target1={t1} target2={t2} target3={t3}
+          current={refPrice} side={direction}
+        />
+      )}
+      <div className="grid grid-cols-3 gap-1 mt-2 text-[9px] font-mono">
+        <div className="text-red-400">stop ${stop?.toFixed(2) ?? '—'}</div>
+        <div className="text-amber-400 text-center">
+          {distToStop != null ? `Δ$${distToStop.toFixed(2)} (${distToStopPct?.toFixed(1)}%)` : '—'}
+        </div>
+        <div className="text-emerald-400 text-right">T1 ${t1?.toFixed(2) ?? '—'}</div>
+      </div>
+      {isOption && (
+        <div className="text-[9px] app-text-muted mt-1 italic">
+          stop / targets are underlying prices
+        </div>
+      )}
+    </div>
+  );
+}
+
+// r52d: split positions into Stocks and Options sections. Each section has
+// its own collapsible header with count + total unrealized P/L.
+function PositionsSections({ positions, ticker, error, busy, closePos }) {
+  const isOption = (p) => (p.asset_type || '').toLowerCase() === 'option'
+    || (p.asset_class || '').toUpperCase().includes('OPTION');
+  const stocks = (positions || []).filter(p => !isOption(p));
+  const options = (positions || []).filter(p => isOption(p));
+  // Put the analyzed-ticker positions first within each section
+  const sortByTicker = (arr) => [
+    ...arr.filter(p => p.symbol === ticker || p.ticker === ticker),
+    ...arr.filter(p => p.symbol !== ticker && p.ticker !== ticker),
+  ];
+  const stocksSorted = sortByTicker(stocks);
+  const optionsSorted = sortByTicker(options);
+  const sumPL = (arr) => arr.reduce((a, p) => a + (p.unrealized_pl || 0), 0);
+  const stocksPL = sumPL(stocks);
+  const optionsPL = sumPL(options);
+
+  if (positions.length === 0) {
+    return (
+      <div className="mb-4 mt-3">
+        <CollapsibleSection title="Open Positions" count={0} defaultOpen={false}>
+          <div className="text-center text-sm app-text-muted italic py-4">
+            {error ? <span className="text-amber-300">Couldn't load positions: {friendlyError(error)}</span> : 'No open positions.'}
+          </div>
+        </CollapsibleSection>
+      </div>
+    );
+  }
+
+  const renderSection = (title, arr, totalPL) => {
+    if (arr.length === 0) return null;
+    const titleNode = (
+      <span className="flex items-center gap-2">
+        <span>{title}</span>
+        <span className={`text-[10px] font-mono ${totalPL >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+          {totalPL >= 0 ? '+' : ''}${totalPL.toFixed(2)}
+        </span>
+      </span>
+    );
+    return (
+      <div className="mb-3 mt-3">
+        <CollapsibleSection title={titleNode} count={arr.length} defaultOpen={true} maxHeight={520}>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {arr.map(p => (
+              <PositionCard key={p.symbol} p={p} ticker={ticker} busy={busy} closePos={closePos} />
+            ))}
+          </div>
+        </CollapsibleSection>
+      </div>
+    );
+  };
+
+  return (
+    <>
+      {renderSection('Stock Positions', stocksSorted, stocksPL)}
+      {renderSection('Option Positions', optionsSorted, optionsPL)}
+    </>
+  );
+}
+
 // ---------- Per-ticker auto-trade toggle ----------
 // Shown in the analysis-view header. Hits PATCH /api/watchlist/{ticker}/auto-trade
 // and re-fetches overview so the WatchlistPanel badge updates in lockstep.
@@ -4597,97 +4760,18 @@ function TradingPanel({ ticker, reloadToken }) {
       {/* r49 UX-P0: Sector exposure widget when N≥2 positions */}
       <SectorExposureWidget positions={positions} />
 
-      {/* r49 UX-P0: Positions section — open by default when non-empty;
-          richer cards with R-progress, distance-to-stop, time held. */}
-      <div className="mb-4 mt-3">
-        <CollapsibleSection
-          title="Open Positions"
-          count={positions.length}
-          defaultOpen={positions.length > 0}
-          maxHeight={520}
-        >
-          {positions.length === 0 ? (
-            <div className="text-center text-sm app-text-muted italic py-4">
-              {/* r42 fix #1.22: distinguish "fetch failed" from "empty book". */}
-              {error ? <span className="text-amber-300">Couldn't load positions: {friendlyError(error)}</span> : 'No open positions.'}
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {[...tickerPositions, ...otherPositions].map(p => {
-                const isWin = p.unrealized_pl >= 0;
-                const rowHighlight = p.symbol === ticker ? 'ring-1 ring-blue-500/50' : '';
-                const side = (p.side || (p.qty < 0 ? 'sell' : 'buy')).toLowerCase();
-                const isLong = side === 'buy' || side === 'long';
-                const direction = isLong ? 'BUY' : 'SELL';
-                const stop = p.current_stop || p.stop_loss;
-                const t1 = p.target1, t2 = p.target2, t3 = p.target3;
-                const r = stop && p.avg_entry_price && p.current_price
-                  ? (p.current_price - p.avg_entry_price) / Math.max(1e-9, Math.abs(p.avg_entry_price - stop)) * (isLong ? 1 : -1)
-                  : null;
-                const distToStop = stop && p.current_price ? Math.abs(p.current_price - stop) : null;
-                const distToStopPct = distToStop && p.current_price ? (distToStop / p.current_price) * 100 : null;
-                const opened = parseServerDate(p.opened_at) || parseServerDate(p.created_at);
-                const heldMin = opened ? Math.max(0, (Date.now() - opened.getTime()) / 60000) : null;
-                const heldFmt = heldMin == null ? '—' :
-                  heldMin < 60 ? `${heldMin.toFixed(0)}m` :
-                  heldMin < 1440 ? `${(heldMin / 60).toFixed(1)}h` :
-                  `${(heldMin / 1440).toFixed(1)}d`;
-                return (
-                  <div key={p.symbol} data-r49-card className={`app-bg-surface-solid rounded-xl p-3 lift border app-border-soft ${rowHighlight}`}>
-                    <div className="flex items-start justify-between mb-2">
-                      <div>
-                        <div className="font-bold text-base flex items-center gap-2">
-                          <span>{p.symbol}</span>
-                          <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider ${isLong ? 'bg-emerald-500/20 text-emerald-300' : 'bg-red-500/20 text-red-300'}`}>
-                            <DirIcon dir={direction} /> {direction}
-                          </span>
-                        </div>
-                        <div className="text-[10px] app-text-muted font-mono">Qty {Math.abs(p.qty)} @ ${p.avg_entry_price?.toFixed(2)} · held {heldFmt}</div>
-                      </div>
-                      <button
-                        disabled={!!busy[`close:${p.symbol}`]}
-                        aria-label={`Close ${p.symbol} position`}
-                        onClick={() => closePos(p.symbol, p)}
-                        className="text-[10px] px-2 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-400 disabled:opacity-50 border border-red-500/30 font-semibold">
-                        {busy[`close:${p.symbol}`] ? 'Closing…' : 'Close'}
-                      </button>
-                    </div>
-                    <div className="flex items-baseline justify-between mb-2">
-                      <div>
-                        <div className="text-[9px] uppercase tracking-wider app-text-muted">Last</div>
-                        <div className="font-mono text-base font-bold">{p.current_price ? `$${p.current_price.toFixed(2)}` : '—'}</div>
-                      </div>
-                      <div className="text-right">
-                        <div className={`font-mono text-lg font-bold ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
-                          <DirIcon dir={isWin ? 'up' : 'down'} className="text-xs mr-1" />
-                          {isWin ? '+' : ''}${p.unrealized_pl?.toFixed(2)}
-                        </div>
-                        <div className={`text-[10px] font-mono ${isWin ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {isWin ? '+' : ''}{p.unrealized_plpc?.toFixed(2)}% · {r != null ? `${r >= 0 ? '+' : ''}${r.toFixed(2)}R` : '—'}
-                        </div>
-                      </div>
-                    </div>
-                    {p.avg_entry_price && stop && (
-                      <RProgressBar
-                        entry={p.avg_entry_price} stop={stop}
-                        target1={t1} target2={t2} target3={t3}
-                        current={p.current_price} side={direction}
-                      />
-                    )}
-                    <div className="grid grid-cols-3 gap-1 mt-2 text-[9px] font-mono">
-                      <div className="text-red-400">stop ${stop?.toFixed(2) ?? '—'}</div>
-                      <div className="text-amber-400 text-center">
-                        {distToStop != null ? `Δ$${distToStop.toFixed(2)} (${distToStopPct?.toFixed(1)}%)` : '—'}
-                      </div>
-                      <div className="text-emerald-400 text-right">T1 ${t1?.toFixed(2) ?? '—'}</div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </CollapsibleSection>
-      </div>
+      {/* r52d: split into Stocks and Options sections. For options, the
+          stop/targets/R-multiple/distance-to-stop are denominated in the
+          UNDERLYING price (not the option premium) — the prior single
+          card mixed units and produced absurd "1237%" distance figures
+          on long calls. */}
+      <PositionsSections
+        positions={positions}
+        ticker={ticker}
+        error={error}
+        busy={busy}
+        closePos={closePos}
+      />
 
       {/* r49 UX-P0: Recent orders — filter chips + group-by-parent */}
       <OrdersTable

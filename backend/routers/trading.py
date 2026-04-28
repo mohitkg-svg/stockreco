@@ -166,6 +166,10 @@ def positions():
             for k in {(a.ticker or "").upper(), (a.symbol or "").upper()}:
                 if k and k not in by_key:
                     by_key[k] = a
+        # r52d: for option positions, also surface the UNDERLYING ticker +
+        # current spot, so the UI can compute distance-to-stop / R against
+        # the underlying instead of the option premium (mixed-units bug).
+        from services.data_fetcher import get_current_price as _cp_pos
         out = []
         for r in rows:
             sym = (r.get("symbol") or "").upper()
@@ -175,6 +179,7 @@ def positions():
                     **r,
                     "trade_id": a.id,
                     "asset_type": a.asset_type,
+                    "ticker": a.ticker,
                     "current_stop": float(a.current_stop) if a.current_stop is not None else None,
                     "stop_loss": float(a.stop_loss) if a.stop_loss is not None else None,
                     "target1": float(a.target1) if a.target1 is not None else None,
@@ -185,6 +190,18 @@ def positions():
                     "opened_at": a.opened_at.isoformat() if a.opened_at else None,
                     "managed_status": a.status,
                 }
+                if (a.asset_type or "").lower() == "option" and a.ticker:
+                    try:
+                        cp = _cp_pos(a.ticker)
+                        if cp and cp[0]:
+                            r["underlying_symbol"] = a.ticker
+                            r["underlying_price"] = float(cp[0])
+                            try:
+                                r["underlying_entry_price"] = float(getattr(a, "underlying_entry_price", None) or 0) or None
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             out.append(r)
         return out
     finally:
