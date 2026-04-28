@@ -285,3 +285,36 @@ class PositionResponse(BaseModel):
     underlying_symbol: Optional[str] = None
     underlying_price: Optional[float] = None
     underlying_entry_price: Optional[float] = None
+
+
+# r52g: typed response for /api/trading/pnl-reconciliation.
+class PnLReconRow(BaseModel):
+    id: int
+    ticker: str
+    asset_type: Optional[str] = None
+    symbol: Optional[str] = None
+    status: Optional[str] = None
+    realized_pl: float
+    closed_at: Optional[str] = None
+
+
+class PnLStatusBreakdown(BaseModel):
+    count: int
+    pl: float
+
+
+class PnLReconciliationResponse(BaseModel):
+    starting_equity: float
+    current_equity: float
+    total_drift: float
+    today_drift: Optional[float] = None
+    realized_total: float
+    realized_by_status: dict  # status_name → PnLStatusBreakdown
+    unrealized_total: float
+    unrealized_stocks: float
+    unrealized_options: float
+    reconciliation_gap: float
+    n_closed: int
+    n_open: int
+    top_losers: List[PnLReconRow] = []
+    top_winners: List[PnLReconRow] = []

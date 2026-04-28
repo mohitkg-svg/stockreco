@@ -310,6 +310,8 @@ or quarterly-stale-tolerant designs.
 | `BestStrategyPerTicker` | Walk-forward winner per (ticker, direction) updated weekly Sun 04:00 UTC. |
 | `ConfidenceCalibration` | Per-confidence-bucket realized win rate from closed auto-trades, computed nightly. |
 | `AIDecisionLog` | r36: every AI judge call (entry_veto / news_exit / confidence_multiplier) — call_site, mode, prompt summary, response, latency, honored flag. Source of truth for shadow-mode review before promoting a call site to active. |
+| `EquitySnapshot` | r46: persisted equity timeseries (5-min during RTH + EOD). Schema `(ts UNIQUE, equity, cash, buying_power, realized_pl_today, unrealized_pl, open_positions, spy_close)`. Read by `account_drawdown_multiplier` and the equity-curve UI panel. |
+| `IVHistory` | r52f: per-ticker daily ATM IV snapshot — `(ticker, ts, atm_iv30, atm_iv60, term_iv_skew, underlying_close)` with `UNIQUE(ticker, ts)`. Captured nightly 04:30 UTC from yfinance options chain. Source for the deferred IV-percentile option-entry gate (252-day rolling rank); `iv_percentile()` helper returns 0-100 once ≥30 history points exist. |
 
 ---
 
@@ -660,10 +662,29 @@ Header also carries: live-stream indicator, theme toggle pill, log-out.
   entry / stop / targets grid, inline post-mortem + news expansion)
 - Lazy Put-Play Watch (doesn't block first paint)
 
-**TradingPanel**:
+**TradingPanel** (r52d/e/f layout):
 - Same hero-stats + capital-deployment gauge pattern
-- Position cards (symbol, side pill, large P/L, hover lift)
-- Themed order table with sticky header
+- **PnLReconciliationPanel** (r52e) — single-source-of-truth
+  accounting: starting equity / current / total drift / today's drift
+  up top; row breakdown of realized vs unrealized vs reconciliation
+  gap (amber when |gap| > $100); collapsibles for status breakdown
+  and top losers/winners.
+- **PositionsSections** (r52d) — split into "Stock Positions" and
+  "Option Positions", each with count + total unrealized P/L badge in
+  the section header. `PositionCard` per row uses underlying-price
+  for distance-to-stop / R-multiple on options (premium % shown
+  separately, labeled "premium"), with the analyzed ticker's
+  positions sorting first within each section.
+- **OrdersTable** (r52c) — Working / Filled / Cancelled filter chips.
+  `pending_cancel`, `held`, `done_for_day`, `accepted_for_bidding` all
+  classified as Working since they tie up qty as `held_for_orders`.
+- **AlertsPanel** (r52) — defaults to unacked-only with "Show acked"
+  toggle; ack-all button enabled only when unacked > 0.
+- **EquityCurvePanel** (r46/r52) — area chart over N days vs SPY;
+  empty-state message when no snapshots exist yet.
+- **DailyLossProgress + CommandBar** — render `—` and "Awaiting equity
+  baseline" when `health.session_dd_pct` is null instead of coalescing
+  to `0.00%`.
 
 **NewsPanel** (per-ticker in Charts view):
 - Headline feed with VADER sentiment pill (pos/neu/neg + score)
@@ -706,8 +727,23 @@ Header also carries: live-stream indicator, theme toggle pill, log-out.
 
 ### Trading
 - `GET /api/trading/account` — balance snapshot
-- `GET /api/trading/positions` — open Alpaca positions
-- `GET /api/trading/orders?status=all&limit=20` — recent orders
+- `GET /api/trading/positions` — open Alpaca positions, **enriched** (r52a)
+  with bot-managed exit fields from the matching open/adopted AutoTrade
+  row: `current_stop`, `target1/2/3`, `level_index`, `hit_t1`,
+  `opened_at`, `asset_type`, `managed_status`. For options also
+  includes `underlying_symbol`, `underlying_price`, `underlying_entry_price`
+  so the UI computes distance-to-stop / R-multiple in correct units.
+  Returns typed `List[PositionResponse]` (Pydantic, r52f).
+- `GET /api/trading/orders?status=all&limit=100` — recent orders
+- `GET /api/trading/equity-curve?lookback_days=30` — persisted equity
+  timeseries from `EquitySnapshot` table (r46), 5-min-bucketed during RTH.
+- `GET /api/trading/pnl-reconciliation` — single-source-of-truth P/L
+  accounting (r52e). Returns starting equity (Alpaca portfolio_history
+  base_value), current equity, total drift, today's drift, realized
+  total + status breakdown, unrealized total + stocks/options split,
+  and the **reconciliation gap** = total_drift − realized − unrealized
+  (the Alpaca-side P/L not captured in the bot's per-trade ledger).
+  Typed response via `PnLReconciliationResponse` (r52g).
 - `POST /api/trading/order` — manual bracket order
 - `POST /api/trading/close/{symbol}` — flatten position
 - `DELETE /api/trading/orders/{id}` — cancel order
@@ -745,6 +781,17 @@ Header also carries: live-stream indicator, theme toggle pill, log-out.
 - `POST /api/admin/age-out-trades` — backdate `closed_at` on listed `AutoTrade` rows by N days (≥31). One-off operational cleanup for removing specific historical trades from 30-day analytics windows when those trades are known to be from now-fixed bugs and not representative of forward behavior. Audit-trail preserving: trades not deleted, only `closed_at` shifts; `note` is appended.
 - `POST /api/admin/sync-positions` — reconcile Alpaca account against `auto_trades` table. Alpaca is source of truth. Two paths: (1) **adopt** Alpaca positions with no DB row → insert `status="adopted"` (suppresses alerts, counts capital, manage loop skips); (2) **close-external** open DB rows with no matching Alpaca position → mark `status="closed_external"`. Idempotent; pending rows untouched. Use after option assignments / manual dashboard trades / missed bracket fills.
 - `POST /api/admin/promote-adopted/{ticker}` — promote an adopted row to `status="open"` with bot-computed stop/T1/T2/T3 levels (1.5×ATR risk distance, 1.5R/2.5R/4R targets, anchored to current price), submit a real broker stop-loss order, and hand the position off to the manage loop's normal trailing/partial-exit logic. Side-effect: marks the row `closed_external` if Alpaca no longer reports the position.
+- `POST /api/admin/record-equity-snapshot` (r52) — manually fire one
+  `EquitySnapshot` row. Used to bootstrap the equity-curve UI after
+  fresh deploys / OOM outages without waiting for the 5-min cron's
+  next RTH boundary. Idempotent (timestamp bucketed to 5-min).
+- `POST /api/admin/backfill-realized-pl` (r52f, smarter in r52g) — pull
+  actual fill prices from Alpaca's order history and patch
+  `realized_pl` on `closed_reconciled` / `closed_external` rows where
+  the bot's field stayed at $0. r52g extension: if `entry_price` is
+  also null (pre-r41 schema), looks up the matching BUY fill too and
+  backfills both fields. Idempotent (only patches rows where
+  `realized_pl IS NULL OR realized_pl = 0`).
 
 ### Health & WS
 - `GET /api/health` — subsystem heartbeat (open, no auth)
@@ -1086,6 +1133,124 @@ so realized PnL is computed against the actual cost basis.
 ---
 
 ## 14. Changelog (current → past)
+
+### Revision 52a-g — operational hygiene batch (2026-04-28 evening)
+
+A run of small, high-value operational fixes triggered by a live OOM
+incident and the user's after-hours debugging session. Each landed as
+its own commit; r52 is the original OOM hotfix described below.
+
+**r52a (`stockrecs-00102`)** — backend-only hotfixes:
+- `force_close_trade` now calls `paper_trader.cancel_all_orders(symbol=t.ticker)`
+  before submitting close, instead of cancelling only `t.parent_order_id`.
+  Adopted positions have no parent, so any working stop/limit order at
+  the broker was holding the qty as `held_for_orders` and Alpaca
+  rejected manual close with `code=40310000 "insufficient qty available
+  for order (requested: N, available: 0)"`. Fix adds 500ms settle for
+  broker bookkeeping.
+- `/api/trading/positions` joins each Alpaca position to its open/adopted
+  AutoTrade row (by ticker for stocks, OCC symbol for options) and
+  merges `current_stop`, `target1/2/3`, `level_index`, `hit_t1`,
+  `opened_at`, `asset_type`, `managed_status`. Prior code returned only
+  Alpaca's native fields, which made the UI position cards render blank
+  Stop / Targets cells.
+
+**r52c (`stockrecs-00106`)** — orders panel surfaces PENDING_CANCEL:
+- Frontend `OrdersTable` filter chips classified orders into Working /
+  Filled / Cancelled, but `pending_cancel` was in NONE of them, making
+  in-flight cancel-pending orders invisible across all tabs. Extended
+  `isWorking` to include `pending_cancel`, `held`, `done_for_day`,
+  `accepted_for_bidding`. Bumped fetch limit 20 → 100 so older stuck
+  orders aren't trimmed before the filter runs.
+- Surfaced by 5 stuck take-profit limit orders (AAPL/TSLA/NVDA/MSFT/IREN)
+  that Alpaca paper refuses to resolve from PENDING_CANCEL via the API
+  (returns `42210000 "order pending cancel"` for every cancel attempt).
+  Server-side bug at Alpaca; orders typically resolve at next market
+  open.
+
+**r52d (`stockrecs-00108`)** — split position cards + fix mixed-units bug:
+- The single combined position-card render computed R-multiple,
+  distance-to-stop, and the RProgressBar against `current_price` while
+  the stop was an underlying price for options. Result: long-call
+  cards showed "Δ$128.61 (1237%)" garbage.
+- Backend: option positions now also surface `underlying_symbol`,
+  `underlying_price`, `underlying_entry_price` (looked up via
+  `data_fetcher.get_current_price`).
+- Frontend: extracted `PositionCard` + `PositionsSections` components.
+  Two collapsible sections — Stock Positions / Option Positions — each
+  with count + total unrealized P/L badge in the header. For options,
+  R / distance-to-stop / RProgressBar use `underlying_price`; the
+  premium % is shown separately, labeled "premium". Analyzed-ticker
+  positions sort first within each section.
+
+**r52e (`stockrecs-00110`)** — P/L reconciliation widget:
+- New `GET /api/trading/pnl-reconciliation` and `PnLReconciliationPanel`
+  on the Paper Trading panel. Single-source-of-truth accounting that
+  surfaces starting equity (from Alpaca `portfolio_history.base_value`),
+  current equity, total drift, today's drift, realized total + breakdown
+  by close status, unrealized total + stocks/options split, and the
+  **reconciliation gap** = `total_drift − realized − unrealized` (the
+  Alpaca-side P/L the bot didn't capture). Gap renders amber when
+  `|gap| > $100`. Top 5 losers + winners collapsible inside.
+- Operator question that surfaced this: "I started at $100k and now at
+  $80k — where did the $20k go?" Required cross-referencing Paper
+  Trading panel + closed-trades ledger + Alpaca portfolio history; now
+  one widget answers it.
+
+**r52f (`stockrecs-00112`)** — five-item batch:
+1. **`POST /api/admin/backfill-realized-pl`** — pulls actual SELL fill
+   prices from Alpaca's order history, patches `realized_pl` on
+   `closed_reconciled` / `closed_external` rows where the bot's field
+   stayed at $0 (positions closed via paths the manage-loop didn't
+   observe). Idempotent. First run captured −$294 across 6 of 9 rows.
+2. **Lifespan teardown reorder** — `live_quotes.stop()` runs FIRST,
+   ahead of `scheduler.shutdown(wait=True)`. Previously the
+   scheduler-drain could eat into Cloud Run's 10s SIGTERM grace
+   window before the Alpaca WS released, which is what cascaded into
+   "connection limit exceeded" at the new instance during the r52 OOM
+   loop.
+3. **Memory observability** on `/api/health.memory` — RSS in MB plus
+   entry counts for `data_fetcher._cache`, `_corr_cache`, `_target_touch_counts`,
+   `_stock_quotes`, `_subscribed_symbols`, `_option_subscribed`,
+   `alerts._dedup`, `options_fetcher._chain_cache`. Also bounded
+   `_corr_cache` (auto_trader) to 256 entries (was unbounded; LRU-by-ts
+   eviction).
+4. **`IVHistory` table + nightly capture cron** at 04:30 UTC — new
+   `services/iv_history.py` writes per-ticker ATM IV30/IV60 daily from
+   yfinance options chain. Schema:
+   `(ticker, ts, atm_iv30, atm_iv60, term_iv_skew, underlying_close)`
+   with `UNIQUE(ticker, ts)`. `iv_percentile()` read helper returns
+   0-100 rank when ≥30 history points exist. Starts the 252-day clock
+   so the deferred IV-percentile option-entry gate becomes usable
+   independent of when we revisit it.
+5. **Typed `PositionResponse` model** — `/api/trading/positions` now
+   declares `response_model=List[PositionResponse]`. Codifies the
+   schema between backend join logic and the frontend `PositionCard`.
+
+**r52g (`stockrecs-00114`)** — backlog batch follow-up:
+- **Smarter backfill** — when `realized_pl` row has null `entry_price`
+  (pre-r41 schema), the endpoint now also looks up the matching BUY
+  fill from Alpaca and uses `filled_avg_price` as entry. Backfilled the
+  last 3 previously-skipped rows (AAPL/SHOP/CRWV); reconciliation gap
+  dropped from −$1,807 → −$974.
+- **`_rv_cache` (options_analyzer) bounded** to 512 entries (FIFO eviction).
+- **Memory observability extended** with `_rv_cache_entries`,
+  `chandelier_atr_entries`, `chandelier_adx_entries`, `price_fallback_entries`.
+- **Typed `PnLReconciliationResponse`** — second incremental Pydantic
+  migration step.
+
+**Locked settings introduced this batch (LIVE_CHECKLIST.md)**:
+- `--memory 2Gi` on api Cloud Run (was 1Gi; 1Gi is now known to be
+  too tight given live_quotes WS subscribers + scanner DataFrames +
+  APScheduler peaked at ~1.1 GiB).
+
+**New endpoints**:
+- `GET  /api/trading/pnl-reconciliation` — single-source P/L accounting
+- `POST /api/admin/record-equity-snapshot` — manually fire one snapshot
+- `POST /api/admin/backfill-realized-pl` — patch realized_pl on stuck rows
+
+**New schema**:
+- `IVHistory` — daily ATM IV30/IV60 per ticker (252-day rolling)
 
 ### Revision 52 — Cloud Run OOM-loop hotfix + UI null/filter polish
 

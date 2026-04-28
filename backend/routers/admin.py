@@ -213,14 +213,44 @@ def backfill_realized_pl():
         all_orders = _pt_b.get_orders(status="closed", limit=500) or []
         for t in rows:
             try:
-                if not t.entry_price:
-                    skipped.append({"id": t.id, "ticker": t.ticker, "reason": "no entry_price"})
-                    continue
-                # Match Alpaca's symbol — for stocks t.ticker, for options t.symbol (OCC)
+                # r52g: if entry_price is null (pre-r41 schema rows), look
+                # up the matching BUY fill from Alpaca too. Reads the same
+                # order list with side="buy" filter; matches by qty and by
+                # submitted_at being closest to opened_at.
+                entry_px = t.entry_price
                 want_sym = (t.symbol or t.ticker or "").upper()
                 multiplier = 100.0 if (t.asset_type or "stock").lower() == "option" else 1.0
+                if not entry_px:
+                    buy_cands = []
+                    for o in all_orders:
+                        if (o.get("symbol") or "").upper() != want_sym:
+                            continue
+                        side = (o.get("side") or "").lower().split(".")[-1]
+                        if "buy" not in side:
+                            continue
+                        if not o.get("filled_avg_price"):
+                            continue
+                        oqty = float(o.get("filled_qty") or o.get("qty") or 0)
+                        if oqty <= 0 or abs(oqty - float(t.qty or 0)) > max(1.0, float(t.qty or 0) * 0.1):
+                            continue
+                        buy_cands.append(o)
+                    if not buy_cands:
+                        skipped.append({"id": t.id, "ticker": t.ticker, "reason": "no entry_price + no matching buy fill"})
+                        continue
+                    # Prefer the BUY fill closest to opened_at
+                    if t.opened_at:
+                        target = t.opened_at.isoformat()
+                        buy_cands.sort(key=lambda x: abs(((x.get("filled_at") or "") > target) - 0.5))
+                    else:
+                        buy_cands.sort(key=lambda x: x.get("filled_at") or "", reverse=True)
+                    entry_px = float(buy_cands[0].get("filled_avg_price") or 0)
+                    if entry_px <= 0:
+                        skipped.append({"id": t.id, "ticker": t.ticker, "reason": "buy fill price 0"})
+                        continue
+                    # Backfill the entry_price too while we're here
+                    t.entry_price = round(entry_px, 4)
+
                 # Find a SELL fill matching qty before close+1d
-                close_ceiling = t.closed_at
                 cands = []
                 for o in all_orders:
                     if (o.get("symbol") or "").upper() != want_sym:
@@ -245,12 +275,12 @@ def backfill_realized_pl():
                 if exit_px <= 0:
                     skipped.append({"id": t.id, "ticker": t.ticker, "reason": "fill price 0"})
                     continue
-                pl = (exit_px - float(t.entry_price)) * float(t.qty or 0) * multiplier
+                pl = (exit_px - float(entry_px)) * float(t.qty or 0) * multiplier
                 t.realized_pl = round(pl, 2)
-                t.note = (t.note or "") + f" | BACKFILL_REALIZED_PL: exit ${exit_px:.2f} (fill {str(fill.get('id'))[:8]})"
+                t.note = (t.note or "") + f" | BACKFILL_REALIZED_PL: entry ${entry_px:.2f} exit ${exit_px:.2f} (fill {str(fill.get('id'))[:8]})"
                 patched.append({
                     "id": t.id, "ticker": t.ticker, "asset_type": t.asset_type,
-                    "entry_price": float(t.entry_price), "exit_price": exit_px,
+                    "entry_price": float(entry_px), "exit_price": exit_px,
                     "realized_pl": t.realized_pl, "fill_id": str(fill.get("id"))[:8],
                 })
             except Exception as e:

@@ -1183,6 +1183,21 @@ def _memory_stats() -> dict:
         out["options_chain_cache_entries"] = len(_opt_cache)
     except Exception:
         pass
+    try:
+        from services.options_analyzer import _rv_cache as _rv
+        out["rv_cache_entries"] = len(_rv)
+    except Exception:
+        pass
+    try:
+        from services.position_manager import (
+            _chandelier_atr_cache as _ca, _chandelier_adx_cache as _cadx,
+            _price_fallback_cache as _pfc,
+        )
+        out["chandelier_atr_entries"] = len(_ca)
+        out["chandelier_adx_entries"] = len(_cadx)
+        out["price_fallback_entries"] = len(_pfc)
+    except Exception:
+        pass
     return out
 
 

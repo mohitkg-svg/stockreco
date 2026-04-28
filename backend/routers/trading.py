@@ -12,7 +12,7 @@ POST   /api/trading/close-all            -> close every position + cancel orders
 from __future__ import annotations
 from typing import Optional, List
 
-from models import PositionResponse
+from models import PositionResponse, PnLReconciliationResponse
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from services import paper_trader, auto_trader
@@ -136,7 +136,7 @@ def account():
     return a
 
 
-@router.get("/pnl-reconciliation")
+@router.get("/pnl-reconciliation", response_model=PnLReconciliationResponse)
 def pnl_reconciliation():
     """One-stop P/L accounting: shows where every dollar of equity drift
     came from. Alpaca account equity is the truth; the bot's per-trade

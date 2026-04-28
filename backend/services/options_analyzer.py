@@ -20,7 +20,11 @@ _IV_RV_RATIO_MAX = 1.75        # skip contracts when IV > 1.75× 20d realized vo
 _IV_RV_WINDOW = 20             # trading days of daily returns for the RV calc
 
 # 20d realized-vol cache: ticker -> (rv_annualized, expiry_ts).
+# r52g: bounded to 512 entries via FIFO eviction. Universe scanner pulls
+# 500+ tickers; without a cap, this dict grew with every ticker ever
+# analyzed across the bot's lifetime.
 _rv_cache: Dict[str, tuple] = {}
+_RV_CACHE_MAX = 512
 _RV_TTL_SEC = 6 * 3600   # recompute twice/day — daily bars don't change intraday
 
 
@@ -45,6 +49,12 @@ def _realized_vol_20d(ticker: str) -> Optional[float]:
             return None
         std_daily = float(r.std())
         rv_ann = std_daily * math.sqrt(252)
+        # r52g: FIFO eviction at cap (insertion order preserved for dicts ≥3.7)
+        if len(_rv_cache) >= _RV_CACHE_MAX and ticker not in _rv_cache:
+            try:
+                _rv_cache.pop(next(iter(_rv_cache)))
+            except StopIteration:
+                pass
         _rv_cache[ticker] = (rv_ann, now + _RV_TTL_SEC)
         return rv_ann
     except Exception as e:
