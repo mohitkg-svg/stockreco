@@ -4943,6 +4943,49 @@ function TradingPanel({ ticker, reloadToken }) {
     });
   };
 
+  // r53g: Close-All button — flatten every open position via the
+  // existing /api/trading/close-all backend (which routes bot-managed
+  // rows through force_close_trade for correct lifecycle handling).
+  // Uses the same staged-undo pattern as single Close so a misclick
+  // can be aborted within the 4s window.
+  const closeAll = () => {
+    if (busy['close:ALL']) return;
+    if (!positions || positions.length === 0) {
+      toast({ msg: 'No open positions to close', kind: 'info', duration: 2500 });
+      return;
+    }
+    const totalNotional = positions.reduce(
+      (a, p) => a + Math.abs((p.qty || 0) * (p.current_price || p.avg_entry_price || 0)),
+      0,
+    );
+    const label = `Closing ALL ${positions.length} positions ≈ $${totalNotional.toFixed(0)} — undo within 4s`;
+    stageAction({
+      label, delayMs: 4000, kind: 'warn',
+      onConfirm: async () => {
+        setBusyKey('close:ALL', true); setActionError(null); setActionInfo(null);
+        try {
+          const res = await api.post('/api/trading/close-all');
+          const closed = res?.closed_managed ?? 0;
+          const errs = (res?.summary?.errors || []).length + (res?.summary?.broker_errors || []).length;
+          if (errs > 0) {
+            toast({
+              msg: `Close-all: ${closed} ok, ${errs} error(s) — see alerts`,
+              kind: 'warn', duration: 6000,
+            });
+          } else {
+            toast({ msg: `Close-all: flattened ${closed} positions`, kind: 'success', duration: 4000 });
+          }
+          pushNotification({ severity: 'info', category: 'manual_close_all', message: `Manually flattened ${closed} positions` });
+          await load();
+          setTimeout(() => { try { load(); } catch (_) {} }, 1500);
+        } catch (e) {
+          setActionError(`Close-all failed: ${friendlyError(e)}`);
+          toast({ msg: `Close-all failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
+        } finally { setBusyKey('close:ALL', false); }
+      },
+    });
+  };
+
   if (!account && !error) {
     return null; // Trading not configured — hide silently
   }
@@ -4980,9 +5023,21 @@ function TradingPanel({ ticker, reloadToken }) {
             </span>
           )}
         </div>
-        <button onClick={load} className="text-xs app-text-secondary hover:app-text-primary flex items-center gap-1 px-2 py-1 rounded-md hover:bg-white/5">
-          <span>↻</span><span>Refresh</span>
-        </button>
+        <div className="flex items-center gap-2">
+          {/* r53g: flatten everything in one click — staged-undo 4s window */}
+          {positions.length > 0 && (
+            <button
+              disabled={!!busy['close:ALL']}
+              onClick={closeAll}
+              title={`Flatten all ${positions.length} open positions`}
+              className="text-xs px-2.5 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 font-semibold disabled:opacity-50">
+              {busy['close:ALL'] ? 'Closing all…' : `Close All (${positions.length})`}
+            </button>
+          )}
+          <button onClick={load} className="text-xs app-text-secondary hover:app-text-primary flex items-center gap-1 px-2 py-1 rounded-md hover:bg-white/5">
+            <span>↻</span><span>Refresh</span>
+          </button>
+        </div>
       </div>
 
       {/* Hero stats row */}

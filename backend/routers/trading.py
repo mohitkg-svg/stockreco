@@ -609,6 +609,9 @@ def cancel_all_orders(symbol: Optional[str] = None):
     return res
 
 
+_OCC_RE = __import__("re").compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
 @router.post("/close/{symbol}")
 def close_position(symbol: str):
     """Close a position; if the bot has an open AutoTrade row for this
@@ -616,17 +619,36 @@ def close_position(symbol: str):
     + touch-count are properly reconciled. r47 fix #T0b-1: prior code only
     called paper_trader.close_position(), leaving the AutoTrade row stuck
     in `open` state — manage tick then detected the missing SL and entered
-    a resubmit storm."""
-    if not _TICKER_RE.match(symbol):
-        raise HTTPException(status_code=400, detail="Invalid ticker")
+    a resubmit storm.
+
+    r53g fix: accepts OCC option symbols (e.g.
+    "BKR260515C00070000") in addition to regular tickers. Prior code
+    rejected option closes with "Invalid ticker" because the ticker
+    regex caps at 10 chars / no digits, while OCC symbols are 18-21
+    chars. For OCC inputs, the AutoTrade query matches on `symbol`
+    (the OCC) instead of `ticker` (the underlying root) so we close
+    only the specific contract — not every option on the same root.
+    """
+    sym_u = (symbol or "").upper()
+    is_occ = bool(_OCC_RE.match(sym_u))
+    if not is_occ and not _TICKER_RE.match(symbol):
+        raise HTTPException(status_code=400, detail="Invalid ticker or OCC option symbol")
     from database import SessionLocal, AutoTrade
     from services.execution_engine import force_close_trade
     db = SessionLocal()
     try:
-        rows = db.query(AutoTrade).filter(
-            AutoTrade.ticker == symbol.upper(),
-            AutoTrade.status.in_(["pending", "open", "adopted"]),
-        ).all()
+        if is_occ:
+            # Option close: match by exact OCC `symbol`, not by underlying.
+            q = db.query(AutoTrade).filter(
+                AutoTrade.symbol == sym_u,
+                AutoTrade.status.in_(["pending", "open", "adopted"]),
+            )
+        else:
+            q = db.query(AutoTrade).filter(
+                AutoTrade.ticker == sym_u,
+                AutoTrade.status.in_(["pending", "open", "adopted"]),
+            )
+        rows = q.all()
         if rows:
             summary: dict = {}
             for t in rows:
@@ -637,7 +659,7 @@ def close_position(symbol: str):
                     raise HTTPException(status_code=502, detail=f"force_close failed: {e}")
             return {"status": "closed", "count": len(rows), "summary": summary}
         # No bot-managed row: fall back to broker-only close.
-        res = paper_trader.close_position(symbol)
+        res = paper_trader.close_position(sym_u)
         if "error" in res:
             raise HTTPException(status_code=400, detail=res["error"])
         return res
