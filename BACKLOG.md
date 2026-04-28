@@ -292,16 +292,27 @@ research, numerical edge cases, observability gaps).
 
 174 tests pass (was 163; 11 new r47 regression tests).
 
-### r47 ⏸️ Deferred to r48+ — items found this pass but NOT shipped
+### r47 ⏸️ Deferred to r48+ — ✅ RESOLVED in r48
 
-The 14-agent audit surfaced ~250 findings. r47 implemented the highest-
-leverage P0 cutover blockers + Tier P new strategies that had a clean
-single-revision implementation. The items below are real findings that
-were deliberately deferred — most are multi-day/multi-week, need data
-ingestion, or need infrastructure (multi-leg options, point-in-time
-data) that doesn't exist yet.
+**The entire ~150-item r47-deferred register was implemented in r48**
+(see r48 section above for the categorized highlights and DESIGN.md §14
+for the full per-item changelog). The original deferred tables have
+been removed; consult git history or DESIGN.md for the per-finding
+detail. The remaining open items from later passes live in the
+**Master deferral register** below and the **Tier C/D/E** backlogs
+under the per-pass review sections.
 
-**⏸️ Concurrency P1/P2 (need atomic-SQL-UPDATE refactor for hot fields)**:
+<details>
+<summary>Original r47 deferred categories (for reference only)</summary>
+
+Concurrency P1/P2 atomic-SQL refactor; DB integrity P0/P1; position
+lifecycle P1/P2; memory/perf P1; backtest validity / edge quantification;
+options pricing P0/P1; new strategy proposals (A2/A3/A4/A5/A7, B8-B13,
+C14-C16, microstructure suite); observability P1/P2; numerical fixes.
+All ~150 items shipped in r48 and pinned by 17 new regression tests
+(suite: 174 → 191 passing).
+
+**Concurrency P1/P2 (atomic-SQL-UPDATE refactor for hot fields)**:
 | Finding | File | Defer reason |
 |---|---|---|
 | `_target_touch_counts` read-modify-write race vs DB column | auto_trader.py:100-131 | Convert to `UPDATE auto_trades SET target_touch_count = target_touch_count + 1` atomic SQL — refactor across all touch sites |
@@ -499,16 +510,9 @@ data) that doesn't exist yet.
 - `dd_score` weight too low in `score_strategy` (50% DD scores 67/100)
 - `book_var_99 = heat × 1.5` doesn't correspond to any real distribution (should be 2.33×)
 
-These categories together represent ~150-180 deferred items. Most are
-1-2 day implementations once their prerequisites are in place. Priority
-for r48: **(a)** complete the options entry path (marketable-limit
-entries + Greeks persistence + portfolio vega cap), **(b)** complete
-observability (slippage metric ladder, AI cost tracker, ML drift,
-heartbeat, generic submit-rejected), **(c)** atomic-SQL refactor for
-hot fields (`realized_pl`, `target_touch_count`, BP), **(d)** Kelly
-proper R-data plumb-through (currently still placebo). Multi-week
-items (point-in-time data, multi-leg options, calibrated_weights
-implementation, CPCV, DSR) gated on operational triggers.
+These categories together represent ~150-180 deferred items.
+
+</details>
 
 ## r46 13-agent maximum-spread audit (2026-04-27)
 
@@ -656,7 +660,7 @@ this register and shipped fixes:
 
 134 tests pass.
 
-## Master deferral register (canonical short-form, current as of r42)
+## Master deferral register (canonical short-form, current as of r52e — 2026-04-28)
 
 ### ⏸️ Deferred — multi-week, gated on data accumulation
 
@@ -756,25 +760,15 @@ All three free high-impact sources shipped together:
   BUY: ≥25% of float shorted → 0.92 (fundamental skepticism); 15-25% → 1.02
   (squeeze tilt). SELL: mirror — already-crowded shorts = 0.92 (late-to-party).
 
-## Tier 2 — Free, moderate-impact
+## Tier 2 — Free, moderate-impact — ✅ DONE
 
-### r/wallstreetbets ticker mention scraper
-- **Source**: Reddit JSON API (no auth) on `r/wallstreetbets/new.json`
-- **Frequency**: 5-min poll
-- **Cost**: $0
-- **Expected lift**: +1–3% on retail-driven tickers, near-zero on the rest
-- **Features to add**:
-  - `wsb_mentions_24h` — count of post titles + comment top-level mentions
-  - `wsb_mentions_7d_zscore` — z-score vs 30-day baseline (catches squeeze setups)
-- **Risks**: easy to overfit; signal is bimodal (great for meme stocks, noise on liquid mega-caps)
+### ✅ r/wallstreetbets ticker mention scraper
+Implemented in `services/wsb_scraper.py`, scheduled every 30 min via
+APScheduler in `main.py:643`. Surfaces `wsb_mentions_*` features.
 
-### Form 13F — Quarterly institutional holdings
-- **Source**: SEC EDGAR
-- **Frequency**: quarterly (45 days post quarter-end)
-- **Cost**: $0
-- **Expected lift**: +1% headline; useful as a slow-moving regime feature
-- **Features**: `inst_ownership_pct_change_qoq`, `top_10_holder_count_change`
-- **Risks**: too slow-moving to be a primary signal
+### ✅ Form 13F — Quarterly institutional holdings
+Implemented in `services/institutional.py` (yfinance-driven 13F proxy),
+scheduled weekly Sunday 05:15 UTC in `main.py:692`.
 
 ## Tier 3 — Paid, higher-impact
 
