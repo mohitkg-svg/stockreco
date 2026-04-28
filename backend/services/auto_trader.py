@@ -4829,7 +4829,9 @@ def manage_open_positions() -> Dict[str, Any]:
                                     f"AutoTrader {t.ticker} unfilled limit > 5m old; cancelling and freeing slot"
                                 )
                                 try:
-                                    paper_trader.cancel_order(t.parent_order_id)
+                                    # Manage-tick cancels — fire-and-forget,
+                                    # don't add 4s latency per call.
+                                    paper_trader.cancel_order(t.parent_order_id, wait_for_terminal=False)
                                 except Exception:
                                     pass
                                 t.status = "closed_unfilled"
@@ -4846,7 +4848,9 @@ def manage_open_positions() -> Dict[str, Any]:
                                     f"AutoTrader {t.ticker} limit unfilled after {age_s:.0f}s; crossing to market"
                                 )
                                 try:
-                                    paper_trader.cancel_order(t.parent_order_id)
+                                    # Manage-tick cancels — fire-and-forget,
+                                    # don't add 4s latency per call.
+                                    paper_trader.cancel_order(t.parent_order_id, wait_for_terminal=False)
                                 except Exception:
                                     pass
                                 cross = paper_trader.submit_bracket_order(
@@ -4873,7 +4877,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                 f"cancelling remainder + resizing bracket legs"
                             )
                             try:
-                                paper_trader.cancel_order(t.parent_order_id)
+                                paper_trader.cancel_order(t.parent_order_id, wait_for_terminal=False)
                             except Exception as e:
                                 logger.warning(f"partial-fill cancel remainder failed for {t.ticker}: {e}")
                             t.qty = int(filled_qty)

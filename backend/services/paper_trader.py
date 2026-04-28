@@ -364,15 +364,63 @@ def submit_bracket_order(
         return {"error": str(e)}
 
 
-def cancel_order(order_id: str) -> Dict[str, Any]:
+def cancel_order(order_id: str, wait_for_terminal: bool = True, timeout_sec: float = 4.0) -> Dict[str, Any]:
+    """Cancel a single order. r53b: optionally polls for terminal state
+    (canceled/filled/rejected/expired) before returning, so the caller
+    sees the canonical post-cancel state — eliminates the UI flash where
+    the cancel toast says "success" but the next /orders fetch (within
+    1-2s) still shows the order as `new` because Alpaca hadn't finished
+    processing the cancel yet.
+
+    Returns:
+        On success: {"id", "status": <terminal-status-or-pending_cancel>}
+        On terminal-already error: {"id", "status": "already_terminal", "note": ...}
+        On other failure: {"error": <message>}
+    """
     c = _get_client()
     if not c:
         return {"error": "Alpaca client not initialized"}
     try:
         c.cancel_order_by_id(order_id)
-        return {"id": order_id, "status": "cancelled"}
     except Exception as e:
-        return {"error": str(e)}
+        msg = str(e)
+        msg_l = msg.lower()
+        # Already-terminal / already-pending-cancel are no-ops, not errors.
+        if (
+            "422" in msg
+            or "404" in msg
+            or "already" in msg_l
+            or "not found" in msg_l
+            or "does not exist" in msg_l
+            or "order pending cancel" in msg_l
+        ):
+            return {"id": order_id, "status": "already_terminal", "note": msg[:200]}
+        return {"error": msg}
+
+    if not wait_for_terminal:
+        return {"id": order_id, "status": "cancel_requested"}
+
+    # Poll for terminal status. Most cancels resolve in <1s; we wait up
+    # to `timeout_sec` total with short pauses to avoid burning API calls.
+    import time as _t_cw
+    deadline = _t_cw.time() + timeout_sec
+    final_status = "pending_cancel"
+    sleep_s = 0.25
+    while _t_cw.time() < deadline:
+        _t_cw.sleep(sleep_s)
+        sleep_s = min(sleep_s * 1.5, 1.0)  # 0.25 → 0.375 → ...
+        try:
+            o = c.get_order_by_id(order_id)
+            s = str(getattr(o, "status", "")).lower().split(".")[-1]
+            final_status = s
+            if s in ("canceled", "cancelled", "filled", "rejected", "expired", "done_for_day"):
+                return {"id": order_id, "status": s}
+        except Exception:
+            # 404 = the order is gone (Alpaca purges some terminal states fast)
+            return {"id": order_id, "status": "canceled"}
+    # Timed out — order is still in pending_cancel. Caller can decide
+    # what to surface (we report the state we last saw).
+    return {"id": order_id, "status": final_status, "note": f"timeout {timeout_sec}s waiting for terminal state"}
 
 
 def cancel_all_orders(symbol: Optional[str] = None) -> Dict[str, Any]:
@@ -672,7 +720,9 @@ def submit_option_entry_with_cross_fallback(
         except Exception:
             break
     try:
-        cancel_order(order_id)
+        # Internal cancel before market cross — don't add 4s latency to
+        # the entry path; just fire-and-forget.
+        cancel_order(order_id, wait_for_terminal=False)
     except Exception:
         pass
     # r53: pre-cross slippage gate. If the current ask is more than
@@ -754,7 +804,9 @@ def submit_option_exit_with_cross_fallback(
             break
     # Not filled — cancel + market cross.
     try:
-        cancel_order(order_id)
+        # Internal cancel before market cross — don't add 4s latency to
+        # the entry path; just fire-and-forget.
+        cancel_order(order_id, wait_for_terminal=False)
     except Exception:
         pass
     return submit_simple_option_order(

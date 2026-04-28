@@ -4850,9 +4850,35 @@ function TradingPanel({ ticker, reloadToken }) {
       onConfirm: async () => {
         setBusyKey(`cxl:${id}`, true); setActionError(null); setActionInfo(null);
         try {
-          await api.delete(`/api/trading/orders/${id}`);
-          toast({ msg: 'Order cancelled', kind: 'success', duration: 3000 });
+          // r53b: backend now polls Alpaca for terminal status before returning.
+          // Use the actual final status to message the operator clearly — the
+          // prior code unconditionally toasted "cancelled" even when Alpaca
+          // still had the order in `pending_cancel`, leaving the operator
+          // confused when the order didn't disappear from the Working tab.
+          const res = await api.delete(`/api/trading/orders/${id}`);
+          const status = String(res?.status || 'cancelled').toLowerCase();
+          if (status === 'canceled' || status === 'cancelled') {
+            toast({ msg: 'Order cancelled', kind: 'success', duration: 3000 });
+          } else if (status === 'filled') {
+            toast({ msg: `Order filled before cancel could process`, kind: 'warn', duration: 5000 });
+          } else if (status === 'pending_cancel') {
+            toast({
+              msg: 'Cancel sent — Alpaca still processing (refresh in a moment)',
+              kind: 'warn', duration: 5000,
+            });
+          } else if (status === 'already_terminal') {
+            toast({ msg: 'Order was already cancelled or filled', kind: 'success', duration: 3000 });
+          } else {
+            toast({ msg: `Cancel: status=${status}`, kind: 'info', duration: 4000 });
+          }
+          // Optimistic UI: drop the order from the displayed list immediately
+          // so the user sees instant feedback even if Alpaca's GET /orders
+          // is still serving the pre-cancel snapshot.
+          setOrders((prev) => (prev || []).filter((o) => o.id !== id));
+          // Then reconcile via load() and again 1.5s later to catch Alpaca's
+          // settlement window for stubborn orders.
           await load();
+          setTimeout(() => { try { load(); } catch (_) {} }, 1500);
         } catch (e) {
           setActionError(`Cancel failed: ${friendlyError(e)}`);
           toast({ msg: `Cancel failed: ${friendlyError(e)}`, kind: 'error', duration: 6000 });
@@ -5035,7 +5061,45 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
     const status = normStatus(o.status);
     const cancellable = isWorking(status);
     const submitted = parseServerDate(o.submitted_at);
-    const submittedLabel = submitted ? submitted.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+    // r53b: include date alongside time. Same-day orders get "HH:MM:SS";
+    // older orders show "MMM D HH:MM" so the operator can tell at a
+    // glance which 6-day-old order they're looking at.
+    const submittedLabel = (() => {
+      if (!submitted) return '—';
+      const now = new Date();
+      const sameDay = (
+        submitted.getFullYear() === now.getFullYear()
+        && submitted.getMonth() === now.getMonth()
+        && submitted.getDate() === now.getDate()
+      );
+      if (sameDay) {
+        return submitted.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      }
+      const dt = submitted.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      const tm = submitted.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return `${dt} ${tm}`;
+    })();
+    // r53b: surface the order's working price (limit, stop, or filled-avg).
+    // Working stops show "stop $X.XX"; working limits show "limit $X.XX";
+    // stop-limit shows both. Filled orders show their fill price.
+    const typeUpper = String(o.type || '').replace(/^OrderType\./, '').toUpperCase();
+    const fmtPx = (n) => (n != null && Number.isFinite(Number(n)))
+      ? `$${Number(n).toFixed(2)}` : null;
+    const limitTxt = fmtPx(o.limit_price);
+    const stopTxt = fmtPx(o.stop_price);
+    const filledTxt = fmtPx(o.filled_avg_price);
+    let priceCell = '—';
+    if (typeUpper.includes('STOP_LIMIT') && stopTxt && limitTxt) {
+      priceCell = `stop ${stopTxt} → lim ${limitTxt}`;
+    } else if (typeUpper.includes('LIMIT') && limitTxt) {
+      priceCell = `limit ${limitTxt}`;
+    } else if (typeUpper.includes('STOP') && stopTxt) {
+      priceCell = `stop ${stopTxt}`;
+    } else if (filledTxt) {
+      priceCell = `@ ${filledTxt}`;
+    } else if (typeUpper === 'MARKET') {
+      priceCell = 'market';
+    }
     return (
       <tr key={o.id} className={`border-b app-border-soft last:border-0 hover:bg-white/3 ${isChild ? 'app-text-muted' : ''}`}>
         <td className="py-2 px-3 font-semibold font-mono">{isChild && <span className="opacity-50">↳ </span>}{o.symbol}</td>
@@ -5043,7 +5107,8 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
           <DirIcon dir={side} className="text-xs mr-0.5" />{side || '—'}
         </td>
         <td className="text-right py-2 px-3 font-mono">{o.qty}</td>
-        <td className="text-right py-2 px-3 app-text-muted">{String(o.type || '').replace(/^OrderType\./, '').toUpperCase()}</td>
+        <td className="text-right py-2 px-3 app-text-muted">{typeUpper}</td>
+        <td className="text-right py-2 px-3 font-mono app-text-primary">{priceCell}</td>
         <td className="text-right py-2 px-3 app-text-secondary">{status.replace(/_/g, ' ')}</td>
         <td className="text-right py-2 px-3 app-text-muted font-mono" title={submitted ? submitted.toLocaleString() : ''}>{submittedLabel}</td>
         <td className="text-right py-2 px-3">
@@ -5114,6 +5179,7 @@ function OrdersTable({ orders, actionError, actionInfo, busy, onCancel }) {
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Side</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Qty</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Type</th>
+                <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Price</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Status</th>
                 <th className="text-right py-2 px-3 font-semibold uppercase tracking-wider text-[10px]">Submitted</th>
                 <th className="py-2 px-3"></th>
