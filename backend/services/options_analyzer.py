@@ -517,8 +517,39 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             # rr_managed and lets sub-threshold contracts slip into the list.
             true_managed_risk = max(premium - effective_stop_premium, 0.0)
             managed_risk = max(true_managed_risk, 0.05)
+
+            # r53 Tier-3 D: theta-decay-adjusted R:R floor for option entries.
+            # The realized R:R on a winning option exit is the gross premium
+            # gain MINUS theta decay accumulated during the hold. A 1.3 R:R
+            # underlying setup can have <1.0 R:R after theta. Subtract the
+            # estimated theta-decay-to-T1 from the reward before checking
+            # the gate. Eliminates the "slow grind to stop" pattern from
+            # post-mortems on 17-22 DTE long options.
+            try:
+                # Use real theta when we have it; else estimate from premium/dte.
+                theta_per_day = abs(float(real_theta)) if real_theta is not None else (premium * 0.025)
+                # Estimated trading days to T1: scale by ATR-distance / daily-ATR.
+                # Without ATR data we approximate as DTE / 4 (assume T1 hits in
+                # the first quarter of the contract's life).
+                est_days_to_t1 = max(1.0, min(float(dte) / 4.0, 14.0))
+                theta_haircut_t1 = theta_per_day * est_days_to_t1
+                theta_haircut_t2 = theta_per_day * min(est_days_to_t1 * 1.7, float(dte) - 1)
+                theta_haircut_t3 = theta_per_day * min(est_days_to_t1 * 2.5, float(dte) - 1)
+                reward_t1_theta = max(0.0, reward_t1 - theta_haircut_t1)
+                reward_t2_theta = max(0.0, reward_t2 - theta_haircut_t2)
+                reward_t3_theta = max(0.0, reward_t3 - theta_haircut_t3)
+                best_theta_reward = max(reward_t1_theta, reward_t2_theta, reward_t3_theta)
+            except Exception:
+                best_theta_reward = max(reward_t1, reward_t2, reward_t3)
+                theta_haircut_t1 = 0.0
+
+            # Gate against the LARGER of (raw best, theta-adjusted best) —
+            # the raw check is the prior r43-fix-#1.9 behavior; the theta
+            # check is the new floor. Both must clear.
             best_reward = max(reward_t1, reward_t2, reward_t3)
             if best_reward < managed_risk * MIN_RR:
+                continue
+            if best_theta_reward < managed_risk * MIN_RR:
                 continue
             rr_t1_managed = round(reward_t1 / managed_risk, 2) if reward_t1 > 0 else round(rr_t1, 2)
             rr_t2_managed = round(reward_t2 / managed_risk, 2) if reward_t2 > 0 else round(rr_t2, 2)

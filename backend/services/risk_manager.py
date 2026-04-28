@@ -1174,6 +1174,58 @@ def current_portfolio_heat() -> float:
         return 0.0
 
 
+def portfolio_kelly_book_throttle(days: int = 60) -> float:
+    """r53 Tier-3 E: portfolio-Kelly book throttle.
+
+    Per-trade Kelly is applied per signal; this is its book-level
+    counterpart. When 60-day rolling expectancy is negative or
+    rolling-Sharpe < 0.5, throttle the WHOLE book to 25-40% of nominal
+    regardless of per-signal strength. With a 19% drawdown still in
+    progress, the bot was sizing each NEW trade at full 2% even while
+    the book's recent realized record argued for sub-1%.
+
+    Returns 1.0 (no throttle) when:
+      - Fewer than 10 closed trades in the lookback (insufficient sample).
+      - Rolling-30d expectancy AND rolling-Sharpe both positive/healthy.
+
+    Returns 0.4 when both expectancy < 0 AND Sharpe < 0.5.
+    Returns 0.7 when one condition triggers but not both.
+    """
+    try:
+        from database import SessionLocal as _SL_pk, AutoTrade as _AT_pk
+        import math
+        from datetime import datetime as _dt_pk, timedelta as _td_pk
+        cutoff = _dt_pk.utcnow() - _td_pk(days=days)
+        db = _SL_pk()
+        try:
+            rows = (db.query(_AT_pk)
+                    .filter(_AT_pk.closed_at.isnot(None))
+                    .filter(_AT_pk.closed_at >= cutoff)
+                    .filter(_AT_pk.realized_pl.isnot(None))
+                    .all())
+        finally:
+            db.close()
+        if len(rows) < 10:
+            return 1.0  # insufficient data — fail-open
+        pls = [float(r.realized_pl or 0) for r in rows]
+        n = len(pls)
+        mean_pl = sum(pls) / n
+        var = sum((p - mean_pl) ** 2 for p in pls) / max(1, n - 1)
+        std = math.sqrt(var) if var > 0 else 0.0
+        # Sharpe-like ratio on per-trade returns (no annualization needed —
+        # we're comparing within the same regime).
+        sharpe = mean_pl / std if std > 0 else 0.0
+        expectancy_negative = mean_pl <= 0
+        sharpe_low = sharpe < 0.5
+        if expectancy_negative and sharpe_low:
+            return 0.4
+        if expectancy_negative or sharpe_low:
+            return 0.7
+        return 1.0
+    except Exception:
+        return 1.0
+
+
 def heat_aware_risk_multiplier(equity: float) -> float:
     """Throttle per-trade risk as live portfolio heat approaches the cap.
 

@@ -180,6 +180,22 @@ def sync_positions():
     return sync_positions_from_alpaca()
 
 
+@router.get("/loss-patterns")
+def loss_patterns_summary():
+    """r53 Tier-3 A: aggregated post-mortem fingerprints + which ones the
+    pre-trade veto would currently fire on."""
+    from services.loss_patterns import loss_pattern_summary
+    return loss_pattern_summary()
+
+
+@router.get("/regime-status")
+def regime_status_endpoint():
+    """r53 Tier-3 C: current SPY regime classification + per-strategy
+    allowlist."""
+    from services.regime_router import regime_status
+    return regime_status()
+
+
 @router.post("/backfill-realized-pl")
 def backfill_realized_pl():
     """Patch `realized_pl` on `closed_reconciled` / `closed_external` rows

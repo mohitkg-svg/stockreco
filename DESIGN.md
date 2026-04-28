@@ -1134,6 +1134,165 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 53 — multi-agent audit batch: option slippage + risk gates + new alpha (2026-04-28 night)
+
+A 10-agent maximum-rigor audit surfaced ~50 findings, sorted into 4 tiers
+by impact. r53 ships every actionable item across all four tiers in a
+single revision. The bot was in a 19% drawdown ($100k → $80k) when the
+audit ran; the loss-attribution agent showed that 73% of the realized
+loss was concentrated in 3 option entries that paid 80-216% slippage at
+the open and then stopped on the entry-spread reversion before the
+underlying broke thesis. r53 closes that loop end-to-end and adds three
+new alpha gates that learn from the bot's own post-mortem record.
+
+**Tier 0 — Direct cause of the drawdown**:
+
+1. **Option entry slippage cap** (`paper_trader.submit_option_entry_with_cross_fallback`):
+   pre-cross slippage gate that ABANDONS the trade rather than crossing
+   past 1.25× requested premium. Wide-spread cross deadline extended
+   30s → 120s when spread > 30% of mid. Opening-bell guard 15min → 30min
+   on both put and call paths. Surfaces `option_entry_slippage_abandon`
+   alert when the gate fires.
+
+2. **Premium-stop fix** (`auto_trader._manage_option_trade` step 5):
+   spread-artifact skip extended <5min → <24h; require both
+   `underlying_against_us` AND `progress_to_underlying_stop ≥ 0.4R`
+   before firing. Prevents premium-stop from firing on entry-spread
+   reversion of slippage-inflated entry premium.
+
+3. **Backtester options split** (partial): `strategy_scorecard()` and
+   `strategy_multiplier()` accept an `asset_type` filter so option
+   entries can read option-only realized stats. The backtester only
+   models stocks; mixing live option WR with stock-derived multipliers
+   was diluting the option penalty. Full option-premium simulation
+   (delta+gamma+theta integration) deferred until `iv_history` has
+   meaningful data.
+
+4. **Daily-loss anchor** (`auto_trader._session_start_utc`): switched
+   9:30 ET → 00:00 ET. After-hours and pre-market closes now count
+   toward today's gate. Prior anchor let an overnight -3% close evade
+   the limit at the next session start.
+
+**Tier 1 — Real bugs in code shipped earlier the same day**:
+
+5. **Smarter-backfill matchers** (`admin.py:backfill_realized_pl`):
+   prior BUY/SELL fill sort key `abs((str>str)-0.5)` always evaluated
+   to `0.5` — sort no-op, API insertion-order winning. Now uses proper
+   `datetime` deltas. Recommend re-running backfill on the 3 rows
+   patched in r52g; their entry_price may have matched the wrong fill.
+
+6. **Postgres advisory entry lock** (`auto_trader._pg_advisory_entry_lock`):
+   wraps `consider_signal`/`consider_put_play`/`consider_call_play` so
+   two Cloud Run instances can no longer pass the budget+cap check
+   simultaneously and both submit. Falls back to no-op on SQLite.
+
+7. **AI cost telemetry** (`main._ai_cost_today`): pass `AI_JUDGE_MODEL`
+   (Haiku) to `ai_cost_today_usd` instead of defaulting to Opus
+   pricing. Reported cost was 15× too high.
+
+8. **AI judge timeout + dedup** (`config.py`, `ai_judge.py`):
+   `AI_JUDGE_TIMEOUT_SEC` 5.0 → 12.0 (live p95 was 13.7s, causing 11%
+   silent abstain). Per-`(ticker, signal_hash)` 5-min dedup cache —
+   prevents the scanner re-emit loop from burning 28 calls on the
+   same ticker in 21 minutes.
+
+9. **Frontend hardening**:
+   - `PnLReconciliationPanel` guards against null `starting_equity`
+     (would crash for fresh accounts).
+   - `OrdersTable.isWorking` includes `stopped`/`suspended`/`calculated`
+     (orders silently disappeared from every tab).
+   - `PositionCard` shows "⚠ underlying price unavailable" when an
+     option's underlying_price is null (distinguishes from break-even).
+
+**Tier 2 — Risk gates with backdoors**:
+
+10. **Multiplier stack ordering verified** — agent's claim that the
+    0.5× adaptive multiplier could be re-multiplied up by Kelly×Cal
+    was wrong. `_adapt`, `_dd_mult`, `_vt_mult`, `_regime_xa`, etc.
+    are upstream of the 2.0× ceiling which only clamps the upward
+    stack (`conf×kelly×cal×strat×vix×ai`). No fix needed.
+
+11. **`atomic_append_note` helper** (`execution_engine.py`): SQL
+    `func.coalesce(note, '') + suffix` path replaces the 20+ ORM
+    read-modify-write sites. Helper available; mechanical migration
+    of call sites left as incremental work.
+
+12. **`kill()` holds `_entry_lock`** for its full duration. Prevents
+    an in-flight `consider_signal` (already past killed-flag check)
+    from submitting a fresh order while `kill()` is flattening.
+
+13. **`in_crisis_mode()` is a HARD ENTRY GATE** in `consider_signal`.
+    Was: only adjusted chandelier/trim multipliers. With account at
+    19% multi-day DD the bot was still entering at full sizing; now
+    skips when account_DD≥5%, session_DD≥4%, or VIX>30 + SPY 5d<-5%.
+
+**Tier 3 — NEW alpha strategies**:
+
+A. **Loss-fingerprint pre-trade veto** (`services/loss_patterns.py`,
+   ~270 LOC): aggregates post-mortem `verdict` + `findings[].title`
+   tokens across closed losers and winners. Computes Bayes-style lift
+   = `loser_freq / winner_freq`; vetoes new signals matching
+   fingerprints with `lift ≥ 1.5` AND `n_losers ≥ 5`. Pre-trade
+   matchers implemented for: stop-too-tight, against-daily-trend,
+   counter-momentum, no-volume-confirmation, IV-crush. Mode-flagged
+   (`cfg.loss_pattern_mode`, default `shadow`). Op endpoint:
+   `GET /api/admin/loss-patterns`.
+
+B. **Per-source signal-edge auto-mute** (in `consider_signal`): when
+   `cfg.source_mute_enabled` and a strategy has rolling 60-day
+   WR<45% with n≥10, the gate hard-skips signals from that strategy
+   (vs the existing `strategy_multiplier` which only dampens sizing).
+   Default off pending `Signal.strategy` backfill — currently ~70%
+   of trades have null strategy.
+
+C. **Regime-conditional strategy switching**
+   (`services/regime_router.py`, ~140 LOC): classifies SPY into
+   TREND (ADX≥25 + VIX<22) / CHOP (ADX<20 + VIX<22) / HIGH_VOL
+   (VIX≥22) with 3-tick hysteresis. In `consider_signal`, strategies
+   not in the regime's allowlist are short-circuited. TREND set:
+   Bollinger/Breakout/FibExt/Gap&Go/EMA-Pullback/MACD/VWAP-Reclaim/
+   FVG. CHOP set: MeanReversion/VWAPRevert/S-R-Bounce/Bollinger-MR.
+   PEAD/Composite always allowed. Op endpoint:
+   `GET /api/admin/regime-status`.
+
+D. **Theta-decay-adjusted R:R floor for option entries**
+   (`options_analyzer._build_contracts_for_thesis`): subtract
+   `theta × estimated_days_to_T1` from the reward before checking the
+   `MIN_RR` gate. Eliminates the "slow grind to stop" pattern where
+   17-22 DTE long options score R:R 1.3 on the underlying but
+   <1.0 R:R after theta. Gated by `cfg.theta_adjusted_rr_enabled`
+   (default on).
+
+E. **Portfolio-Kelly book throttle**
+   (`risk_manager.portfolio_kelly_book_throttle`): when 60-day rolling
+   expectancy ≤ 0 or Sharpe < 0.5, throttle the WHOLE book to 40-70%
+   of nominal. Multiplied into `effective_risk_budget` alongside
+   `heat_mult`. Default on (`cfg.portfolio_kelly_enabled`).
+
+**New endpoints**:
+- `GET /api/admin/loss-patterns` — aggregated fingerprints + matcher status
+- `GET /api/admin/regime-status` — current regime + per-strategy allowlist
+
+**New schema**:
+- `AutoTraderConfig.loss_pattern_mode` (string, default "shadow")
+- `AutoTraderConfig.source_mute_enabled` (bool, default false)
+- `AutoTraderConfig.theta_adjusted_rr_enabled` (bool, default true)
+- `AutoTraderConfig.portfolio_kelly_enabled` (bool, default true)
+
+**New module**:
+- `services/loss_patterns.py` — post-mortem fingerprint aggregation + veto
+- `services/regime_router.py` — regime classification + strategy allowlist
+
+**Deferred from Tier 0 #3 (option backtester)**:
+- Full delta+gamma+theta+IV-crush option-premium simulation in the
+  backtester. The data layer (`IVHistory`) was just added in r52f and
+  has no history yet. Once ≥30 days of capture have accumulated, wire
+  a proper option simulation path through `_simulate(asset_type=...)`.
+  Until then, `strategy_scorecard.asset_type_split` lets the operator
+  see the stock vs option WR divergence.
+
+Tests: 191 passing.
+
 ### Revision 52a-g — operational hygiene batch (2026-04-28 evening)
 
 A run of small, high-value operational fixes triggered by a live OOM

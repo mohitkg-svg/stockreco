@@ -6,7 +6,7 @@ not here. Items below are genuinely open with explicit revisit triggers
 or gate conditions. If you can't find a clear "what would unlock this",
 move it to ❌ Rejected.
 
-Last cleaned: 2026-04-28 (post-r52g).
+Last cleaned: 2026-04-28 (post-r53).
 
 ---
 
@@ -39,6 +39,9 @@ that would make them ROI-positive haven't materialized.
 | **Decompose `consider_signal`** into Gates / Sizing / Submission helpers | After paper-trade volume produces dedicated unit-test coverage per section. r40 added section dividers as visual scaffolding; full extraction is the next step. |
 | **Memory-leak root-cause** | Tomorrow's RTH data through the new `health.memory` observability — looking for which counter grows unboundedly. r52f bounded `_corr_cache`; r52g bounded `_rv_cache`. If RSS still climbs past 1.5 GiB on stable RTH days, dig deeper. |
 | **Pydantic migration of `consider_signal` internal dicts** | Incremental — pick one signal-consumer at a time. r52f added `PositionResponse`; r52g added `PnLReconciliationResponse`. Next natural slice: AutoTraderConfig response shape. |
+| **`atomic_append_note` migration of 20+ call sites** | Helper added in r53 (`execution_engine.atomic_append_note`). Migration of existing `t.note = (t.note or "") + "..."` sites is mechanical; do it incrementally. |
+| **Full option-premium backtest simulation** | r53 added `strategy_scorecard.asset_type_split` so stock vs option WR is visible. Once `IVHistory` has ≥30 days of capture, wire delta+gamma+theta integration through `_simulate(asset_type='option')`. |
+| **`Signal.strategy` backfill + auto-mute activation** | r53 wired `cfg.source_mute_enabled` (default off). Currently ~70% of trades have null strategy, so the mute can't see them. Backfill via `Signal.strategy = signal_meta['strategy']` migration, then flip the flag. |
 
 ## ⏸️ Open — cost-gated
 
@@ -55,7 +58,8 @@ that would make them ROI-positive haven't materialized.
 | Flip `AI_NEWS_EXIT_MODE: shadow → active` | Same — entry-veto first, news-exit later |
 | Flip `AI_CONFIDENCE_MULT_MODE: shadow → active` | Same path |
 | Promote AI judge call sites from shadow to honored | After reviewing ≥200 decisions in `ai_decision_log` |
-| Backfill 3 pre-r41 closed_reconciled rows with null entry_price | r52g shipped a smarter `POST /api/admin/backfill-realized-pl` that reads BUY+SELL fills from Alpaca. All previously-skipped rows now patched. |
+| Promote `cfg.loss_pattern_mode: shadow → active` | After reviewing ≥1 week of `loss_pattern_match_shadow` events in metrics. Endpoint: `GET /api/admin/loss-patterns`. |
+| Re-run `POST /api/admin/backfill-realized-pl` | r53 fixed the broken sort-key in the BUY-fill matcher. The 3 rows backfilled in r52g (AAPL/SHOP/CRWV) may have matched the wrong fill; re-run idempotently and verify. |
 
 ---
 

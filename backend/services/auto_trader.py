@@ -2429,6 +2429,73 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if ws and getattr(ws, "auto_trade_enabled", True) is False:
             return None
 
+        # r53 Tier-3 C: regime-conditional strategy switching. In CHOP,
+        # turn off momentum/breakout strategies entirely; in TREND, turn
+        # off mean-reversion. Fail-open when regime classification is
+        # unavailable.
+        try:
+            from services.regime_router import (
+                classify_regime as _cr,
+                is_strategy_allowed_in_regime as _is_allowed,
+            )
+            _strat_for_regime = signal.get("strategy")
+            _current_regime = _cr()
+            if _strat_for_regime and _current_regime and not _is_allowed(_strat_for_regime, _current_regime):
+                logger.info(
+                    f"AutoTrader skip {ticker}: strategy '{_strat_for_regime}' "
+                    f"not allowed in regime {_current_regime}"
+                )
+                metrics.inc("autotrade_skip", reason="strategy_off_regime")
+                return None
+        except Exception as _rr_e:
+            logger.debug(f"regime_router check failed (fail-open): {_rr_e}")
+
+        # r53 Tier-3 B: per-source signal-edge auto-mute when WR<45%, n>=10.
+        # Hard short-circuit (vs the existing strategy_multiplier which
+        # only dampens sizing). Gated by cfg.source_mute_enabled (default
+        # off pending Signal.strategy backfill).
+        try:
+            if bool(getattr(cfg, "source_mute_enabled", False)):
+                _strat_mute_name = signal.get("strategy")
+                if _strat_mute_name:
+                    _scard_mute = strategy_scorecard(days=60, min_trades=10).get(_strat_mute_name)
+                    if _scard_mute:
+                        _wr_mute = float(_scard_mute.get("win_rate") or 1.0)
+                        _n_mute = int(_scard_mute.get("n") or 0)
+                        if _n_mute >= 10 and _wr_mute < 0.45:
+                            logger.info(
+                                f"AutoTrader skip {ticker}: strategy "
+                                f"'{_strat_mute_name}' AUTO-MUTED "
+                                f"(wr={_wr_mute:.2f}, n={_n_mute})"
+                            )
+                            metrics.inc("autotrade_skip", reason=f"source_mute_{_strat_mute_name}")
+                            return None
+        except Exception as _sm_e:
+            logger.debug(f"source_mute check failed (fail-open): {_sm_e}")
+
+        # r53 Tier-3 A: loss-fingerprint pre-trade veto. Reads aggregated
+        # post-mortem patterns from past losers and matches them against
+        # the new signal's pre-trade context. Mode-flagged shadow → active.
+        try:
+            _lp_mode = (getattr(cfg, "loss_pattern_mode", "off") or "off").strip().lower()
+            if _lp_mode in ("shadow", "active"):
+                from services.loss_patterns import loss_pattern_veto as _lp_veto
+                _lp_match = _lp_veto(signal, context={"sector": locals().get("sector")})
+                if _lp_match:
+                    metrics.inc(
+                        "autotrade_event",
+                        event=f"loss_pattern_match_{_lp_mode}",
+                    )
+                    logger.info(
+                        f"AutoTrader loss_pattern {ticker}: matched {_lp_match} "
+                        f"[mode={_lp_mode}]"
+                    )
+                    if _lp_mode == "active":
+                        metrics.inc("autotrade_skip", reason="loss_pattern_veto")
+                        return None
+        except Exception as _lp_e:
+            logger.debug(f"loss_pattern veto failed (fail-open): {_lp_e}")
+
         # One open auto-trade per ticker. Include `adopted` so the bot
         # doesn't enter a new trade on top of an externally-held position
         # in the same name.
@@ -2885,7 +2952,22 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # ceiling.
         from services.risk_manager import heat_aware_risk_multiplier as _heat_mult
         heat_mult = _heat_mult(equity)
-        effective_risk_budget = risk_budget * clamped_stack * heat_mult
+        # r53 Tier-3 E: portfolio-Kelly book throttle. Cuts the entire
+        # book's risk to 40-70% nominal when 60d expectancy<0 or Sharpe<0.5.
+        # Gated by cfg.portfolio_kelly_enabled (default on).
+        pk_mult = 1.0
+        try:
+            if bool(getattr(cfg, "portfolio_kelly_enabled", True)):
+                from services.risk_manager import portfolio_kelly_book_throttle as _pk
+                pk_mult = float(_pk())
+        except Exception:
+            pk_mult = 1.0
+        effective_risk_budget = risk_budget * clamped_stack * heat_mult * pk_mult
+        if pk_mult < 1.0:
+            logger.info(
+                f"AutoTrader {ticker}: portfolio_kelly throttle {pk_mult:.2f}× "
+                f"(60d expectancy/Sharpe argues for smaller book)"
+            )
         if raw_stack > _MULT_CEILING:
             logger.info(
                 f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "

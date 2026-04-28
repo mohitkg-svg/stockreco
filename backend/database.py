@@ -272,6 +272,17 @@ class AutoTraderConfig(Base):
     factor_strategies_enabled = Column(Boolean, default=True)
     flow_strategies_enabled = Column(Boolean, default=True)
     ml_drift_brier_alert_threshold = Column(Float, default=0.05)
+    # r53 Tier-3 A: loss-fingerprint pre-trade veto. off / shadow / active.
+    # Default shadow so the operator can review the gate's behavior before
+    # promoting to active. Reads `services.loss_patterns.loss_pattern_veto()`.
+    loss_pattern_mode = Column(String, default="shadow")
+    # r53 Tier-3 B: per-source signal-edge auto-mute when WR<45% & n>=10.
+    # Default off until backfill of Signal.strategy completes.
+    source_mute_enabled = Column(Boolean, default=False)
+    # r53 Tier-3 D: theta-decay-adjusted R:R floor for option entries.
+    theta_adjusted_rr_enabled = Column(Boolean, default=True)
+    # r53 Tier-3 E: portfolio-Kelly book throttle.
+    portfolio_kelly_enabled = Column(Boolean, default=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -946,6 +957,11 @@ def create_tables():
     _ensure_column("auto_trader_config", "flow_strategies_enabled", "BOOLEAN DEFAULT TRUE")
     _ensure_column("auto_trader_config", "index_inclusion_tickers", "VARCHAR DEFAULT ''")
     _ensure_column("auto_trader_config", "ml_drift_brier_alert_threshold", "DOUBLE PRECISION DEFAULT 0.05")
+    # r53 Tier-3 config knobs
+    _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
+    _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")
+    _ensure_column("auto_trader_config", "portfolio_kelly_enabled", "BOOLEAN DEFAULT TRUE")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:
