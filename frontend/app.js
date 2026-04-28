@@ -5882,10 +5882,10 @@ function SafetyBanner() {
         <div
           key={i}
           role="alert"
-          className={`rounded-xl border px-3 py-2 flex items-start gap-2 ${
+          className={`rounded-xl border px-3 py-2 flex items-start gap-2 safety-banner ${
             b.kind === 'critical'
-              ? 'bg-red-500/15 border-red-500/40 text-red-100'
-              : 'bg-amber-500/15 border-amber-500/40 text-amber-100'
+              ? 'bg-red-500/15 border-red-500/40 text-red-200'
+              : 'bg-amber-500/15 border-amber-500/40 text-amber-200'
           }`}
         >
           <span aria-hidden className="text-base leading-none mt-0.5">{b.kind === 'critical' ? '⛔' : '⚠️'}</span>

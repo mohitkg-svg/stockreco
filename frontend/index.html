@@ -212,6 +212,18 @@
         html[data-theme="light"] .text-gray-400 { color: var(--text-secondary) !important; }
         html[data-theme="light"] .text-gray-500, html[data-theme="light"] .text-gray-600 { color: var(--text-muted) !important; }
 
+        /* r53n: SafetyBanner contrast fix. The banner uses `text-red-200`
+           / `text-amber-200` which are pale pinks/yellows — readable on
+           dark mode, near-invisible on light mode (light tint over light
+           tint). Force dark high-contrast text for the banner in light
+           mode so the operator can actually read the freeze/crisis
+           message without selecting it. Scoped to .safety-banner so
+           we don't affect other places that use those classes. */
+        html[data-theme="light"] .safety-banner.text-red-200,
+        html[data-theme="light"] .safety-banner .text-red-200 { color: #991b1b !important; }
+        html[data-theme="light"] .safety-banner.text-amber-200,
+        html[data-theme="light"] .safety-banner .text-amber-200 { color: #92400e !important; }
+
         /* Hover tints */
         html[data-theme="light"] .hover\:bg-white\/5:hover { background-color: rgba(15, 23, 42, 0.04) !important; }
         html[data-theme="light"] .hover\:bg-white\/10:hover { background-color: rgba(15, 23, 42, 0.07) !important; }
