@@ -283,6 +283,17 @@ class AutoTraderConfig(Base):
     theta_adjusted_rr_enabled = Column(Boolean, default=True)
     # r53 Tier-3 E: portfolio-Kelly book throttle.
     portfolio_kelly_enabled = Column(Boolean, default=True)
+    # r54 Tier-1 #5: cross-sectional z-score scoring v2. off / shadow / active.
+    # In shadow, CandidatePool.score_v2 is computed alongside the legacy
+    # score; in active, score_v2 replaces score for top-N selection.
+    universe_scoring_v2 = Column(String, default="shadow")
+    # r54 Tier-1 #6: comma-separated list of enabled sub-scanners.
+    # Default: just breakout (legacy). Extras: pead, sector_rel, vol_exp.
+    universe_scanners_enabled = Column(String, default="breakout")
+    # r54 Tier-1 #7: time-of-day-aware scoring weights.
+    universe_tod_profiles_enabled = Column(Boolean, default=False)
+    # r54 Tier-2 #11: include sector ETFs in the universe.
+    include_sector_etfs = Column(Boolean, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -401,6 +412,18 @@ class CandidatePool(Base):
     last_stock_reason = Column(String, nullable=True)     # e.g. "regime_chop", "sector_cap", "ai_veto", "loss_pattern"
     last_option_decision = Column(String, nullable=True)  # "entered_call" | "entered_put" | "skipped" | "no_thesis"
     last_option_reason = Column(String, nullable=True)
+    # r54 Tier-0 #1: atomic generation token for race-free pool rebuilds.
+    # Reads filter to MAX(generation); writes use generation = MAX+1, then
+    # an async cleanup deletes prior generations. Prevents readers from
+    # seeing an empty/partial pool mid-rebuild.
+    generation = Column(Integer, default=1, index=True)
+    # r54 Tier-1 #6: which sub-scanner produced this row. Multi-pool
+    # architecture writes to a unified table with source attribution.
+    pool_source = Column(String, default="breakout", index=True)
+    # r54 Tier-1 #5: parallel score from the cross-sectional z-score
+    # stack. Operator compares score_v2 vs score in shadow mode before
+    # flipping cfg.universe_scoring_v2 to "active".
+    score_v2 = Column(Float, nullable=True)
 
 
 class BestStrategyPerTicker(Base):
@@ -976,6 +999,15 @@ def create_tables():
     _ensure_column("candidate_pool", "last_stock_reason", "VARCHAR")
     _ensure_column("candidate_pool", "last_option_decision", "VARCHAR")
     _ensure_column("candidate_pool", "last_option_reason", "VARCHAR")
+    # r54: candidate-pool atomicity + multi-source + v2 scoring columns
+    _ensure_column("candidate_pool", "generation", "INTEGER DEFAULT 1")
+    _ensure_column("candidate_pool", "pool_source", "VARCHAR DEFAULT 'breakout'")
+    _ensure_column("candidate_pool", "score_v2", "DOUBLE PRECISION")
+    # r54 Tier-1 #5/#7 + Tier-2 #11 config knobs
+    _ensure_column("auto_trader_config", "universe_scoring_v2", "VARCHAR DEFAULT 'shadow'")
+    _ensure_column("auto_trader_config", "universe_scanners_enabled", "VARCHAR DEFAULT 'breakout'")
+    _ensure_column("auto_trader_config", "universe_tod_profiles_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "include_sector_etfs", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")

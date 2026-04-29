@@ -356,12 +356,26 @@ def scheduled_scan():
         finally:
             _local.close()
 
-    # Cap at 4 to stay inside the Yahoo token-bucket (30 req/min) — each
-    # ticker fans out to 7 timeframes + meta; 4 parallel scanners ≈ 28 rps.
+    # r54 Tier-0 #4: process top-K candidates SERIALLY before fanning out.
+    # `tickers` is already EV-sorted (pool by score, interleaved with
+    # watchlist). ThreadPoolExecutor.map() runs in nondeterministic order,
+    # which means the highest-EV ticker isn't guaranteed to evaluate first.
+    # Whoever passes all entry gates first eats the BP slot. Now: top 5
+    # tickers run serial (deterministic order), rest go parallel for
+    # throughput. Trades a small amount of latency for ranking fidelity.
+    SERIAL_HEAD_K = 5
     max_workers = min(4, max(1, len(tickers)))
     if tickers:
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="scan") as pool:
-            list(pool.map(_scan_one, tickers))
+        head = tickers[:SERIAL_HEAD_K]
+        tail = tickers[SERIAL_HEAD_K:]
+        for t in head:
+            try:
+                _scan_one(t)
+            except Exception as e:
+                logger.error(f"Scan error (serial head) for {t}: {e}")
+        if tail:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="scan") as pool:
+                list(pool.map(_scan_one, tail))
     _app_health["last_scan_at"] = _dt.now(_tz.utc).isoformat()
 
 

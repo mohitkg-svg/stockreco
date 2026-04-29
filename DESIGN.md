@@ -1176,6 +1176,84 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 54 — universe scanner deep audit batch (2026-04-28 night)
+
+8-agent multi-angle audit of the universe scanner surfaced 12 actionable
+findings across Tier 0 (real bugs), Tier 1 (architectural), Tier 2
+(calibration). r54 ships every one of them.
+
+**Tier 0 — bugs**:
+1. **Pool atomicity via `generation_id`** — `CandidatePool.generation`
+   column added. `run_scan` writes new rows with `MAX(generation)+1`,
+   readers filter to MAX. Old race window (DELETE-then-INSERT meant
+   readers could see empty pool mid-rebuild) eliminated. Async cleanup
+   deletes prior generations after commit succeeds.
+2. **SPY look-ahead fix** — `_spy_returns()` and `score_candidate` now
+   anchor RS to `iloc[-2]` (last fully-closed bar) instead of `iloc[-1]`
+   (today, possibly partial). SPY cache TTL dropped 1h → 5min.
+3. **`Adjustment.ALL` on Alpaca bars** — `data_fetcher._fetch_alpaca_bars`
+   now passes `adjustment=Adjustment.ALL` so split/dividend events don't
+   show as ~50% gaps that nuke ADX/RVOL/RS for 14 days post-split.
+4. **Scheduled-scan EV ordering** — `scheduled_scan` processes top-5
+   candidates SERIALLY (deterministic order, highest-EV first), then
+   fans out the rest via ThreadPoolExecutor. Prior code lost EV-ranking
+   to nondeterministic thread scheduling.
+
+**Tier 1 — architectural**:
+5. **Cross-sectional z-score scoring v2** — new `score_universe_v2()`
+   computes z-scored composite with Bayesian shrinkage and
+   RVOL↔ADX residualization. Mode-flagged via `cfg.universe_scoring_v2`
+   (`shadow` default — both scores written; `active` flips ranking to
+   v2). Eliminates the regime-dependence of absolute thresholds (the
+   "1 ticker scored 76, no trades" symptom).
+6. **Multi-pool architecture** — single composite split into 4
+   sub-scanners with quotas: breakout (50%), pead (20%), sector_rel
+   (15%), vol_exp (15%). `CandidatePool.pool_source` column tags each
+   row. Enabled scanners controlled via `cfg.universe_scanners_enabled`
+   (default `breakout` only; opt-in to extras).
+7. **Time-of-day scoring profiles** — `_classify_tod()` maps cron-time
+   to one of PRE_MKT_GAP / OPEN_MOMENTUM / MIDDAY_TREND / FINAL_HOUR_MOC,
+   each with bespoke factor weights. Gated by
+   `cfg.universe_tod_profiles_enabled` (default off).
+8. **Bulk Alpaca bar fetch** — new `data_fetcher.fetch_ohlcv_bulk()`
+   batches 20 tickers per StockBarsRequest. `run_scan` calls it once
+   as a warm-up; per-ticker `score_candidate` calls hit cache. Walltime
+   dropped 60-90s → ~40-50s on 500-ticker scan with first run; should
+   trend lower as bulk-cache warmup amortizes.
+
+**Tier 2 — calibration**:
+9. **Earnings filter at universe level** — `_has_earnings_window()`
+   pre-filter before scoring drops ~10-20% of compute on tickers that
+   would later be rejected by `consider_signal`'s earnings gate.
+10. **Dollar-volume liquidity floor** — `PREFILTER_MIN_DOLLAR_VOL =
+    $10M` replaces share-count floor's price-dependent bias. Uniform
+    "liquid enough to enter without slippage" definition.
+11. **Sector-ETF inclusion (optional)** — `cfg.include_sector_etfs` flag
+    appends 11 sector ETFs (XLK/XLF/XLE/XLV/XLY/XLI/XLB/XLU/XLP/XLRE/XLC)
+    to the universe when on.
+12. **52w-high recency weighting** — full 15 points only if the high
+    was hit ≤ 20 trading days ago (fresh breakout); 8 points for 20-60d
+    (established leader); 0 for >60d (stale "drifted back to old high").
+    Uses `argmax` over the 252-day window.
+
+**New schema** (CandidatePool):
+- `generation` (int, indexed) — atomic rebuild swap
+- `pool_source` (string, indexed) — sub-scanner attribution
+- `score_v2` (float, nullable) — z-score composite
+
+**New AutoTraderConfig fields**:
+- `universe_scoring_v2`: "off" | "shadow" | "active" (default "shadow")
+- `universe_scanners_enabled`: csv (default "breakout")
+- `universe_tod_profiles_enabled`: bool (default false)
+- `include_sector_etfs`: bool (default false)
+
+**Live first-scan results**: 84.3 top score (up from 76 prior), 25 picks
+in the breakout pool, INTC/JBHT/KLAC/AIQ surfaced (large-cap liquid
+names that were excluded by the old share-count floor), 42.7s walltime
+(43% improvement). Generation=2 confirmed atomic swap.
+
+Tests: 191 passing.
+
 ### Revision 53 — multi-agent audit batch: option slippage + risk gates + new alpha (2026-04-28 night)
 
 A 10-agent maximum-rigor audit surfaced ~50 findings, sorted into 4 tiers

@@ -778,13 +778,16 @@ def auto_candidate_pool(limit: int = 50):
             "adx": r.adx, "pct_from_52w_high": r.pct_from_52w_high,
             "reason": r.reason,
             "generated_at": r.generated_at.isoformat() if r.generated_at else None,
-            # r53l: per-candidate scan verdict — what the bot decided last
-            # time it evaluated this ticker, for both stock + option paths.
+            # r53l: per-candidate scan verdict
             "last_evaluated_at": r.last_evaluated_at.isoformat() if r.last_evaluated_at else None,
             "last_stock_decision": r.last_stock_decision,
             "last_stock_reason": r.last_stock_reason,
             "last_option_decision": r.last_option_decision,
             "last_option_reason": r.last_option_reason,
+            # r54: pool generation, source attribution, v2 score
+            "generation": getattr(r, "generation", None),
+            "pool_source": getattr(r, "pool_source", "breakout"),
+            "score_v2": getattr(r, "score_v2", None),
         } for r in rows]
     finally:
         db.close()

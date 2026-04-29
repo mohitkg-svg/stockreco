@@ -3630,6 +3630,8 @@ function CandidatePoolPanel() {
                   <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">#</th>
                   <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Ticker</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Score</th>
+                  <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]" title="r54 cross-sectional z-score (shadow). Becomes the ranking key when cfg.universe_scoring_v2 = active.">Score v2</th>
+                  <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]" title="Which sub-scanner produced this candidate. Default: breakout. Multi-pool: pead, sector_rel, vol_exp.">Source</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Price</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">RVOL</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">RS 20d</th>
@@ -3647,6 +3649,8 @@ function CandidatePoolPanel() {
                       <TickerLink ticker={r.ticker} />
                     </td>
                     <td className="text-right py-1.5 px-2 font-mono font-semibold">{r.score?.toFixed(1)}</td>
+                    <td className="text-right py-1.5 px-2 font-mono app-text-secondary">{r.score_v2 != null ? r.score_v2.toFixed(1) : '—'}</td>
+                    <td className="py-1.5 px-2 text-[10px] app-text-muted uppercase">{r.pool_source || 'breakout'}</td>
                     <td className="text-right py-1.5 px-2 font-mono">${r.price?.toFixed(2)}</td>
                     <td className={`text-right py-1.5 px-2 font-mono ${r.rvol >= 1.5 ? 'text-emerald-400' : r.rvol < 0.7 ? 'text-red-400' : ''}`}>
                       {r.rvol?.toFixed(2)}

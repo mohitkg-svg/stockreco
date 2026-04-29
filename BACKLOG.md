@@ -6,7 +6,7 @@ not here. Items below are genuinely open with explicit revisit triggers
 or gate conditions. If you can't find a clear "what would unlock this",
 move it to ❌ Rejected.
 
-Last cleaned: 2026-04-28 (post-r53).
+Last cleaned: 2026-04-28 (post-r54).
 
 ---
 
@@ -59,6 +59,9 @@ that would make them ROI-positive haven't materialized.
 | Flip `AI_CONFIDENCE_MULT_MODE: shadow → active` | Same path |
 | Promote AI judge call sites from shadow to honored | After reviewing ≥200 decisions in `ai_decision_log` |
 | Promote `cfg.loss_pattern_mode: shadow → active` | After reviewing ≥1 week of `loss_pattern_match_shadow` events in metrics. Endpoint: `GET /api/admin/loss-patterns`. |
+| Promote `cfg.universe_scoring_v2: shadow → active` | After reviewing 5 trading days where score and score_v2 produce different top-N. Endpoint: candidate-pool API now returns both. |
+| Enable additional universe scanners | Set `cfg.universe_scanners_enabled = "breakout,pead,sector_rel,vol_exp"` after evaluating each pool's source attribution in candidate-pool view for ≥30 trades per source. |
+| Enable `cfg.universe_tod_profiles_enabled` | After validating that the bot's existing 4-cron schedule (12/14:30/17/19:30 UTC) aligns with the time-of-day profiles. |
 | Re-run `POST /api/admin/backfill-realized-pl` | r53 fixed the broken sort-key in the BUY-fill matcher. The 3 rows backfilled in r52g (AAPL/SHOP/CRWV) may have matched the wrong fill; re-run idempotently and verify. |
 
 ---
