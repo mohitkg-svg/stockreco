@@ -6,7 +6,7 @@ not here. Items below are genuinely open with explicit revisit triggers
 or gate conditions. If you can't find a clear "what would unlock this",
 move it to ❌ Rejected.
 
-Last cleaned: 2026-04-29 (post-r55, second universe-scanner audit fixes).
+Last cleaned: 2026-04-29 (post-r56, third ground-up universe audit + Option B foundation).
 
 ---
 
@@ -44,6 +44,11 @@ that would make them ROI-positive haven't materialized.
 | **`Signal.strategy` backfill + auto-mute activation** | r53 wired `cfg.source_mute_enabled` (default off). Currently ~70% of trades have null strategy, so the mute can't see them. Backfill via `Signal.strategy = signal_meta['strategy']` migration, then flip the flag. |
 | **Validate r55 sub-scanner pools have meaningfully different tickers** | r55 implemented the real PEAD / sector_rel / vol_exp logic. Breakout-vs-others overlap should drop from ~80% → ~20-40%. Watch the candidate-pool view across 5 trading days; if overlap is still >60% the heuristics need parameter tuning. |
 | **Tune `entry_1m_gate_mode` after live observation** | r55 default flipped to "relaxed" (2-of-3 majority). If the false-positive rate (= entries that immediately wick out) climbs above pre-r55 baseline, flip back to "strict". |
+| **Run r56 validation scripts after 30 days of data** | `backend/scripts/{analyze_score_divergence,gate_counterfactual,factor_ic_sweep}.py` close the long-standing shadow loops. Run weekly; promote/demote cfg knobs based on output. |
+| **Phase 2 event detectors: NEW_HIGH, BREAKDOWN, PEAD** | r56 shipped GAP/RVOL_SURGE/SQUEEZE_RELEASE. The remaining three need per-kind data: NEW_HIGH/BREAKDOWN want intraday minute-bar streaming; PEAD wants SUE-decile from a paid earnings-surprise feed. Defer until r57+ with operator-validated thresholds. |
+| **Per-event-kind strategy handlers in auto_trader** | r56's `consider_event` routes all events through `consider_signal` with a synthesized signal. Real Option B has dedicated handlers (PEAD holds longer, GAP uses tighter stops, SQUEEZE_RELEASE has wider targets). Promote once GAP/RVOL_SURGE/SQUEEZE_RELEASE accumulate ≥30 trades each. |
+| **WebSocket streaming detection** | r56's event_detector polls every 2min on top-50. Real-time WS subscribe to all 1000 R1000 names would fire events within 1-3s of the trigger, not 1-2min. Defer until paper bot's edge is validated; WS adds operational burden. |
+| **Quarterly Russell 1000 file refresh** | `data/russell1000.txt` is a static snapshot. Refresh from FTSE Russell or iShares IWB holdings. Auto-update via a nightly download script is future work. |
 
 ## ⏸️ Open — cost-gated
 

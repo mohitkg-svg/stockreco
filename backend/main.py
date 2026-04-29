@@ -346,6 +346,24 @@ def scheduled_scan():
     finally:
         db.close()
 
+    # r56 Tier-3 Option B: drain event-driven candidates BEFORE the
+    # poll-driven scan. Active events get a fast-path through
+    # consider_event so a fresh GAP/RVOL_SURGE/SQUEEZE_RELEASE doesn't
+    # wait for the next 5-min cron tick to be evaluated.
+    try:
+        from services.event_detector import get_active_events
+        from services.auto_trader import consider_event
+        events = get_active_events(max_age_min=20)
+        if events:
+            logger.info(f"event-driven path: {len(events)} active events to consider")
+            for ev in events[:20]:  # cap per-tick to avoid stalling the cron
+                try:
+                    consider_event(ev)
+                except Exception as e:
+                    logger.warning(f"consider_event {ev.get('ticker')} failed: {e}")
+    except Exception as e:
+        logger.debug(f"event-driven path skipped: {e}")
+
     def _scan_one(ticker: str):
         logger.info(f"Auto-scanning {ticker}")
         _local = SessionLocal()
@@ -522,24 +540,53 @@ async def lifespan(app: FastAPI):
     # Scans ~500 liquid US equities, scores by RVOL/ADX/RS/52w-high proximity,
     # keeps top 30 in candidate_pool. Auto-trader reads from this when
     # cfg.use_universe_scanner=True. No-op when off.
-    # Ground-up Tier 1: universe scanner. Runs 4× per day at market-relevant
-    # UTC slots (~pre-open, ~10am ET, midday, ~3pm ET during EDT):
-    #   12:00 UTC  — 08:00 ET pre-market warm-up (catches overnight movers)
-    #   14:30 UTC  — 10:30 ET mid-morning (first hour of RTH has played out)
-    #   17:00 UTC  — 13:00 ET midday lull (fresh afternoon setups)
-    #   19:30 UTC  — 15:30 ET final hour (captures closing-auction flow)
+    # r56 B3 + B4 + D9: scanner crons now anchored to America/New_York
+    # (DST-safe) instead of naive UTC. Schedule covers pre-market through
+    # final-hour-MOC, plus a post-close slot. Slots in ET:
+    #   08:30 ET — pre-market gap detection (1h before open)
+    #   10:30 ET — opening-range plays (1h post-open)
+    #   13:00 ET — midday trend continuations
+    #   15:00 ET — final-hour MOC (1h before close)
+    #   16:30 ET — post-close summary (only if extended-hours alpha is enabled)
+    # Cloud Run multi-instance guard: each scan does pg_try_advisory_lock
+    # (universe_scanner.py r56 B5) so a 1-3× cron fan-out across N=1..3
+    # instances will only do work in one — the rest return immediately.
     try:
         from services import universe_scanner as _usnv
         from apscheduler.triggers.cron import CronTrigger as _Cron
-        for hh, mm in [(12, 0), (14, 30), (17, 0), (19, 30)]:
+        _NY_TZ = "America/New_York"
+        for hh, mm, label in [
+            (8, 30,  "premkt"),
+            (10, 30, "open60"),
+            (13, 0,  "midday"),
+            (15, 0,  "final60"),
+        ]:
             scheduler.add_job(
                 _usnv.run_scan,
-                trigger=_Cron(hour=hh, minute=mm),
-                id=f"universe_scan_{hh:02d}{mm:02d}",
+                trigger=_Cron(hour=hh, minute=mm, timezone=_NY_TZ),
+                id=f"universe_scan_{label}",
                 max_instances=1, coalesce=True, misfire_grace_time=900,
             )
     except Exception as _e:
         logger.warning(f"universe_scanner job not scheduled: {_e}")
+
+    # r56 Tier-3 Option B: event-driven candidate detector. Runs every
+    # 2 min during RTH. Detects discrete setup events (GAP, RVOL_SURGE,
+    # SQUEEZE_RELEASE) on the top-K of the legacy candidate_pool and
+    # writes to candidate_events for consider_event to pick up. Cheaper
+    # than streaming WS (which needs Alpaca data tier) and good enough
+    # for paper-bot validation; promote to WS in r57+.
+    try:
+        from services import event_detector as _ed
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        scheduler.add_job(
+            _ed.detect_events,
+            trigger=_Cron(hour="9-16", minute="*/2", timezone="America/New_York"),
+            id="event_detector",
+            max_instances=1, coalesce=True, misfire_grace_time=60,
+        )
+    except Exception as _e:
+        logger.warning(f"event_detector job not scheduled: {_e}")
 
     # Ground-up Tier 2: weekly best-strategy-per-ticker recompute.
     # Walk-forward backtest across every tracked ticker; persist the winning

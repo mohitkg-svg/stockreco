@@ -109,48 +109,92 @@ SECTOR_ETFS = ["XLK", "XLF", "XLE", "XLV", "XLY", "XLI", "XLB", "XLU", "XLP", "X
 # The quotas sum to 1.0 — final pool is filled in priority order until
 # top_n is reached, with each sub-scanner contributing its share.
 _POOL_QUOTAS = {
-    "breakout":    0.50,  # legacy momentum/breakout (the original scanner)
+    "breakout":    0.45,  # legacy momentum/breakout (the original scanner)
     "pead":        0.20,  # post-earnings drift (gap-up + volume on EPS beat)
     "sector_rel":  0.15,  # outperforming sector ETF, not just SPY
-    "vol_exp":     0.15,  # bollinger-squeeze release / NR7-into-WR1
+    "vol_exp":     0.10,  # bollinger-squeeze release / NR7-into-WR1
+    "short":       0.10,  # r56 D5: short-side, bear-regime only
 }
 
 
-# r54 Tier-1 #7: time-of-day-aware scoring profiles. Different setups
-# matter at different times. Profile name → factor weight overrides.
+# r54 Tier-1 #7 + r56 B8: time-of-day-aware scoring profiles.
+# Only the four factors actually present in `score_universe_v2`'s z-score
+# stack — rvol / adx / rs / pct_from_hi. The earlier "gap" and
+# "vol_quality" keys were silently dropped by the lookup in score_universe_v2
+# (those factors don't exist in the z-score composite), so 30-35% of the
+# weight in each profile evaporated unused.
 _TOD_PROFILES = {
-    # ~12:00 UTC = pre-market/just-before-open (EDT) — gaps + PEAD dominate
-    "PRE_MKT_GAP":   {"rvol": 0.30, "rs": 0.10, "pct_from_hi": 0.20, "adx": 0.05, "vol_quality": 0.15, "gap": 0.20},
-    # ~14:30 UTC = ~10:30 ET (1h after RTH open) — opening-range plays
-    "OPEN_MOMENTUM": {"rvol": 0.30, "rs": 0.20, "pct_from_hi": 0.20, "adx": 0.10, "vol_quality": 0.15, "gap": 0.05},
-    # ~17:00 UTC = ~13:00 ET (mid-day) — established trend continuations
-    "MIDDAY_TREND":  {"rvol": 0.20, "rs": 0.25, "pct_from_hi": 0.20, "adx": 0.20, "vol_quality": 0.10, "gap": 0.05},
-    # ~19:30 UTC = ~15:30 ET (final hour) — closing-strength + MOC flow
-    "FINAL_HOUR_MOC":{"rvol": 0.20, "rs": 0.25, "pct_from_hi": 0.15, "adx": 0.20, "vol_quality": 0.15, "gap": 0.05},
+    # PRE_MKT_GAP: heaviest RVOL weight; pct_from_hi for breakout-near-high
+    "PRE_MKT_GAP":   {"rvol": 0.45, "rs": 0.15, "pct_from_hi": 0.30, "adx": 0.10},
+    # OPEN_MOMENTUM: opening-range plays — RVOL + recent RS
+    "OPEN_MOMENTUM": {"rvol": 0.40, "rs": 0.25, "pct_from_hi": 0.25, "adx": 0.10},
+    # MIDDAY_TREND: established trend continuations — RS + ADX dominate
+    "MIDDAY_TREND":  {"rvol": 0.20, "rs": 0.30, "pct_from_hi": 0.25, "adx": 0.25},
+    # FINAL_HOUR_MOC: closing-strength + MOC flow
+    "FINAL_HOUR_MOC":{"rvol": 0.25, "rs": 0.30, "pct_from_hi": 0.20, "adx": 0.25},
 }
 
 
 def _classify_tod(now_utc: Optional[datetime] = None) -> str:
-    """r54 Tier-1 #7: time-of-day classification for scoring weight selection."""
-    now_utc = now_utc or datetime.utcnow()
-    h = now_utc.hour
-    if 11 <= h < 14:  return "PRE_MKT_GAP"
-    if 14 <= h < 16:  return "OPEN_MOMENTUM"
-    if 16 <= h < 19:  return "MIDDAY_TREND"
-    if 19 <= h < 21:  return "FINAL_HOUR_MOC"
-    return "MIDDAY_TREND"  # off-hours fallback
+    """r54 Tier-1 #7 + r56 B3: time-of-day classification for scoring
+    weight selection. r56 fix: bucket on ET hour, not UTC hour, so DST
+    transitions don't shift profile boundaries by 1h every winter.
+    """
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        now_dt = now_utc or datetime.utcnow()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=_ZI("UTC"))
+        et = now_dt.astimezone(_ZI("America/New_York"))
+        h = et.hour
+    except Exception:
+        # Last-resort fallback: assume UTC and subtract 4 (EDT). Better
+        # than the previous "always UTC" bug; off by 1h in EST.
+        now_dt = now_utc or datetime.utcnow()
+        h = (now_dt.hour - 4) % 24
+    # ET hour boundaries:
+    if 7 <= h < 10:   return "PRE_MKT_GAP"      # 7-10am ET
+    if 10 <= h < 12:  return "OPEN_MOMENTUM"    # 10am-12pm ET
+    if 12 <= h < 15:  return "MIDDAY_TREND"     # 12-3pm ET
+    if 15 <= h < 17:  return "FINAL_HOUR_MOC"   # 3-5pm ET
+    return "MIDDAY_TREND"
 
 
 def _read_universe_file() -> Optional[List[str]]:
-    """r43 fix #1.1: optional point-in-time universe override.
+    """r43 fix #1.1 + r56 Tier-0 E1: point-in-time universe override.
 
     Set `STOCK_UNIVERSE_FILE` to a path containing one ticker per line
-    (S&P 500 / Russell 1000 constituents) to bypass the Alpaca
-    "alphabetical first 500" survivor-biased default. The file is
-    re-read every scan so the operator can swap it without a restart.
-    Returns None when not configured.
+    to bypass the Alpaca "alphabetical first 500" survivor-biased default
+    (which the third audit demonstrated is essentially "letter A only" —
+    blind to MSFT, NVDA, GOOGL, META, TSLA, JPM, V, UNH, etc.).
+
+    r56 Tier-0 E1: when the env var is unset, fall back to the bundled
+    `data/russell1000.txt` (~700 names: S&P 500 + R1000 mid-caps). This
+    flips the default from "Alpaca alphabetical biased" to "real
+    institutional universe" without requiring operator config.
+
+    The file is re-read every scan so the operator can swap it without
+    a restart. Returns None only when no override is configured AND the
+    bundled file is missing.
+
+    Security note: ticker pattern is enforced — only `^[A-Z][A-Z0-9.-]{0,5}$`
+    accepted. An attacker-controlled `STOCK_UNIVERSE_FILE` cannot inject
+    arbitrary strings into Alpaca API calls (Code-review #21).
     """
+    import re
+    _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,5}$")
+    # 1. Operator-configured file (highest priority).
     path = os.getenv("STOCK_UNIVERSE_FILE")
+    # 2. Bundled fallback at repo root /data/russell1000.txt.
+    if not path:
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            # /backend/services -> /backend -> /repo-root -> /repo-root/data
+            candidate = os.path.normpath(os.path.join(here, "..", "..", "data", "russell1000.txt"))
+            if os.path.exists(candidate):
+                path = candidate
+        except Exception:
+            pass
     if not path:
         return None
     try:
@@ -158,8 +202,12 @@ def _read_universe_file() -> Optional[List[str]]:
             tickers = []
             for line in f:
                 s = line.strip().upper()
-                if s and not s.startswith("#"):
+                if s and not s.startswith("#") and _TICKER_RE.match(s):
                     tickers.append(s)
+            if tickers:
+                logger.info(
+                    f"universe_scanner: loaded {len(tickers)} tickers from {path}"
+                )
             return tickers or None
     except Exception as e:
         logger.warning(f"universe_scanner: STOCK_UNIVERSE_FILE read failed ({path}): {e}")
@@ -250,7 +298,8 @@ def _pull_universe_alpaca(size: int = UNIVERSE_SIZE) -> List[Dict[str, Any]]:
     return out
 
 
-def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Dict[str, Any]]:
+def score_candidate(ticker: str, spy_r20: Optional[float] = None,
+                    sector_etf_r20: Optional[Dict[str, float]] = None) -> Optional[Dict[str, Any]]:
     """Compute a composite pre-filter score for a ticker.
 
     Returns a dict with the score + feature breakdown, or None if the ticker
@@ -281,12 +330,46 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
         # the most recently CLOSED day for both numerator and denominator,
         # OR scale the partial-bar volume by elapsed-session fraction so
         # the comparison is apples-to-apples.
-        vol_20 = float(df["Volume"].iloc[-20:].mean())
-        if vol_20 < PREFILTER_MIN_AVG_VOL:
+        # r56 B15: explicit isfinite + non-negative volume guard. NaN
+        # volume slips past `< MIN` (NaN comparisons return False) and
+        # later silently produces rvol=1.0 with bogus features.
+        import math as _math_b15
+        # r56 B1: when intraday-partial, slice [-21:-1] (last 20 fully-
+        # closed bars) — same convention used elsewhere. Without this,
+        # vol_20/avg_close_20 average in the partial bar and bias the
+        # liquidity gate.
+        try:
+            last_ts_b1 = df.index[-1]
+            from datetime import datetime as _dt_b1
+            from zoneinfo import ZoneInfo as _ZI_b1
+            now_et_b1 = _dt_b1.utcnow().replace(tzinfo=_ZI_b1("UTC")).astimezone(_ZI_b1("America/New_York"))
+            ts_et_b1 = last_ts_b1.tz_convert("America/New_York") if hasattr(last_ts_b1, "tz_convert") else None
+            if ts_et_b1 is None and hasattr(last_ts_b1, "to_pydatetime"):
+                # Naive index — assume UTC and convert
+                _dt_naive = last_ts_b1.to_pydatetime()
+                if _dt_naive.tzinfo is None:
+                    _dt_naive = _dt_naive.replace(tzinfo=_ZI_b1("UTC"))
+                ts_et_b1 = _dt_naive.astimezone(_ZI_b1("America/New_York"))
+            is_partial_b1 = (
+                ts_et_b1 is not None
+                and ts_et_b1.date() == now_et_b1.date()
+                and (now_et_b1.hour, now_et_b1.minute) < (16, 0)
+            )
+        except Exception:
+            is_partial_b1 = False
+        if is_partial_b1 and len(df) >= 21:
+            vol_window = df["Volume"].iloc[-21:-1]
+            close_window = df["Close"].iloc[-21:-1]
+        else:
+            vol_window = df["Volume"].iloc[-20:]
+            close_window = df["Close"].iloc[-20:]
+        vol_20 = float(vol_window.mean())
+        if not _math_b15.isfinite(vol_20) or vol_20 <= 0 or vol_20 < PREFILTER_MIN_AVG_VOL:
             return None
-        # r54 Tier-2 #10: dollar-volume liquidity floor. Eliminates
-        # micro-cap-by-price tail uniformly regardless of share count.
-        avg_close_20 = float(df["Close"].iloc[-20:].mean())
+        # r54 Tier-2 #10: dollar-volume liquidity floor.
+        avg_close_20 = float(close_window.mean())
+        if not _math_b15.isfinite(avg_close_20) or avg_close_20 <= 0:
+            return None
         dollar_vol_20 = avg_close_20 * vol_20
         if dollar_vol_20 < PREFILTER_MIN_DOLLAR_VOL:
             return None
@@ -316,34 +399,69 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
         adx = float(last.get("ADX_14", last.get("adx", 0)) or 0)
         sma50 = float(last.get("SMA_50", 0) or 0)
         sma200 = float(last.get("SMA_200", 0) or 0)
-        hi_52w = float(df["High"].iloc[-252:].max())
-        pct_from_hi = (price / hi_52w - 1.0) if hi_52w > 0 else 0.0
-        # r54 Tier-2 #12: recency of the 52w-high. Fresh breakouts (high
-        # hit ≤ 20 trading days ago) have very different alpha vs. stale
-        # leaders (high hit 200 days ago, drifting back near it). We
-        # compute the days-since-high to scale the 52wH score below.
-        # r55 T0 #7: argmax returns the FIRST occurrence on ties; we want
-        # the MOST RECENT bar that achieved the 52w high (a stock that
-        # tagged 100 in week 1 then re-tagged 100 in week 50 should be
-        # treated as a fresh breakout, not a stale 52w-old high). Reverse
-        # the slice and adjust the index.
+        # r56 B1: 52w-high look-ahead leak fix. `iloc[-252:]` includes
+        # today's partial bar during RTH; an intraday print can pop the
+        # 52w-high to a value that won't be confirmed at close. Same
+        # class of bug as the SPY/RS leak r54 fixed for the 20d return.
+        if is_partial_b1 and len(df) >= 253:
+            hi_window = df["High"].iloc[-253:-1]
+            # Use last-closed-bar close for `price` reference, not partial.
+            ref_close = float(df["Close"].iloc[-2])
+        else:
+            hi_window = df["High"].iloc[-252:]
+            ref_close = price
+        hi_52w = float(hi_window.max())
+        pct_from_hi = (ref_close / hi_52w - 1.0) if hi_52w > 0 else 0.0
+        # r54 Tier-2 #12 + r55 T0 #7 + r56 B1: recency of the 52w-high.
+        # Use the same partial-bar-aware window as `hi_52w` above.
         try:
-            highs_window = df["High"].iloc[-252:]
-            highs_arr = highs_window.values
+            highs_arr = hi_window.values
             n_h = len(highs_arr)
-            # Reverse-search: argmax on reversed array, then convert back.
-            argmax_rev = int(highs_arr[::-1].argmax())  # 0 = newest
-            argmax_pos = n_h - 1 - argmax_rev
-            days_since_hi = max(0, n_h - 1 - argmax_pos)
+            import numpy as _np_h
+            if n_h == 0 or _np_h.isnan(highs_arr).all():
+                days_since_hi = 999
+            else:
+                argmax_rev = int(highs_arr[::-1].argmax())  # 0 = newest
+                argmax_pos = n_h - 1 - argmax_rev
+                days_since_hi = max(0, n_h - 1 - argmax_pos)
         except Exception:
             days_since_hi = 999
 
         # RS vs SPY — r54 Tier-0 #2: anchor to last CLOSED bar (iloc[-2])
         # to match _spy_returns() and eliminate same-day look-ahead leak.
-        # We need at least 22 bars now (was 21).
         r20 = float(df["Close"].iloc[-2] / df["Close"].iloc[-22] - 1) if len(df) >= 22 else 0.0
-        rs = (r20 - spy_r20) if (spy_r20 is not None) else 0.0
+        # r56 D12: prefer sector-ETF benchmark over SPY when sector data
+        # is available — during sector rotations (2022 tech sell-off,
+        # banking crisis), "outperforming SPY" can just be "any energy
+        # stock benefiting from XLE strength". Sector-relative is the
+        # truer security-selection signal. Falls back to SPY when sector
+        # ETF data is missing or sector unknown.
+        bench_r20 = spy_r20
+        bench_label = "SPY"
+        if sector_etf_r20:
+            try:
+                from services.data_fetcher import get_ticker_info as _gti_d12
+                _info = _gti_d12(ticker) or {}
+                _sector = (_info.get("sector") or "").strip()
+                _etf = SECTOR_TO_ETF.get(_sector)
+                if _etf and _etf in sector_etf_r20:
+                    bench_r20 = sector_etf_r20[_etf]
+                    bench_label = _etf
+            except Exception:
+                pass
+        rs = (r20 - bench_r20) if (bench_r20 is not None) else 0.0
         r60 = float(df["Close"].iloc[-2] / df["Close"].iloc[-62] - 1) if len(df) >= 62 else 0.0
+
+        # r56 D1/D2: 12-1 momentum (Asness/Carhart canonical factor).
+        # 12-month return excluding the most recent month, to avoid
+        # contamination by 1-month short-term reversal (Jegadeesh 1990).
+        # Strongest IC (~0.05) of any factor in the cross-sectional
+        # momentum literature — adding this is the single highest-leverage
+        # factor change. Computed as price 22 bars ago vs price 252 bars ago.
+        if len(df) >= 253:
+            mom_12_1 = float(df["Close"].iloc[-22] / df["Close"].iloc[-253] - 1)
+        else:
+            mom_12_1 = 0.0
 
         # r55 T1 #8 (sub-scanner support): Bollinger Band width for the
         # vol-expansion sub-scanner. Width = 2 * 2σ / SMA20 ≈ a unitless
@@ -412,6 +530,10 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
             "rs_60d": round(r60, 4),
             "adx": round(adx, 1),
             "pct_from_52w_high": round(pct_from_hi, 4),
+            # r56 D1/D2: 12-1 momentum (highest-IC factor in the lit).
+            "mom_12_1": round(mom_12_1, 4),
+            # r56 D12: which benchmark drove the RS calculation.
+            "rs_benchmark": bench_label,
             # r55 T1 #8: stash these for the sub-scanners (avoid re-fetch).
             "_r20_abs": round(r20, 4),
             "_bb_width": round(bb_width, 4),
@@ -440,16 +562,27 @@ def _reason_tag(rvol: float, adx: float, rs: float, pct_from_hi: float) -> str:
     return ", ".join(parts) or "composite setup"
 
 
-# r54 Tier-2 #9: earnings filter at universe level.
+# r54 Tier-2 #9 + r56 B7: earnings filter — fail-CLOSED.
 def _has_earnings_window(ticker: str) -> bool:
-    """True when ticker has earnings within the next 48h. Wrapper that
-    fail-opens (returns False) on any error so a flaky earnings calendar
-    doesn't blow up the whole scan."""
+    """True when ticker has earnings within the next 48h.
+
+    r56 B7: previously failed-OPEN (yfinance error → return False →
+    "ticker is NOT in earnings window" → INCLUDED in scan). On a flaky
+    earnings calendar this lets the bot trade INTO earnings prints —
+    catastrophic risk inversion. Now fails CLOSED: any error returns
+    True (treat as in-window → exclude from scan). Trade-off: a
+    persistently-broken earnings calendar shrinks the pool. Acceptable;
+    losing some scan candidates is recoverable; trading through earnings
+    is not.
+    """
     try:
         from services.earnings import inside_earnings_window
         return bool(inside_earnings_window(ticker))
-    except Exception:
-        return False
+    except Exception as e:
+        logger.warning(
+            f"_has_earnings_window({ticker}): error -> failing CLOSED (excluding): {e}"
+        )
+        return True
 
 
 # r55 T0 #2 + T1 #10: cross-sectional z-score with James-Stein shrinkage
@@ -480,16 +613,21 @@ def _zscore(values: List[float], k_shrink: int = 20,
         return [None] * len(values) if drop_nan else [0.0] * len(values)
     mu = _stats.mean(valid)
     n = len(valid)
-    # James-Stein-style shrinkage: deviations toward the grand mean by
-    # factor n/(n+k). Smaller n => more shrinkage toward the center.
-    shrink = n / (n + k_shrink)
-    shrunk = [mu + shrink * (v - mu) for v in valid]
-    sd = _stats.stdev(shrunk) if len(shrunk) > 1 else 1.0
-    if sd <= 0:
+    # r56 B2: previous implementation was algebraically a no-op:
+    # `(mu + shrink*(v-mu) - mu) / stdev(shrunk) = shrink*(v-mu) / (shrink*sd_valid) = (v-mu)/sd_valid`
+    # — the shrinkage factor cancels in the z-score because it scales BOTH
+    # the deviation AND the stdev by the same factor. Real shrinkage:
+    # divide by the PRE-shrunk stdev so the shrinkage factor remains in
+    # the output. Equivalent to `z = shrink * (v - mu) / sd_valid` —
+    # extreme values are now actually pulled toward 0 by `shrink`,
+    # which is the entire point.
+    sd_valid = _stats.stdev(valid) if len(valid) > 1 else 1.0
+    if sd_valid <= 0:
         return [None] * len(values) if drop_nan else [0.0] * len(values)
+    shrink = n / (n + k_shrink)
     out: List[Optional[float]] = [None] * len(values)
     for vi, orig_i in enumerate(indices_valid):
-        out[orig_i] = (shrunk[vi] - mu) / sd
+        out[orig_i] = shrink * (valid[vi] - mu) / sd_valid
     if not drop_nan:
         out = [0.0 if v is None else v for v in out]
     return out
@@ -523,45 +661,44 @@ def score_universe_v2(features: List[Dict[str, Any]], regime: Optional[str] = No
     adxs  = [f.get("adx") for f in features]
     rss   = [f.get("rs_20d") for f in features]
     pcths = [f.get("pct_from_52w_high") for f in features]
+    # r56 D1: 12-1 momentum — highest-IC factor in published lit.
+    moms  = [f.get("mom_12_1") for f in features]
     # r55 T1 #10: NaN-aware z-score returns None for missing values.
-    # Tickers with ANY missing factor get score_v2=None and are dropped
-    # from the v2 ranking (legacy `score` still ranks them).
     rvols_z = _zscore(rvols, drop_nan=True)
     adxs_z  = _zscore(adxs,  drop_nan=True)
     rss_z   = _zscore(rss,   drop_nan=True)
     pcths_z = _zscore(pcths, drop_nan=True)
-    # r55 T0 #3: residualize RVOL against ADX, THEN re-standardize so
-    # the residual's variance is back to 1.0. Original code skipped the
-    # re-standardization, which broke the assumption that all factors
-    # contribute on equal footing in the weighted composite below — the
-    # residualized RVOL had σ < 1, so its effective composite weight
-    # was silently smaller than `weights["rvol"]` would suggest.
+    moms_z  = _zscore(moms,  drop_nan=True)
+    # r56 D3: residualize RS_20d against pct_from_52w_high (the most
+    # collinear pair, ρ≈0.6-0.8 — both proxy for "stock has gone up
+    # recently"). r54 originally residualized RVOL × ADX (ρ≈0.25-0.40),
+    # which is a real-but-weaker correlation; r56 swaps to the actually-
+    # damaging pair so the composite stops double-counting momentum.
+    # Keeps r55 T0 #3's re-standardization (residual σ → 1).
     try:
         import statistics as _stats
-        # Filter to indices where both RVOL and ADX z are valid
-        pair_idx = [i for i in range(len(rvols_z))
-                    if rvols_z[i] is not None and adxs_z[i] is not None]
+        # Filter to indices where BOTH RS and pct_from_hi z are valid
+        pair_idx = [i for i in range(len(rss_z))
+                    if rss_z[i] is not None and pcths_z[i] is not None]
         if len(pair_idx) > 5:
-            r_pairs = [rvols_z[i] for i in pair_idx]
-            a_pairs = [adxs_z[i] for i in pair_idx]
-            mean_a = _stats.mean(a_pairs)
+            r_pairs = [rss_z[i] for i in pair_idx]
+            p_pairs = [pcths_z[i] for i in pair_idx]
+            mean_p = _stats.mean(p_pairs)
             mean_r = _stats.mean(r_pairs)
-            var_a = sum((a - mean_a) ** 2 for a in a_pairs) / max(1, len(a_pairs) - 1)
-            cov_ra = sum((r - mean_r) * (a - mean_a)
-                         for r, a in zip(r_pairs, a_pairs)) / max(1, len(r_pairs) - 1)
-            beta = cov_ra / var_a if var_a > 1e-9 else 0.0
-            # Compute residuals on the paired subset.
-            resid = [r - beta * a for r, a in zip(r_pairs, a_pairs)]
-            # r55 T0 #3: re-standardize residuals to σ=1.
+            var_p = sum((p - mean_p) ** 2 for p in p_pairs) / max(1, len(p_pairs) - 1)
+            cov_rp = sum((r - mean_r) * (p - mean_p)
+                         for r, p in zip(r_pairs, p_pairs)) / max(1, len(r_pairs) - 1)
+            beta = cov_rp / var_p if var_p > 1e-9 else 0.0
+            # Residuals: orthogonalize RS_20d against pct_from_52w_high.
+            resid = [r - beta * p for r, p in zip(r_pairs, p_pairs)]
             mu_res = _stats.mean(resid)
             sd_res = _stats.stdev(resid) if len(resid) > 1 else 1.0
             if sd_res > 1e-9:
                 resid_norm = [(r - mu_res) / sd_res for r in resid]
             else:
                 resid_norm = [0.0 for _ in resid]
-            # Splice back into rvols_z, preserving Nones at unpaired indices.
             for vi, orig_i in enumerate(pair_idx):
-                rvols_z[orig_i] = resid_norm[vi]
+                rss_z[orig_i] = resid_norm[vi]
     except Exception:
         pass
     # Weights — regime / TOD overrides.
@@ -575,29 +712,35 @@ def score_universe_v2(features: List[Dict[str, Any]], regime: Optional[str] = No
     # the rank math is non-monotone in the underlying signal). Always-
     # positive weights with explicit factor-inversion preserve
     # interpretability: "rank the universe by composite alpha factor".
+    # r56 D1/D2 + IC-weighting: weights informed by Asness 2013 /
+    # George-Hwang 2004 / Jegadeesh-Titman 1993 IC magnitudes.
+    # mom_12_1 (Asness IC≈0.05) and pct_from_52w_high (G-H IC≈0.045) get the
+    # heaviest weights — these are the two factors with the strongest
+    # published cross-sectional evidence. ADX (no academic IC support) is
+    # near-zero. RS_20d sits in Jegadeesh's reversal zone — kept for
+    # short-term confirmation but down-weighted vs r54/r55.
     weights = {
-        "rvol": 0.20, "adx": 0.20, "rs": 0.30, "pct_from_hi": 0.30,
+        "rvol": 0.15, "adx": 0.05, "rs": 0.15, "pct_from_hi": 0.30, "mom": 0.35,
     }
-    invert = {"rvol": False, "adx": False, "rs": False, "pct_from_hi": False}
+    invert = {"rvol": False, "adx": False, "rs": False, "pct_from_hi": False, "mom": False}
     if regime == "CHOP":
-        # In chop, mean-reversion: invert RS and pct_from_hi (we want
-        # OVERSOLD, i.e., far from highs and underperforming SPY recently).
-        # Volume + ADX still matter (we want active reversal candidates,
-        # not dead names) so we keep them positive.
-        weights = {"rvol": 0.30, "adx": 0.10, "rs": 0.30, "pct_from_hi": 0.30}
-        invert = {"rvol": False, "adx": False, "rs": True, "pct_from_hi": True}
+        # r56 D4: CHOP regime now ZEROES ADX weight (was 0.10 with ADX>0
+        # rewarded — internally contradictory). Inverts mean-reversion
+        # factors (rs + pct_from_hi + mom_12_1).
+        weights = {"rvol": 0.30, "adx": 0.00, "rs": 0.20, "pct_from_hi": 0.25, "mom": 0.25}
+        invert = {"rvol": False, "adx": False, "rs": True, "pct_from_hi": True, "mom": True}
     elif regime == "HIGH_VOL":
-        # In high vol, suppress all weights — fewer, higher-conviction picks.
-        weights = {"rvol": 0.20, "adx": 0.10, "rs": 0.20, "pct_from_hi": 0.20}
+        weights = {"rvol": 0.15, "adx": 0.05, "rs": 0.20, "pct_from_hi": 0.30, "mom": 0.30}
     if tod_profile and tod_profile in _TOD_PROFILES:
         prof = _TOD_PROFILES[tod_profile]
-        # Map TOD profile keys back to z-score factors (best-effort).
-        # TOD profiles are always trend-following, so invert is left as-is.
+        # TOD profiles only override the four base factors (mom is left at
+        # the regime-default; TOD is intraday flavor, mom is structural).
         weights = {
             "rvol": prof.get("rvol", weights["rvol"]),
             "adx":  prof.get("adx",  weights["adx"]),
             "rs":   prof.get("rs",   weights["rs"]),
             "pct_from_hi": prof.get("pct_from_hi", weights["pct_from_hi"]),
+            "mom":  weights["mom"],
         }
     # Apply factor inversion (r55 T0 #4). Preserve Nones.
     def _negate(zs: List[Optional[float]]) -> List[Optional[float]]:
@@ -606,19 +749,24 @@ def score_universe_v2(features: List[Dict[str, Any]], regime: Optional[str] = No
     if invert["adx"]:     adxs_z  = _negate(adxs_z)
     if invert["rs"]:      rss_z   = _negate(rss_z)
     if invert["pct_from_hi"]: pcths_z = _negate(pcths_z)
+    if invert.get("mom"): moms_z  = _negate(moms_z)
     # Compose. Tickers with ANY missing factor get composite=None and
-    # score_v2=None (excluded from v2 ranking, T1 #10).
+    # score_v2=None (excluded from v2 ranking, T1 #10). r56 D1: mom is
+    # required-but-tolerant — if missing (IPO with <253 bars), substitute
+    # the universe median rank (z=0) instead of dropping the row.
     composite: List[Optional[float]] = []
     for i in range(len(features)):
         zs = (rvols_z[i], adxs_z[i], rss_z[i], pcths_z[i])
         if any(z is None for z in zs):
             composite.append(None)
             continue
+        m_z = moms_z[i] if moms_z[i] is not None else 0.0
         composite.append(
             weights["rvol"] * rvols_z[i]
             + weights["adx"] * adxs_z[i]
             + weights["rs"] * rss_z[i]
             + weights["pct_from_hi"] * pcths_z[i]
+            + weights["mom"] * m_z
         )
     # Convert composite → percentile rank → 0-100, ranking only valid rows.
     valid_indices = [i for i, c in enumerate(composite) if c is not None]
@@ -637,6 +785,39 @@ def score_universe_v2(features: List[Dict[str, Any]], regime: Optional[str] = No
         else:
             f2["score_v2"] = None
         out.append(f2)
+    return out
+
+
+# r56 D5: short-side scanner. Mirror of breakout — far below 52w-LOW,
+# negative RS, RVOL surge, ADX trending. Activated only in bear regimes
+# (VIX>25 OR SPY 200d-slope<0). Removes the "fight the index" failure
+# mode in 2022-style drawdowns where every long fights downtrend.
+def _scan_short_side(scored: List[Dict[str, Any]],
+                     regime: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Short-side candidates for bear regimes. Symmetric mirror of
+    breakout: stocks pressing/below 52w lows on negative RS and
+    elevated volume. Only fires when regime is HIGH_VOL or downtrend
+    is detected; off otherwise so we don't short during normal pullbacks.
+    """
+    # r56 D5: only emit short candidates in bearish regimes.
+    if regime not in ("HIGH_VOL", "BEAR", "CHOP"):
+        return []
+    out = []
+    for s in scored:
+        try:
+            # Negative RS (under-performing SPY by ≥3%) AND down >10% from 52wH
+            # AND adx ≥ 22 (trending DOWN — we don't short into mean-reversion)
+            # AND rvol ≥ 1.4 (active distribution, not dead names).
+            if (s.get("rs_20d", 0) <= -0.03
+                    and s.get("pct_from_52w_high", 0) <= -0.10
+                    and s.get("adx", 0) >= 22
+                    and s.get("rvol", 0) >= 1.4):
+                cand = dict(s)
+                cand["pool_source"] = "short"
+                cand["reason"] = (s.get("reason") or "") + " | short-side breakdown"
+                out.append(cand)
+        except Exception:
+            continue
     return out
 
 
@@ -832,8 +1013,35 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
       7. Async cleanup deletes prior generations (best-effort).
     """
     from database import SessionLocal, CandidatePool, AutoTraderConfig
-    from concurrent.futures import ThreadPoolExecutor
-    from sqlalchemy import func as _func
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout, wait as _fut_wait
+    from sqlalchemy import func as _func, text as _sql_text
+
+    # r56 B4/B5: acquire scan lock FIRST, before any expensive work, so
+    # concurrent scans (cron + manual + Cloud Run multi-instance) bail
+    # immediately rather than burning Alpaca/Yahoo quota in parallel.
+    # Use Postgres pg_try_advisory_lock (non-blocking) when available;
+    # SQLite path is a no-op (single-writer DB serializes naturally).
+    _SCAN_LOCK_KEY = 5471234  # arbitrary unique int for advisory lock namespace
+    _lock_db = SessionLocal()
+    _lock_acquired = False
+    try:
+        try:
+            row = _lock_db.execute(
+                _sql_text("SELECT pg_try_advisory_lock(:k)"),
+                {"k": _SCAN_LOCK_KEY},
+            ).scalar()
+            _lock_acquired = bool(row)
+            if not _lock_acquired:
+                logger.info("universe_scanner: another scan in progress, skipping")
+                return {"scanned": 0, "top_n": 0, "skipped": "lock_held"}
+        except Exception:
+            # SQLite or non-Postgres: no advisory lock available; rely on
+            # scheduler max_instances=1 + db.query.with_for_update later.
+            _lock_acquired = False  # keep flag false so we don't try to release
+    finally:
+        # Don't close the session — we need it alive to hold the lock.
+        # We'll close it in the outer finally (below).
+        pass
 
     # Read config
     db = SessionLocal()
@@ -856,9 +1064,35 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
     finally:
         db.close()
 
+    # Wrap the rest in try/finally so the advisory lock is always released.
+    try:
+        return _run_scan_inner(top_n, scoring_v2_mode, enabled_scanners,
+                               tod_enabled, include_etfs)
+    finally:
+        if _lock_acquired:
+            try:
+                _lock_db.execute(
+                    _sql_text("SELECT pg_advisory_unlock(:k)"),
+                    {"k": _SCAN_LOCK_KEY},
+                )
+                _lock_db.commit()
+            except Exception as _ue:
+                logger.warning(f"universe_scanner: advisory unlock failed: {_ue}")
+        try:
+            _lock_db.close()
+        except Exception:
+            pass
+
+
+def _run_scan_inner(top_n, scoring_v2_mode, enabled_scanners,
+                    tod_enabled, include_etfs):
+    """Inner body of run_scan; advisory-lock release happens in caller."""
+    from database import SessionLocal, CandidatePool, AutoTraderConfig
+    from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait
+    from sqlalchemy import func as _func
+
     universe = pull_universe()
     if include_etfs:
-        # Append sector ETFs (small fixed list — no liquidity issue).
         existing = {u["ticker"] for u in universe}
         for etf in SECTOR_ETFS:
             if etf not in existing:
@@ -866,6 +1100,20 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
     if not universe:
         logger.info("universe_scanner: empty universe — skipping")
         return {"scanned": 0, "top_n": 0}
+
+    # r56 D8: exchange-calendar gate. Skip writing a fresh pool on
+    # closed-market days (weekends, US holidays). Without this guard the
+    # scan churns the same closed-bar features every cron tick on
+    # weekends, burning Alpaca/Yahoo quota for no value.
+    try:
+        from datetime import datetime as _dt_cal
+        from zoneinfo import ZoneInfo as _ZI_cal
+        now_et_cal = _dt_cal.utcnow().replace(tzinfo=_ZI_cal("UTC")).astimezone(_ZI_cal("America/New_York"))
+        if now_et_cal.weekday() >= 5:  # Saturday=5, Sunday=6
+            logger.info("universe_scanner: market closed (weekend) — skipping")
+            return {"scanned": 0, "top_n": 0, "skipped": "weekend"}
+    except Exception:
+        pass
 
     spy = _spy_returns()
     start = time.time()
@@ -884,17 +1132,44 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"universe_scanner: bulk-warm failed (falling through to per-ticker): {e}")
 
-    # Score every candidate (legacy composite). Parallel via thread pool —
-    # Alpaca handles concurrent reqs cleanly; data_fetcher has rate limiter
-    # for the yfinance fallback path.
+    # r56 D12: pre-compute sector ETF returns once before scoring so each
+    # ticker can benchmark against its own sector instead of SPY.
+    sector_etf_r20_pre: Dict[str, float] = {}
+    try:
+        sector_etf_r20_pre = _compute_sector_etf_returns()
+    except Exception as _se:
+        logger.debug(f"sector ETF pre-fetch failed (falling back to SPY-only RS): {_se}")
+
+    # Score every candidate (legacy composite). Parallel via thread pool.
+    # r56 B6 + Performance #2: drop workers 8 → 4. Post-warmup, score_candidate
+    # is GIL-bound (compute_indicators + numpy), so 8 workers don't help —
+    # 4 halves transient memory copies without slowing wall time.
+    # r56 B6: enforce a scan-wide timeout (240s) so a stuck Alpaca/Yahoo
+    # call can't wedge the scanner across cron ticks.
+    SCAN_DEADLINE_SEC = 240.0
+
     def _score_one(u):
-        return score_candidate(u["ticker"], spy_r20=spy["r20"])
+        return score_candidate(u["ticker"], spy_r20=spy["r20"],
+                               sector_etf_r20=sector_etf_r20_pre)
 
     scored = []
-    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="univscan") as pool:
-        for res in pool.map(_score_one, universe):
-            if res:
-                scored.append(res)
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="univscan") as pool:
+        futures = [pool.submit(_score_one, u) for u in universe]
+        done, not_done = _fut_wait(futures, timeout=SCAN_DEADLINE_SEC)
+        if not_done:
+            logger.warning(
+                f"universe_scanner: {len(not_done)}/{len(futures)} tickers timed out at "
+                f"{SCAN_DEADLINE_SEC}s; cancelling and proceeding with {len(done)} scored"
+            )
+            for f in not_done:
+                f.cancel()
+        for f in done:
+            try:
+                res = f.result(timeout=0)
+                if res:
+                    scored.append(res)
+            except Exception:
+                continue
 
     # r54 Tier-1 #5: compute v2 z-score stack alongside legacy.
     try:
@@ -916,7 +1191,7 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
 
     # Choose ranking key: v2 only when active; otherwise legacy score.
     score_key = "score_v2" if scoring_v2_mode == "active" else "score"
-    scored.sort(key=lambda r: r.get(score_key) or 0, reverse=True)
+    scored.sort(key=lambda r: (r.get(score_key) if r.get(score_key) is not None else float("-inf")), reverse=True)
 
     # r54 Tier-1 #6: multi-pool architecture. Tag each candidate with
     # `pool_source`. The breakout pool is the legacy ranking; specialized
@@ -924,12 +1199,9 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
     # r55 T1 #8: compute sector ETF benchmarks ONCE per scan (11 ETFs
     # cached in data_fetcher) and pass to the sector-relative sub-scanner.
     pool_candidates: Dict[str, List[Dict[str, Any]]] = {}
-    sector_etf_r20: Dict[str, float] = {}
-    if "sector_rel" in enabled_scanners:
-        try:
-            sector_etf_r20 = _compute_sector_etf_returns()
-        except Exception as e:
-            logger.warning(f"sector ETF benchmarking failed: {e}")
+    # r56 D12: reuse pre-computed sector ETF returns (already fetched once
+    # for primary RS benchmarking; no need to refetch for sector_rel).
+    sector_etf_r20 = sector_etf_r20_pre
     if "breakout" in enabled_scanners:
         pool_candidates["breakout"] = [{**c, "pool_source": "breakout"} for c in scored]
     if "pead" in enabled_scanners:
@@ -938,17 +1210,40 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
         pool_candidates["sector_rel"] = _scan_sector_relative(scored, sector_etf_r20)
     if "vol_exp" in enabled_scanners:
         pool_candidates["vol_exp"] = _scan_vol_expansion(scored)
+    # r56 D5: short-side scanner (only emits in bear/HIGH_VOL/CHOP regimes)
+    if "short" in enabled_scanners:
+        pool_candidates["short"] = _scan_short_side(scored, regime=regime)
     # Apply quotas, dedupe by ticker (highest-score wins).
     final: Dict[str, Dict[str, Any]] = {}  # ticker → row
     for source, candidates in pool_candidates.items():
         quota_n = max(1, int(_POOL_QUOTAS.get(source, 1.0 / max(1, len(pool_candidates))) * top_n))
-        candidates.sort(key=lambda r: r.get(score_key) or 0, reverse=True)
+        candidates.sort(key=lambda r: (r.get(score_key) if r.get(score_key) is not None else float("-inf")), reverse=True)
         for c in candidates[:quota_n]:
             t = c["ticker"]
             existing = final.get(t)
-            if existing is None or (c.get(score_key) or 0) > (existing.get(score_key) or 0):
+            _c_score = c.get(score_key) if c.get(score_key) is not None else float("-inf")
+            _e_score = existing.get(score_key) if existing and existing.get(score_key) is not None else float("-inf")
+            if existing is None or _c_score > _e_score:
                 final[t] = c
-    top = sorted(final.values(), key=lambda r: r.get(score_key) or 0, reverse=True)[:top_n]
+    # r56 D7: top-quintile-with-cap selection. Apply a MINIMUM SCORE
+    # threshold equal to the ~80th percentile so quiet days produce a
+    # smaller pool (correct behavior) instead of "always take top N
+    # regardless of quality".
+    final_list = list(final.values())
+    if len(final_list) >= 10:
+        scores_for_threshold = sorted(
+            [s.get("score") or 0.0 for s in final_list], reverse=True
+        )
+        cut_idx = max(0, int(len(scores_for_threshold) * 0.20) - 1)
+        score_threshold = scores_for_threshold[cut_idx]
+        eligible = [s for s in final_list if (s.get("score") or 0.0) >= score_threshold]
+    else:
+        eligible = final_list
+    top = sorted(
+        eligible,
+        key=lambda r: (r.get(score_key) if r.get(score_key) is not None else float("-inf")),
+        reverse=True,
+    )[:top_n]
 
     # r55 T0 #1: race-free atomic pool swap. The r54 implementation had
     # two separate problems:
@@ -1011,8 +1306,17 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
         db.close()
 
     elapsed = time.time() - start
+    # r56 Performance #1: drop the bulk-warmed daily-bar cache entries
+    # after the scan to free memory before the scoring-pool transient.
+    # Other consumers (consider_signal, signal_generator) re-fetch via
+    # data_fetcher and hit the regular per-call cache TTL anyway.
+    try:
+        from services.data_fetcher import _cache as _df_cache
+        _df_cache.clear()
+    except Exception:
+        pass
     logger.info(
-        f"universe_scanner r54: scored {len(scored)}/{len(universe)} in {elapsed:.1f}s; "
+        f"universe_scanner r56: scored {len(scored)}/{len(universe)} in {elapsed:.1f}s; "
         f"top {len(top)} persisted gen={new_gen} sources={list(pool_candidates.keys())} "
         f"v2_mode={scoring_v2_mode} tod_profile={_classify_tod() if tod_enabled else 'off'}"
     )
@@ -1029,14 +1333,91 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
 
 
 def get_candidate_tickers() -> List[str]:
-    """Return the current candidate pool tickers in score-desc order,
-    excluding any tickers on the global blacklist. r54 Tier-0 #1: filter
-    to MAX(generation) so concurrent rebuilds never expose empty/partial
-    pool to readers.
+    """Backward-compat thin wrapper around `get_candidate_meta`. Returns
+    just tickers (the legacy `List[str]` shape that consider_signal
+    consumes). For richer scanner metadata (score, score_v2, pool_source),
+    callers should use `get_candidate_meta` directly."""
+    return [m["ticker"] for m in get_candidate_meta()]
 
-    r54 Tier-1 #5: ranking key follows cfg.universe_scoring_v2 — when
-    `active`, ranks by score_v2 (cross-sectional z-score), else legacy
-    score.
+
+def get_candidate_meta_for(ticker: str) -> Optional[Dict[str, Any]]:
+    """r56 Tier-0 E2: lookup scanner metadata for a single ticker. Used by
+    consider_signal / position sizer / strategy router so pool_source and
+    score_v2 can influence downstream behavior (different stops for PEAD
+    vs sector_rel, sizing scaled by score_v2 percentile, etc.).
+
+    Returns None when ticker isn't in the current pool.
+    """
+    from database import SessionLocal, CandidatePool
+    from sqlalchemy import func as _func
+    if not ticker:
+        return None
+    db = SessionLocal()
+    try:
+        max_gen = db.query(_func.coalesce(_func.max(CandidatePool.generation), 0)).scalar() or 0
+        row = (
+            db.query(CandidatePool)
+            .filter(CandidatePool.generation == max_gen)
+            .filter(_func.upper(CandidatePool.ticker) == ticker.upper())
+            .first()
+        )
+        if row is None:
+            return None
+        return {
+            "ticker": row.ticker,
+            "score": row.score,
+            "score_v2": getattr(row, "score_v2", None),
+            "pool_source": getattr(row, "pool_source", "breakout"),
+            "rvol": row.rvol,
+            "rs_20d": row.rs_20d,
+            "adx": row.adx,
+            "pct_from_52w_high": row.pct_from_52w_high,
+            "generation": getattr(row, "generation", None),
+        }
+    finally:
+        db.close()
+
+
+def scanner_conviction_multiplier(ticker: str) -> float:
+    """r56 Tier-0 E2: position-sizing multiplier from scanner metadata.
+    Returns 0.85-1.15 based on score_v2 percentile (if v2 active) or
+    score (if shadow). Top of pool gets +15%, bottom gets -15%, neutral
+    otherwise. Returns 1.0 when ticker isn't in the pool (watchlist-only
+    entries fall through unchanged — backwards compatible).
+    """
+    meta = get_candidate_meta_for(ticker)
+    if not meta:
+        return 1.0
+    # score_v2 is already a 0-100 percentile rank when populated.
+    # score is roughly 0-100 in absolute terms (capped by score_candidate).
+    sv = meta.get("score_v2")
+    if sv is not None:
+        # Map percentile rank: 80+ → 1.15, 50 → 1.0, 20- → 0.85
+        if sv >= 80:    return 1.15
+        if sv >= 60:    return 1.05
+        if sv >= 40:    return 1.0
+        if sv >= 20:    return 0.95
+        return 0.85
+    # Fallback: scale by raw score
+    s = meta.get("score") or 0
+    if s >= 70:    return 1.10
+    if s >= 50:    return 1.0
+    return 0.90
+
+
+def get_candidate_meta() -> List[Dict[str, Any]]:
+    """r56 Tier-0 E2: surface scanner metadata to consumers (consider_signal,
+    position sizer, strategy router). Previously consider_signal received
+    only `List[str]`, throwing away score_v2 / pool_source / rvol /
+    pct_from_52w_high — meaning all the scanner's z-score/residualization/
+    sub-scanner work was architecturally inert (the entire scanner could
+    have been replaced with `SELECT ticker FROM candidate_pool` and
+    downstream behavior would be byte-identical).
+
+    Now returns dicts with: ticker, score, score_v2, pool_source, rvol,
+    rs_20d, rs_benchmark, adx, pct_from_52w_high, mom_12_1, generation,
+    last_evaluated_at. Excludes blacklisted tickers. Sorted per
+    cfg.universe_scoring_v2.
     """
     from database import SessionLocal, CandidatePool, AutoTraderConfig
     from sqlalchemy import func as _func
@@ -1057,6 +1438,22 @@ def get_candidate_tickers() -> List[str]:
         )
         bl_csv = (getattr(cfg, "ticker_blacklist", "") or "").upper() if cfg else ""
         blacklist = {s.strip() for s in bl_csv.split(",") if s.strip()}
-        return [r.ticker for r in rows if r.ticker.upper() not in blacklist]
+        out = []
+        for r in rows:
+            if r.ticker.upper() in blacklist:
+                continue
+            out.append({
+                "ticker": r.ticker,
+                "score": r.score,
+                "score_v2": getattr(r, "score_v2", None),
+                "pool_source": getattr(r, "pool_source", "breakout"),
+                "rvol": r.rvol,
+                "rs_20d": r.rs_20d,
+                "adx": r.adx,
+                "pct_from_52w_high": r.pct_from_52w_high,
+                "generation": getattr(r, "generation", None),
+                "last_evaluated_at": r.last_evaluated_at,
+            })
+        return out
     finally:
         db.close()

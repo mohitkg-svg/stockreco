@@ -17,27 +17,48 @@ logger = logging.getLogger(__name__)
 
 
 class _BoundedTTLCache(OrderedDict):
-    """LRU-bounded dict of (value, expiry_ts). Evicts oldest on overflow.
-
-    Keeps the same `_cache[key] = (df, expiry)` / `if key in _cache` API the
-    rest of data_fetcher already uses, so drop-in. The admin /clear-cache
-    endpoint also still works because .clear()/len() inherit from OrderedDict.
+    """LRU-bounded thread-safe dict of (value, expiry_ts). r56 B9 added a
+    threading.Lock around all mutating ops because the universe scanner's
+    ThreadPoolExecutor calls fetch_ohlcv concurrently — without the lock,
+    OrderedDict.move_to_end / popitem can raise
+    `RuntimeError: OrderedDict mutated during iteration` or corrupt the
+    linked list under concurrent writes.
     """
     def __init__(self, max_entries: int):
         super().__init__()
         self._max = max_entries
+        import threading as _t
+        self._lock = _t.RLock()
 
     def __setitem__(self, key, value):
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        while len(self) > self._max:
-            self.popitem(last=False)  # drop LRU
+        with self._lock:
+            if key in self:
+                self.move_to_end(key)
+            super().__setitem__(key, value)
+            while len(self) > self._max:
+                self.popitem(last=False)  # drop LRU
 
     def __getitem__(self, key):
-        v = super().__getitem__(key)
-        self.move_to_end(key)
-        return v
+        with self._lock:
+            v = super().__getitem__(key)
+            self.move_to_end(key)
+            return v
+
+    def __contains__(self, key):
+        with self._lock:
+            return super().__contains__(key)
+
+    def clear(self):
+        with self._lock:
+            super().clear()
+
+    def keys_snapshot(self):
+        """r56 B9 + Code-review #20: return a list snapshot of current
+        keys so callers can iterate safely without holding the lock or
+        racing concurrent writers (`for k in _cache:` raises if another
+        thread inserts mid-iteration)."""
+        with self._lock:
+            return list(self.keys())
 
 
 # In-memory cache: {cache_key: (dataframe_or_dict, expiry_timestamp)}
@@ -410,10 +431,28 @@ def fetch_ohlcv_bulk(tickers: List[str], timeframe: str = "1d", batch_size: int 
                         df_t = df_t.copy()
                         df_t.columns = [c.title() if c.lower() in ("open", "high", "low", "close", "volume") else c for c in df_t.columns]
                         out[t] = df_t
-                        # Cache it so subsequent fetch_ohlcv hits hit the cache.
+                        # r56 B12 / Code-review #1: previous code did
+                        # `cfg["ttl"] if isinstance(cfg, dict) else 3600`,
+                        # but `cfg = _ALPACA_TF.get(timeframe)` is a tuple,
+                        # so isinstance was always False → hardcoded 3600s.
+                        # That's wrong for intraday timeframes (5m wants
+                        # 300s, 15m wants 300s, etc.). Look up the real
+                        # TTL from TIMEFRAME_CONFIG.
+                        # r56 B13 / Code-review #2: tag the cache entry
+                        # with `source="alpaca"` so a later Yahoo
+                        # fallback (`source="yahoo"`) doesn't collide on
+                        # the default `auto` key — which would mix
+                        # adjusted (Alpaca) and unadjusted (Yahoo) bars.
                         try:
-                            key = _cache_key(t, timeframe)
-                            _cache[key] = (df_t.copy(), now_ts + cfg["ttl"] if isinstance(cfg, dict) else now_ts + 3600)
+                            tf_cfg = TIMEFRAME_CONFIG.get(timeframe, {})
+                            ttl = int(tf_cfg.get("ttl", 3600))
+                            # Cache under both alpaca-tagged AND auto-tagged keys
+                            # so existing fetch_ohlcv readers (which use auto)
+                            # see the warmup, and source-aware readers see the
+                            # alpaca-tagged variant.
+                            for src_tag in ("alpaca", "auto"):
+                                key = _cache_key(t, timeframe, source=src_tag)
+                                _cache[key] = (df_t.copy(), now_ts + ttl)
                         except Exception:
                             pass
                     except Exception:
@@ -518,10 +557,21 @@ def get_ticker_info(ticker: str) -> dict:
         if now < expiry:
             return info
 
+    # r56 B10 / Code-review #12: every fallback path MUST return a dict
+    # with the same shape as the success path — including `sector`,
+    # `industry`, `currency`. Caller (sector_rel scanner) does
+    # `info.get("sector").strip()` — None.strip() raises and gets caught
+    # silently, dropping the ticker from the sector_rel pool with no log.
+    _DEFAULT_INFO = {
+        "name": ticker.upper(),
+        "sector": "",
+        "industry": "",
+        "currency": "USD",
+    }
     try:
         if not _yf_acquire():
             logger.warning(f"yahoo rate-limit timeout for ticker_info {ticker}")
-            return {"name": ticker.upper()}
+            return dict(_DEFAULT_INFO)
         crumb = _get_crumb()
         sess = _get_session()
         url = f"{BASE_URL}/v10/finance/quoteSummary/{ticker.upper()}"
@@ -533,10 +583,6 @@ def get_ticker_info(ticker: str) -> dict:
         profile = block.get("summaryProfile", {}) or {}
         result = {
             "name": price_data.get("longName") or price_data.get("shortName", ticker),
-            # C3 fix: actually extract sector (was hardcoded ""). Without this,
-            # the auto-trader's per-sector cap is a no-op because every trade
-            # has sector="" and max_per_sector never gates. yfinance returns
-            # sector on the summaryProfile module (already in our params list).
             "sector": (profile.get("sector") or "").strip(),
             "industry": (profile.get("industry") or "").strip(),
             "currency": price_data.get("currency", "USD"),
@@ -545,14 +591,7 @@ def get_ticker_info(ticker: str) -> dict:
         return result
     except Exception as e:
         logger.warning(f"Could not fetch info for {ticker}: {e}")
-        # Try fallback: get name from chart meta
-        try:
-            df = fetch_ohlcv(ticker, "1d")
-            if not df.empty:
-                return {"name": ticker.upper()}
-        except Exception:
-            pass
-        return {"name": ticker.upper()}
+        return dict(_DEFAULT_INFO)
 
 
 def _alpaca_latest_trade(ticker: str) -> Optional[float]:
@@ -669,6 +708,12 @@ def get_current_price(ticker: str) -> Optional[Tuple[float, float]]:
 
 
 def invalidate_cache(ticker: str):
-    keys_to_remove = [k for k in _cache if k.startswith(ticker.upper() + ":")]
+    # r56 B9 / Code-review #20: use snapshot to avoid concurrent-mutation
+    # crash when a scoring thread is writing to _cache mid-iteration.
+    prefix = ticker.upper() + ":"
+    keys_to_remove = [k for k in _cache.keys_snapshot() if k.startswith(prefix)]
     for k in keys_to_remove:
-        del _cache[k]
+        try:
+            del _cache[k]
+        except KeyError:
+            pass

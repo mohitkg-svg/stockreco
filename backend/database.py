@@ -437,6 +437,54 @@ class CandidatePool(Base):
     score_v2 = Column(Float, nullable=True)
 
 
+class CandidateEvent(Base):
+    """r56 Tier-3 Option B: event-driven candidate stream.
+
+    The legacy CandidatePool model is poll-driven ("every 15min, score
+    500 stocks, write top-30") — fundamentally a portfolio-construction
+    abstraction we don't need (we trade single positions, not a 500-name
+    book). Real momentum/breakout alpha is event-shaped: a gap fires
+    NOW, an RVOL surge fires NOW. Polling at 15-min cadence loses the
+    event timestamp (the alpha) and forces the bot to either trade flat
+    days or starve on storm days when 100 names are screaming.
+
+    CandidateEvent is the event-driven complement: each row is a discrete
+    setup detection at a specific timestamp, tagged with `kind` so the
+    consumer (auto_trader.consider_event) can route to the right strategy
+    handler. Threshold-based, not top-N. Quiet days produce 0-3 events;
+    active days produce 30-100; the pre-existing concurrent-position cap,
+    correlation gate, and book-VAR cap throttle from the consumer side.
+
+    The legacy CandidatePool continues to populate from the cron-based
+    universe_scanner.run_scan() during the transition window so neither
+    path is exclusive.
+    """
+    __tablename__ = "candidate_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # Event kind. Each kind maps to a strategy handler in auto_trader:
+    #   "GAP"             — open vs prev close > 2× ATR
+    #   "RVOL_SURGE"      — rolling 5min vol > 2× same-time-of-day 20d avg
+    #   "NEW_HIGH"        — prints above 20-day high on RVOL>1.3
+    #   "SQUEEZE_RELEASE" — BB-width expansion ≥1.4× compressed prior + RVOL
+    #   "PEAD"            — earnings within last 10 days + post-earnings drift
+    #   "BREAKDOWN"       — short-side: prints below 20-day low on RVOL>1.3
+    kind = Column(String, index=True, nullable=False)
+    ticker = Column(String, index=True, nullable=False)
+    # When the event fired (event-time, not detection-time).
+    event_at = Column(DateTime, default=datetime.utcnow, index=True)
+    # Liveness — events have a TTL ("act within 30 min or stale").
+    expires_at = Column(DateTime, nullable=True, index=True)
+    # Score per kind: each kind has its own scoring rubric. Roughly 0-100
+    # (e.g., GAP score = abs(gap)/ATR * 50).
+    score = Column(Float, nullable=False)
+    # Triggering features at event time (gap_pct, rvol, atr, etc.)
+    features = Column(String, nullable=True)  # JSON-serialized
+    # Was this event acted on? (consider_event sets this when an entry fires.)
+    consumed_at = Column(DateTime, nullable=True, index=True)
+    consumed_decision = Column(String, nullable=True)  # "entered"|"skipped"|"no_thesis"
+    consumed_reason = Column(String, nullable=True)
+
+
 class BestStrategyPerTicker(Base):
     """Cached winner of the per-ticker walk-forward backtest.
 

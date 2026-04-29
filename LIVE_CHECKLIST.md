@@ -152,6 +152,10 @@ Conservative first-month profile. JSON to send:
   // ── Universe ──
   "use_universe_scanner": false,             // ⚠️ watchlist only for known names
   "universe_top_n": 30,
+  // r56 Tier-0 E1: STOCK_UNIVERSE_FILE auto-discovers data/russell1000.txt
+  // when env var is unset. To override, set STOCK_UNIVERSE_FILE=/path/to/file.
+  // r56 Tier-3 Option B: event_detector runs every 2min during RTH and emits
+  // CandidateEvent rows. consider_event drains these in scheduled_scan.
   "ticker_blacklist": "VTWO,CNTA",           // recent paper losers; add as discovered
   // r54/r55 universe-scanner knobs:
   "universe_scoring_v2": "shadow",           // off | shadow | active. r55 fixed

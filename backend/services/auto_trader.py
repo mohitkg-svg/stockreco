@@ -1984,6 +1984,67 @@ MIN_OPTION_SCORE = 65             # contract score gate in default mode
 MIN_OPTION_SCORE_AGGRESSIVE = 55  # lowered gate when aggressive_options_mode is on
 
 
+def consider_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """r56 Tier-3 Option B: event-driven entry consumer.
+
+    Called by scheduled_scan when `event_detector.get_active_events()`
+    returns un-consumed candidate events. The kind dispatches to a
+    strategy handler (currently routes through the existing
+    consider_signal / consider_call_play paths with a synthesized signal,
+    pending dedicated per-kind handlers in r57+).
+
+    The point of this hook is to make event-driven candidates first-class
+    citizens of the auto_trader's gate stack — same crisis_mode / sector
+    cap / correlation gate / book-VAR filtering as cron-driven entries.
+
+    Mark-consumed semantics: every path (entered, skipped-by-gate,
+    no_thesis) calls event_detector.mark_consumed so the same event
+    isn't re-processed on the next 2-min tick.
+    """
+    from services import event_detector as _ed
+    eid = event.get("id")
+    ticker = event.get("ticker")
+    kind = event.get("kind")
+    if not (eid and ticker and kind):
+        return None
+
+    # Phase 1: synthesize a stock BUY signal from the event and route
+    # through consider_signal. Future revisions add per-kind handlers
+    # (PEAD with longer hold, GAP with tighter stops, etc.).
+    fake_signal = {
+        "ticker": ticker,
+        "signal_type": "BUY" if kind != "BREAKDOWN" else "SELL",
+        # Score from event_detector is roughly 0-100; treat as confidence
+        # input. Real per-kind tuning comes later — this is the bridge.
+        "confidence": float(event.get("score") or 60.0),
+        "timeframe": "1d",  # event-driven entries operate on daily bars
+        "entry": None,
+        "stop_loss": None,
+        "target1": None,
+        "strategy": f"event:{kind}",
+        # Tag the source so downstream filters can adapt.
+        "source": "event_detector",
+        "event_kind": kind,
+    }
+    try:
+        result = consider_signal(fake_signal)
+        decision = "entered" if result else "skipped"
+        # Pull the most recent skip reason captured by the metrics decorator.
+        try:
+            reason = getattr(_DECISION_TLS, "last_skip_reason", None)
+        except Exception:
+            reason = None
+        _ed.mark_consumed(eid, decision, reason=reason)
+        return result
+    except Exception as e:
+        logger.warning(f"consider_event({ticker}, {kind}) failed: {e}")
+        try:
+            _ed.mark_consumed(eid, "error", reason=str(e)[:200])
+        except Exception:
+            pass
+        return None
+
+
 def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Called after each analysis run. If the signal is strong enough and budget
@@ -3017,9 +3078,21 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 _factor_mult = 1.0
         except Exception:
             _factor_mult = 1.0
+        # r56 Tier-0 E2: scanner-conviction multiplier from universe-scanner
+        # metadata (score_v2 percentile if v2 active, else legacy score).
+        # Top-of-pool gets +15%, bottom -15%. Watchlist-only entries return
+        # 1.0 (no change). This is the FIRST place the scanner's z-score
+        # work actually affects downstream behavior — previously every
+        # rank-related computation was thrown away at the consumer boundary.
+        try:
+            from services.universe_scanner import scanner_conviction_multiplier as _scan_conv
+            _scanner_mult = _scan_conv(ticker)
+        except Exception:
+            _scanner_mult = 1.0
         risk_budget = (equity * cfg.max_risk_per_trade_pct
                        * _adapt * _dd_mult * _vt_mult
-                       * _regime_xa * _cal_mult * _r47_mult * _factor_mult) / _beta
+                       * _regime_xa * _cal_mult * _r47_mult * _factor_mult
+                       * _scanner_mult) / _beta
         # Profit-max: scale risk budget with confidence headroom above threshold.
         # Signals that clear the gate by a wide margin deserve a bigger bet.
         conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))

@@ -1176,6 +1176,170 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 56 — third (ground-up) audit: universe overhaul + Option B foundation (2026-04-29)
+
+A 10-agent ground-up audit (NOT limited to last 2 revisions) found three
+**existential** issues that dwarfed all the calibration improvements
+shipped in r53/r54/r55:
+
+  E1. Universe was essentially "letter A only" — Alpaca's first-500-
+      alphabetical excluded MSFT, NVDA, GOOGL, META, TSLA, JPM, V, UNH,
+      WMT, XOM, JNJ — ~70-80% of US market cap.
+  E2. Scanner metadata was DROPPED at the consumer boundary. Every
+      z-score / James-Stein / residualization / sub-scanner / TOD
+      computation was architecturally inert — `get_candidate_tickers()`
+      returned `List[str]` and consider_signal never read score_v2,
+      pool_source, rvol, or any other scanner-derived field. The entire
+      1063-line scanner could have been replaced with `SELECT ticker
+      FROM candidate_pool` with byte-identical downstream behavior.
+  E3. The scanner had NEVER been validated. `score_v2` shadow data
+      was being collected since r54 but no analysis script existed.
+      Same for AI judge, loss_pattern, 1m-bar gate counterfactual.
+      Verdict: "vibes-driven engineering with rigor on the wrong layer."
+
+r56 lands all three Tier-0 fixes plus Tier 1 bug batch, Tier 2 design
+fixes, and Tier 3 Option B (event-driven detection) foundation.
+
+**Tier 0 — existential**:
+
+  E1. **Russell 1000 default universe**. `data/russell1000.txt` (611
+      names: SP500 + R1000 mid-caps). `_read_universe_file` auto-
+      discovers it when STOCK_UNIVERSE_FILE is unset. Now sees the
+      actual investable equity market, not just letter A.
+  E2. **Scanner metadata wired to consumer**. New `get_candidate_meta`
+      returns full row dicts; new `get_candidate_meta_for(ticker)`
+      lookup; new `scanner_conviction_multiplier(ticker)` returns
+      0.85-1.15 sizing multiplier from score_v2 percentile. Wired into
+      `consider_signal`'s position sizing pipeline as `_scanner_mult`.
+      First place the scanner's z-score work actually affects
+      downstream behavior.
+  E3. **Validation scripts** under `backend/scripts/`:
+      - `analyze_score_divergence.py` — closes the score_v2 vs score
+        shadow loop. Per-day overlap %, exclusive-set hit rate, and
+        verdict (PROMOTE_V2_TO_ACTIVE / DISABLE_V2 / INCONCLUSIVE).
+      - `gate_counterfactual.py` — 1m-bar gate cleared-vs-rejected
+        outcomes. Verdict: GATE_VALUABLE_KEEP / GATE_NOT_HELPING / etc.
+      - `factor_ic_sweep.py` — Spearman IC of every factor at 5d/10d/
+        20d horizons. Per-factor verdict: KEEP / DROP / INVERT.
+
+**Tier 1 — bugs**:
+
+  B1. **52w-high look-ahead leak still existed** — same class as the
+      SPY/RS leak r54 supposedly fixed. `df["High"].iloc[-252:]`
+      included today's partial bar; intraday print could pop the high.
+      Now uses `iloc[-253:-1]` when `is_partial`.
+  B2. **James-Stein shrinkage was algebraically a no-op** — proven
+      math: `(mu + shrink*(v-mu) - mu) / stdev(shrunk) = (v-mu)/sd_valid`,
+      shrinkage cancels. Fix: divide by PRE-shrunk stdev so `shrink`
+      stays in the output. Now actually pulls extreme values toward 0.
+  B3. **Cron was naive UTC** (DST-blind) — `_classify_tod` and the
+      scanner cron both. Now `timezone="America/New_York"` on cron;
+      `_classify_tod` buckets on ET hour. Boundaries shifted to ET:
+      7-10am PRE_MKT_GAP, 10am-12pm OPEN_MOMENTUM, 12-3pm MIDDAY_TREND,
+      3-5pm FINAL_HOUR_MOC.
+  B4. **Cron multi-fired across Cloud Run instances** (api min=1/max=3
+      → 1-3× duplicated work per tick). Now uses `pg_try_advisory_lock`
+      at the TOP of `run_scan` (B5 too) — concurrent scans return
+      immediately instead of duplicating Alpaca quota.
+  B5. **Lock acquired AFTER 60-90s of scoring** in r55. r56 moves it
+      to the very top of `run_scan`.
+  B6. **No scan timeout** — stuck thread could wedge across cron ticks.
+      Now 240s deadline with `concurrent.futures.wait()`; cancel
+      stragglers.
+  B7. **Earnings filter failed OPEN** — yfinance hiccup → bot trades
+      INTO earnings prints. Now fails CLOSED (errored ticker excluded).
+  B8. **TOD profiles silently dropped 30% of weight** — `gap=0.20` and
+      `vol_quality=0.15` keys had no corresponding factors in the
+      z-score stack. Removed; profiles now sum to 1.0.
+  B9. **`_BoundedTTLCache` not thread-safe** — `move_to_end`/`popitem`
+      could `RuntimeError` mid-iteration. Added `RLock` around all
+      mutating ops; `keys_snapshot()` for safe iteration.
+  B10. **`get_ticker_info` failure silently disabled sector_rel** —
+       fallback dict had no `sector` key → AttributeError caught →
+       ticker dropped with no log/metric. Fallback now always returns
+       full shape.
+  B11. **`r.get(score_key) or 0` mishandled None vs 0.0 vs negative**.
+       Now `float("-inf")` sentinel.
+  B12. **`fetch_ohlcv_bulk` cache TTL was wrong** for non-1d
+       timeframes — `cfg` was a tuple, `isinstance(cfg, dict)` always
+       False, hardcoded 3600s. Now reads `TIMEFRAME_CONFIG[tf]["ttl"]`.
+  B13. **`fetch_ohlcv_bulk` source-key collision** — Yahoo (unadjusted)
+       and Alpaca (adjusted) bars overwrote each other on `auto`-tagged
+       key. Now caches under `alpaca` AND `auto` keys.
+  B14. **Bulk-warmup + scoring overlap** was the OOM culprit (150-300MB
+       transient peak). r56: drop workers 8→4 (post-warmup is GIL-bound,
+       so 8 doesn't help); `_cache.clear()` after scan.
+  B15. **NaN volume slipped past prefilter** → rvol=1.0 silently. Now
+       explicit `isfinite + > 0` guard.
+
+**Tier 2 — design**:
+
+  D1/D2. **12-1 momentum factor added**. Asness/Carhart canonical (IC
+         ≈0.05 — strongest in the literature). `mom_12_1` now in
+         `score_candidate` output and in the `score_universe_v2`
+         composite at weight 0.35. RS_20d down-weighted to 0.15
+         because it sits in Jegadeesh's reversal zone.
+  D3. **Residualization swapped to the right pair**. Was RVOL × ADX
+      (ρ≈0.25-0.40); now RS_20d × pct_from_52w_high (ρ≈0.6-0.8 — the
+      actually-collinear pair). Stops double-counting momentum.
+  D4. **CHOP regime ADX zero-weight** — was 0.10 with ADX>0 rewarded,
+      contradictory ("we're in chop, find me trending names"). Now 0.0.
+  D5. **Short-side scanner** (`_scan_short_side`). Activates only in
+      HIGH_VOL/CHOP regimes; symmetric mirror of breakout. Removes the
+      "fight the index" failure mode in 2022-style drawdowns.
+  D7. **Top-quintile threshold-based selection** — was strict `top_n`
+      regardless of quality (forced trades on flat days). Now applies
+      80th-percentile-by-score threshold; quiet days produce smaller
+      pool, active days saturate to top_n.
+  D8. **Exchange calendar gate** — weekends skip the scan entirely
+      (avoids burning Alpaca quota for no value).
+  D9. **Pre-market scan slot added** (8:30am ET); cron now covers
+      08:30 / 10:30 / 13:00 / 15:00 ET, all NY-timezone-anchored.
+  D12. **Primary RS now benchmarks against sector ETF** (with SPY
+       fallback) — during sector rotations, "outperform SPY" was
+       sector-momentum masquerading as security-selection. Now uses
+       the GICS-sector → SPDR map already built for sector_rel.
+
+**Tier 3 — Option B foundation (event-driven)**:
+
+  - New `services/event_detector.py` — detects discrete setup events
+    (GAP, RVOL_SURGE, SQUEEZE_RELEASE) every 2 min during RTH.
+    Threshold-based, not top-N. Quiet days produce 0-3 events; active
+    days 30-100. Per-kind dwell windows prevent re-emission. Each
+    event gets `expires_at` so consumers skip stale signals.
+  - New `CandidateEvent` table — kind, ticker, event_at, expires_at,
+    score, features (JSON), consumed_at, consumed_decision.
+  - New `auto_trader.consider_event()` — fast-path consumer; routes
+    events through `consider_signal` for now (synthesized signal),
+    will gain dedicated per-kind handlers in r57+.
+  - `scheduled_scan` drains active events BEFORE the poll-driven loop
+    so a fresh GAP doesn't wait 5min for cron.
+  - Coexists with universe_scanner during transition; both populate
+    auto_trader's decision-tier inputs.
+
+**New AutoTraderConfig fields**: none (event detector tuned via the
+hard-coded thresholds in `_DETECTORS`; promote to cfg after live-data
+calibration).
+
+**New schema**: `candidate_events` table.
+
+**New scripts**: 3 validation analyses under `backend/scripts/`.
+
+**Behavior changes operator should know**:
+- Universe is now ~611 names (Russell 1000) instead of 500 alphabetical.
+  Walltime should be similar; quality is much higher.
+- score_v2 now actually shrinks extreme values (was a no-op). Top-N
+  ranks may shift by 5-15 percentile points across the board.
+- Position sizing now varies ±15% by score_v2 percentile.
+- CHOP regime picks DIFFERENT tickers than r55 (ADX-zero-weight).
+- Mom_12_1 is the heaviest factor in v2 composite (weight 0.35).
+- Short-side picks may now appear in `pool_source="short"` during
+  HIGH_VOL / CHOP regimes.
+- Event-driven entries appear in CandidateEvent table; auto_trader
+  drains these BEFORE the poll-driven scan each 5min tick.
+
+Tests: 191 passing.
+
 ### Revision 55 — second-audit fixes for r54 itself (2026-04-29)
 
 A follow-on multi-agent audit (deeper scopes including code review of
