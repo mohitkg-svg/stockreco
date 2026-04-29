@@ -1176,6 +1176,103 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 55 — second-audit fixes for r54 itself (2026-04-29)
+
+A follow-on multi-agent audit (deeper scopes including code review of
+r54) found 12 issues with r54's implementation. r55 lands all of them.
+
+**Tier 0 — bugs in r54**:
+1. **Generation-ID race + ticker-unique conflict** — r54's atomic swap
+   had two latent bugs: (a) two concurrent scans could both compute
+   `MAX(generation)+1` to the same value (no transaction isolation),
+   and (b) inserts of new-gen rows BEFORE deleting old-gen rows
+   collided with the `ticker UNIQUE` constraint. r55 wraps the swap
+   in a single transaction with `SELECT ... FOR UPDATE` on
+   AutoTraderConfig row 1 (Postgres advisory lock; SQLite no-op since
+   it's single-writer), and DELETEs old gen FIRST in the same
+   transaction. Readers see old pool until COMMIT, then atomically the
+   new pool — no empty-pool window, no UNIQUE violations.
+2. **Bayesian shrinkage applied to z-scores not means** — r54's
+   `_zscore` multiplied the final z-value by `n/(n+k)`, which
+   under-shrinks tails relative to center. Real James-Stein shrinks
+   each *observation toward the grand mean* by `n/(n+k)` BEFORE
+   standardization. r55 implements the correct formulation.
+3. **Residualization broke unit variance** — r54 regressed RVOL_z on
+   ADX_z to decorrelate, but the residual's σ ≠ 1 anymore; the
+   composite's `weights["rvol"] * rvols_z[i]` term silently had
+   smaller-than-intended weight. r55 re-standardizes residuals to σ=1.
+4. **CHOP regime weights summed negative** — r54 implemented "in chop,
+   prefer mean-reversion" by setting some weights NEGATIVE
+   (`{"adx": -0.20, "rs": -0.10, "pct_from_hi": -0.50}`). Combined
+   with the percentile-rank conversion this is non-monotone and ranks
+   strong-momentum + near-52wH names backwards. r55 keeps weights
+   strictly positive and instead INVERTS factor signs (`z_rs ← -z_rs`)
+   when CHOP wants the opposite of trend-following.
+5. **`fetch_ohlcv_bulk` case-sensitive multi-index lookup** — `t in
+   df_raw.index.get_level_values(0)` silently missed tickers if the
+   Alpaca SDK returned lowercase keys. r55 builds an upper-case-keyed
+   map of the multi-index symbols and looks up case-insensitively.
+6. **`universe_scanners_enabled` empty-string fallback** — `or
+   "breakout"` collapsed an explicit `""` (operator wants all
+   scanners off) to default. r55 uses `is None` so the operator can
+   actually disable all scanners.
+7. **52w-high recency = LAST occurrence, not first** — r54's
+   `argmax(highs)` returns the FIRST tie-breaker in the 252-day
+   window, but a stock that tagged the high in week 1 then re-tagged
+   it in week 50 is a fresh breakout, not a stale 52w-old high. r55
+   reverse-searches to find the most recent occurrence.
+
+**Tier 1 — design**:
+8. **Sub-scanners are no longer "theater"** — r54's PEAD/sector_rel/
+   vol_exp implementations were proxies that overlapped >80% with
+   breakout. r55 wires up the real implementations:
+   - **PEAD** now requires `services.earnings.recent_earnings_catalyst`
+     to return True (actual earnings event in last 10 days), not just
+     "high RVOL + positive RS".
+   - **sector_rel** now benchmarks against the ticker's actual GICS-
+     sector ETF (XLK / XLF / XLE / XLV / XLY / XLI / XLB / XLU / XLP
+     / XLRE / XLC) using `data_fetcher.get_ticker_info` for sector
+     attribution, not SPY-as-proxy.
+   - **vol_exp** now uses real Bollinger-band-width compression
+     detection: prior-20d BBW in bottom-quartile of the universe AND
+     current 20d BBW ≥ 1.40× prior — i.e., BB squeeze followed by
+     expansion, not "ADX in [18,35] + RVOL>1.7".
+9. **1m-bar entry gate tunable** — r54's strict gate (last closed bar
+   close ≥ open) was likely silently blocking high-conviction signals
+   on routine pullback bars. r55 adds `cfg.entry_1m_gate_mode` with
+   three modes: `strict` (original), `relaxed` (2-of-last-3 closed
+   bars must agree — new default), `off` (gate disabled). Reason
+   `one_min_bar_disagrees` continues to surface in
+   `/auto/skip-counts` and per-row `last_stock_reason`.
+10. **NaN handling in `_zscore` no longer biases IPOs** — r54
+    imputed missing values to z=0, which ranks IPOs / short-history
+    names at the universe median. r55 returns `None` for NaN inputs
+    and excludes those tickers from the v2 ranking entirely (legacy
+    `score` still ranks them so they're not lost).
+
+**Tier 2**:
+11. **N<5 short-circuit** in `score_universe_v2` — assigns score_v2=0
+    to all tickers when too few survive prefilter for stable z-score
+    computation.
+12. **`include_sector_etfs` gate already correct** — verified: the
+    SECTOR_ETFS append is properly guarded by `if include_etfs:`.
+
+**New AutoTraderConfig field**:
+- `entry_1m_gate_mode`: "strict" | "relaxed" | "off" (default "relaxed")
+
+**Behavior changes the operator should know**:
+- 1m gate now defaults to relaxed (2-of-3 majority). Set to "strict"
+  in cfg if the original behavior is preferred.
+- CHOP regime now picks DIFFERENT tickers than r54 did (the prior
+  picks were inverted by the negative-weight bug).
+- v2 z-score rankings will shift slightly across the board because
+  the residualization is now correctly normalized — magnitude of
+  shifts ~5-10 percentile-rank points for residualized names.
+- Sub-scanner pools now contain MEANINGFULLY DIFFERENT tickers from
+  the breakout pool (was ~80% overlap, expected ~20-40% now).
+
+Tests: 191 passing.
+
 ### Revision 54 — universe scanner deep audit batch (2026-04-28 night)
 
 8-agent multi-angle audit of the universe scanner surfaced 12 actionable

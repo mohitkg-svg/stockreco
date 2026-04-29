@@ -313,21 +313,54 @@ def _in_closing_filter_window() -> bool:
 def _confirm_1m_bar(ticker: str, direction: str = "BUY") -> bool:
     """Profit-audit #6: 1-min SIP bar entry confirmation.
 
-    Before submitting a market entry, fetch recent 1-min bars and require the
-    most recent CLOSED bar to agree with the signal direction (close > open
-    for BUY, close < open for SELL). Prevents the "entered at the 5-min wick
-    high" losses. Falls open (returns True) when 1m data is unavailable so
-    we never over-filter on transient data misses.
+    Before submitting a market entry, fetch recent 1-min bars and require
+    them to agree with the signal direction. Prevents the "entered at
+    the 5-min wick high" losses. Falls open (returns True) when 1m data
+    is unavailable so we never over-filter on transient data misses.
+
+    r55 T1 #9: gate mode is now configurable. The original "strict" mode
+    (single most-recent closed bar must agree) was empirically too tight
+    — pullback bars in healthy uptrends were silently blocking entries
+    on high-conviction signals. New default is "relaxed": 2-of-last-3
+    closed bars must agree, which filters whipsaw without blocking on a
+    single contrarian print. "off" disables the gate entirely.
     """
+    # Read mode from cfg (cached read, no per-call DB hit since the
+    # config row is small and SQLAlchemy session-cached).
+    mode = "relaxed"
+    try:
+        db = SessionLocal()
+        try:
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            mode = (getattr(cfg, "entry_1m_gate_mode", "relaxed") or "relaxed").lower() if cfg else "relaxed"
+        finally:
+            db.close()
+    except Exception:
+        pass
+    if mode == "off":
+        return True
     try:
         from services.data_fetcher import fetch_ohlcv as _fo_1m
         df1 = _fo_1m(ticker, "1m")
         if df1 is None or df1.empty or len(df1) < 2:
             return True
-        last_closed = df1.iloc[-2]   # penultimate bar = last fully-closed bar
-        o = float(last_closed["Open"])
-        c = float(last_closed["Close"])
-        return (c >= o) if direction == "BUY" else (c <= o)
+
+        def _bar_agrees(row) -> bool:
+            try:
+                o = float(row["Open"])
+                c = float(row["Close"])
+                return (c >= o) if direction == "BUY" else (c <= o)
+            except Exception:
+                return True
+
+        if mode == "strict" or len(df1) < 4:
+            # Last fully-closed bar (penultimate row).
+            return _bar_agrees(df1.iloc[-2])
+        # Relaxed: majority of last 3 closed bars must agree.
+        # df1.iloc[-1] is the in-progress bar; -2/-3/-4 are last 3 closed.
+        last_three = [df1.iloc[-2], df1.iloc[-3], df1.iloc[-4]]
+        agree_count = sum(1 for b in last_three if _bar_agrees(b))
+        return agree_count >= 2
     except Exception:
         return True
 

@@ -294,6 +294,17 @@ class AutoTraderConfig(Base):
     universe_tod_profiles_enabled = Column(Boolean, default=False)
     # r54 Tier-2 #11: include sector ETFs in the universe.
     include_sector_etfs = Column(Boolean, default=False)
+    # r55 T1 #9: 1-minute bar entry confirmation gate mode.
+    #   "strict"  — original: most-recent CLOSED 1m bar must agree on direction
+    #               (close >= open for BUY). Sensitive — single bear bar blocks.
+    #   "relaxed" — 2-of-last-3 closed bars must agree (more permissive,
+    #               filters whipsaw noise without blocking on a single pullback).
+    #   "off"     — gate disabled. Use for diagnostics or when the operator
+    #               trusts the upstream confidence signal alone.
+    # Default "relaxed" — empirical analysis from the second universe-scanner
+    # audit showed the strict version was likely silently blocking most
+    # high-conviction signals (see DESIGN.md §14 r55 entry).
+    entry_1m_gate_mode = Column(String, default="relaxed")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -1008,6 +1019,8 @@ def create_tables():
     _ensure_column("auto_trader_config", "universe_scanners_enabled", "VARCHAR DEFAULT 'breakout'")
     _ensure_column("auto_trader_config", "universe_tod_profiles_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "include_sector_etfs", "BOOLEAN DEFAULT FALSE")
+    # r55 T1 #9: 1m bar gate mode — strict / relaxed / off
+    _ensure_column("auto_trader_config", "entry_1m_gate_mode", "VARCHAR DEFAULT 'relaxed'")
     _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")

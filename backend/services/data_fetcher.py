@@ -389,10 +389,21 @@ def fetch_ohlcv_bulk(tickers: List[str], timeframe: str = "1d", batch_size: int 
                 if df_raw is None or df_raw.empty:
                     continue
                 # alpaca-py returns a multi-index df (symbol, timestamp).
-                # Split per-ticker.
+                # r55 T0 #5: case-insensitive slicing. The Alpaca SDK
+                # returns symbols in whatever case it was queried with —
+                # but if a request is internally normalized (or a future
+                # SDK upgrade changes behavior), our `t in level_values(0)`
+                # check would silently miss every ticker. Build a
+                # case-insensitive symbol → index-key map up front and
+                # use that for the lookup.
+                symbol_keys = {str(s).upper(): s
+                               for s in df_raw.index.get_level_values(0).unique()}
                 for t in batch:
                     try:
-                        df_t = df_raw.loc[t] if t in df_raw.index.get_level_values(0) else None
+                        idx_key = symbol_keys.get(t.upper())
+                        if idx_key is None:
+                            continue
+                        df_t = df_raw.loc[idx_key]
                         if df_t is None or df_t.empty:
                             continue
                         # Normalize to the same shape fetch_ohlcv returns.

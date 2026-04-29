@@ -6,7 +6,7 @@ not here. Items below are genuinely open with explicit revisit triggers
 or gate conditions. If you can't find a clear "what would unlock this",
 move it to ❌ Rejected.
 
-Last cleaned: 2026-04-28 (post-r54).
+Last cleaned: 2026-04-29 (post-r55, second universe-scanner audit fixes).
 
 ---
 
@@ -42,6 +42,8 @@ that would make them ROI-positive haven't materialized.
 | **`atomic_append_note` migration of 20+ call sites** | Helper added in r53 (`execution_engine.atomic_append_note`). Migration of existing `t.note = (t.note or "") + "..."` sites is mechanical; do it incrementally. |
 | **Full option-premium backtest simulation** | r53 added `strategy_scorecard.asset_type_split` so stock vs option WR is visible. Once `IVHistory` has ≥30 days of capture, wire delta+gamma+theta integration through `_simulate(asset_type='option')`. |
 | **`Signal.strategy` backfill + auto-mute activation** | r53 wired `cfg.source_mute_enabled` (default off). Currently ~70% of trades have null strategy, so the mute can't see them. Backfill via `Signal.strategy = signal_meta['strategy']` migration, then flip the flag. |
+| **Validate r55 sub-scanner pools have meaningfully different tickers** | r55 implemented the real PEAD / sector_rel / vol_exp logic. Breakout-vs-others overlap should drop from ~80% → ~20-40%. Watch the candidate-pool view across 5 trading days; if overlap is still >60% the heuristics need parameter tuning. |
+| **Tune `entry_1m_gate_mode` after live observation** | r55 default flipped to "relaxed" (2-of-3 majority). If the false-positive rate (= entries that immediately wick out) climbs above pre-r55 baseline, flip back to "strict". |
 
 ## ⏸️ Open — cost-gated
 
