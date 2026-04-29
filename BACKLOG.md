@@ -6,7 +6,7 @@ not here. Items below are genuinely open with explicit revisit triggers
 or gate conditions. If you can't find a clear "what would unlock this",
 move it to ❌ Rejected.
 
-Last cleaned: 2026-04-29 (post-r56, third ground-up universe audit + Option B foundation).
+Last cleaned: 2026-04-29 (post-r57, universe scanner DELETE PASS).
 
 ---
 
@@ -42,7 +42,7 @@ that would make them ROI-positive haven't materialized.
 | **`atomic_append_note` migration of 20+ call sites** | Helper added in r53 (`execution_engine.atomic_append_note`). Migration of existing `t.note = (t.note or "") + "..."` sites is mechanical; do it incrementally. |
 | **Full option-premium backtest simulation** | r53 added `strategy_scorecard.asset_type_split` so stock vs option WR is visible. Once `IVHistory` has ≥30 days of capture, wire delta+gamma+theta integration through `_simulate(asset_type='option')`. |
 | **`Signal.strategy` backfill + auto-mute activation** | r53 wired `cfg.source_mute_enabled` (default off). Currently ~70% of trades have null strategy, so the mute can't see them. Backfill via `Signal.strategy = signal_meta['strategy']` migration, then flip the flag. |
-| **Validate r55 sub-scanner pools have meaningfully different tickers** | r55 implemented the real PEAD / sector_rel / vol_exp logic. Breakout-vs-others overlap should drop from ~80% → ~20-40%. Watch the candidate-pool view across 5 trading days; if overlap is still >60% the heuristics need parameter tuning. |
+| **Validate r55 sub-scanner pools have meaningfully different tickers** | ❌ obsolete: r57 deleted the sub-scanners. |
 | **Tune `entry_1m_gate_mode` after live observation** | r55 default flipped to "relaxed" (2-of-3 majority). If the false-positive rate (= entries that immediately wick out) climbs above pre-r55 baseline, flip back to "strict". |
 | **Run r56 validation scripts after 30 days of data** | `backend/scripts/{analyze_score_divergence,gate_counterfactual,factor_ic_sweep}.py` close the long-standing shadow loops. Run weekly; promote/demote cfg knobs based on output. |
 | **Phase 2 event detectors: NEW_HIGH, BREAKDOWN, PEAD** | r56 shipped GAP/RVOL_SURGE/SQUEEZE_RELEASE. The remaining three need per-kind data: NEW_HIGH/BREAKDOWN want intraday minute-bar streaming; PEAD wants SUE-decile from a paid earnings-surprise feed. Defer until r57+ with operator-validated thresholds. |

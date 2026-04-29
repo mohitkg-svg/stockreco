@@ -157,28 +157,11 @@ Conservative first-month profile. JSON to send:
   // r56 Tier-3 Option B: event_detector runs every 2min during RTH and emits
   // CandidateEvent rows. consider_event drains these in scheduled_scan.
   "ticker_blacklist": "VTWO,CNTA",           // recent paper losers; add as discovered
-  // r54/r55 universe-scanner knobs:
-  "universe_scoring_v2": "shadow",           // off | shadow | active. r55 fixed
-                                             //   shrinkage + residualization +
-                                             //   CHOP-inversion bugs. Promote to
-                                             //   active after 5 trading days
-                                             //   shadow comparison.
-  "universe_scanners_enabled": "breakout",   // csv subset of {breakout,pead,
-                                             //   sector_rel,vol_exp}. r55
-                                             //   re-implemented sub-scanners
-                                             //   with real heuristics; turn
-                                             //   each on individually after
-                                             //   ≥30 trades from each.
-  "universe_tod_profiles_enabled": false,    // bool — TOD-aware factor weights
-  "include_sector_etfs": false,              // bool — append XLK/XLF/etc to universe
-  "entry_1m_gate_mode": "relaxed",           // r55 T1 #9: strict | relaxed | off.
-                                             //   Default flipped from r54
-                                             //   strict (= single-bar gate)
-                                             //   to relaxed (2-of-3 majority).
-                                             //   Watch /auto/skip-counts for
-                                             //   one_min_bar_disagrees count;
-                                             //   if entries-that-immediately-
-                                             //   wick spike, flip to strict.
+  // r57 simplified scanner — most knobs deleted along with the v2 stack.
+  // Remaining knobs:
+  "entry_1m_gate_mode": "relaxed",           // strict | relaxed | off
+  // Universe source: data/russell1000.txt (auto-discovered) or
+  // STOCK_UNIVERSE_FILE env var to override.
 
   // ── ML ──
   "ml_scoring_enabled": false,               // KEEP shadow until ≥200 live closed trades

@@ -796,8 +796,54 @@ def auto_candidate_pool(limit: int = 50):
 @router.post("/auto/universe-scan")
 def auto_universe_scan():
     """Manually trigger the universe scanner (for operator testing / warm-up)."""
-    from services import universe_scanner as _us
-    return _us.run_scan()
+    from services import scanner as _sc
+    return _sc.run_scan()
+
+
+@router.get("/auto/candidate-events")
+def auto_candidate_events(max_age_min: int = 30):
+    """r57: list active (non-expired, non-consumed) candidate events.
+    Surfaces the event-driven path to operator UI; without this the
+    detect_events output is invisible."""
+    from services import scanner as _sc
+    rows = _sc.get_active_events(max_age_min=max_age_min)
+    return [{
+        "id": r["id"],
+        "kind": r["kind"],
+        "ticker": r["ticker"],
+        "score": r["score"],
+        "event_at": r["event_at"].isoformat() if r["event_at"] else None,
+        "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+        "features": r["features"],
+    } for r in rows]
+
+
+@router.get("/auto/candidate-events-recent")
+def auto_candidate_events_recent(limit: int = 50):
+    """r57: recently-consumed events (entered, skipped, errored) — for
+    operator post-mortem of the event path."""
+    from database import SessionLocal, CandidateEvent
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(CandidateEvent)
+            .filter(CandidateEvent.consumed_at.isnot(None))
+            .order_by(CandidateEvent.consumed_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [{
+            "id": r.id,
+            "kind": r.kind,
+            "ticker": r.ticker,
+            "score": r.score,
+            "event_at": r.event_at.isoformat() if r.event_at else None,
+            "consumed_at": r.consumed_at.isoformat() if r.consumed_at else None,
+            "consumed_decision": r.consumed_decision,
+            "consumed_reason": r.consumed_reason,
+        } for r in rows]
+    finally:
+        db.close()
 
 
 @router.post("/auto/manage-now")

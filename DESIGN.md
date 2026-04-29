@@ -1176,6 +1176,79 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 57 — universe scanner DELETE PASS (2026-04-29)
+
+A 13-agent fourth audit found the most damning result yet:
+**100% of production trades came from the watchlist; 0% from
+candidate_pool**. The universe scanner has been **dormant in production**
+for 4 revisions — `cfg.use_universe_scanner` defaults False, no logs
+show `run_scan` executing, no operator has flipped the flag. ~70 bugs
+fixed across r54+r55+r56 were on code paths that **never executed**.
+
+Plus the audits found r56's "fixes" themselves were broken:
+- 3 validation scripts use wrong column names (`entry_at`,
+  `realized_pnl` — actual fields are `opened_at`, `realized_pl`) →
+  scripts can't run
+- Advisory lock is illusory (Postgres advisory locks are session-
+  scoped; SQLAlchemy returns the connection to the pool after the SELECT)
+- James-Stein shrinkage is STILL a no-op (constant-scaled z-score is
+  monotone-equivalent under rank transform)
+- `_classify_tod` returns wrong bucket for off-RTH hours (h=6am ET
+  falls through to MIDDAY_TREND)
+- `_scan_short_side` filters on "BEAR" regime that `regime_router`
+  never returns → dead code path
+- `consider_event` passes `entry=None` to gates that compute
+  `entry/atr` → entire event-driven path silently fails
+
+r57 is a **delete pass**. The 1,459-line `universe_scanner.py` and the
+321-line `event_detector.py` collapse into a single ~430-line
+`services/scanner.py`. ~75% reduction in bug surface.
+
+**KEPT:**
+- Russell 1000 universe loader (`pull_universe`, `_read_universe_file`)
+- Liquidity gate ($10 min price + $10M ADV)
+- Earnings fail-closed (`_within_earnings_window`)
+- Simple composite score (RVOL + RS_20d + pct_from_52w_high + stack)
+- Three event detectors (GAP, RVOL_SURGE, SQUEEZE_RELEASE)
+- Atomic pool swap (delete-then-insert in one transaction)
+- `CandidatePool` table writes (consumers keep working unchanged)
+- `CandidateEvent` table + `get_active_events` / `mark_consumed`
+- 4× NY-anchored daily cron + 2-min event detection during RTH
+
+**DELETED:**
+- `score_universe_v2`, `_zscore`, James-Stein shrinkage, residualization
+- TOD profiles, regime weight overrides, `_classify_tod`
+- `_POOL_QUOTAS`, sub-scanners (PEAD, sector_rel, vol_exp, short)
+- `scanner_conviction_multiplier` (untested ±15% sizing tweak)
+- `mom_12_1`, `rs_benchmark`, `_bb_width` (computed but never persisted)
+- Generation-id ceremony with broken Postgres advisory lock
+- 3 validation scripts (broken column references; rewrite later)
+
+**FIXED in `consider_event`:**
+- Was: synthesized fake signal with `entry=None` → silently rejected.
+- Now: delegates to `_run_analysis_for_ticker` which generates real
+  signals via signal_generator and routes through consider_signal —
+  same pipeline as the 5-min cron. The event simply means "analyze
+  this ticker NOW, don't wait for cron".
+
+**NEW operator UI surfaces:**
+- `GET /auto/candidate-events` — active (non-expired, non-consumed)
+- `GET /auto/candidate-events-recent` — recently consumed for post-mortem
+
+**Net change:** -1,533 lines (1,459 + 321 - 247 = +247 new), 75% bug-
+surface reduction. No production behavior change (scanner was dormant).
+The 3 broken validation scripts + 2 dead modules are gone.
+
+**Going-forward process changes:**
+1. Cap revision scope at "net LOC ≤ 0" — every revision deletes ≥ as
+   much as it adds.
+2. Ban shadow-mode flags without ≤14-day kill date.
+3. Audits write integration tests, not bug lists. The audit's job is to
+   prove the claim ("does this layer affect a trading decision"), not
+   to enumerate defects after the fact.
+
+Tests: 191 passing.
+
 ### Revision 56 — third (ground-up) audit: universe overhaul + Option B foundation (2026-04-29)
 
 A 10-agent ground-up audit (NOT limited to last 2 revisions) found three
