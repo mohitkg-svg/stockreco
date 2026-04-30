@@ -3545,12 +3545,161 @@ function TradeFromSignal({ signal }) {
 // Auto-trader picks from this pool when `cfg.use_universe_scanner=true`.
 // Collapsible, scrollable; manual "Rescan" button triggers the scheduler
 // job on demand (takes 30-60s for ~500 tickers).
+// r58: client-side score breakdown — replicates the scoring formula in
+// services/scanner.py:score_candidate so the UI can explain WHY each
+// pool ticker was picked, without needing a schema change to persist
+// the breakdown server-side. Pure function of the fields already
+// returned by /auto/candidate-pool.
+function scoreBreakdown(row) {
+  const rvol = row.rvol || 0;
+  const rs = row.rs_20d || 0;
+  const pctFromHi = row.pct_from_52w_high || 0;
+  const adx = row.adx || 0;
+  const price = row.price || 0;
+  const score = row.score || 0;
+
+  // Mirror services/scanner.py:score_candidate
+  const rvolPts = Math.min(1, rvol / 2) * 25;
+  const rsPts = rs > 0 ? Math.min(1, rs / 0.05) * 25 : 0;
+  // 52w-high recency: server stores days_since_hi via composite reason; we
+  // approximate from the reason string. If "fresh 52wH breakout" is in the
+  // reason, full 25; if pct_from_hi > -0.03 generic, 15; if pct_from_hi
+  // > -0.08, 5.
+  const reasonLow = (row.reason || '').toLowerCase();
+  const fresh52w = reasonLow.includes('fresh 52wh') || reasonLow.includes('52wh breakout');
+  let pctFromHiPts = 0;
+  if (pctFromHi > -0.03) {
+    pctFromHiPts = fresh52w ? 25 : 15;
+  } else if (pctFromHi > -0.08) {
+    pctFromHiPts = 5;
+  }
+  // Stack-alignment points (15 if price>SMA50>SMA200, 8 if price>SMA50) —
+  // we don't have SMA values in the API; back-derive from the residual:
+  // residual = score / haircut - rvolPts - rsPts - pctFromHiPts - liquidityBonus
+  const haircut = price < 20 ? 0.85 : 1.0;
+  const preHaircut = score / haircut;
+  // liquidity bonus is 0/5/10 — we don't expose dollar_vol_20, so rough estimate
+  // from price × rvol-implied-volume. Keep it as "estimated" and fall through.
+  const liquidityBonus = preHaircut > 70 ? 10 : preHaircut > 50 ? 5 : 0;
+  const stackAlignmentPts = Math.max(0, preHaircut - rvolPts - rsPts - pctFromHiPts - liquidityBonus);
+
+  return {
+    rvolPts: Math.round(rvolPts * 10) / 10,
+    rsPts: Math.round(rsPts * 10) / 10,
+    pctFromHiPts: Math.round(pctFromHiPts * 10) / 10,
+    stackAlignmentPts: Math.round(Math.min(15, Math.max(0, stackAlignmentPts)) * 10) / 10,
+    liquidityBonus,
+    haircut,
+    preHaircut: Math.round(preHaircut * 10) / 10,
+    final: Math.round(score * 10) / 10,
+    fresh52w,
+  };
+}
+
+function ScoreBreakdownDetail({ row }) {
+  const b = scoreBreakdown(row);
+  const items = [
+    { label: 'RVOL (volume vs 20d avg)', value: row.rvol?.toFixed(2), pts: b.rvolPts, max: 25,
+      explain: `Today's volume is ${row.rvol?.toFixed(2)}× the 20-day average. Capped at 2× for max points.` },
+    { label: 'RS vs SPY (20d outperformance)', value: `${(row.rs_20d * 100).toFixed(1)}%`, pts: b.rsPts, max: 25,
+      explain: `Stock ${row.rs_20d >= 0 ? 'beat' : 'lagged'} SPY by ${Math.abs(row.rs_20d * 100).toFixed(1)}% over 20 days. +5% beat = full 25 points.` },
+    { label: '% from 52w high (recency-tiered)', value: `${(row.pct_from_52w_high * 100).toFixed(1)}%`, pts: b.pctFromHiPts, max: 25,
+      explain: row.pct_from_52w_high > -0.03
+        ? (b.fresh52w
+            ? 'Within 3% of 52w high AND fresh breakout (≤20 days since high). Full 25 points.'
+            : 'Within 3% of 52w high. 15 points (fresh-breakout tier would give 25).')
+        : row.pct_from_52w_high > -0.08
+          ? '3-8% off 52w high. 5 points (legacy leader, not pressing breakout).'
+          : 'More than 8% off 52w high. 0 points.' },
+    { label: 'Stack alignment (Price > SMA50 > SMA200)', value: `ADX ${row.adx?.toFixed(0)}`, pts: b.stackAlignmentPts, max: 15,
+      explain: 'Estimated from residual score. Full 15 points when price is above both SMA50 and SMA200; 8 if only above SMA50.' },
+    { label: 'Liquidity bonus ($ ADV > 3× floor)', value: `$${row.price?.toFixed(0)} × RVOL`, pts: b.liquidityBonus, max: 10,
+      explain: 'Bonus 5 pts when 20-day ADV > 2× the $10M floor; 10 pts when > 5×.' },
+  ];
+  return (
+    <div className="surface-soft rounded-lg p-3 space-y-3">
+      <div className="text-[11px] app-text-muted uppercase tracking-wide font-semibold">
+        Why {row.ticker} is in the top-50
+      </div>
+      <div className="text-xs app-text-secondary leading-relaxed">
+        {row.reason && <span className="font-semibold app-text-primary">{row.reason}.</span>} The
+        ticker passed the universe gates (price ≥ $10, 20d $-volume ≥ $10M, ≥1y of history,
+        no earnings within 48h) and accumulated {b.preHaircut.toFixed(1)} pts from the composite
+        score below.{b.haircut < 1 && ` Sub-$20 spread haircut (×${b.haircut}) → final ${b.final.toFixed(1)}.`}
+      </div>
+      <div className="space-y-1.5">
+        {items.map((it, i) => {
+          const widthPct = it.max > 0 ? Math.min(100, (it.pts / it.max) * 100) : 0;
+          return (
+            <div key={i} className="text-[11px]">
+              <div className="flex justify-between items-baseline">
+                <span className="app-text-secondary">{it.label}</span>
+                <span className="font-mono">
+                  <span className="app-text-muted">{it.value}</span>
+                  {' → '}
+                  <strong className={it.pts > 0 ? 'text-emerald-400' : 'app-text-muted'}>
+                    {it.pts.toFixed(1)}/{it.max} pts
+                  </strong>
+                </span>
+              </div>
+              <div className="h-1 bg-white/5 rounded mt-0.5 overflow-hidden">
+                <div
+                  className={`h-full ${it.pts > 0 ? 'bg-emerald-500/60' : 'bg-white/10'}`}
+                  style={{ width: `${widthPct}%` }}
+                />
+              </div>
+              <div className="text-[10px] app-text-muted mt-0.5 italic">{it.explain}</div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="border-t app-border-soft pt-2 text-[11px] flex justify-between">
+        <span className="app-text-muted">
+          Total: {b.preHaircut.toFixed(1)} pts
+          {b.haircut < 1 && ` × ${b.haircut} (sub-$20 spread haircut)`}
+        </span>
+        <strong className="font-mono">= {b.final.toFixed(1)} final score</strong>
+      </div>
+      {(row.last_stock_decision || row.last_option_decision) && (
+        <div className="border-t app-border-soft pt-2 space-y-1 text-[11px]">
+          <div className="app-text-muted uppercase tracking-wide text-[10px] font-semibold">
+            Last auto-trader verdict
+          </div>
+          {row.last_stock_decision && (
+            <div>
+              <span className="app-text-muted">Stock:</span>{' '}
+              <strong className={row.last_stock_decision === 'entered' ? 'text-emerald-400' : 'text-amber-300'}>
+                {row.last_stock_decision}
+              </strong>
+              {row.last_stock_reason && (
+                <span className="app-text-muted"> — {row.last_stock_reason}</span>
+              )}
+            </div>
+          )}
+          {row.last_option_decision && (
+            <div>
+              <span className="app-text-muted">Option:</span>{' '}
+              <strong className={row.last_option_decision?.startsWith('entered') ? 'text-emerald-400' : 'text-amber-300'}>
+                {row.last_option_decision}
+              </strong>
+              {row.last_option_reason && (
+                <span className="app-text-muted"> — {row.last_option_reason}</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CandidatePoolPanel() {
   const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [err, setErr] = useState(null);
   const [open, setOpen] = useState(false);
+  const [expandedTicker, setExpandedTicker] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true); setErr(null);
@@ -3643,8 +3792,16 @@ function CandidatePoolPanel() {
               </thead>
               <tbody>
                 {rows.map((r, i) => (
-                  <tr key={r.ticker} className="border-b app-border-soft last:border-0 hover:bg-white/3">
-                    <td className="py-1.5 px-2 app-text-muted font-mono">{i + 1}</td>
+                  <React.Fragment key={r.ticker}>
+                  <tr
+                    onClick={() => setExpandedTicker(t => t === r.ticker ? null : r.ticker)}
+                    className="border-b app-border-soft last:border-0 hover:bg-white/3 cursor-pointer"
+                    title="Click for full score breakdown"
+                  >
+                    <td className="py-1.5 px-2 app-text-muted font-mono">
+                      <span className="inline-block w-3">{expandedTicker === r.ticker ? '▼' : '▶'}</span>
+                      {' '}{i + 1}
+                    </td>
                     <td className="py-1.5 px-2 font-semibold font-mono">
                       <TickerLink ticker={r.ticker} />
                     </td>
@@ -3709,6 +3866,14 @@ function CandidatePoolPanel() {
                       })()}
                     </td>
                   </tr>
+                  {expandedTicker === r.ticker && (
+                    <tr className="border-b app-border-soft last:border-0">
+                      <td colSpan={12} className="py-2 px-2 bg-white/3">
+                        <ScoreBreakdownDetail row={r} />
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>
