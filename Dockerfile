@@ -36,6 +36,8 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY backend ./backend
 COPY frontend ./frontend
+# r57 fix: scanner needs data/russell1000.txt for the universe.
+COPY data ./data
 
 # Alpaca certs land in certifi — override SSL bundle path at runtime.
 ENV SSL_CERT_FILE="" REQUESTS_CA_BUNDLE=""

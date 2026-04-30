@@ -72,11 +72,62 @@ def _read_universe_file() -> Optional[List[str]]:
 
 
 def pull_universe(size: int = UNIVERSE_SIZE) -> List[Dict[str, Any]]:
-    """Return list of {ticker, name, exchange} dicts."""
+    """Return list of {ticker, name, exchange} dicts.
+
+    Primary path: Russell 1000 file. Defensive fallback: pull liquid
+    US equities from Alpaca's /v2/assets so a missing file doesn't
+    silently zero the pool (which is exactly what happened post-r57
+    deploy when the Dockerfile forgot to copy data/).
+    """
     tickers = _read_universe_file()
-    if not tickers:
+    if tickers:
+        return [{"ticker": t, "name": t, "exchange": "list"} for t in tickers[:size]]
+    logger.warning("scanner: universe file unavailable, falling back to Alpaca assets")
+    return _pull_universe_alpaca(size)
+
+
+def _pull_universe_alpaca(size: int) -> List[Dict[str, Any]]:
+    """Fallback: pull tradable US equities from Alpaca. Used only when
+    the Russell 1000 file is missing."""
+    key = os.getenv("APCA_API_KEY_ID")
+    secret = os.getenv("APCA_API_SECRET_KEY")
+    if not key or not secret:
         return []
-    return [{"ticker": t, "name": t, "exchange": "list"} for t in tickers[:size]]
+    try:
+        import httpx
+        url = "https://paper-api.alpaca.markets/v2/assets"
+        if os.getenv("ALPACA_LIVE", "0") == "1":
+            url = "https://api.alpaca.markets/v2/assets"
+        headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+        merged: List[Dict[str, Any]] = []
+        with httpx.Client(timeout=15.0) as c:
+            for exch in ("NASDAQ", "NYSE"):
+                r = c.get(url, headers=headers, params={
+                    "status": "active", "asset_class": "us_equity", "exchange": exch,
+                })
+                if r.status_code == 200:
+                    merged.extend(r.json())
+        merged = [
+            a for a in merged
+            if a.get("tradable") and a.get("status") == "active"
+            and a.get("class") == "us_equity"
+            and a.get("symbol") and "." not in a["symbol"]
+            and "/" not in a["symbol"] and len(a["symbol"]) <= 5
+        ]
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for a in merged:
+            s = a["symbol"]
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append({"ticker": s, "name": a.get("name") or s, "exchange": a.get("exchange")})
+            if len(out) >= size:
+                break
+        return out
+    except Exception as e:
+        logger.warning(f"scanner: Alpaca fallback failed: {e}")
+        return []
 
 
 # ───────────────────────── SPY benchmark ─────────────────────────
