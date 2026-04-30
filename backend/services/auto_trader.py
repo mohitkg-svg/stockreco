@@ -762,6 +762,19 @@ def get_config_dict() -> Dict[str, Any]:
             "ml_scoring_enabled": bool(getattr(cfg, "ml_scoring_enabled", False)),
             "pdt_enforce": bool(getattr(cfg, "pdt_enforce", False)),
             "auto_promote_adopted": bool(getattr(cfg, "auto_promote_adopted", False)),
+            # r57 schema-drift fix #2: status now exposes the r53-r56
+            # config fields the operator may need to observe/toggle.
+            "entry_1m_gate_mode": getattr(cfg, "entry_1m_gate_mode", "relaxed") or "relaxed",
+            "rr_min": float(getattr(cfg, "rr_min", 1.3) or 1.3),
+            "loss_pattern_mode": getattr(cfg, "loss_pattern_mode", "shadow") or "shadow",
+            "source_mute_enabled": bool(getattr(cfg, "source_mute_enabled", False)),
+            "theta_adjusted_rr_enabled": bool(getattr(cfg, "theta_adjusted_rr_enabled", True)),
+            "portfolio_kelly_enabled": bool(getattr(cfg, "portfolio_kelly_enabled", True)),
+            "vol_target_annual": float(getattr(cfg, "vol_target_annual", 0.12) or 0.12),
+            "leverage_cap": float(getattr(cfg, "leverage_cap", 1.5) or 1.5),
+            "book_var_99_cap_pct": float(getattr(cfg, "book_var_99_cap_pct", 0.05) or 0.05),
+            "bracket_tif": getattr(cfg, "bracket_tif", "day") or "day",
+            "max_correlated_open": int(getattr(cfg, "max_correlated_open", 1) or 1),
         }
     finally:
         db.close()
