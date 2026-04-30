@@ -4533,6 +4533,292 @@ function AutoTraderPanel({ reloadToken }) {
           chain-fetch run, ~3-5s per refresh) without providing
           additional alpha. The OptionsWatchSection component is still
           defined for any future reuse but is no longer mounted. */}
+
+      {/* r58: Transparency reports — scanner runs + decision log */}
+      <TransparencyPanel />
+    </div>
+  );
+}
+
+// r58 Transparency: two-tab panel showing every scanner-run rejection
+// and every auto-trader decision with friendly tooltips.
+function TransparencyPanel() {
+  const [tab, setTab] = useState('scanner');
+  const [defs, setDefs] = useState(null);
+  // Lazy-load definitions once on mount.
+  useEffect(() => {
+    api.get('/api/trading/auto/check-definitions')
+      .then(setDefs)
+      .catch(() => setDefs({ scanner: {}, trader: {}, families: {} }));
+  }, []);
+  return (
+    <div className="surface-soft rounded-xl p-4 mt-4">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <div className="text-xs app-text-muted uppercase tracking-[0.14em] font-semibold">
+            🔍 Transparency
+          </div>
+        </div>
+        <div className="flex gap-1">
+          <button
+            onClick={() => setTab('scanner')}
+            className={`text-xs px-3 py-1 rounded-md ${tab === 'scanner' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
+          >Scanner Runs</button>
+          <button
+            onClick={() => setTab('decisions')}
+            className={`text-xs px-3 py-1 rounded-md ${tab === 'decisions' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
+          >Decision Log</button>
+        </div>
+      </div>
+      {tab === 'scanner' && <ScannerRunsTab defs={defs} />}
+      {tab === 'decisions' && <DecisionLogTab defs={defs} />}
+    </div>
+  );
+}
+
+function CheckDefinitionTooltip({ reason, source = 'trader', defs, children }) {
+  // Resolve definition for parametrized reasons too.
+  const resolve = (r) => {
+    if (!defs) return null;
+    if (source === 'scanner') return defs.scanner?.[r];
+    if (defs.trader?.[r]) return defs.trader[r];
+    if (r?.startsWith('bear_conf_')) return defs.families?.['bear_conf_*_below_*'];
+    if (r?.startsWith('bull_conf_')) return defs.families?.['bull_conf_*_below_*'];
+    if (r?.startsWith('source_mute_')) return defs.families?.['source_mute_*'];
+    return null;
+  };
+  const def = resolve(reason);
+  if (!def) return <span>{children}</span>;
+  // Native browser tooltip via title attribute (simple and accessible).
+  const tooltip = `${def.title}\n\nWhat: ${def.what}\n\nWhy: ${def.why}\n\nFix: ${def.fix}`;
+  return (
+    <span title={tooltip} className="cursor-help underline decoration-dotted decoration-app-text-muted/40">
+      {children}
+    </span>
+  );
+}
+
+function ScannerRunsTab({ defs }) {
+  const [runs, setRuns] = useState([]);
+  const [openId, setOpenId] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api.get('/api/trading/auto/scan-runs?limit=20');
+      setRuns(r || []);
+    } catch (e) { /* ignore */ }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  const openDetail = async (id) => {
+    if (openId === id) { setOpenId(null); setDetail(null); return; }
+    setOpenId(id); setDetail(null);
+    try {
+      const r = await api.get(`/api/trading/auto/scan-runs/${id}`);
+      setDetail(r);
+    } catch (e) {
+      setDetail({ error: String(e?.detail || e?.message || e) });
+    }
+  };
+  if (loading && runs.length === 0) return <div className="text-xs app-text-muted">Loading…</div>;
+  if (runs.length === 0) return <div className="text-xs app-text-muted">No scan runs persisted yet. Triggers populate this on the next scheduled scan or when /auto/universe-scan is called manually.</div>;
+  return (
+    <div className="space-y-2">
+      <div className="text-[11px] app-text-muted leading-relaxed mb-2">
+        Each row = one scanner run. Click to expand the full rejection list grouped by reason.
+        Hover any reason for a detailed definition.
+      </div>
+      {runs.map(r => (
+        <div key={r.id} className="border app-border-soft rounded-lg overflow-hidden">
+          <button
+            onClick={() => openDetail(r.id)}
+            className="w-full px-3 py-2 text-left hover:bg-white/5 flex items-center justify-between text-xs"
+          >
+            <div className="flex items-center gap-3 flex-wrap">
+              <span className="font-mono app-text-secondary">
+                {r.started_at ? new Date(r.started_at).toLocaleString() : '—'}
+              </span>
+              {r.skipped_reason && <span className="pill pill-warn">skipped: {r.skipped_reason}</span>}
+              <span>universe: <strong>{r.universe_size}</strong></span>
+              <span>scored: <strong>{r.scored}</strong></span>
+              <span>top_n: <strong>{r.top_n_size}</strong></span>
+              <span>elapsed: <strong>{r.elapsed_sec ?? 0}s</strong></span>
+              <span className="app-text-muted">rejections: <strong>{r.rejection_count}</strong></span>
+            </div>
+            <span className="app-text-muted">{openId === r.id ? '▼' : '▶'}</span>
+          </button>
+          {openId === r.id && (
+            <div className="px-3 py-3 border-t app-border-soft bg-white/5">
+              {!detail ? <div className="text-xs app-text-muted">Loading detail…</div>
+              : detail.error ? <div className="text-xs text-red-400">Error: {detail.error}</div>
+              : <ScanRunDetail detail={detail} defs={defs} />}
+            </div>
+          )}
+        </div>
+      ))}
+      <button onClick={load} className="text-[11px] app-text-muted hover:app-text-primary underline">
+        Refresh
+      </button>
+    </div>
+  );
+}
+
+function ScanRunDetail({ detail, defs }) {
+  // Group rejections by reason.
+  const groups = {};
+  for (const r of (detail.rejections || [])) {
+    const key = r.reason || 'unknown';
+    (groups[key] = groups[key] || []).push(r);
+  }
+  const sortedKeys = Object.keys(groups).sort((a, b) => groups[b].length - groups[a].length);
+  return (
+    <div className="space-y-3 text-xs">
+      {detail.top_picks && detail.top_picks.length > 0 && (
+        <details className="border app-border-soft rounded-md p-2">
+          <summary className="cursor-pointer font-semibold text-emerald-400">
+            ✅ Top picks ({detail.top_picks.length}) — entered the candidate pool
+          </summary>
+          <div className="mt-2 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-1 text-[11px] font-mono">
+            {detail.top_picks.map((p, i) => (
+              <div key={i} className="px-1.5 py-0.5 rounded bg-emerald-500/10">
+                {p.ticker} <span className="app-text-muted">({p.score?.toFixed?.(1) ?? p.score})</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+      {sortedKeys.map(key => (
+        <details key={key} className="border app-border-soft rounded-md p-2">
+          <summary className="cursor-pointer">
+            <CheckDefinitionTooltip reason={key} source="scanner" defs={defs}>
+              <strong className="text-amber-300">{key}</strong>
+            </CheckDefinitionTooltip>{' '}
+            <span className="app-text-muted">— {groups[key].length} ticker{groups[key].length !== 1 ? 's' : ''}</span>
+            {defs?.scanner?.[key]?.title && (
+              <span className="app-text-muted ml-2 text-[10px] italic">({defs.scanner[key].title})</span>
+            )}
+          </summary>
+          <div className="mt-2 flex flex-wrap gap-1 text-[11px] font-mono">
+            {groups[key].slice(0, 200).map((r, i) => (
+              <span key={i} className="px-1.5 py-0.5 rounded bg-white/5"
+                title={r.features ? JSON.stringify(r.features) : ''}>
+                {r.ticker}
+              </span>
+            ))}
+            {groups[key].length > 200 && (
+              <span className="px-1.5 py-0.5 app-text-muted">…+{groups[key].length - 200} more</span>
+            )}
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
+function DecisionLogTab({ defs }) {
+  const [rows, setRows] = useState([]);
+  const [tickerFilter, setTickerFilter] = useState('');
+  const [decisionFilter, setDecisionFilter] = useState('');
+  const [loading, setLoading] = useState(false);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('limit', '200');
+      params.set('since_hours', '48');
+      if (tickerFilter.trim()) params.set('ticker', tickerFilter.trim().toUpperCase());
+      if (decisionFilter) params.set('decision', decisionFilter);
+      const r = await api.get(`/api/trading/auto/decision-log?${params.toString()}`);
+      setRows(r || []);
+    } catch (e) { /* ignore */ }
+    finally { setLoading(false); }
+  }, [tickerFilter, decisionFilter]);
+  useEffect(() => { load(); }, [load]);
+  return (
+    <div className="space-y-2">
+      <div className="text-[11px] app-text-muted leading-relaxed mb-2">
+        Each row = one consider_signal / consider_call_play / consider_put_play evaluation.
+        Filter by ticker (e.g., AAPL) or decision (entered / skipped). Hover any reason for a definition.
+      </div>
+      <div className="flex gap-2 mb-2 flex-wrap">
+        <input
+          type="text"
+          placeholder="Filter by ticker"
+          value={tickerFilter}
+          onChange={e => setTickerFilter(e.target.value)}
+          className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs"
+        />
+        <select
+          value={decisionFilter}
+          onChange={e => setDecisionFilter(e.target.value)}
+          className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs"
+        >
+          <option value="">All decisions</option>
+          <option value="entered">Entered only</option>
+          <option value="skipped">Skipped only</option>
+          <option value="error">Errors only</option>
+          <option value="no_signal">No-signal only</option>
+        </select>
+        <button onClick={load} className="text-xs app-text-muted hover:app-text-primary underline">
+          Refresh
+        </button>
+      </div>
+      {loading && rows.length === 0 ? (
+        <div className="text-xs app-text-muted">Loading…</div>
+      ) : rows.length === 0 ? (
+        <div className="text-xs app-text-muted">
+          No decisions logged in the selected window. The decision log only populates from
+          consider_signal / consider_call_play / consider_put_play calls — the next 5-min scan
+          tick will start filling this.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left app-text-muted border-b app-border-soft">
+                <th className="py-1 pr-2">Time</th>
+                <th className="pr-2">Ticker</th>
+                <th className="pr-2">Kind</th>
+                <th className="pr-2">Decision</th>
+                <th className="pr-2">Reason</th>
+                <th className="pr-2">Conf</th>
+                <th className="pr-2">TF</th>
+                <th className="pr-2">Strategy</th>
+              </tr>
+            </thead>
+            <tbody className="font-mono">
+              {rows.map(r => (
+                <tr key={r.id} className="border-b app-border-soft/40">
+                  <td className="py-1 pr-2 app-text-muted">
+                    {r.ts ? new Date(r.ts).toLocaleTimeString() : '—'}
+                  </td>
+                  <td className="pr-2"><strong>{r.ticker}</strong></td>
+                  <td className="pr-2 app-text-muted">{r.kind}</td>
+                  <td className={`pr-2 ${r.decision === 'entered' || (r.decision || '').startsWith('entered') ? 'text-emerald-400' : r.decision === 'error' ? 'text-red-400' : 'app-text-secondary'}`}>
+                    {r.decision}
+                  </td>
+                  <td className="pr-2 text-amber-300">
+                    {r.reason ? (
+                      <CheckDefinitionTooltip reason={r.reason} source="trader" defs={defs}>
+                        {r.reason}
+                      </CheckDefinitionTooltip>
+                    ) : <span className="app-text-muted">—</span>}
+                  </td>
+                  <td className="pr-2 app-text-secondary">
+                    {r.confidence != null ? Number(r.confidence).toFixed(0) : '—'}
+                  </td>
+                  <td className="pr-2 app-text-muted">{r.timeframe ?? '—'}</td>
+                  <td className="pr-2 app-text-muted truncate max-w-[160px]">
+                    {r.strategy ?? '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
