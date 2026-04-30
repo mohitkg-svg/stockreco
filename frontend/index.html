@@ -536,6 +536,14 @@
          Babel-standalone in-browser transpile path: it was 1MB+ of runtime
          that ran on every page load and required script-src 'unsafe-eval'.
          For local dev with edit-and-refresh: run `node build.js --watch`. -->
-    <script src="/app.compiled.js"></script>
+    <!-- r58: cache-bust via fetch-and-eval so browser ETag/conditional-GET
+         works even when intermediate proxies cache aggressively. -->
+    <script>
+      (function () {
+        const s = document.createElement('script');
+        s.src = '/app.compiled.js?v=' + Date.now();
+        document.body.appendChild(s);
+      })();
+    </script>
 </body>
 </html>

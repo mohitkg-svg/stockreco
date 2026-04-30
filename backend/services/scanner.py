@@ -274,54 +274,138 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
         else:
             rs = 0.0
 
-        # 52w-high recency.
+        # 52w high AND low — direction-agnostic scoring needs both.
+        # r58 Option B: scanner now picks bullish AND bearish setups; the
+        # downstream consider_call_play / consider_put_play decide which
+        # direction to trade. Previously the scanner was a pure BUY-side
+        # screener so put plays could never source from the pool.
         hi_arr = hi_window.values
+        if is_partial and len(df) >= 253:
+            lo_window = df["Low"].iloc[-253:-1]
+        else:
+            lo_window = df["Low"].iloc[-min(252, len(df)):]
+        lo_arr = lo_window.values
         hi_52w = float(hi_arr.max()) if len(hi_arr) else 0.0
+        lo_52w = float(lo_arr.min()) if len(lo_arr) else 0.0
         pct_from_hi = (price / hi_52w - 1.0) if hi_52w > 0 else 0.0
+        # pct_from_low is always >= 0 (price ≥ 52w low). Smaller = closer to low.
+        pct_from_low = (price / lo_52w - 1.0) if lo_52w > 0 else 0.0
         try:
             argmax_rev = int(hi_arr[::-1].argmax())
             days_since_hi = max(0, len(hi_arr) - 1 - argmax_rev - argmax_rev)
         except Exception:
             days_since_hi = 999
+        try:
+            argmin_rev = int(lo_arr[::-1].argmin())
+            days_since_lo = max(0, len(lo_arr) - 1 - argmin_rev - argmin_rev)
+        except Exception:
+            days_since_lo = 999
 
         adx = float(last_closed.get("ADX_14", last_closed.get("adx", 0)) or 0)
         sma50 = float(last_closed.get("SMA_50", 0) or 0)
         sma200 = float(last_closed.get("SMA_200", 0) or 0)
 
-        # Compose
+        # ─── Direction-agnostic scoring (r58 Option B) ───
+        # Volume + ADX are always direction-agnostic. RS, extreme-proximity,
+        # and stack-alignment switch behavior based on which direction the
+        # setup is leaning. We pick the direction that produces the higher
+        # composite score, expose `direction` and `dir_score`, plus the
+        # winning factor breakdown.
         score = 0.0
+        # 1. RVOL — always direction-agnostic (high volume = activity).
         score += min(1.0, rvol / 2.0) * 25
-        if rs > 0:
-            score += min(1.0, rs / 0.05) * 25
-        if pct_from_hi > -0.03:
-            if days_since_hi <= 20:
-                score += 25
-            elif days_since_hi <= 60:
-                score += 15
+
+        # 2. RS factor — score by ABS(RS), tag direction.
+        # +5% beat or -5% lag both earn full 25 points.
+        score += min(1.0, abs(rs) / 0.05) * 25
+
+        # 3. Extreme proximity — score by closeness to EITHER 52w extreme.
+        # "Long" candidates press 52w highs; "short" candidates press 52w lows.
+        # Pick whichever extreme the price is closer to (in % terms).
+        # pct_from_hi is negative (or 0); pct_from_low is positive (or 0).
+        # If |pct_from_hi| < pct_from_low → closer to high → bullish setup.
+        # Else → closer to low → bearish setup.
+        near_high_dist = abs(pct_from_hi)
+        near_low_dist = abs(pct_from_low)
+        if near_high_dist <= near_low_dist:
+            extreme_dir = "long"
+            extreme_dist = near_high_dist
+            extreme_recency_days = days_since_hi
+        else:
+            extreme_dir = "short"
+            extreme_dist = near_low_dist
+            extreme_recency_days = days_since_lo
+        # Same scoring tiers, but applied to whichever extreme is closer.
+        extreme_pts = 0
+        if extreme_dist < 0.03:
+            if extreme_recency_days <= 20:
+                extreme_pts = 25
+            elif extreme_recency_days <= 60:
+                extreme_pts = 15
             else:
-                score += 5
-        elif pct_from_hi > -0.08:
-            score += 5
+                extreme_pts = 5
+        elif extreme_dist < 0.08:
+            extreme_pts = 5
+        score += extreme_pts
+
+        # 4. Stack alignment — symmetric. Bullish stack (P>SMA50>SMA200) OR
+        # bearish stack (P<SMA50<SMA200) earns 15 pts; partial earns 8.
         if price > sma50 > sma200 > 0:
             score += 15
+            stack_dir = "long"
+        elif sma200 > sma50 > price > 0:
+            score += 15
+            stack_dir = "short"
         elif price > sma50 > 0:
             score += 8
+            stack_dir = "long"
+        elif sma50 > price > 0 and sma50 > 0:
+            score += 8
+            stack_dir = "short"
+        else:
+            stack_dir = "neutral"
+
+        # 5. Liquidity bonus — direction-agnostic.
         if dollar_vol_20 > PREFILTER_MIN_DOLLAR_VOL * 5:
             score += 10
         elif dollar_vol_20 > PREFILTER_MIN_DOLLAR_VOL * 2:
             score += 5
-        # Spread-drag haircut on cheap names.
+
+        # Spread-drag haircut on cheap names (direction-agnostic).
         if price < 20:
             score *= 0.85
 
+        # Resolve overall direction. RS sign is the strongest signal:
+        # rs > 0 favors long, rs < 0 favors short. Use that as primary;
+        # break ties via the extreme proximity.
+        if rs >= 0.02:
+            direction = "long"
+        elif rs <= -0.02:
+            direction = "short"
+        else:
+            direction = extreme_dir if extreme_pts > 0 else "neutral"
+
+        # Build human-readable reason tags appropriate to the direction.
         reason_parts = []
         if rvol >= 2.0:    reason_parts.append("RVOL surge")
         elif rvol >= 1.3:  reason_parts.append("rising volume")
         if adx >= 25:      reason_parts.append("trending")
-        if rs >= 0.05:     reason_parts.append("outperform +5%")
-        elif rs >= 0.02:   reason_parts.append("outperform +2%")
-        if pct_from_hi >= -0.03 and days_since_hi <= 20:
-            reason_parts.append("fresh 52wH breakout")
+        if direction == "long":
+            if rs >= 0.05:     reason_parts.append("outperform +5%")
+            elif rs >= 0.02:   reason_parts.append("outperform +2%")
+            if pct_from_hi >= -0.03 and days_since_hi <= 20:
+                reason_parts.append("fresh 52wH breakout")
+            elif pct_from_hi >= -0.03:
+                reason_parts.append("near 52wH")
+        elif direction == "short":
+            if rs <= -0.05:    reason_parts.append("underperform -5%")
+            elif rs <= -0.02:  reason_parts.append("underperform -2%")
+            if pct_from_low <= 0.03 and days_since_lo <= 20:
+                reason_parts.append("fresh 52wL breakdown")
+            elif pct_from_low <= 0.03:
+                reason_parts.append("near 52wL")
+            if stack_dir == "short":
+                reason_parts.append("bearish stack")
 
         return {
             "ticker": ticker,
@@ -331,6 +415,8 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
             "rs_20d": round(rs, 4),
             "adx": round(adx, 1),
             "pct_from_52w_high": round(pct_from_hi, 4),
+            "pct_from_52w_low": round(pct_from_low, 4),
+            "direction": direction,  # r58 Option B: long | short | neutral
             "reason": ", ".join(reason_parts) or "composite setup",
         }
     except Exception as e:
@@ -499,6 +585,8 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
                 rs_20d=r["rs_20d"],
                 adx=r["adx"],
                 pct_from_52w_high=r["pct_from_52w_high"],
+                pct_from_52w_low=r.get("pct_from_52w_low"),
+                direction=r.get("direction", "long"),
                 reason=r["reason"],
                 generation=1,
                 pool_source="breakout",

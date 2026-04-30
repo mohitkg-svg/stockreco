@@ -807,6 +807,10 @@ def auto_candidate_pool(limit: int = 50):
             "generation": getattr(r, "generation", None),
             "pool_source": getattr(r, "pool_source", "breakout"),
             "score_v2": getattr(r, "score_v2", None),
+            # r58 Option B: direction-agnostic scanner — operator UI uses
+            # this to render the long/short tag on each pool row.
+            "direction": getattr(r, "direction", "long"),
+            "pct_from_52w_low": getattr(r, "pct_from_52w_low", None),
         } for r in rows]
     finally:
         db.close()

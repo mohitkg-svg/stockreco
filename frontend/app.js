@@ -3546,86 +3546,129 @@ function TradeFromSignal({ signal }) {
 // Collapsible, scrollable; manual "Rescan" button triggers the scheduler
 // job on demand (takes 30-60s for ~500 tickers).
 // r58: client-side score breakdown — replicates the scoring formula in
-// services/scanner.py:score_candidate so the UI can explain WHY each
-// pool ticker was picked, without needing a schema change to persist
-// the breakdown server-side. Pure function of the fields already
-// returned by /auto/candidate-pool.
+// services/scanner.py:score_candidate. r58 Option B: scanner is now
+// direction-agnostic (picks long AND short setups); this breakdown
+// reflects whichever direction won.
 function scoreBreakdown(row) {
   const rvol = row.rvol || 0;
   const rs = row.rs_20d || 0;
   const pctFromHi = row.pct_from_52w_high || 0;
-  const adx = row.adx || 0;
+  const pctFromLow = row.pct_from_52w_low || 0;
+  const direction = row.direction || 'long';
   const price = row.price || 0;
   const score = row.score || 0;
 
-  // Mirror services/scanner.py:score_candidate
+  // 1. RVOL — direction-agnostic
   const rvolPts = Math.min(1, rvol / 2) * 25;
-  const rsPts = rs > 0 ? Math.min(1, rs / 0.05) * 25 : 0;
-  // 52w-high recency: server stores days_since_hi via composite reason; we
-  // approximate from the reason string. If "fresh 52wH breakout" is in the
-  // reason, full 25; if pct_from_hi > -0.03 generic, 15; if pct_from_hi
-  // > -0.08, 5.
+
+  // 2. RS — abs(rs) drives points (either direction)
+  const rsPts = Math.min(1, Math.abs(rs) / 0.05) * 25;
+
+  // 3. Extreme proximity — direction-aware
+  const nearHighDist = Math.abs(pctFromHi);
+  const nearLowDist = Math.abs(pctFromLow);
+  const closerToLow = nearLowDist < nearHighDist;
+  const extremeDist = Math.min(nearHighDist, nearLowDist);
   const reasonLow = (row.reason || '').toLowerCase();
-  const fresh52w = reasonLow.includes('fresh 52wh') || reasonLow.includes('52wh breakout');
-  let pctFromHiPts = 0;
-  if (pctFromHi > -0.03) {
-    pctFromHiPts = fresh52w ? 25 : 15;
-  } else if (pctFromHi > -0.08) {
-    pctFromHiPts = 5;
+  const fresh52wHi = reasonLow.includes('fresh 52wh');
+  const fresh52wLo = reasonLow.includes('fresh 52wl') || reasonLow.includes('52wl breakdown');
+  let extremePts = 0;
+  if (extremeDist < 0.03) {
+    if (fresh52wHi || fresh52wLo) extremePts = 25;
+    else extremePts = 15;
+  } else if (extremeDist < 0.08) {
+    extremePts = 5;
   }
-  // Stack-alignment points (15 if price>SMA50>SMA200, 8 if price>SMA50) —
-  // we don't have SMA values in the API; back-derive from the residual:
-  // residual = score / haircut - rvolPts - rsPts - pctFromHiPts - liquidityBonus
+
+  // 4. Stack alignment — back-derive
   const haircut = price < 20 ? 0.85 : 1.0;
   const preHaircut = score / haircut;
-  // liquidity bonus is 0/5/10 — we don't expose dollar_vol_20, so rough estimate
-  // from price × rvol-implied-volume. Keep it as "estimated" and fall through.
   const liquidityBonus = preHaircut > 70 ? 10 : preHaircut > 50 ? 5 : 0;
-  const stackAlignmentPts = Math.max(0, preHaircut - rvolPts - rsPts - pctFromHiPts - liquidityBonus);
+  const stackPts = Math.max(0, Math.min(15, preHaircut - rvolPts - rsPts - extremePts - liquidityBonus));
 
   return {
     rvolPts: Math.round(rvolPts * 10) / 10,
     rsPts: Math.round(rsPts * 10) / 10,
-    pctFromHiPts: Math.round(pctFromHiPts * 10) / 10,
-    stackAlignmentPts: Math.round(Math.min(15, Math.max(0, stackAlignmentPts)) * 10) / 10,
+    extremePts: Math.round(extremePts * 10) / 10,
+    extremeNearLow: closerToLow,
+    extremeFresh: closerToLow ? fresh52wLo : fresh52wHi,
+    stackAlignmentPts: Math.round(stackPts * 10) / 10,
     liquidityBonus,
     haircut,
     preHaircut: Math.round(preHaircut * 10) / 10,
     final: Math.round(score * 10) / 10,
-    fresh52w,
+    direction,
   };
 }
 
 function ScoreBreakdownDetail({ row }) {
   const b = scoreBreakdown(row);
+  const direction = row.direction || 'long';
+  const dirLabel = direction === 'long' ? '🟢 LONG (call/buy)'
+                 : direction === 'short' ? '🔴 SHORT (put)'
+                 : '⚪ NEUTRAL';
+  const dirHelp = direction === 'long'
+    ? 'Setup leans bullish — auto-trader will hunt BUY signals + call plays on this ticker.'
+    : direction === 'short'
+    ? 'Setup leans bearish — auto-trader will hunt put-play setups (consider_put_play) on this ticker.'
+    : 'Mixed signals — neither direction dominates.';
+
+  const rs = row.rs_20d || 0;
+  const pctFromHi = row.pct_from_52w_high || 0;
+  const pctFromLow = row.pct_from_52w_low || 0;
+  const closerToLow = b.extremeNearLow;
   const items = [
     { label: 'RVOL (volume vs 20d avg)', value: row.rvol?.toFixed(2), pts: b.rvolPts, max: 25,
-      explain: `Today's volume is ${row.rvol?.toFixed(2)}× the 20-day average. Capped at 2× for max points.` },
-    { label: 'RS vs SPY (20d outperformance)', value: `${(row.rs_20d * 100).toFixed(1)}%`, pts: b.rsPts, max: 25,
-      explain: `Stock ${row.rs_20d >= 0 ? 'beat' : 'lagged'} SPY by ${Math.abs(row.rs_20d * 100).toFixed(1)}% over 20 days. +5% beat = full 25 points.` },
-    { label: '% from 52w high (recency-tiered)', value: `${(row.pct_from_52w_high * 100).toFixed(1)}%`, pts: b.pctFromHiPts, max: 25,
-      explain: row.pct_from_52w_high > -0.03
-        ? (b.fresh52w
-            ? 'Within 3% of 52w high AND fresh breakout (≤20 days since high). Full 25 points.'
-            : 'Within 3% of 52w high. 15 points (fresh-breakout tier would give 25).')
-        : row.pct_from_52w_high > -0.08
-          ? '3-8% off 52w high. 5 points (legacy leader, not pressing breakout).'
-          : 'More than 8% off 52w high. 0 points.' },
-    { label: 'Stack alignment (Price > SMA50 > SMA200)', value: `ADX ${row.adx?.toFixed(0)}`, pts: b.stackAlignmentPts, max: 15,
-      explain: 'Estimated from residual score. Full 15 points when price is above both SMA50 and SMA200; 8 if only above SMA50.' },
-    { label: 'Liquidity bonus ($ ADV > 3× floor)', value: `$${row.price?.toFixed(0)} × RVOL`, pts: b.liquidityBonus, max: 10,
-      explain: 'Bonus 5 pts when 20-day ADV > 2× the $10M floor; 10 pts when > 5×.' },
+      explain: `Today's volume is ${row.rvol?.toFixed(2)}× the 20-day average. Direction-agnostic — capped at 2× for full points.` },
+    { label: `RS vs SPY (|20d outperformance|)`, value: `${(rs * 100).toFixed(1)}%`, pts: b.rsPts, max: 25,
+      explain: `Stock ${rs >= 0 ? 'beat' : 'lagged'} SPY by ${Math.abs(rs * 100).toFixed(1)}% over 20 days. r58 Option B uses absolute value: ±5% earns full 25 points (positive favors long, negative favors short).` },
+    closerToLow ? {
+      label: '% from 52w LOW (bearish setup)',
+      value: `+${(pctFromLow * 100).toFixed(1)}%`,
+      pts: b.extremePts, max: 25,
+      explain: pctFromLow < 0.03
+        ? (b.extremeFresh
+            ? 'Within 3% of 52w LOW AND fresh breakdown (≤20 days since low). Full 25 points — strong put setup.'
+            : 'Within 3% of 52w low. 15 points.')
+        : pctFromLow < 0.08
+          ? '3-8% off 52w low. 5 points.'
+          : 'Far from 52w low. 0 points.'
+    } : {
+      label: '% from 52w HIGH (bullish setup)',
+      value: `${(pctFromHi * 100).toFixed(1)}%`,
+      pts: b.extremePts, max: 25,
+      explain: Math.abs(pctFromHi) < 0.03
+        ? (b.extremeFresh
+            ? 'Within 3% of 52w HIGH AND fresh breakout (≤20 days since high). Full 25 points — strong call setup.'
+            : 'Within 3% of 52w high. 15 points.')
+        : Math.abs(pctFromHi) < 0.08
+          ? '3-8% off 52w high. 5 points.'
+          : 'Far from 52w high. 0 points.'
+    },
+    { label: 'Stack alignment (symmetric)', value: `ADX ${row.adx?.toFixed(0)}`, pts: b.stackAlignmentPts, max: 15,
+      explain: direction === 'long'
+        ? 'Bullish stack: Price > SMA50 > SMA200 = full 15 pts; only above SMA50 = 8 pts.'
+        : direction === 'short'
+        ? 'Bearish stack: Price < SMA50 < SMA200 = full 15 pts; only below SMA50 = 8 pts.'
+        : 'No clean stack alignment.' },
+    { label: 'Liquidity bonus ($ ADV)', value: `$${row.price?.toFixed(0)}`, pts: b.liquidityBonus, max: 10,
+      explain: 'Bonus 5 pts when 20-day $-volume > 2× the $10M floor; 10 pts when > 5×.' },
   ];
   return (
     <div className="surface-soft rounded-lg p-3 space-y-3">
-      <div className="text-[11px] app-text-muted uppercase tracking-wide font-semibold">
-        Why {row.ticker} is in the top-50
+      <div className="flex items-center justify-between">
+        <div className="text-[11px] app-text-muted uppercase tracking-wide font-semibold">
+          Why {row.ticker} is in the top-50
+        </div>
+        <span className={`pill text-[10px] ${direction === 'long' ? 'pill-success' : direction === 'short' ? 'pill-warn' : ''}`}>
+          {dirLabel}
+        </span>
       </div>
       <div className="text-xs app-text-secondary leading-relaxed">
-        {row.reason && <span className="font-semibold app-text-primary">{row.reason}.</span>} The
+        {row.reason && <span className="font-semibold app-text-primary">{row.reason}.</span>} {dirHelp} The
         ticker passed the universe gates (price ≥ $10, 20d $-volume ≥ $10M, ≥1y of history,
-        no earnings within 48h) and accumulated {b.preHaircut.toFixed(1)} pts from the composite
-        score below.{b.haircut < 1 && ` Sub-$20 spread haircut (×${b.haircut}) → final ${b.final.toFixed(1)}.`}
+        no earnings within 48h) and accumulated {b.preHaircut.toFixed(1)} pts.
+        {b.haircut < 1 && ` Sub-$20 spread haircut (×${b.haircut}) → final ${b.final.toFixed(1)}.`}
       </div>
       <div className="space-y-1.5">
         {items.map((it, i) => {
@@ -3761,7 +3804,7 @@ function CandidatePoolPanel() {
         {header}
       </button>
       <div className="text-[11px] app-text-muted leading-relaxed mt-1">
-        Top {count} setups ranked across ~500 liquid US equities. Auto-trader picks from this pool when <code className="app-text-primary">use_universe_scanner</code> is enabled. Scans 4× per day at market-sensitive UTC slots (12:00, 14:30, 17:00, 19:30).
+        Top {count} setups ranked across ~611 Russell 1000 equities — <strong>direction-agnostic</strong> (r58 Option B). Each row tagged 🟢 LONG (auto-trader hunts BUY + calls) or 🔴 SHORT (hunts puts) based on whether RS, 52w-extreme proximity, and stack alignment lean bullish or bearish. Scans 4× per day NY-anchored at 8:30 / 10:30 / 13:00 / 15:00 ET. Click a row for the full score breakdown.
       </div>
       {open && (
         <div className="mt-3 overflow-x-auto">
@@ -3780,7 +3823,7 @@ function CandidatePoolPanel() {
                   <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Ticker</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Score</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]" title="r54 cross-sectional z-score (shadow). Becomes the ranking key when cfg.universe_scoring_v2 = active.">Score v2</th>
-                  <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]" title="Which sub-scanner produced this candidate. Default: breakout. Multi-pool: pead, sector_rel, vol_exp.">Source</th>
+                  <th className="text-left py-2 px-2 font-semibold uppercase tracking-wider text-[10px]" title="r58 Option B: scanner picks both bullish (long) and bearish (short) setups. Long → auto-trader hunts BUY + call plays. Short → put plays.">Direction</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">Price</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">RVOL</th>
                   <th className="text-right py-2 px-2 font-semibold uppercase tracking-wider text-[10px]">RS 20d</th>
@@ -3807,7 +3850,14 @@ function CandidatePoolPanel() {
                     </td>
                     <td className="text-right py-1.5 px-2 font-mono font-semibold">{r.score?.toFixed(1)}</td>
                     <td className="text-right py-1.5 px-2 font-mono app-text-secondary">{r.score_v2 != null ? r.score_v2.toFixed(1) : '—'}</td>
-                    <td className="py-1.5 px-2 text-[10px] app-text-muted uppercase">{r.pool_source || 'breakout'}</td>
+                    <td className="py-1.5 px-2 text-[10px]">
+                      {(() => {
+                        const d = r.direction || 'long';
+                        const label = d === 'long' ? '🟢 LONG' : d === 'short' ? '🔴 SHORT' : '⚪';
+                        const cls = d === 'long' ? 'text-emerald-400' : d === 'short' ? 'text-amber-400' : 'app-text-muted';
+                        return <span className={`font-semibold ${cls}`}>{label}</span>;
+                      })()}
+                    </td>
                     <td className="text-right py-1.5 px-2 font-mono">${r.price?.toFixed(2)}</td>
                     <td className={`text-right py-1.5 px-2 font-mono ${r.rvol >= 1.5 ? 'text-emerald-400' : r.rvol < 0.7 ? 'text-red-400' : ''}`}>
                       {r.rvol?.toFixed(2)}
@@ -4170,10 +4220,12 @@ function AutoTraderPanel({ reloadToken }) {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setShowCfg(s => !s)}
-            className="text-xs app-text-secondary hover:app-text-primary flex items-center gap-1 px-2.5 py-1.5 rounded-lg hover:bg-white/5 border app-border-soft"
+            type="button"
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); setShowCfg(s => !s); }}
+            aria-expanded={showCfg}
+            className={`text-xs flex items-center gap-1 px-2.5 py-1.5 rounded-lg border ${showCfg ? 'app-text-primary bg-white/10 border-blue-500/40' : 'app-text-secondary hover:app-text-primary hover:bg-white/5 app-border-soft'}`}
           >
-            <span>⚙</span><span>Config</span>
+            <span>⚙</span><span>Config{showCfg ? ' ▼' : ''}</span>
           </button>
           <button
             onClick={toggle}
@@ -4793,7 +4845,8 @@ function ScannerRunsTab({ defs }) {
     <div className="space-y-2">
       <div className="text-[11px] app-text-muted leading-relaxed mb-2">
         Each row = one scanner run. Click to expand the full rejection list grouped by reason.
-        Hover any reason for a detailed definition.
+        Hover any reason for a detailed definition. r58 Option B: scanner now picks both
+        bullish AND bearish setups, so the pool feeds put-play candidates too.
       </div>
       {runs.map(r => (
         <div key={r.id} className="border app-border-soft rounded-lg overflow-hidden">

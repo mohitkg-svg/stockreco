@@ -452,6 +452,13 @@ class CandidatePool(Base):
     # stack. Operator compares score_v2 vs score in shadow mode before
     # flipping cfg.universe_scoring_v2 to "active".
     score_v2 = Column(Float, nullable=True)
+    # r58 Option B: direction-agnostic scanner. "long" | "short" | "neutral".
+    # Determines which side (consider_call_play vs consider_put_play) the
+    # auto-trader should prioritize for this candidate.
+    direction = Column(String, default="long", index=True, nullable=True)
+    # r58 Option B: distance from 52w low (always >= 0). Used by the scoring
+    # explanation UI; "short" candidates are picked when this is small.
+    pct_from_52w_low = Column(Float, nullable=True)
 
 
 class CandidateEvent(Base):
@@ -1135,6 +1142,9 @@ def create_tables():
     _ensure_column("candidate_pool", "generation", "INTEGER DEFAULT 1")
     _ensure_column("candidate_pool", "pool_source", "VARCHAR DEFAULT 'breakout'")
     _ensure_column("candidate_pool", "score_v2", "DOUBLE PRECISION")
+    # r58 Option B: direction-agnostic scanner
+    _ensure_column("candidate_pool", "direction", "VARCHAR DEFAULT 'long'")
+    _ensure_column("candidate_pool", "pct_from_52w_low", "DOUBLE PRECISION")
     # r54 Tier-1 #5/#7 + Tier-2 #11 config knobs
     _ensure_column("auto_trader_config", "universe_scoring_v2", "VARCHAR DEFAULT 'shadow'")
     _ensure_column("auto_trader_config", "universe_scanners_enabled", "VARCHAR DEFAULT 'breakout'")
