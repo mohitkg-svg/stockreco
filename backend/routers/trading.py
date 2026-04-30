@@ -57,6 +57,20 @@ class AutoTraderConfigRequest(BaseModel):
     ml_scoring_enabled: Optional[bool] = None
     pdt_enforce: Optional[bool] = None
     auto_promote_adopted: Optional[bool] = None
+    # r57 schema-drift fix: these AutoTraderConfig fields existed in the DB
+    # since r53-r55 but were never added to the request schema, so POST
+    # /auto/config silently dropped them. Operator can now actually toggle.
+    entry_1m_gate_mode: Optional[str] = Field(None, pattern="^(strict|relaxed|off)$")
+    rr_min: Optional[float] = Field(None, ge=0, le=10)
+    loss_pattern_mode: Optional[str] = Field(None, pattern="^(off|shadow|active)$")
+    source_mute_enabled: Optional[bool] = None
+    theta_adjusted_rr_enabled: Optional[bool] = None
+    portfolio_kelly_enabled: Optional[bool] = None
+    vol_target_annual: Optional[float] = Field(None, ge=0, le=2)
+    leverage_cap: Optional[float] = Field(None, ge=0, le=10)
+    book_var_99_cap_pct: Optional[float] = Field(None, ge=0, le=1)
+    bracket_tif: Optional[str] = Field(None, pattern="^(day|gtc|DAY|GTC)$")
+    max_correlated_open: Optional[int] = Field(None, ge=0, le=50)
 
 
 class KillSwitchRequest(BaseModel):
