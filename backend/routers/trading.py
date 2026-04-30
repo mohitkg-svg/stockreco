@@ -819,6 +819,114 @@ def auto_universe_scan():
     return _sc.run_scan()
 
 
+@router.get("/auto/scan-runs")
+def auto_scan_runs(limit: int = 30):
+    """r58 transparency: list recent scanner runs (timestamp, universe size,
+    rejections count, etc.) for the Scanner Run History UI panel."""
+    from database import SessionLocal, ScanRun
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ScanRun)
+            .order_by(ScanRun.started_at.desc())
+            .limit(int(limit))
+            .all()
+        )
+        out = []
+        for r in rows:
+            import json as _json
+            rejs = _json.loads(r.rejections) if r.rejections else []
+            out.append({
+                "id": r.id,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "universe_size": r.universe_size,
+                "scored": r.scored,
+                "top_n_size": r.top_n_size,
+                "elapsed_sec": r.elapsed_sec,
+                "skipped_reason": r.skipped_reason,
+                "rejection_count": len(rejs),
+                # Top-5 reasons aggregated for the list view
+                "top_rejection_reasons": _aggregate_top_reasons(rejs, n=5),
+            })
+        return out
+    finally:
+        db.close()
+
+
+def _aggregate_top_reasons(rejs, n=5):
+    from collections import Counter
+    c = Counter([r.get("reason") for r in rejs if r.get("reason")])
+    return [{"reason": k, "count": v} for k, v in c.most_common(n)]
+
+
+@router.get("/auto/scan-runs/{run_id}")
+def auto_scan_run_detail(run_id: int):
+    """r58 transparency: full rejection list for a specific scan run."""
+    from database import SessionLocal, ScanRun
+    import json as _json
+    db = SessionLocal()
+    try:
+        r = db.query(ScanRun).filter(ScanRun.id == run_id).first()
+        if not r:
+            return {"error": "not_found"}
+        return {
+            "id": r.id,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "universe_size": r.universe_size,
+            "scored": r.scored,
+            "top_n_size": r.top_n_size,
+            "elapsed_sec": r.elapsed_sec,
+            "skipped_reason": r.skipped_reason,
+            "top_picks": _json.loads(r.top_picks) if r.top_picks else [],
+            "rejections": _json.loads(r.rejections) if r.rejections else [],
+        }
+    finally:
+        db.close()
+
+
+@router.get("/auto/decision-log")
+def auto_decision_log(limit: int = 100, ticker: Optional[str] = None,
+                     decision: Optional[str] = None, since_hours: int = 24):
+    """r58 transparency: per-ticker decision log for the Decision Transparency
+    UI. Filter by ticker / decision / age."""
+    from database import SessionLocal, DecisionLog
+    from datetime import datetime as _dt, timedelta as _td
+    db = SessionLocal()
+    try:
+        q = db.query(DecisionLog)
+        cutoff = _dt.utcnow() - _td(hours=int(since_hours))
+        q = q.filter(DecisionLog.ts >= cutoff)
+        if ticker:
+            q = q.filter(DecisionLog.ticker == ticker.upper())
+        if decision:
+            q = q.filter(DecisionLog.decision == decision)
+        rows = q.order_by(DecisionLog.ts.desc()).limit(int(limit)).all()
+        return [{
+            "id": r.id,
+            "ts": r.ts.isoformat() if r.ts else None,
+            "ticker": r.ticker,
+            "kind": r.kind,
+            "decision": r.decision,
+            "reason": r.reason,
+            "confidence": r.confidence,
+            "timeframe": r.timeframe,
+            "strategy": r.strategy,
+            "trade_id": r.trade_id,
+        } for r in rows]
+    finally:
+        db.close()
+
+
+@router.get("/auto/check-definitions")
+def auto_check_definitions():
+    """r58 transparency: human-friendly definitions for every scanner +
+    auto-trader check. UI uses this for tooltips and the legend panel."""
+    from services.check_definitions import all_definitions
+    return all_definitions()
+
+
 @router.get("/auto/candidate-events")
 def auto_candidate_events(max_age_min: int = 30):
     """r57: list active (non-expired, non-consumed) candidate events.

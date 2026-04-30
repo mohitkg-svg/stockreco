@@ -502,6 +502,62 @@ class CandidateEvent(Base):
     consumed_reason = Column(String, nullable=True)
 
 
+class ScanRun(Base):
+    """r58 transparency: one row per scanner run. Captures the full output —
+    universe size, scored count, top-N persisted, plus a JSON blob of every
+    rejected ticker with the rejection reason. Lets the operator audit
+    "why didn't AAPL make the pool today?" via the UI without curl.
+
+    `rejections` JSON shape: [{"ticker": "AAPL", "reason": "below_dollar_vol", "score": null, ...}]
+    `top_picks` JSON shape: [{"ticker": "BEN", "score": 77.5, ...}]
+    """
+    __tablename__ = "scan_runs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    universe_size = Column(Integer, nullable=False, default=0)
+    scored = Column(Integer, nullable=False, default=0)
+    top_n_size = Column(Integer, nullable=False, default=0)
+    elapsed_sec = Column(Float, nullable=True)
+    skipped_reason = Column(String, nullable=True)  # weekend / lock_held / etc.
+    # JSON blob: [{"ticker", "reason", "stage", "features"}, ...]
+    rejections = Column(Text, nullable=True)
+    # JSON blob: [{"ticker", "score", "rvol", "rs_20d", ...}, ...]
+    top_picks = Column(Text, nullable=True)
+
+
+class DecisionLog(Base):
+    """r58 transparency: one row per consider_signal/consider_call_play/
+    consider_put_play evaluation. Captures the dominant gate that
+    fired — whether the trade was taken or rejected and why.
+
+    Wired via the existing `_DECISION_TLS` capture in auto_trader.py
+    that already tracks last_skip_reason for CandidatePool. We promote
+    that capture into a persistent log here for the UI's
+    Decision Transparency report. ~30 day retention via cleanup cron
+    (planned for r59).
+
+    Indexed on (ts, ticker) for fast filtering. Capped at ~30 days of
+    history to bound disk usage.
+    """
+    __tablename__ = "decision_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    ticker = Column(String, index=True, nullable=False)
+    # "stock" | "option_call" | "option_put" | "event"
+    kind = Column(String, index=True, nullable=False)
+    # "entered" | "skipped" | "error" | "no_signal"
+    decision = Column(String, index=True, nullable=False)
+    # The dominant skip reason (or "ok" when entered).
+    reason = Column(String, nullable=True)
+    # Brief context — confidence, timeframe, signal source.
+    confidence = Column(Float, nullable=True)
+    timeframe = Column(String, nullable=True)
+    strategy = Column(String, nullable=True)
+    # Optional FK-ish reference to the AutoTrade that resulted (when entered).
+    trade_id = Column(Integer, nullable=True, index=True)
+
+
 class BestStrategyPerTicker(Base):
     """Cached winner of the per-ticker walk-forward backtest.
 

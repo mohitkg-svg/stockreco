@@ -444,19 +444,31 @@ def _patched_metrics_inc(name, **labels):
 metrics.inc = _patched_metrics_inc
 
 
-def _begin_decision(ticker: str, kind: str) -> None:
-    """Reset the thread-local capture state for a new evaluation."""
+def _begin_decision(ticker: str, kind: str, signal: Optional[Dict[str, Any]] = None) -> None:
+    """Reset the thread-local capture state for a new evaluation.
+    r58: optionally capture signal_view for richer DecisionLog rows."""
     _DECISION_TLS.ticker = (ticker or "").upper()
     _DECISION_TLS.kind = kind  # "stock" | "option"
     _DECISION_TLS.last_skip_reason = None
     _DECISION_TLS.entered = False
     _DECISION_TLS.entered_kind = None  # "call" | "put" | None
+    _DECISION_TLS.entered_trade_id = None
+    if signal:
+        _DECISION_TLS.signal_view = {
+            "confidence": signal.get("confidence"),
+            "timeframe": signal.get("timeframe"),
+            "strategy": signal.get("strategy"),
+        }
+    else:
+        _DECISION_TLS.signal_view = None
 
 
-def _mark_entered(option_kind: Optional[str] = None) -> None:
+def _mark_entered(option_kind: Optional[str] = None, trade_id: Optional[int] = None) -> None:
     _DECISION_TLS.entered = True
     if option_kind:
         _DECISION_TLS.entered_kind = option_kind
+    if trade_id is not None:
+        _DECISION_TLS.entered_trade_id = trade_id
 
 
 # r53r: low-information skip reasons. The bot calls consider_signal once
@@ -562,6 +574,32 @@ def _persist_decision() -> None:
                         _db_d.commit()
             finally:
                 _db_d.close()
+        except Exception:
+            pass
+        # r58 transparency: also append to DecisionLog so the Decision
+        # Transparency UI can show every per-ticker evaluation, not
+        # just the latest verdict on tickers in the candidate_pool.
+        try:
+            from database import SessionLocal as _SL_dl, DecisionLog as _DL
+            sig_view = getattr(_DECISION_TLS, "signal_view", None) or {}
+            _db_dl = _SL_dl()
+            try:
+                _db_dl.add(_DL(
+                    ticker=ticker,
+                    kind=("option_call" if kind == "option" and entered_kind == "call"
+                          else "option_put" if kind == "option" and entered_kind == "put"
+                          else "option" if kind == "option"
+                          else "stock"),
+                    decision=decision,
+                    reason=reason,
+                    confidence=sig_view.get("confidence"),
+                    timeframe=sig_view.get("timeframe"),
+                    strategy=sig_view.get("strategy"),
+                    trade_id=getattr(_DECISION_TLS, "entered_trade_id", None),
+                ))
+                _db_dl.commit()
+            finally:
+                _db_dl.close()
         except Exception:
             pass
     except Exception:
@@ -2107,7 +2145,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         )
         metrics.inc("autotrade_skip", reason="malformed_signal")
         return None
-    _begin_decision(signal.get("ticker") or "", "stock")
+    _begin_decision(signal.get("ticker") or "", "stock", signal=signal)
     # Short-circuit if the buying-power breaker tripped recently.
     if bp_breaker_active():
         metrics.inc("autotrade_skip", reason="bp_breaker")

@@ -195,9 +195,17 @@ def _is_partial_bar(df) -> bool:
 
 # ───────────────────────── Scoring ─────────────────────────
 
+def _rejected(ticker: str, reason: str, **features) -> Dict[str, Any]:
+    """r58 transparency: tag a rejection so run_scan can persist it
+    instead of silently dropping the ticker."""
+    return {"ticker": ticker, "_rejected": reason, "_features": features}
+
+
 def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """Composite pre-filter score for a ticker. Returns dict with score
-    and feature breakdown, or None if ticker fails liquidity / data gates.
+    """Composite pre-filter score for a ticker. Returns either:
+      - {"ticker", "score", ...} on pass
+      - {"ticker", "_rejected": "<reason>", "_features": {...}} on reject
+      - None on unrecoverable error
 
     Score (0-100):
       • RVOL          → 25 pts  (today's vol vs 20d avg, capped at 2×)
@@ -211,16 +219,23 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
         from services.data_fetcher import fetch_ohlcv
         from services.indicators import compute_indicators
         df = fetch_ohlcv(ticker, "1d")
-        if df is None or df.empty or len(df) < 65:
-            return None
+        if df is None or df.empty:
+            return _rejected(ticker, "no_ohlcv_data")
+        if len(df) < 65:
+            return _rejected(ticker, "insufficient_history",
+                             bars_available=len(df), bars_required=65)
         df = compute_indicators(df)
         is_partial = _is_partial_bar(df)
 
         # Anchor on last fully-closed bar to avoid look-ahead leaks.
         last_closed = df.iloc[-2] if is_partial and len(df) >= 2 else df.iloc[-1]
         price = float(last_closed.get("Close", 0) or 0)
-        if not (PREFILTER_MIN_PRICE <= price <= PREFILTER_MAX_PRICE):
-            return None
+        if price < PREFILTER_MIN_PRICE:
+            return _rejected(ticker, "price_below_floor",
+                             price=round(price, 2), floor=PREFILTER_MIN_PRICE)
+        if price > PREFILTER_MAX_PRICE:
+            return _rejected(ticker, "price_above_ceiling",
+                             price=round(price, 2), ceiling=PREFILTER_MAX_PRICE)
 
         # Liquidity gates use windows of fully-closed bars.
         if is_partial and len(df) >= 21:
@@ -236,12 +251,15 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
         vol_20 = float(vol_window.mean())
         avg_close_20 = float(close_window.mean())
         if not (math.isfinite(vol_20) and math.isfinite(avg_close_20)):
-            return None
+            return _rejected(ticker, "nan_features")
         if vol_20 <= 0 or avg_close_20 <= 0:
-            return None
+            return _rejected(ticker, "non_positive_features",
+                             vol_20=vol_20, avg_close_20=avg_close_20)
         dollar_vol_20 = avg_close_20 * vol_20
         if dollar_vol_20 < PREFILTER_MIN_DOLLAR_VOL:
-            return None
+            return _rejected(ticker, "below_dollar_volume",
+                             dollar_vol_20=round(dollar_vol_20),
+                             floor=PREFILTER_MIN_DOLLAR_VOL)
 
         # RVOL using yesterday's volume when bar is partial (today's
         # cumulative is incomplete and biases time-of-day).
@@ -317,7 +335,7 @@ def score_candidate(ticker: str, spy_r20: Optional[float] = None) -> Optional[Di
         }
     except Exception as e:
         logger.debug(f"scanner score {ticker}: {e}")
-        return None
+        return _rejected(ticker, "scoring_error", error=str(e)[:120])
 
 
 # ───────────────────────── Pool persistence ─────────────────────────
@@ -334,11 +352,18 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
     from database import SessionLocal, CandidatePool, AutoTraderConfig
     from concurrent.futures import ThreadPoolExecutor, wait as _fut_wait
 
+    # r58: capture start time for ScanRun.started_at.
+    start_dt = datetime.utcnow()
+    start = time.time()
+
     # Skip on weekends.
     try:
         from zoneinfo import ZoneInfo as _ZI
         now_et = datetime.utcnow().replace(tzinfo=_ZI("UTC")).astimezone(_ZI("America/New_York"))
         if now_et.weekday() >= 5:
+            _persist_scan_run(start_dt=start_dt, elapsed_sec=0.0, universe_size=0,
+                              scored=0, top_n_size=0, skipped_reason="weekend",
+                              rejections=[], top_picks=[])
             return {"scanned": 0, "top_n": 0, "skipped": "weekend"}
     except Exception:
         pass
@@ -355,10 +380,15 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
     universe = pull_universe()
     if not universe:
         logger.info("scanner: empty universe — skipping")
+        _persist_scan_run(start_dt=start_dt, elapsed_sec=time.time() - start,
+                          universe_size=0, scored=0, top_n_size=0,
+                          skipped_reason="empty_universe", rejections=[], top_picks=[])
         return {"scanned": 0, "top_n": 0}
 
     spy_r20 = _spy_r20()
-    start = time.time()
+
+    # r58: keep pre-filter snapshot for the rejection log.
+    universe_pre_earnings_filter = list(universe)
 
     # Earnings pre-filter (fail-closed on errors).
     universe = [u for u in universe if not _within_earnings_window(u["ticker"])]
@@ -371,25 +401,59 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
         logger.warning(f"scanner: bulk-warm failed (per-ticker fallback): {e}")
 
     # Score in parallel (4 workers — post-warmup is GIL-bound).
+    # r58 transparency: capture rejections (tagged with `_rejected`)
+    # alongside passes (`scored`) so the operator can audit "why didn't
+    # AAPL make the pool?".
     SCAN_DEADLINE_SEC = 240.0
-    scored = []
+    scored: List[Dict[str, Any]] = []
+    rejections: List[Dict[str, Any]] = []
+    timed_out_tickers: List[str] = []
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="scanscore") as pool:
-        futures = [pool.submit(score_candidate, u["ticker"], spy_r20) for u in universe]
-        done, not_done = _fut_wait(futures, timeout=SCAN_DEADLINE_SEC)
+        future_to_ticker = {
+            pool.submit(score_candidate, u["ticker"], spy_r20): u["ticker"]
+            for u in universe
+        }
+        done, not_done = _fut_wait(list(future_to_ticker.keys()), timeout=SCAN_DEADLINE_SEC)
         if not_done:
             logger.warning(f"scanner: {len(not_done)} tickers timed out at {SCAN_DEADLINE_SEC}s")
             for f in not_done:
+                timed_out_tickers.append(future_to_ticker.get(f) or "?")
                 f.cancel()
         for f in done:
+            ticker = future_to_ticker.get(f) or "?"
             try:
                 res = f.result(timeout=0)
-                if res:
+                if res is None:
+                    rejections.append({"ticker": ticker, "reason": "unknown_error", "stage": "score"})
+                elif res.get("_rejected"):
+                    rejections.append({
+                        "ticker": ticker,
+                        "reason": res["_rejected"],
+                        "stage": "score",
+                        "features": res.get("_features", {}),
+                    })
+                else:
                     scored.append(res)
-            except Exception:
-                continue
+            except Exception as e:
+                rejections.append({"ticker": ticker, "reason": "future_exception", "stage": "score",
+                                   "error": str(e)[:120]})
+
+    # Add timed-out tickers to rejections.
+    for t in timed_out_tickers:
+        rejections.append({"ticker": t, "reason": "scan_timeout", "stage": "score"})
+
+    # r58: pre-existing earnings filter rejections — record them too.
+    earnings_rejected_tickers = [u["ticker"] for u in universe_pre_earnings_filter
+                                 if u not in universe]
+    for t in earnings_rejected_tickers:
+        rejections.append({"ticker": t, "reason": "earnings_window", "stage": "earnings_filter"})
 
     if not scored:
         logger.info("scanner: nothing scored — skipping pool write")
+        elapsed_no_scored = time.time() - start
+        _persist_scan_run(start_dt=start_dt, elapsed_sec=elapsed_no_scored,
+                          universe_size=len(universe), scored=0, top_n_size=0,
+                          skipped_reason=None, rejections=rejections, top_picks=[])
         return {"scanned": 0, "top_n": 0}
 
     scored.sort(key=lambda r: r.get("score") or 0, reverse=True)
@@ -399,10 +463,26 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
     if len(scored) >= 10:
         cut_idx = max(0, int(len(scored) * 0.20) - 1)
         threshold = scored[cut_idx].get("score") or 0
-        eligible = [s for s in scored if (s.get("score") or 0) >= threshold]
+        eligible = []
+        for s in scored:
+            if (s.get("score") or 0) >= threshold:
+                eligible.append(s)
+            else:
+                rejections.append({
+                    "ticker": s["ticker"], "reason": "below_top_quintile",
+                    "stage": "selection",
+                    "features": {"score": s["score"], "threshold": round(threshold, 1)},
+                })
     else:
         eligible = scored
     top = eligible[:top_n]
+    # Anyone in eligible but past top_n also rejected.
+    for s in eligible[top_n:]:
+        rejections.append({
+            "ticker": s["ticker"], "reason": "below_top_n",
+            "stage": "selection",
+            "features": {"score": s["score"], "rank": eligible.index(s) + 1, "top_n": top_n},
+        })
 
     # Atomic swap: delete old pool + insert new in one transaction.
     db = SessionLocal()
@@ -432,16 +512,55 @@ def run_scan(top_n: Optional[int] = None) -> Dict[str, Any]:
         db.close()
 
     elapsed = time.time() - start
+    # r58: persist the full ScanRun record for the Transparency UI.
+    top_picks_brief = [
+        {"ticker": r["ticker"], "score": r["score"], "rvol": r["rvol"],
+         "rs_20d": r["rs_20d"], "pct_from_52w_high": r["pct_from_52w_high"],
+         "price": r["price"], "reason": r.get("reason")}
+        for r in top
+    ]
+    _persist_scan_run(
+        start_dt=start_dt, elapsed_sec=elapsed,
+        universe_size=len(universe), scored=len(scored), top_n_size=len(top),
+        skipped_reason=None, rejections=rejections, top_picks=top_picks_brief,
+    )
+
     logger.info(
-        f"scanner r57: scored {len(scored)}/{len(universe)} in {elapsed:.1f}s; "
-        f"top {len(top)} persisted"
+        f"scanner r58: scored {len(scored)}/{len(universe)} in {elapsed:.1f}s; "
+        f"top {len(top)} persisted; {len(rejections)} rejections logged"
     )
     return {
         "scanned": len(scored),
         "universe_size": len(universe),
         "top_n": len(top),
         "elapsed_sec": round(elapsed, 1),
+        "rejections": len(rejections),
     }
+
+
+def _persist_scan_run(*, start_dt, elapsed_sec, universe_size, scored, top_n_size,
+                      skipped_reason, rejections, top_picks):
+    """Persist a ScanRun row with rejections + top_picks JSON blobs."""
+    from database import SessionLocal, ScanRun
+    db = SessionLocal()
+    try:
+        db.add(ScanRun(
+            started_at=start_dt,
+            completed_at=datetime.utcnow(),
+            universe_size=universe_size,
+            scored=scored,
+            top_n_size=top_n_size,
+            elapsed_sec=round(elapsed_sec, 1),
+            skipped_reason=skipped_reason,
+            rejections=json.dumps(rejections) if rejections else None,
+            top_picks=json.dumps(top_picks) if top_picks else None,
+        ))
+        db.commit()
+    except Exception as e:
+        logger.warning(f"scanner: ScanRun persist failed: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 
 def get_candidate_tickers() -> List[str]:
