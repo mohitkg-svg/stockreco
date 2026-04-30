@@ -20,6 +20,24 @@ set -euo pipefail
 REGION="${1:-us-central1}"
 SERVICE="stockrecs"
 
+# ---- Pre-deploy frontend build ----------------------------------------------
+# r58 fix: app.compiled.js is what Cloud Run serves. Without rebuilding before
+# every deploy, frontend changes in app.js never reach production. Skip with
+# SKIP_FRONTEND_BUILD=1 if iterating backend-only.
+if [ "${SKIP_FRONTEND_BUILD:-0}" != "1" ]; then
+  echo "── Rebuilding frontend (esbuild) ──"
+  if command -v node >/dev/null 2>&1 && [ -f frontend/build.js ]; then
+    if (cd frontend && node build.js 2>&1 | tail -5); then
+      echo "✅ frontend rebuilt"
+    else
+      echo "❌ frontend build failed — aborting. Set SKIP_FRONTEND_BUILD=1 to override."
+      exit 1
+    fi
+  else
+    echo "ℹ️  node or frontend/build.js missing; skipping frontend rebuild"
+  fi
+fi
+
 # ---- Pre-deploy lint (ruff) -------------------------------------------------
 # Conservative ruleset (syntax errors, undefined names, redefinitions only).
 # Skip with SKIP_LINT=1; doesn't block if ruff isn't installed locally.
