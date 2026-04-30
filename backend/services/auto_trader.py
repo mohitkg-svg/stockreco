@@ -775,6 +775,11 @@ def get_config_dict() -> Dict[str, Any]:
             "book_var_99_cap_pct": float(getattr(cfg, "book_var_99_cap_pct", 0.05) or 0.05),
             "bracket_tif": getattr(cfg, "bracket_tif", "day") or "day",
             "max_correlated_open": int(getattr(cfg, "max_correlated_open", 1) or 1),
+            # r58: option-floor configs (previously hardcoded)
+            "option_thesis_min_conf_aggressive": float(getattr(cfg, "option_thesis_min_conf_aggressive", 60.0) or 60.0),
+            "option_thesis_min_conf_mult": float(getattr(cfg, "option_thesis_min_conf_mult", 0.85) or 0.85),
+            "option_contract_min_score": float(getattr(cfg, "option_contract_min_score", 65.0) or 65.0),
+            "option_contract_min_score_aggressive": float(getattr(cfg, "option_contract_min_score_aggressive", 55.0) or 55.0),
         }
     finally:
         db.close()
@@ -1993,8 +1998,8 @@ def regenerate_post_mortem(trade_id: int) -> Optional[Dict[str, Any]]:
 
 # ---------- Entry: react to a fresh signal --------------------------------
 
-MIN_OPTION_SCORE = 65             # contract score gate in default mode
-MIN_OPTION_SCORE_AGGRESSIVE = 55  # lowered gate when aggressive_options_mode is on
+MIN_OPTION_SCORE = 65             # default-mode fallback (overridden by cfg.option_contract_min_score)
+MIN_OPTION_SCORE_AGGRESSIVE = 55  # aggressive-mode fallback (overridden by cfg.option_contract_min_score_aggressive)
 
 
 def consider_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -3644,10 +3649,18 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             # WHY put-play didn't fire instead of muting it as no_signal.
             metrics.inc("autotrade_skip", reason="no_bear_thesis")
             return None
-        # Floor: aggressive 60, non-aggressive 0.85×threshold. Previously 45 /
-        # 0.7× let a conf-53 GFS put through that lost $360 on weak volume.
+        # r58: floor is now configurable. Previously hardcoded as
+        # `60 if aggressive else 0.85 × threshold`. Operator can tune via
+        # cfg.option_thesis_min_conf_aggressive / option_thesis_min_conf_mult
+        # without a code deploy. Previously 45 / 0.7× let a conf-53 GFS
+        # put through that lost $360 on weak volume — now operator owns
+        # that risk threshold explicitly.
         aggressive = bool(getattr(cfg, "aggressive_options_mode", False))
-        min_bear_conf = 60.0 if aggressive else (cfg.confidence_threshold * 0.85)
+        if aggressive:
+            min_bear_conf = float(getattr(cfg, "option_thesis_min_conf_aggressive", 60.0) or 60.0)
+        else:
+            mult = float(getattr(cfg, "option_thesis_min_conf_mult", 0.85) or 0.85)
+            min_bear_conf = cfg.confidence_threshold * mult
         if thesis["confidence"] < min_bear_conf:
             metrics.inc("autotrade_skip", reason=f"bear_conf_{int(thesis['confidence'])}_below_{int(min_bear_conf)}")
             return None
@@ -3693,7 +3706,11 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         if not contracts:
             return None
         top = contracts[0]
-        min_score = MIN_OPTION_SCORE_AGGRESSIVE if aggressive else MIN_OPTION_SCORE
+        # r58: min option-contract score is now configurable.
+        if aggressive:
+            min_score = float(getattr(cfg, "option_contract_min_score_aggressive", MIN_OPTION_SCORE_AGGRESSIVE) or MIN_OPTION_SCORE_AGGRESSIVE)
+        else:
+            min_score = float(getattr(cfg, "option_contract_min_score", MIN_OPTION_SCORE) or MIN_OPTION_SCORE)
         if top.get("score", 0) < min_score:
             return None
 
@@ -4075,9 +4092,12 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         if not thesis:
             metrics.inc("autotrade_skip", reason="no_bull_thesis")
             return None
-        # Floor: aggressive 60, non-aggressive 0.85×threshold. Mirrors put gate
-        # tightening after GFS conf-53 loss.
-        min_bull_conf = 60.0 if aggressive else (cfg.confidence_threshold * 0.85)
+        # r58: floor is now configurable; mirrors put gate at line ~3653.
+        if aggressive:
+            min_bull_conf = float(getattr(cfg, "option_thesis_min_conf_aggressive", 60.0) or 60.0)
+        else:
+            mult = float(getattr(cfg, "option_thesis_min_conf_mult", 0.85) or 0.85)
+            min_bull_conf = cfg.confidence_threshold * mult
         if thesis["confidence"] < min_bull_conf:
             metrics.inc("autotrade_skip", reason=f"bull_conf_{int(thesis['confidence'])}_below_{int(min_bull_conf)}")
             return None
@@ -4117,7 +4137,11 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         if not contracts:
             return None
         top = contracts[0]
-        min_score = MIN_OPTION_SCORE_AGGRESSIVE if aggressive else MIN_OPTION_SCORE
+        # r58: min option-contract score is now configurable.
+        if aggressive:
+            min_score = float(getattr(cfg, "option_contract_min_score_aggressive", MIN_OPTION_SCORE_AGGRESSIVE) or MIN_OPTION_SCORE_AGGRESSIVE)
+        else:
+            min_score = float(getattr(cfg, "option_contract_min_score", MIN_OPTION_SCORE) or MIN_OPTION_SCORE)
         if top.get("score", 0) < min_score:
             return None
 

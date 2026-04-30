@@ -305,6 +305,23 @@ class AutoTraderConfig(Base):
     # audit showed the strict version was likely silently blocking most
     # high-conviction signals (see DESIGN.md §14 r55 entry).
     entry_1m_gate_mode = Column(String, default="relaxed")
+    # r58: option-side floor configs (previously hardcoded in auto_trader.py).
+    # Promoted to cfg so the operator can tune without a code deploy when
+    # option entries get blocked by `bear_conf_X_below_Y` skips.
+    #
+    #   option_thesis_min_conf_aggressive  — when aggressive_options_mode=True,
+    #                                        the absolute minimum thesis confidence
+    #                                        for put/call entries (was hardcoded 60).
+    #   option_thesis_min_conf_mult        — when aggressive_options_mode=False,
+    #                                        floor = cfg.confidence_threshold × this
+    #                                        (was hardcoded 0.85).
+    #   option_contract_min_score          — minimum suggested-contract score gate
+    #                                        in default mode (was MIN_OPTION_SCORE=65).
+    #   option_contract_min_score_aggressive — same in aggressive mode (was 55).
+    option_thesis_min_conf_aggressive = Column(Float, default=60.0)
+    option_thesis_min_conf_mult = Column(Float, default=0.85)
+    option_contract_min_score = Column(Float, default=65.0)
+    option_contract_min_score_aggressive = Column(Float, default=55.0)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -1069,6 +1086,11 @@ def create_tables():
     _ensure_column("auto_trader_config", "include_sector_etfs", "BOOLEAN DEFAULT FALSE")
     # r55 T1 #9: 1m bar gate mode — strict / relaxed / off
     _ensure_column("auto_trader_config", "entry_1m_gate_mode", "VARCHAR DEFAULT 'relaxed'")
+    # r58: option-floor configs promoted from hardcoded constants.
+    _ensure_column("auto_trader_config", "option_thesis_min_conf_aggressive", "DOUBLE PRECISION DEFAULT 60.0")
+    _ensure_column("auto_trader_config", "option_thesis_min_conf_mult", "DOUBLE PRECISION DEFAULT 0.85")
+    _ensure_column("auto_trader_config", "option_contract_min_score", "DOUBLE PRECISION DEFAULT 65.0")
+    _ensure_column("auto_trader_config", "option_contract_min_score_aggressive", "DOUBLE PRECISION DEFAULT 55.0")
     _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")

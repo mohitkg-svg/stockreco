@@ -4133,9 +4133,13 @@ function AutoTraderPanel({ reloadToken }) {
                 <div className={(!cfg.trade_options || !cfg.trade_calls) ? 'opacity-50' : ''}>
                   <div className="font-semibold">🚀 Aggressive options mode</div>
                   <div className="text-[11px] app-text-muted leading-relaxed">
-                    Treat options as the <em>primary</em> growth vehicle. Liberalizes call/put
-                    triggers (45% thesis floor), drops contract score gate to 55,
-                    raises per-ticker option cap to 50%, and removes the concentration
+                    Treat options as the <em>primary</em> growth vehicle. Counter-intuitively
+                    this RAISES the thesis-confidence floor for puts/calls to a hardcoded
+                    {' '}<strong>{cfg.option_thesis_min_conf_aggressive ?? 60}</strong>{' '}(when OFF: floor =
+                    {' '}<strong>{((cfg.option_thesis_min_conf_mult ?? 0.85) * cfg.confidence_threshold).toFixed(0)}</strong>{' '}=
+                    cfg.confidence_threshold × {cfg.option_thesis_min_conf_mult ?? 0.85}).
+                    Drops contract score gate to {cfg.option_contract_min_score_aggressive ?? 55} (vs {cfg.option_contract_min_score ?? 65} default).
+                    Raises per-ticker option cap to 50% and removes the concentration
                     guard so a call can stack on an existing stock long. Pair with a
                     30/70 stock/option budget split.
                     {!(cfg.trade_options && cfg.trade_calls) && <span className="block mt-1 text-amber-400">Requires both PUTs and CALLs enabled.</span>}
@@ -4166,7 +4170,7 @@ function AutoTraderPanel({ reloadToken }) {
               <div>
                 <div className="font-semibold">🎯 Universe scanner (top-N ranked)</div>
                 <div className="text-[11px] app-text-muted leading-relaxed">
-                  Trade from the daily top-{cfg.universe_top_n ?? 30} setups across ~500 liquid US equities instead of just the watchlist. Scan runs 4× per day at UTC 12:00 / 14:30 / 17:00 / 19:30.
+                  Trade from the daily top-{cfg.universe_top_n ?? 30} setups across ~611 Russell 1000 names instead of just the watchlist. Scan runs 4× per day NY-anchored at 8:30 / 10:30 / 13:00 / 15:00 ET.
                 </div>
               </div>
             </label>
@@ -4206,6 +4210,162 @@ function AutoTraderPanel({ reloadToken }) {
               </div>
             </label>
           </div>
+          {/* r58: Advanced Gates — high-leverage knobs previously curl-only */}
+          <div className="mt-3 pt-3 border-t app-border-soft">
+            <details>
+              <summary className="cursor-pointer text-[11px] uppercase tracking-wide app-text-muted font-semibold mb-2 hover:app-text-primary">
+                ⚙ Advanced Gates (curl-only previously — flip with care)
+              </summary>
+              <div className="mt-3 space-y-3">
+                <div className="text-[11px] app-text-muted leading-relaxed">
+                  These gates determine why entries do/don't fire. Diagnose via{' '}
+                  <code>/auto/skip-counts</code> first — whichever skip reason has the
+                  highest count is the binding constraint.
+                </div>
+
+                {/* Numeric gates */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <CfgField label="R:R floor (rr_min)" value={cfg.rr_min ?? 1.3} suffix=":1"
+                            onCommit={v => updateCfg({ rr_min: Number(v) })} />
+                  <CfgField label="Max concurrent positions" value={cfg.max_concurrent_positions ?? 15} suffix="open"
+                            onCommit={v => updateCfg({ max_concurrent_positions: Number(v) })} />
+                  <CfgField label="Max per sector" value={cfg.max_per_sector ?? 5} suffix="trades"
+                            onCommit={v => updateCfg({ max_per_sector: Number(v) })} />
+                  <CfgField label="Max correlated open (ρ≥0.7)" value={cfg.max_correlated_open ?? 1} suffix="trades"
+                            onCommit={v => updateCfg({ max_correlated_open: Number(v) })} />
+                  <CfgField label="Daily loss limit" value={(cfg.daily_loss_limit_pct ?? 0.03) * 100} suffix="% equity"
+                            onCommit={v => updateCfg({ daily_loss_limit_pct: Number(v) / 100 })} />
+                  <CfgField label="Book VaR-99 cap" value={(cfg.book_var_99_cap_pct ?? 0.05) * 100} suffix="% equity"
+                            onCommit={v => updateCfg({ book_var_99_cap_pct: Number(v) / 100 })} />
+                  <CfgField label="Leverage cap" value={cfg.leverage_cap ?? 1.5} suffix="× gross"
+                            onCommit={v => updateCfg({ leverage_cap: Number(v) })} />
+                  <CfgField label="Vol target (annual)" value={(cfg.vol_target_annual ?? 0.12) * 100} suffix="% σ"
+                            onCommit={v => updateCfg({ vol_target_annual: Number(v) / 100 })} />
+                  <CfgField label="Universe top-N" value={cfg.universe_top_n ?? 30} suffix="picks"
+                            onCommit={v => updateCfg({ universe_top_n: Number(v) })} />
+                </div>
+
+                {/* 1m bar gate select */}
+                <div className="pt-2">
+                  <label className="text-gray-500 block mb-1 text-xs">1m bar entry-confirmation gate</label>
+                  <select
+                    value={cfg.entry_1m_gate_mode ?? 'relaxed'}
+                    onChange={e => updateCfg({ entry_1m_gate_mode: e.target.value })}
+                    className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm"
+                  >
+                    <option value="strict">strict (last bar must agree)</option>
+                    <option value="relaxed">relaxed (2-of-3 majority)</option>
+                    <option value="off">off (skip the gate)</option>
+                  </select>
+                  <span className="text-[11px] app-text-muted ml-2">
+                    Filters wick-high entries; rejects 25-30% of signals when on.
+                  </span>
+                </div>
+
+                {/* Bracket TIF select */}
+                <div>
+                  <label className="text-gray-500 block mb-1 text-xs">Bracket time-in-force</label>
+                  <select
+                    value={cfg.bracket_tif ?? 'day'}
+                    onChange={e => updateCfg({ bracket_tif: e.target.value })}
+                    className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm"
+                  >
+                    <option value="day">day (default — closes weekend gap exposure)</option>
+                    <option value="gtc">gtc (rest until filled/cancelled)</option>
+                  </select>
+                </div>
+
+                {/* Signal timeframes */}
+                <div>
+                  <label className="text-gray-500 block mb-1 text-xs">Signal timeframes (CSV)</label>
+                  <input
+                    type="text"
+                    defaultValue={cfg.signal_timeframes ?? '1h,4h,1d'}
+                    onBlur={e => {
+                      if (e.target.value !== (cfg.signal_timeframes ?? '1h,4h,1d')) {
+                        updateCfg({ signal_timeframes: e.target.value });
+                      }
+                    }}
+                    className="w-48 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm"
+                  />
+                  <span className="text-[11px] app-text-muted ml-2">
+                    Allowlist: any TF not here gets `tf_not_allowed`.
+                  </span>
+                </div>
+
+                {/* Loss pattern + source mute */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-2 border-t app-border-soft">
+                  <label className="text-xs flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={!!cfg.source_mute_enabled}
+                           onChange={e => updateCfg({ source_mute_enabled: e.target.checked })}
+                           className="accent-blue-500" />
+                    <span>Source-strategy auto-mute (WR&lt;45% on n≥10 → mute)</span>
+                  </label>
+                  <label className="text-xs flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={!!cfg.theta_adjusted_rr_enabled}
+                           onChange={e => updateCfg({ theta_adjusted_rr_enabled: e.target.checked })}
+                           className="accent-blue-500" />
+                    <span>Theta-adjusted R:R floor on options</span>
+                  </label>
+                  <label className="text-xs flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={!!cfg.portfolio_kelly_enabled}
+                           onChange={e => updateCfg({ portfolio_kelly_enabled: e.target.checked })}
+                           className="accent-blue-500" />
+                    <span>Portfolio-Kelly book throttle</span>
+                  </label>
+                  <label className="text-xs flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={!!cfg.flatten_by_eod}
+                           onChange={e => updateCfg({ flatten_by_eod: e.target.checked })}
+                           className="accent-blue-500" />
+                    <span>Flatten all positions by EOD</span>
+                  </label>
+                  <label className="text-xs flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={!!cfg.dry_run}
+                           onChange={e => updateCfg({ dry_run: e.target.checked })}
+                           className="accent-amber-500" />
+                    <span>Dry run (signals fire but no broker submit)</span>
+                  </label>
+                </div>
+
+                {/* Loss pattern mode select */}
+                <div>
+                  <label className="text-gray-500 block mb-1 text-xs">Loss-pattern veto mode</label>
+                  <select
+                    value={cfg.loss_pattern_mode ?? 'shadow'}
+                    onChange={e => updateCfg({ loss_pattern_mode: e.target.value })}
+                    className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm"
+                  >
+                    <option value="off">off (no veto, no logging)</option>
+                    <option value="shadow">shadow (log but don't veto)</option>
+                    <option value="active">active (veto on fingerprint match)</option>
+                  </select>
+                </div>
+
+                {/* Option floor configs (r58 promoted from hardcoded) */}
+                <div className="pt-3 border-t app-border-soft">
+                  <div className="text-[11px] uppercase tracking-wide app-text-muted font-semibold mb-2">
+                    Option-side floors (r58 — previously hardcoded)
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <CfgField label="Aggressive option-thesis min conf" value={cfg.option_thesis_min_conf_aggressive ?? 60} suffix="conf"
+                              onCommit={v => updateCfg({ option_thesis_min_conf_aggressive: Number(v) })} />
+                    <CfgField label="Non-aggressive option floor mult" value={cfg.option_thesis_min_conf_mult ?? 0.85} suffix="× thresh"
+                              onCommit={v => updateCfg({ option_thesis_min_conf_mult: Number(v) })} />
+                    <CfgField label="Option contract min score" value={cfg.option_contract_min_score ?? 65} suffix="score"
+                              onCommit={v => updateCfg({ option_contract_min_score: Number(v) })} />
+                    <CfgField label="Option contract min score (aggressive)" value={cfg.option_contract_min_score_aggressive ?? 55} suffix="score"
+                              onCommit={v => updateCfg({ option_contract_min_score_aggressive: Number(v) })} />
+                  </div>
+                  <div className="text-[11px] app-text-muted leading-relaxed mt-2">
+                    Lower these to unblock option entries when{' '}
+                    <code>bear_conf_X_below_Y</code> or <code>bull_conf_X_below_Y</code>{' '}
+                    skip reasons dominate. Comment in code warns &lt;50 has historical losses.
+                  </div>
+                </div>
+              </div>
+            </details>
+          </div>
+
           <div className="mt-3 text-[11px] app-text-muted leading-relaxed">
             Strategy: long stock on BUY ≥ threshold with bracket stop. Soft-BE at T1 · BE at T2 · recompute + chandelier past T3. Puts use a synthesized bear thesis; exits on T1/T2 hit, 50% premium decay, or underlying broke stop.
           </div>

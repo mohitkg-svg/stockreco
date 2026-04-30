@@ -71,6 +71,11 @@ class AutoTraderConfigRequest(BaseModel):
     book_var_99_cap_pct: Optional[float] = Field(None, ge=0, le=1)
     bracket_tif: Optional[str] = Field(None, pattern="^(day|gtc|DAY|GTC)$")
     max_correlated_open: Optional[int] = Field(None, ge=0, le=50)
+    # r58: option floor configs (previously hardcoded)
+    option_thesis_min_conf_aggressive: Optional[float] = Field(None, ge=0, le=100)
+    option_thesis_min_conf_mult: Optional[float] = Field(None, ge=0, le=2)
+    option_contract_min_score: Optional[float] = Field(None, ge=0, le=200)
+    option_contract_min_score_aggressive: Optional[float] = Field(None, ge=0, le=200)
 
 
 class KillSwitchRequest(BaseModel):
