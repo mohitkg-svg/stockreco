@@ -2452,6 +2452,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             from datetime import datetime as _dt_w, timezone as _tz_w, timedelta as _td_w
             from services.paper_trader import is_market_open as _imo_w
             from zoneinfo import ZoneInfo as _ZI_w
+            from database import EquitySnapshot as _ES_w
             _wd_cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
             _snap_max_age_min = float(getattr(_wd_cfg, "equity_snapshot_max_age_min", 15) or 15) if _wd_cfg else 15.0
             if _imo_w():
@@ -2462,9 +2463,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 _session_start_et = _now_et.replace(hour=9, minute=30, second=0, microsecond=0)
                 _session_start_utc = _session_start_et.astimezone(_tz_w.utc).replace(tzinfo=None)
                 _last_today = (
-                    db.query(EquitySnapshot)
-                    .filter(EquitySnapshot.ts >= _session_start_utc)
-                    .order_by(EquitySnapshot.ts.desc())
+                    db.query(_ES_w)
+                    .filter(_ES_w.ts >= _session_start_utc)
+                    .order_by(_ES_w.ts.desc())
                     .first()
                 )
                 # Grace window: don't fire the watchdog in the first
