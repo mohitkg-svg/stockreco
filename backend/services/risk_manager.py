@@ -242,12 +242,22 @@ def sl_resubmit_failures_1h() -> int:
 
 
 def dynamic_daily_loss_limit_pct(static_pct: float = 0.03) -> float:
-    """r44 fix #0.11: dynamic daily-loss ceiling = max(static_pct, 3 ×
-    recent_avg_daily_pnl/equity). On a great month (avg +$300/day) the
-    static 3% halts at -$3,000; dynamic anchors near -$900. On a bad
-    month, dynamic floors at the static value.
-    Uses last 30d realized-PnL series. Floors at 1.5% to prevent runaway
-    over-tightening on strong months.
+    """r62 bug fix: previously the code did `min(static, 3×avg_pnl/eq)`
+    floored at 1.5%, which TIGHTENED the limit on small-PnL periods —
+    the OPPOSITE of what the docstring claimed. With static=10% and a
+    paper bot with $30/day avg PnL, the limit was being clamped to
+    ~1.5%, halting trading after a 1.5% intraday drawdown.
+
+    Now the operator's `cfg.daily_loss_limit_pct` is treated as a HARD
+    CEILING that the function will NEVER exceed (so you don't accidentally
+    risk more than configured), but the dynamic-tightening computation
+    is gated by an opt-in: only applies when avg_daily_pnl/equity > 0.5
+    × static (i.e., recent PnL volatility is meaningful relative to the
+    static cap). Otherwise, return static_pct unchanged.
+
+    Equivalently: respect the operator setting; only clamp downward
+    when there's empirical evidence of small-PnL volatility worth
+    protecting.
     """
     try:
         from database import SessionLocal as _SL_dl, AutoTrade as _AT_dl
@@ -271,8 +281,15 @@ def dynamic_daily_loss_limit_pct(static_pct: float = 0.03) -> float:
                 return float(static_pct)
             total_pl = sum(float(r.realized_pl or 0.0) for r in rows)
             avg_daily_pnl = abs(total_pl) / 30.0
-            dynamic_pct = max(0.015, min(float(static_pct), 3 * avg_daily_pnl / equity))
-            return float(dynamic_pct)
+            # The dynamic cap based on recent realized vol.
+            dynamic_pct = 3.0 * avg_daily_pnl / equity
+            # Only tighten when the dynamic cap is at least HALF the static
+            # cap — otherwise a low-volume period would trivially drop the
+            # limit far below operator intent. Always honor the operator's
+            # configured static_pct as the upper bound.
+            if dynamic_pct < 0.5 * float(static_pct):
+                return float(static_pct)
+            return float(min(float(static_pct), max(0.015, dynamic_pct)))
         finally:
             db.close()
     except Exception:
