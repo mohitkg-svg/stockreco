@@ -444,17 +444,47 @@ def _patched_metrics_inc(name, **labels):
 metrics.inc = _patched_metrics_inc
 
 
+def _gate_record(name: str, result: str, **details: Any) -> None:
+    """r65 transparency: record a per-gate evaluation outcome with the
+    actual computed values + threshold + plain-language formula. The
+    Decision Log UI renders this so the operator can see exactly WHY
+    each gate passed/failed without reading code.
+
+    Result values:  "pass" | "fail" | "na" (didn't apply / data missing)
+    Common keys:    computed, threshold, formula, ...
+    """
+    try:
+        if not hasattr(_DECISION_TLS, "gate_log") or _DECISION_TLS.gate_log is None:
+            _DECISION_TLS.gate_log = []
+        entry = {"gate": name, "result": result}
+        for k, v in details.items():
+            if v is None:
+                continue
+            if isinstance(v, float):
+                if abs(v) >= 1000:
+                    entry[k] = round(v, 2)
+                elif abs(v) >= 1:
+                    entry[k] = round(v, 4)
+                else:
+                    entry[k] = round(v, 6)
+            else:
+                entry[k] = v
+        _DECISION_TLS.gate_log.append(entry)
+    except Exception:
+        pass
+
+
 def _begin_decision(ticker: str, kind: str, signal: Optional[Dict[str, Any]] = None) -> None:
     """Reset the thread-local capture state for a new evaluation.
-    r63: capture FULL signal levels (entry, stop, target1, R:R, ATR) so
-    the Decision Log audit panel can show the operator exactly what
-    setup was being evaluated when the gate fired."""
+    r63/r65: capture FULL signal levels + per-gate audit log so the
+    Decision Log UI can render the complete computation trace."""
     _DECISION_TLS.ticker = (ticker or "").upper()
     _DECISION_TLS.kind = kind  # "stock" | "option"
     _DECISION_TLS.last_skip_reason = None
     _DECISION_TLS.entered = False
     _DECISION_TLS.entered_kind = None  # "call" | "put" | None
     _DECISION_TLS.entered_trade_id = None
+    _DECISION_TLS.gate_log = []  # r65: per-gate computation trace
     if signal:
         # r63/r64: keep a richer signal snapshot in TLS — the persist
         # function folds this into details_json. r64: also capture
@@ -643,6 +673,8 @@ def _persist_decision() -> None:
                     pass
             except Exception:
                 pass
+            # r65: per-gate audit log (computed values + thresholds + formulas)
+            gate_log = list(getattr(_DECISION_TLS, "gate_log", []) or [])
             details = {
                 "ticker": ticker,
                 "kind": kind,
@@ -652,6 +684,7 @@ def _persist_decision() -> None:
                 "rr_net": rr_net,
                 "context": ctx,
                 "check_definition": check_def,
+                "gate_log": gate_log,
             }
             _db_dl = _SL_dl()
             try:
@@ -2278,26 +2311,36 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         return None
 
     # Basic filters before heavy I/O or locking.
-    if signal.get("signal_type") != "BUY":
+    sig_type = signal.get("signal_type")
+    if sig_type != "BUY":
+        _gate_record("non_buy_signal", "fail",
+                     signal_type=sig_type,
+                     formula=f"signal_type='{sig_type}' ≠ 'BUY' → reject")
         metrics.inc("autotrade_skip", reason="non_buy_signal")
         return None
+    _gate_record("non_buy_signal", "pass",
+                 signal_type=sig_type, formula="signal_type='BUY' → continue")
 
     # Profit-audit #6: 1-min bar entry confirmation.
-    # Move I/O (fetch OHLCV) outside the global entry lock to prevent
-    # blocking parallel scans when the data API is slow.
-    if not _confirm_1m_bar(ticker, direction="BUY"):
-        logger.info(
-            f"AutoTrader skip {ticker}: 1-min bar disagrees with BUY direction "
-            f"(pre-lock confirmation check)"
-        )
-        # r53s: this gate previously only fired `autotrade_event` — invisible
-        # in /auto/skip-counts AND in the candidate-pool decision tracker.
-        # Operator was puzzled why high-conf signals never resulted in entries.
-        # Now it logs against `autotrade_skip` too so the aggregate counter
-        # reflects reality.
+    _bar_ok = _confirm_1m_bar(ticker, direction="BUY")
+    # Capture mode for the audit so operator sees if it's strict/relaxed/off.
+    try:
+        _gate_db = SessionLocal()
+        _gate_cfg = _gate_db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+        _gate_mode = (getattr(_gate_cfg, "entry_1m_gate_mode", "relaxed") or "relaxed") if _gate_cfg else "relaxed"
+        _gate_db.close()
+    except Exception:
+        _gate_mode = "?"
+    if not _bar_ok:
+        _gate_record("one_min_bar_disagrees", "fail",
+                     mode=_gate_mode,
+                     formula=f"mode={_gate_mode} — last 1m bars rejected the BUY direction (close < open or majority disagree)")
         metrics.inc("autotrade_event", event="one_min_disagree")
         metrics.inc("autotrade_skip", reason="one_min_bar_disagrees")
         return None
+    _gate_record("one_min_bar_disagrees", "pass",
+                 mode=_gate_mode,
+                 formula=f"mode={_gate_mode} — last closed 1m bars agreed with BUY direction (close ≥ open)")
 
     # r42 fix #1.5: prefetch the AI veto verdict OUTSIDE the entry lock so a
     # 1-2s Claude round-trip doesn't stall every other ticker's entry path.
@@ -2426,8 +2469,16 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         except Exception:
             _eff_conf_thresh = cfg.confidence_threshold
         if confidence < _eff_conf_thresh:
+            _gate_record("below_confidence_threshold", "fail",
+                         confidence=confidence, threshold=_eff_conf_thresh,
+                         gap=round(confidence - _eff_conf_thresh, 1),
+                         formula=f"signal confidence {confidence:.0f} < threshold {_eff_conf_thresh:.0f} → reject (gap of {confidence - _eff_conf_thresh:.0f})")
             metrics.inc("autotrade_skip", reason="below_confidence_threshold")
             return None
+        _gate_record("below_confidence_threshold", "pass",
+                     confidence=confidence, threshold=_eff_conf_thresh,
+                     headroom=round(confidence - _eff_conf_thresh, 1),
+                     formula=f"signal confidence {confidence:.0f} ≥ threshold {_eff_conf_thresh:.0f} → continue (headroom {confidence - _eff_conf_thresh:.0f})")
 
         # ════════════════════════════════════════════════════════════════════
         # § ENTRY GATES — rule-based reject conditions (~25 gates)
@@ -2451,7 +2502,15 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             except Exception:
                 _unr = 0.0
             _combined = _rpnl + _unr
-            if _equity_probe > 0 and _combined <= -abs(dll) * _equity_probe:
+            _halt_threshold = -abs(dll) * _equity_probe
+            if _equity_probe > 0 and _combined <= _halt_threshold:
+                _gate_record("daily_loss_halt", "fail",
+                             realized_today=round(_rpnl, 2), unrealized=round(_unr, 2),
+                             combined=round(_combined, 2),
+                             equity=round(_equity_probe, 2),
+                             limit_pct=round(dll * 100, 2),
+                             halt_threshold=round(_halt_threshold, 2),
+                             formula=f"realized ${_rpnl:.0f} + unrealized ${_unr:.0f} = combined ${_combined:.0f} ≤ halt ${_halt_threshold:.0f} (-{dll*100:.1f}% × equity ${_equity_probe:.0f}) → reject")
                 logger.warning(
                     f"AutoTrader skip {signal.get('ticker')}: daily-loss limit hit "
                     f"(combined {_combined:.2f} = realized {_rpnl:.2f} + unrealized {_unr:.2f} "
@@ -2460,6 +2519,15 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 metrics.inc("autotrade_event", event="daily_loss_halt")
                 metrics.inc("autotrade_skip", reason="daily_loss_halt")
                 return None
+            else:
+                _gate_record("daily_loss_halt", "pass",
+                             realized_today=round(_rpnl, 2), unrealized=round(_unr, 2),
+                             combined=round(_combined, 2),
+                             equity=round(_equity_probe, 2),
+                             limit_pct=round(dll * 100, 2),
+                             halt_threshold=round(_halt_threshold, 2),
+                             headroom=round(_combined - _halt_threshold, 2),
+                             formula=f"combined ${_combined:.0f} > halt ${_halt_threshold:.0f} (-{dll*100:.1f}% × equity) → continue (headroom ${_combined - _halt_threshold:.0f})")
             # r44 fix #0.12: auto-deleveraging trigger. At -4% session drop,
             # trim 33% of every losing position; at -6% kill switch.
             try:
@@ -2492,7 +2560,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         from services.risk_manager import regime_concurrent_cap as _regime_cap
         mcp_base = int(getattr(cfg, "max_concurrent_positions", 0) or 0)
         mcp = _regime_cap(mcp_base) if mcp_base > 0 else 0
-        if mcp > 0 and count_open_auto_trades() >= mcp:
+        _open_count = count_open_auto_trades()
+        if mcp > 0 and _open_count >= mcp:
+            _gate_record("max_concurrent_cap", "fail",
+                         open_count=_open_count, cap=mcp, base_cap=mcp_base,
+                         formula=f"open trades {_open_count} ≥ effective cap {mcp} (base {mcp_base}, regime-tightened) → reject")
             logger.info(
                 f"AutoTrader skip {signal.get('ticker')}: max_concurrent {mcp} reached "
                 f"(base {mcp_base}, regime-tightened)" if mcp != mcp_base else
@@ -2500,6 +2572,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             )
             metrics.inc("autotrade_skip", reason="max_concurrent_cap")
             return None
+        if mcp > 0:
+            _gate_record("max_concurrent_cap", "pass",
+                         open_count=_open_count, cap=mcp, base_cap=mcp_base,
+                         headroom=mcp - _open_count,
+                         formula=f"open trades {_open_count} < cap {mcp} → continue (headroom {mcp - _open_count})")
 
         # Portfolio-heat cap — total $-at-risk across all open auto-trades
         # must stay under _PORTFOLIO_HEAT_CAP_PCT of equity. This complements
@@ -2601,8 +2678,14 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         allowed_tfs = {s.strip() for s in (cfg.signal_timeframes or "1h,4h,1d").split(",") if s.strip()}
         sig_tf = (signal.get("timeframe") or "").strip()
         if allowed_tfs and sig_tf not in allowed_tfs:
+            _gate_record("tf_not_allowed", "fail",
+                         timeframe=sig_tf, allowed=sorted(allowed_tfs),
+                         formula=f"signal timeframe '{sig_tf}' not in cfg.signal_timeframes {sorted(allowed_tfs)} → reject")
             metrics.inc("autotrade_skip", reason="tf_not_allowed")
             return None
+        _gate_record("tf_not_allowed", "pass",
+                     timeframe=sig_tf, allowed=sorted(allowed_tfs),
+                     formula=f"signal timeframe '{sig_tf}' is in allowlist → continue")
         entry = signal.get("entry")
         stop = signal.get("stop_loss")
         t1 = signal.get("target1")
@@ -2644,6 +2727,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         _gross_risk = max(0.01, entry - stop)
         _rr_net = _net_reward / _gross_risk
         if _rr_net < _rr_min:
+            _gate_record("bad_rr", "fail",
+                         entry=round(entry, 4), stop=round(stop, 4), t1=round(t1, 4),
+                         net_reward=round(_net_reward, 4), gross_risk=round(_gross_risk, 4),
+                         cost_buffer=round(_cost_buffer, 4),
+                         rr_net=round(_rr_net, 3), rr_min=round(_rr_min, 3),
+                         formula=f"net R:R = (T1 ${t1:.2f} − entry ${entry:.2f} − cost ${_cost_buffer:.2f}) / (entry − stop ${stop:.2f}) = {_rr_net:.2f} < min {_rr_min:.2f} → reject")
             logger.info(
                 f"AutoTrader skip {signal.get('ticker')}: net R:R {_rr_net:.2f} < {_rr_min:.2f} "
                 f"after {_cost_buffer:.2f} cost buffer (entry={entry}, t1={t1}, stop={stop})"
@@ -2651,6 +2740,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             metrics.inc("autotrade_event", event="bad_rr")
             metrics.inc("autotrade_skip", reason="bad_rr")
             return None
+        _gate_record("bad_rr", "pass",
+                     rr_net=round(_rr_net, 3), rr_min=round(_rr_min, 3),
+                     entry=round(entry, 4), stop=round(stop, 4), t1=round(t1, 4),
+                     formula=f"net R:R {_rr_net:.2f} ≥ min {_rr_min:.2f} → continue")
         # C10: Fat-finger guard — risk-per-share outside [0.1%, 10%] of entry
         # almost always indicates a bad level (stop on wrong side of a gap,
         # or a stop so wide the trade is a lottery ticket). Reject loudly
@@ -2742,12 +2835,22 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             _strat_name = (signal.get("strategy") or "").upper()
             _is_mean_rev = "MEANREV" in _strat_name or "MEAN_REVERSION" in _strat_name
             if _t_adx is not None and _t_adx < 18 and not _is_mean_rev:
+                _gate_record("ticker_chop", "fail",
+                             adx=round(_t_adx, 2), threshold=18,
+                             strategy=_strat_name, is_mean_rev=_is_mean_rev,
+                             formula=f"ADX {_t_adx:.1f} < 18 (chop regime) AND strategy '{_strat_name}' is not mean-reversion → reject (trend strategies don't work in chop)")
                 logger.info(
                     f"AutoTrader skip {ticker}: ticker ADX {_t_adx:.1f} < 18 "
                     f"(chop) and strategy {_strat_name!r} is not mean-reversion"
                 )
                 metrics.inc("autotrade_skip", reason="ticker_chop")
                 return None
+            _gate_record("ticker_chop", "pass",
+                         adx=round(_t_adx, 2) if _t_adx is not None else None,
+                         threshold=18, strategy=_strat_name, is_mean_rev=_is_mean_rev,
+                         formula=(f"ADX {_t_adx:.1f} ≥ 18 → continue" if _t_adx is not None and _t_adx >= 18
+                                  else f"strategy '{_strat_name}' is mean-reversion (chop OK) → continue" if _is_mean_rev
+                                  else "ADX unavailable → continue (gate not applied)"))
         except Exception as _e:
             logger.warning(f"ticker-ADX gate {ticker}: {_e}")
 
@@ -3115,12 +3218,26 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # r44 fix #1.7: book-VaR 99% sanity check (heat-derived approximation).
         _var99 = _book_var(equity)
         _var_cap_pct = float(getattr(cfg, "book_var_99_cap_pct", 0.05) or 0.05)
-        if _var99 >= _var_cap_pct * equity:
+        _var_cap_dollars = _var_cap_pct * equity
+        if _var99 >= _var_cap_dollars:
+            _gate_record("book_var_99", "fail",
+                         book_var_99=round(_var99, 2),
+                         cap_pct=round(_var_cap_pct * 100, 2),
+                         cap_dollars=round(_var_cap_dollars, 2),
+                         equity=round(equity, 2),
+                         formula=f"current book VaR99 (β-weighted heat × 2.33) = ${_var99:.0f} ≥ cap ${_var_cap_dollars:.0f} ({_var_cap_pct*100:.1f}% × equity ${equity:.0f}) → reject (book already at risk capacity; close existing positions to free VaR budget)")
             logger.warning(
                 f"AutoTrader skip {ticker}: book VaR99 ${_var99:.0f} ≥ {_var_cap_pct*100:.1f}% × equity ${equity:.0f}"
             )
             metrics.inc("autotrade_skip", reason="book_var_99")
             return None
+        _gate_record("book_var_99", "pass",
+                     book_var_99=round(_var99, 2),
+                     cap_pct=round(_var_cap_pct * 100, 2),
+                     cap_dollars=round(_var_cap_dollars, 2),
+                     equity=round(equity, 2),
+                     headroom=round(_var_cap_dollars - _var99, 2),
+                     formula=f"book VaR99 ${_var99:.0f} < cap ${_var_cap_dollars:.0f} ({_var_cap_pct*100:.1f}% × equity ${equity:.0f}) → continue (headroom ${_var_cap_dollars - _var99:.0f})")
         # r44 fix #1.4: beta-symmetric sizing — heat already counts beta-
         # weighted via current_portfolio_heat, but sizing didn't. A β=1.8
         # ticker consumed 1.0× risk-budget at entry but 1.8× heat
@@ -3757,10 +3874,15 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
 
         thesis = build_bear_thesis(ticker, "1d")
         if not thesis:
+            _gate_record("no_bear_thesis", "fail",
+                         formula="build_bear_thesis returned None — no viable bearish setup (insufficient breakdown evidence, support holding, etc.)")
             # r53t: surface "no bear thesis" so the candidate pool shows
             # WHY put-play didn't fire instead of muting it as no_signal.
             metrics.inc("autotrade_skip", reason="no_bear_thesis")
             return None
+        _gate_record("no_bear_thesis", "pass",
+                     thesis_confidence=round(float(thesis.get("confidence", 0)), 2),
+                     formula=f"bear thesis built with confidence {thesis.get('confidence', 0):.0f}")
         # r58: floor is now configurable. Previously hardcoded as
         # `60 if aggressive else 0.85 × threshold`. Operator can tune via
         # cfg.option_thesis_min_conf_aggressive / option_thesis_min_conf_mult
@@ -3770,12 +3892,27 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         aggressive = bool(getattr(cfg, "aggressive_options_mode", False))
         if aggressive:
             min_bear_conf = float(getattr(cfg, "option_thesis_min_conf_aggressive", 60.0) or 60.0)
+            _floor_source = "cfg.option_thesis_min_conf_aggressive (aggressive_options_mode=true)"
         else:
             mult = float(getattr(cfg, "option_thesis_min_conf_mult", 0.85) or 0.85)
             min_bear_conf = cfg.confidence_threshold * mult
-        if thesis["confidence"] < min_bear_conf:
+            _floor_source = f"cfg.confidence_threshold ({cfg.confidence_threshold}) × cfg.option_thesis_min_conf_mult ({mult}) = {min_bear_conf:.0f}"
+        _bear_conf_val = thesis["confidence"]
+        if _bear_conf_val < min_bear_conf:
+            _gate_record("bear_conf_below_floor", "fail",
+                         bear_thesis_conf=round(float(_bear_conf_val), 2),
+                         floor=round(float(min_bear_conf), 2),
+                         floor_source=_floor_source,
+                         aggressive=aggressive,
+                         formula=f"bear thesis confidence {_bear_conf_val:.0f} < floor {min_bear_conf:.0f} ({_floor_source}) → reject")
             metrics.inc("autotrade_skip", reason=f"bear_conf_{int(thesis['confidence'])}_below_{int(min_bear_conf)}")
             return None
+        _gate_record("bear_conf_below_floor", "pass",
+                     bear_thesis_conf=round(float(_bear_conf_val), 2),
+                     floor=round(float(min_bear_conf), 2),
+                     floor_source=_floor_source,
+                     aggressive=aggressive,
+                     formula=f"bear thesis confidence {_bear_conf_val:.0f} ≥ floor {min_bear_conf:.0f} → continue")
 
         # Postmortem fix H4: bear-thesis is computed off cached daily data
         # (up to 1h TTL). If the underlying ripped through the bear-thesis
@@ -4202,17 +4339,35 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
 
         thesis = build_bull_thesis(ticker, "1d")
         if not thesis:
+            _gate_record("no_bull_thesis", "fail",
+                         formula="build_bull_thesis returned None — no viable bullish setup")
             metrics.inc("autotrade_skip", reason="no_bull_thesis")
             return None
+        _gate_record("no_bull_thesis", "pass",
+                     thesis_confidence=round(float(thesis.get("confidence", 0)), 2),
+                     formula=f"bull thesis built with confidence {thesis.get('confidence', 0):.0f}")
         # r58: floor is now configurable; mirrors put gate at line ~3653.
         if aggressive:
             min_bull_conf = float(getattr(cfg, "option_thesis_min_conf_aggressive", 60.0) or 60.0)
+            _floor_source = "cfg.option_thesis_min_conf_aggressive (aggressive_options_mode=true)"
         else:
             mult = float(getattr(cfg, "option_thesis_min_conf_mult", 0.85) or 0.85)
             min_bull_conf = cfg.confidence_threshold * mult
-        if thesis["confidence"] < min_bull_conf:
+            _floor_source = f"cfg.confidence_threshold ({cfg.confidence_threshold}) × cfg.option_thesis_min_conf_mult ({mult}) = {min_bull_conf:.0f}"
+        _bull_conf_val = thesis["confidence"]
+        if _bull_conf_val < min_bull_conf:
+            _gate_record("bull_conf_below_floor", "fail",
+                         bull_thesis_conf=round(float(_bull_conf_val), 2),
+                         floor=round(float(min_bull_conf), 2),
+                         floor_source=_floor_source,
+                         aggressive=aggressive,
+                         formula=f"bull thesis confidence {_bull_conf_val:.0f} < floor {min_bull_conf:.0f} ({_floor_source}) → reject")
             metrics.inc("autotrade_skip", reason=f"bull_conf_{int(thesis['confidence'])}_below_{int(min_bull_conf)}")
             return None
+        _gate_record("bull_conf_below_floor", "pass",
+                     bull_thesis_conf=round(float(_bull_conf_val), 2),
+                     floor=round(float(min_bull_conf), 2),
+                     formula=f"bull thesis confidence {_bull_conf_val:.0f} ≥ floor {min_bull_conf:.0f} → continue")
 
         # Live-price gap: bull-thesis stop sits BELOW price. If live price
         # has already cracked below it, the thesis is stale.

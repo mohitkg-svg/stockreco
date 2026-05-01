@@ -4797,6 +4797,92 @@ function AutoTraderPanel({ reloadToken }) {
   );
 }
 
+// r65: open the signal_generator reasoning in a clean popup window
+// with grouped sections (price stack, momentum, patterns, fundamentals,
+// ML/sentiment) so the operator can read the confidence breakdown
+// without scrolling inside a small embedded panel.
+function openReasoningPopup(ticker, confidence, reasoning, timeframe) {
+  const lines = (reasoning || '').split('\n').map(l => l.trim()).filter(Boolean);
+  // Categorize each line by first emoji marker.
+  const categorize = (line) => {
+    if (line.includes('SMA') || line.includes('uptrend') || line.includes('downtrend') || line.includes('Stack')) return 'price';
+    if (line.includes('RSI') || line.includes('MACD') || line.includes('momentum') || line.includes('Stoch') || line.includes('ADX')) return 'momentum';
+    if (line.includes('volume') || line.includes('Volume') || line.includes('RVOL') || line.includes('OBV') || line.includes('VWAP')) return 'volume';
+    if (line.includes('Pattern') || line.includes('engulfing') || line.includes('hammer') || line.includes('doji') || line.includes('NR7')) return 'patterns';
+    if (line.includes('Support') || line.includes('Resistance') || line.includes('S/R') || line.includes('zone') || line.includes('Pivot')) return 'levels';
+    if (line.includes('RS ') || line.includes('SPY') || line.includes('sector') || line.includes('breadth')) return 'cross';
+    if (line.includes('analyst') || line.includes('Fundamental') || line.includes('FCF') || line.includes('Yield')) return 'fundamentals';
+    if (line.includes('Short') || line.includes('Sentiment') || line.includes('insider') || line.includes('WSB')) return 'sentiment';
+    if (line.includes('ML') || line.includes('🤖')) return 'ml';
+    if (line.includes('Earnings') || line.includes('earnings')) return 'earnings';
+    if (line.includes('News') || line.includes('news')) return 'news';
+    return 'other';
+  };
+  const groups = {};
+  for (const line of lines) {
+    const cat = categorize(line);
+    (groups[cat] = groups[cat] || []).push(line);
+  }
+  const labels = {
+    price: '📈 Price stack & trend (SMAs)',
+    momentum: '⚡ Momentum (RSI, MACD, ADX, Stoch)',
+    volume: '📊 Volume / OBV',
+    patterns: '🕯 Candlestick patterns',
+    levels: '🧱 Support / Resistance / zones',
+    cross: '🌐 Cross-sectional (RS, SPY, sector)',
+    fundamentals: '🏛 Fundamentals',
+    sentiment: '💬 Sentiment / Short-interest / Insider',
+    ml: '🤖 ML scorer',
+    earnings: '📅 Earnings',
+    news: '📰 News',
+    other: '— Other',
+  };
+  const order = ['price', 'momentum', 'volume', 'patterns', 'levels', 'cross', 'fundamentals', 'sentiment', 'ml', 'earnings', 'news', 'other'];
+  const html = `<!doctype html>
+<html><head><title>${ticker} signal reasoning · conf=${confidence}</title>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: #0c1018; color: #d1d5db; padding: 24px; max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .meta { color: #9ca3af; font-size: 12px; margin-bottom: 20px; }
+  .group { margin-bottom: 18px; border: 1px solid #1f2937; border-radius: 8px; padding: 12px; background: #0f1420; }
+  .group-title { font-size: 12px; font-weight: 600; color: #93c5fd; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .item { font-size: 13px; line-height: 1.6; padding: 2px 0; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .item-positive { color: #6ee7b7; }
+  .item-negative { color: #fca5a5; }
+  .item-warn { color: #fcd34d; }
+  .footer { margin-top: 20px; font-size: 11px; color: #6b7280; line-height: 1.6; }
+</style></head><body>
+<h1>${ticker} signal reasoning</h1>
+<div class="meta">timeframe: <strong>${timeframe || '—'}</strong> · final confidence: <strong>${confidence}</strong> · ${lines.length} contributors fired</div>
+${order.filter(k => groups[k] && groups[k].length).map(k => `
+  <div class="group">
+    <div class="group-title">${labels[k]} (${groups[k].length})</div>
+    ${groups[k].map(line => {
+      let cls = '';
+      if (line.startsWith('✅')) cls = 'item-positive';
+      else if (line.startsWith('❌')) cls = 'item-negative';
+      else if (line.startsWith('⚠️') || line.startsWith('⚠')) cls = 'item-warn';
+      const escaped = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return `<div class="item ${cls}">${escaped}</div>`;
+    }).join('')}
+  </div>
+`).join('')}
+<div class="footer">
+  signal_generator builds confidence from these contributors as a weighted evidence sum,
+  then multiplies by a regime-aware stack (RVOL · RS · sector · breadth · ML · ...) clamped to
+  0.7-1.4× to prevent compounding. Final = round(base × clamped_stack, 0), capped at 95.
+</div>
+</body></html>`;
+  // Use a popup window so the user can position it next to the dashboard.
+  const w = window.open('', '_blank', 'width=950,height=750,scrollbars=yes,resizable=yes');
+  if (w) {
+    w.document.write(html);
+    w.document.close();
+  } else {
+    alert('Popup blocked — please allow popups for this site.');
+  }
+}
+
 // r58 Transparency: two-tab panel showing every scanner-run rejection
 // and every auto-trader decision with friendly tooltips.
 // r61: collapsed by default to keep the dashboard tight; click header to expand.
@@ -5132,18 +5218,26 @@ function DecisionDetail({ row, defs }) {
         </div>
       )}
 
-      {/* Confidence breakdown (r64) — show WHY confidence was X */}
+      {/* Confidence breakdown (r64+r65) — opens in popup */}
       {sig.reasoning && (
         <div className="border-t app-border-soft pt-2">
-          <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold mb-1">
-            How signal_generator arrived at confidence={sig.confidence}
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold">
+              How signal_generator arrived at confidence={sig.confidence}
+            </div>
+            <button
+              type="button"
+              onClick={() => openReasoningPopup(row.ticker, sig.confidence, sig.reasoning, sig.timeframe)}
+              className="text-[11px] px-2 py-0.5 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/40"
+            >
+              📋 Open in popup
+            </button>
           </div>
           <div className="text-[11px] app-text-secondary leading-relaxed">
-            signal_generator runs ~50 weighted contributors (indicator stack,
-            patterns, S/R levels, RVOL/RS/ADX, fundamentals, sector breadth,
-            ML, news/sentiment). Each fires a ✅/❌/⚠️ contributor below; the
-            net evidence is mapped to a base confidence, then multiplied by
-            up to 14 regime-aware factors (clamped to 0.7-1.4×).
+            signal_generator runs ~50 weighted contributors. Each fires a
+            ✅/❌/⚠️ marker below; net evidence → base confidence → multiplied
+            by ~14 regime/RVOL/sector/ML factors (clamped 0.7-1.4×).
+            Click <strong>📋 Open in popup</strong> for a clean window with grouped sections.
           </div>
           <div className="mt-2 max-h-[200px] overflow-y-auto bg-white/3 rounded p-2 border app-border-soft">
             <pre className="text-[10px] leading-relaxed whitespace-pre-wrap font-mono">
@@ -5167,15 +5261,21 @@ function DecisionDetail({ row, defs }) {
 }
 
 function GateSequence({ row, defs }) {
-  // Resolve canonical gate order from definitions endpoint.
+  const [expandedGate, setExpandedGate] = useState(null);
   const orderKey = row.kind === 'stock' ? 'stock'
                   : row.kind === 'option_call' ? 'option_call'
                   : 'option_put';
   const order = defs?.gate_order?.[orderKey] || [];
   const reason = row.reason;
-  // Find the index of the failing gate in the canonical order. Note
-  // parametrized reasons (bear_conf_X_below_Y) get matched against the
-  // family wildcard.
+  // r65: gate_log from the backend has the per-gate computed values.
+  // Index it by gate name for quick lookup. Some entries are parametrized
+  // (bear_conf_below_floor); the canonical order may match the param family.
+  const gateLog = row.details?.gate_log || [];
+  const gateLogByName = {};
+  for (const g of gateLog) {
+    gateLogByName[g.gate] = g;
+  }
+  // Find the failing index in canonical order (handle parametrized reasons).
   let failIdx = -1;
   for (let i = 0; i < order.length; i++) {
     const g = order[i];
@@ -5189,20 +5289,32 @@ function GateSequence({ row, defs }) {
     if (g.includes('*')) return defs?.families?.[g];
     return null;
   };
+  // Map canonical gate name to gate_log entry. The instrumented gate names
+  // don't always match the canonical ones (e.g., canonical "below_confidence_threshold"
+  // maps to logged "below_confidence_threshold"; canonical "bear_conf_*_below_*" maps
+  // to logged "bear_conf_below_floor"). Provide explicit mappings.
+  const logKeyFor = (canonical) => {
+    if (canonical.includes('*')) {
+      if (canonical.startsWith('bear_conf_')) return 'bear_conf_below_floor';
+      if (canonical.startsWith('bull_conf_')) return 'bull_conf_below_floor';
+    }
+    return canonical;
+  };
   const decisionEntered = (row.decision || '').startsWith('entered');
   return (
     <div className="mt-2 space-y-0.5 app-text-secondary text-[11px]">
       <div className="text-[10px] app-text-muted mb-1">
-        ✅ passed (gate ran and didn't reject) · ⛔ FAILED (the gate that fired) · ⚪ not evaluated (short-circuited)
+        ✅ passed · ⛔ FAILED · ⚪ not evaluated (short-circuited).
+        Gates with 🔍 marker have detailed computed values — click to expand.
       </div>
       {order.map((g, i) => {
         const def = resolveDef(g);
+        const logEntry = gateLogByName[logKeyFor(g)];
+        const hasDetails = !!logEntry;
         let icon, cls;
         if (decisionEntered) {
-          // Entered → all gates passed
           icon = '✅'; cls = 'text-emerald-400/70';
         } else if (failIdx === -1) {
-          // Reason not matched in canonical order — show all neutral
           icon = '·'; cls = 'app-text-muted';
         } else if (i < failIdx) {
           icon = '✅'; cls = 'text-emerald-400/70';
@@ -5211,18 +5323,76 @@ function GateSequence({ row, defs }) {
         } else {
           icon = '⚪'; cls = 'app-text-muted opacity-60';
         }
+        const isExpanded = expandedGate === g;
         return (
-          <div key={g} className={cls}>
-            <span className="font-mono mr-2 inline-block w-4">{icon}</span>
-            <span className="font-mono mr-2">{g}</span>
-            {def && <span className="app-text-muted">— {def.title}</span>}
+          <div key={g}>
+            <div
+              className={`${cls} ${hasDetails ? 'cursor-pointer hover:bg-white/5' : ''}`}
+              onClick={() => hasDetails && setExpandedGate(isExpanded ? null : g)}
+            >
+              <span className="font-mono mr-2 inline-block w-4">{icon}</span>
+              <span className="font-mono mr-2">{g}</span>
+              {def && <span className="app-text-muted">— {def.title}</span>}
+              {hasDetails && (
+                <span className="ml-2 text-[10px]">
+                  🔍 {isExpanded ? '▼' : '▶'}
+                </span>
+              )}
+            </div>
+            {isExpanded && logEntry && (
+              <GateDetailRow gate={g} logEntry={logEntry} def={def} />
+            )}
           </div>
         );
       })}
+      {/* Also surface gate_log entries that aren't in the canonical order */}
+      {gateLog.filter(g => !order.some(c => logKeyFor(c) === g.gate)).map(g => (
+        <div key={`extra-${g.gate}`} className={g.result === 'fail' ? 'text-amber-300' : 'app-text-muted'}>
+          <span className="font-mono mr-2 inline-block w-4">{g.result === 'fail' ? '⛔' : '✅'}</span>
+          <span className="font-mono mr-2">{g.gate}</span>
+          <span className="app-text-muted text-[10px] italic">(extra gate, not in canonical order)</span>
+        </div>
+      ))}
       {failIdx === -1 && reason && (
         <div className="mt-2 text-[10px] app-text-muted italic">
           Note: reason "{reason}" isn't in the canonical stock-gate order list.
-          May be a parametrized family or a route-specific gate (option side, manage loop, etc).
+          May be a parametrized family or a route-specific gate.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GateDetailRow({ gate, logEntry, def }) {
+  // Render every captured field from the log (formula, computed, threshold, etc.)
+  const knownKeys = new Set(['gate', 'result', 'formula']);
+  const dataKeys = Object.keys(logEntry).filter(k => !knownKeys.has(k));
+  return (
+    <div className="ml-6 mt-1 mb-2 p-2 bg-white/5 rounded border app-border-soft text-[11px]">
+      <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold mb-1">
+        Gate detail · {logEntry.result === 'fail' ? '⛔ FAILED' : '✅ passed'}
+      </div>
+      {logEntry.formula && (
+        <div className="mb-2 font-mono text-emerald-200 leading-relaxed bg-black/30 p-2 rounded border app-border-soft">
+          {logEntry.formula}
+        </div>
+      )}
+      {dataKeys.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-0.5 mb-2">
+          {dataKeys.map(k => (
+            <div key={k} className="flex justify-between">
+              <span className="app-text-muted">{k}:</span>
+              <span className="font-mono">{
+                typeof logEntry[k] === 'object' ? JSON.stringify(logEntry[k]) : String(logEntry[k])
+              }</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {def && (
+        <div className="text-[10px] app-text-muted leading-relaxed border-t app-border-soft pt-1">
+          <strong>Why this gate exists:</strong> {def.why}<br/>
+          <strong>How to fix:</strong> <span className="text-emerald-300">{def.fix}</span>
         </div>
       )}
     </div>
