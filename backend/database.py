@@ -1088,7 +1088,7 @@ def _apply_migrations():
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             "  version INTEGER PRIMARY KEY, "
             "  description TEXT NOT NULL, "
-            "  applied_at DATETIME DEFAULT CURRENT_TIMESTAMP"
+            "  applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
             ")"
         ))
         applied = {row[0] for row in conn.execute(text("SELECT version FROM schema_migrations"))}
