@@ -3943,6 +3943,7 @@ function SchedulerPanel() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState({});
+  const [open, setOpen] = useState(false);  // r61: default collapsed
   const load = useCallback(async () => {
     try {
       const r = await api.get('/api/trading/auto/schedule');
@@ -3950,10 +3951,11 @@ function SchedulerPanel() {
     } catch (e) { setErr(friendlyError(e)); }
   }, []);
   useEffect(() => {
+    if (!open) return;  // r61: only fetch when expanded
     load();
     const iv = setInterval(load, 60000);
     return () => clearInterval(iv);
-  }, [load]);
+  }, [load, open]);
 
   const fire = async (label, path, ack) => {
     if (busy[label]) return;
@@ -4014,12 +4016,19 @@ function SchedulerPanel() {
   return (
     <div className="surface rounded-2xl p-4 shadow-xl mb-4" data-r49-card>
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-        <h3 className="text-sm font-bold uppercase tracking-wider app-text-secondary flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setOpen(o => !o)}
+          aria-expanded={open}
+          className="text-sm font-bold uppercase tracking-wider app-text-secondary flex items-center gap-2 hover:app-text-primary"
+        >
+          <span>{open ? '▼' : '▶'}</span>
           <span>⏰</span><span>Scheduler & Manual Triggers</span>
-        </h3>
-        <button onClick={load} className="text-[10px] app-text-muted hover:app-text-primary">↻ Refresh</button>
+        </button>
+        {open && <button onClick={load} className="text-[10px] app-text-muted hover:app-text-primary">↻ Refresh</button>}
       </div>
 
+      {!open ? null : <>
       <div className="flex flex-wrap gap-2 mb-3 sched-trigger-row">
         <button
           disabled={!!busy.scan}
@@ -4072,6 +4081,7 @@ function SchedulerPanel() {
           </tbody>
         </table>
       </div>
+      </>}
     </div>
   );
 }
@@ -4789,36 +4799,45 @@ function AutoTraderPanel({ reloadToken }) {
 
 // r58 Transparency: two-tab panel showing every scanner-run rejection
 // and every auto-trader decision with friendly tooltips.
+// r61: collapsed by default to keep the dashboard tight; click header to expand.
 function TransparencyPanel() {
   const [tab, setTab] = useState('scanner');
+  const [open, setOpen] = useState(false);
   const [defs, setDefs] = useState(null);
-  // Lazy-load definitions once on mount.
+  // Lazy-load definitions only when the user expands the panel.
   useEffect(() => {
+    if (!open || defs) return;
     api.get('/api/trading/auto/check-definitions')
       .then(setDefs)
       .catch(() => setDefs({ scanner: {}, trader: {}, families: {} }));
-  }, []);
+  }, [open, defs]);
   return (
     <div className="surface-soft rounded-xl p-4 mt-4">
       <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <div className="text-xs app-text-muted uppercase tracking-[0.14em] font-semibold">
-            🔍 Transparency
+        <button
+          type="button"
+          onClick={() => setOpen(o => !o)}
+          aria-expanded={open}
+          className="text-xs app-text-muted uppercase tracking-[0.14em] font-semibold flex items-center gap-2 hover:app-text-primary"
+        >
+          <span>{open ? '▼' : '▶'}</span>
+          <span>🔍 Transparency</span>
+        </button>
+        {open && (
+          <div className="flex gap-1">
+            <button
+              onClick={() => setTab('scanner')}
+              className={`text-xs px-3 py-1 rounded-md ${tab === 'scanner' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
+            >Scanner Runs</button>
+            <button
+              onClick={() => setTab('decisions')}
+              className={`text-xs px-3 py-1 rounded-md ${tab === 'decisions' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
+            >Decision Log</button>
           </div>
-        </div>
-        <div className="flex gap-1">
-          <button
-            onClick={() => setTab('scanner')}
-            className={`text-xs px-3 py-1 rounded-md ${tab === 'scanner' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
-          >Scanner Runs</button>
-          <button
-            onClick={() => setTab('decisions')}
-            className={`text-xs px-3 py-1 rounded-md ${tab === 'decisions' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
-          >Decision Log</button>
-        </div>
+        )}
       </div>
-      {tab === 'scanner' && <ScannerRunsTab defs={defs} />}
-      {tab === 'decisions' && <DecisionLogTab defs={defs} />}
+      {open && tab === 'scanner' && <ScannerRunsTab defs={defs} />}
+      {open && tab === 'decisions' && <DecisionLogTab defs={defs} />}
     </div>
   );
 }
@@ -4970,6 +4989,7 @@ function DecisionLogTab({ defs }) {
   const [tickerFilter, setTickerFilter] = useState('');
   const [decisionFilter, setDecisionFilter] = useState('');
   const [loading, setLoading] = useState(false);
+  const [lastLoadAt, setLastLoadAt] = useState(null);
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -4980,15 +5000,31 @@ function DecisionLogTab({ defs }) {
       if (decisionFilter) params.set('decision', decisionFilter);
       const r = await api.get(`/api/trading/auto/decision-log?${params.toString()}`);
       setRows(r || []);
+      setLastLoadAt(new Date());
     } catch (e) { /* ignore */ }
     finally { setLoading(false); }
   }, [tickerFilter, decisionFilter]);
-  useEffect(() => { load(); }, [load]);
+  // r61: load on mount + filter change + auto-refresh every 15s so manual
+  // scan-now firings show up without an explicit refresh click.
+  useEffect(() => {
+    load();
+    const iv = setInterval(load, 15000);
+    return () => clearInterval(iv);
+  }, [load]);
   return (
     <div className="space-y-2">
-      <div className="text-[11px] app-text-muted leading-relaxed mb-2">
-        Each row = one consider_signal / consider_call_play / consider_put_play evaluation.
-        Filter by ticker (e.g., AAPL) or decision (entered / skipped). Hover any reason for a definition.
+      <div className="text-[11px] app-text-muted leading-relaxed mb-2 flex items-center justify-between flex-wrap gap-2">
+        <span>
+          Each row = one consider_signal / consider_call_play / consider_put_play evaluation.
+          Filter by ticker (e.g., AAPL) or decision (entered / skipped). Hover any reason for a definition.
+          Auto-refreshes every 15s.
+        </span>
+        {lastLoadAt && (
+          <span className="text-[10px] font-mono">
+            <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 align-middle"></span>
+            {rows.length} rows · loaded {lastLoadAt.toLocaleTimeString()}
+          </span>
+        )}
       </div>
       <div className="flex gap-2 mb-2 flex-wrap">
         <input
