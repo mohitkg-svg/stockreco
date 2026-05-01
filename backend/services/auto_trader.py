@@ -818,6 +818,8 @@ def get_config_dict() -> Dict[str, Any]:
             "option_thesis_min_conf_mult": float(getattr(cfg, "option_thesis_min_conf_mult", 0.85) or 0.85),
             "option_contract_min_score": float(getattr(cfg, "option_contract_min_score", 65.0) or 65.0),
             "option_contract_min_score_aggressive": float(getattr(cfg, "option_contract_min_score_aggressive", 55.0) or 55.0),
+            # r60: universe source
+            "universe_source": getattr(cfg, "universe_source", "russell1000") or "russell1000",
         }
     finally:
         db.close()

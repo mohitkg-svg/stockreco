@@ -76,6 +76,8 @@ class AutoTraderConfigRequest(BaseModel):
     option_thesis_min_conf_mult: Optional[float] = Field(None, ge=0, le=2)
     option_contract_min_score: Optional[float] = Field(None, ge=0, le=200)
     option_contract_min_score_aggressive: Optional[float] = Field(None, ge=0, le=200)
+    # r60: scanner universe source toggle
+    universe_source: Optional[str] = Field(None, pattern="^(russell1000|sp500)$")
 
 
 class KillSwitchRequest(BaseModel):

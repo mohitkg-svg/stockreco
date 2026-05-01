@@ -498,6 +498,18 @@ async def lifespan(app: FastAPI):
             id="positions_reconcile",
             max_instances=1, coalesce=True, misfire_grace_time=120,
         )
+        # r60: reconcile pending → open every 5min so freshly-filled bracket
+        # orders don't sit stuck for an hour. Previously the only path was
+        # the 60min `auto_reconcile_positions`, leaving operator-visible
+        # `status=pending` rows after fills until the next sweep.
+        try:
+            from routers.admin import reconcile_pending_trades as _rpt
+            scheduler.add_job(
+                _rpt, "interval", minutes=5, id="pending_reconcile",
+                max_instances=1, coalesce=True, misfire_grace_time=60,
+            )
+        except Exception as _e:
+            logger.warning(f"pending_reconcile job not scheduled: {_e}")
         try:
             auto_trader.auto_reconcile_positions()
         except Exception as _e:

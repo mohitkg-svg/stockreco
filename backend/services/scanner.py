@@ -46,16 +46,36 @@ PREFILTER_MIN_DOLLAR_VOL = 10_000_000  # $10M ADV — uniform liquidity floor
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,5}$")
 
 
-def _bundled_universe_path() -> str:
+def _bundled_universe_path(name: str = "russell1000") -> str:
+    """Resolve a bundled universe file by short name. Currently:
+      • 'russell1000' → data/russell1000.txt (~611 names)
+      • 'sp500'       → data/sp500.txt       (~500 names)
+    """
     here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(os.path.join(here, "..", "..", "data", "russell1000.txt"))
+    fname = "sp500.txt" if name == "sp500" else "russell1000.txt"
+    return os.path.normpath(os.path.join(here, "..", "..", "data", fname))
 
 
 def _read_universe_file() -> Optional[List[str]]:
-    """Read the Russell 1000 constituent file. Operator can override via
-    `STOCK_UNIVERSE_FILE` env var; otherwise falls back to the bundled
-    `data/russell1000.txt` (~611 names: SP500 + R1000 mid-caps)."""
-    path = os.getenv("STOCK_UNIVERSE_FILE") or _bundled_universe_path()
+    """Read the active universe file. Resolution order:
+      1. STOCK_UNIVERSE_FILE env var (operator override)
+      2. cfg.universe_source ("russell1000" or "sp500") → bundled file
+      3. Default: russell1000.txt
+    """
+    path = os.getenv("STOCK_UNIVERSE_FILE")
+    if not path:
+        # r60: read source from cfg
+        try:
+            from database import SessionLocal, AutoTraderConfig
+            _db = SessionLocal()
+            try:
+                cfg = _db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+                source = (getattr(cfg, "universe_source", None) or "russell1000") if cfg else "russell1000"
+            finally:
+                _db.close()
+        except Exception:
+            source = "russell1000"
+        path = _bundled_universe_path(source)
     try:
         tickers: List[str] = []
         with open(path) as f:

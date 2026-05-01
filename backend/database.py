@@ -322,6 +322,10 @@ class AutoTraderConfig(Base):
     option_thesis_min_conf_mult = Column(Float, default=0.85)
     option_contract_min_score = Column(Float, default=65.0)
     option_contract_min_score_aggressive = Column(Float, default=55.0)
+    # r60: scanner universe source. "russell1000" (~611 names, default) or
+    # "sp500" (~500 names, S&P 500 only — narrower / higher quality).
+    # Read by services.scanner._read_universe_file.
+    universe_source = Column(String, default="russell1000")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -1157,6 +1161,8 @@ def create_tables():
     _ensure_column("auto_trader_config", "option_thesis_min_conf_mult", "DOUBLE PRECISION DEFAULT 0.85")
     _ensure_column("auto_trader_config", "option_contract_min_score", "DOUBLE PRECISION DEFAULT 65.0")
     _ensure_column("auto_trader_config", "option_contract_min_score_aggressive", "DOUBLE PRECISION DEFAULT 55.0")
+    # r60: universe-source toggle (russell1000 | sp500)
+    _ensure_column("auto_trader_config", "universe_source", "VARCHAR DEFAULT 'russell1000'")
     _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")
