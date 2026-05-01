@@ -3821,15 +3821,30 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
     db = SessionLocal()
     try:
         cfg = get_config(db)
-        if not (cfg.enabled and cfg.trade_options):
+        if not cfg.enabled:
+            _gate_record("disabled", "fail", formula="cfg.enabled = false → bot is paused")
+            metrics.inc("autotrade_skip", reason="disabled")
+            return None
+        if not cfg.trade_options:
+            _gate_record("trade_options_off", "fail",
+                         formula="cfg.trade_options = false → put-play hunt skipped")
+            metrics.inc("autotrade_skip", reason="trade_options_off")
             return None
         if not paper_trader.is_enabled():
+            _gate_record("broker_not_enabled", "fail", formula="Alpaca client not initialized")
+            metrics.inc("autotrade_skip", reason="broker_not_enabled")
             return None
+        _gate_record("trade_options_off", "pass",
+                     formula="cfg.trade_options = true → put-play hunt enabled")
 
         ticker = ticker.upper()
 
         # Global ticker blacklist.
         if is_blacklisted(ticker, cfg):
+            _gate_record("ticker_blacklisted", "fail",
+                         ticker=ticker, blacklist=getattr(cfg, "ticker_blacklist", ""),
+                         formula=f"{ticker} is in cfg.ticker_blacklist")
+            metrics.inc("autotrade_skip", reason="ticker_blacklisted")
             return None
 
         # Macro release blackout — options-strict (1.5× window) to account for
@@ -3875,7 +3890,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         thesis = build_bear_thesis(ticker, "1d")
         if not thesis:
             _gate_record("no_bear_thesis", "fail",
-                         formula="build_bear_thesis returned None — no viable bearish setup (insufficient breakdown evidence, support holding, etc.)")
+                         formula="build_bear_thesis returned None — no viable bearish setup (insufficient breakdown evidence, support holding, or failed to find a swing-high stop)")
             # r53t: surface "no bear thesis" so the candidate pool shows
             # WHY put-play didn't fire instead of muting it as no_signal.
             metrics.inc("autotrade_skip", reason="no_bear_thesis")
@@ -3883,6 +3898,23 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         _gate_record("no_bear_thesis", "pass",
                      thesis_confidence=round(float(thesis.get("confidence", 0)), 2),
                      formula=f"bear thesis built with confidence {thesis.get('confidence', 0):.0f}")
+        # r66: capture thesis as signal_view so the Decision Log audit
+        # panel shows entry/stop/target levels and reasoning for option puts.
+        try:
+            _DECISION_TLS.signal_view = {
+                "confidence": thesis.get("confidence"),
+                "signal_type": "PUT",
+                "timeframe": "1d",
+                "strategy": "Bear Thesis (put play)",
+                "entry": thesis.get("entry"),
+                "stop_loss": thesis.get("stop"),
+                "target1": thesis.get("target1"),
+                "target2": thesis.get("target2"),
+                "atr": thesis.get("atr"),
+                "reasoning": thesis.get("reasoning") or thesis.get("rationale"),
+            }
+        except Exception:
+            pass
         # r58: floor is now configurable. Previously hardcoded as
         # `60 if aggressive else 0.85 × threshold`. Operator can tune via
         # cfg.option_thesis_min_conf_aggressive / option_thesis_min_conf_mult
@@ -4262,15 +4294,35 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         cfg = get_config(db)
         # Requires BOTH trade_options (options trading is approved) AND
         # the call-specific flag (user has opted in to call plays).
-        if not (cfg.enabled and getattr(cfg, "trade_calls", False) and cfg.trade_options):
+        if not cfg.enabled:
+            _gate_record("disabled", "fail", formula="cfg.enabled = false → bot is paused")
+            metrics.inc("autotrade_skip", reason="disabled")
+            return None
+        if not cfg.trade_options:
+            _gate_record("trade_options_off", "fail",
+                         formula="cfg.trade_options = false → call-play hunt skipped (puts must be enabled first)")
+            metrics.inc("autotrade_skip", reason="trade_options_off")
+            return None
+        if not getattr(cfg, "trade_calls", False):
+            _gate_record("trade_calls_off", "fail",
+                         formula="cfg.trade_calls = false → call-play hunt skipped (operator hasn't enabled calls)")
+            metrics.inc("autotrade_skip", reason="trade_calls_off")
             return None
         if not paper_trader.is_enabled():
+            _gate_record("broker_not_enabled", "fail", formula="Alpaca client not initialized")
+            metrics.inc("autotrade_skip", reason="broker_not_enabled")
             return None
+        _gate_record("trade_calls_off", "pass",
+                     formula="cfg.trade_options=true AND cfg.trade_calls=true → call-play hunt enabled")
 
         ticker = ticker.upper()
 
         # Global ticker blacklist.
         if is_blacklisted(ticker, cfg):
+            _gate_record("ticker_blacklisted", "fail",
+                         ticker=ticker, blacklist=getattr(cfg, "ticker_blacklist", ""),
+                         formula=f"{ticker} is in cfg.ticker_blacklist")
+            metrics.inc("autotrade_skip", reason="ticker_blacklisted")
             return None
 
         # Macro release blackout — options-strict mirror of put-side guard.
@@ -4340,12 +4392,29 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         thesis = build_bull_thesis(ticker, "1d")
         if not thesis:
             _gate_record("no_bull_thesis", "fail",
-                         formula="build_bull_thesis returned None — no viable bullish setup")
+                         formula="build_bull_thesis returned None — no viable bullish setup (insufficient breakout evidence, resistance holding, or failed swing-low stop)")
             metrics.inc("autotrade_skip", reason="no_bull_thesis")
             return None
         _gate_record("no_bull_thesis", "pass",
                      thesis_confidence=round(float(thesis.get("confidence", 0)), 2),
                      formula=f"bull thesis built with confidence {thesis.get('confidence', 0):.0f}")
+        # r66: capture thesis as signal_view so the audit panel shows
+        # entry/stop/target levels and reasoning for option calls.
+        try:
+            _DECISION_TLS.signal_view = {
+                "confidence": thesis.get("confidence"),
+                "signal_type": "CALL",
+                "timeframe": "1d",
+                "strategy": "Bull Thesis (call play)",
+                "entry": thesis.get("entry"),
+                "stop_loss": thesis.get("stop"),
+                "target1": thesis.get("target1"),
+                "target2": thesis.get("target2"),
+                "atr": thesis.get("atr"),
+                "reasoning": thesis.get("reasoning") or thesis.get("rationale"),
+            }
+        except Exception:
+            pass
         # r58: floor is now configurable; mirrors put gate at line ~3653.
         if aggressive:
             min_bull_conf = float(getattr(cfg, "option_thesis_min_conf_aggressive", 60.0) or 60.0)

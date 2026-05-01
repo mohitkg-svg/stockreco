@@ -5218,31 +5218,23 @@ function DecisionDetail({ row, defs }) {
         </div>
       )}
 
-      {/* Confidence breakdown (r64+r65) — opens in popup */}
+      {/* Confidence breakdown (r66) — popup-only, no inline pre block */}
       {sig.reasoning && (
         <div className="border-t app-border-soft pt-2">
-          <div className="flex items-center justify-between mb-1">
-            <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold">
-              How signal_generator arrived at confidence={sig.confidence}
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="text-[11px] app-text-secondary leading-relaxed flex-1">
+              <strong className="app-text-primary">How signal_generator arrived at confidence={sig.confidence ?? '—'}</strong>:
+              ~50 weighted contributors (price stack, momentum, patterns, S/R,
+              cross-sectional, fundamentals, sentiment, ML). Net evidence → base confidence
+              → multiplied by ~14 regime/RVOL/sector/ML factors (clamped 0.7-1.4×).
             </div>
             <button
               type="button"
               onClick={() => openReasoningPopup(row.ticker, sig.confidence, sig.reasoning, sig.timeframe)}
-              className="text-[11px] px-2 py-0.5 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/40"
+              className="text-xs px-3 py-1.5 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/40 font-semibold whitespace-nowrap"
             >
-              📋 Open in popup
+              📋 Open contributors in popup
             </button>
-          </div>
-          <div className="text-[11px] app-text-secondary leading-relaxed">
-            signal_generator runs ~50 weighted contributors. Each fires a
-            ✅/❌/⚠️ marker below; net evidence → base confidence → multiplied
-            by ~14 regime/RVOL/sector/ML factors (clamped 0.7-1.4×).
-            Click <strong>📋 Open in popup</strong> for a clean window with grouped sections.
-          </div>
-          <div className="mt-2 max-h-[200px] overflow-y-auto bg-white/3 rounded p-2 border app-border-soft">
-            <pre className="text-[10px] leading-relaxed whitespace-pre-wrap font-mono">
-              {sig.reasoning}
-            </pre>
           </div>
         </div>
       )}
