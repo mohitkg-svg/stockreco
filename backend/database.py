@@ -272,21 +272,22 @@ class AutoTraderConfig(Base):
     factor_strategies_enabled = Column(Boolean, default=True)
     flow_strategies_enabled = Column(Boolean, default=True)
     ml_drift_brier_alert_threshold = Column(Float, default=0.05)
-    # r53 Tier-3 A: loss-fingerprint pre-trade veto. off / shadow / active.
-    # Default shadow so the operator can review the gate's behavior before
-    # promoting to active. Reads `services.loss_patterns.loss_pattern_veto()`.
-    loss_pattern_mode = Column(String, default="shadow")
-    # r53 Tier-3 B: per-source signal-edge auto-mute when WR<45% & n>=10.
-    # Default off until backfill of Signal.strategy completes.
+    # r53/r67: loss_pattern_mode column kept for back-compat — gate REMOVED in
+    # r67 per shadow-flag sunset rule (no eval pipeline, permanent shadow).
+    # Default forced to "off"; column stays to avoid migration churn.
+    loss_pattern_mode = Column(String, default="off")
+    # r53/r67: source_mute_enabled column kept for back-compat — gate REMOVED
+    # in r67 (was disabled-by-default since r53, never shipped).
     source_mute_enabled = Column(Boolean, default=False)
     # r53 Tier-3 D: theta-decay-adjusted R:R floor for option entries.
     theta_adjusted_rr_enabled = Column(Boolean, default=True)
     # r53 Tier-3 E: portfolio-Kelly book throttle.
     portfolio_kelly_enabled = Column(Boolean, default=True)
-    # r54 Tier-1 #5: cross-sectional z-score scoring v2. off / shadow / active.
-    # In shadow, CandidatePool.score_v2 is computed alongside the legacy
-    # score; in active, score_v2 replaces score for top-N selection.
-    universe_scoring_v2 = Column(String, default="shadow")
+    # r54/r67: universe_scoring_v2 column kept for back-compat — feature
+    # was permanent-shadow with no producer (scanner refactor in r57 dropped
+    # the score_v2 writer). Default forced to "off"; will be removed in a
+    # later revision once a calibrated v2 ranker ships with an eval harness.
+    universe_scoring_v2 = Column(String, default="off")
     # r54 Tier-1 #6: comma-separated list of enabled sub-scanners.
     # Default: just breakout (legacy). Extras: pead, sector_rel, vol_exp.
     universe_scanners_enabled = Column(String, default="breakout")
@@ -326,6 +327,18 @@ class AutoTraderConfig(Base):
     # "sp500" (~500 names, S&P 500 only — narrower / higher quality).
     # Read by services.scanner._read_universe_file.
     universe_source = Column(String, default="russell1000")
+    # r68-A: equity-snapshot freshness watchdog. Auto-trader rejects entries
+    # when the most recent EquitySnapshot row is older than this many minutes
+    # (during RTH only). Prevents trading at full size when reconciliation
+    # cron is wedged and downstream DD/crisis gates would read stale state.
+    equity_snapshot_max_age_min = Column(Float, default=15.0)
+    # r68-B: setup_quality_score composite gate threshold. Used by r69
+    # composite — setup_quality_score is computed from weighted contributors
+    # (confidence headroom, R:R, geometry, freshness, liquidity, ADX) and
+    # rejected when below this floor. Only active when
+    # setup_quality_gate_enabled is True; default off to allow shadow eval.
+    setup_quality_min = Column(Float, default=55.0)
+    setup_quality_gate_enabled = Column(Boolean, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -572,6 +585,18 @@ class DecisionLog(Base):
     # regime, in_blackout), and the check_definition for the dominant
     # reason. Lets the Decision Log UI render a full per-row audit panel.
     details_json = Column(Text, nullable=True)
+    # r68-C: gate-outcome hindsight telemetry. After 5 trading days, the
+    # nightly job (services.gate_telemetry.recompute) walks rejected rows,
+    # fetches forward bars, and writes the realized 5-day P&L (in % of
+    # signal entry) the trade WOULD have produced if it had been entered.
+    # Aggregated per `reason` to identify gates that are filtering winners.
+    hindsight_pnl_5d_pct = Column(Float, nullable=True)
+    hindsight_computed_at = Column(DateTime, nullable=True)
+    # Cached entry/stop/target from the signal at decision time (so the
+    # hindsight calc doesn't need to re-parse details_json).
+    sig_entry = Column(Float, nullable=True)
+    sig_stop = Column(Float, nullable=True)
+    sig_target1 = Column(Float, nullable=True)
 
 
 class BestStrategyPerTicker(Base):
@@ -781,6 +806,24 @@ class MLPrediction(Base):
     realized_pl = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     closed_at = Column(DateTime, nullable=True)
+
+
+class MLEvalResult(Base):
+    """r68-B: nightly ML scorer evaluation (Brier / ECE / AUC) over the last
+    60 days of closed MLPrediction labels. The `ready_for_promotion` flag is
+    a boolean composite of all four thresholds (see services.ml_eval). The
+    operator inspects the latest row via /api/ml/eval-summary and decides
+    whether to flip cfg.ml_scoring_enabled."""
+    __tablename__ = "ml_eval_results"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    computed_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    window_days = Column(Integer, nullable=False, default=60)
+    n = Column(Integer, nullable=False)
+    brier = Column(Float, nullable=True)
+    ece = Column(Float, nullable=True)
+    auc = Column(Float, nullable=True)
+    ready_for_promotion = Column(Boolean, nullable=False, default=False)
+    buckets_json = Column(Text, nullable=True)
 
 
 class MacroEvent(Base):
@@ -1168,9 +1211,19 @@ def create_tables():
     _ensure_column("auto_trader_config", "option_contract_min_score_aggressive", "DOUBLE PRECISION DEFAULT 55.0")
     # r60: universe-source toggle (russell1000 | sp500)
     _ensure_column("auto_trader_config", "universe_source", "VARCHAR DEFAULT 'russell1000'")
+    # r68: equity-snapshot freshness watchdog and setup_quality composite gate
+    _ensure_column("auto_trader_config", "equity_snapshot_max_age_min", "DOUBLE PRECISION DEFAULT 15.0")
+    _ensure_column("auto_trader_config", "setup_quality_min", "DOUBLE PRECISION DEFAULT 55.0")
+    _ensure_column("auto_trader_config", "setup_quality_gate_enabled", "BOOLEAN DEFAULT FALSE")
     # r63: DecisionLog rich audit JSON (signal + context + definition)
     _ensure_column("decision_log", "details_json", "TEXT")
-    _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
+    # r68-C: gate-outcome hindsight telemetry
+    _ensure_column("decision_log", "hindsight_pnl_5d_pct", "DOUBLE PRECISION")
+    _ensure_column("decision_log", "hindsight_computed_at", "TIMESTAMP")
+    _ensure_column("decision_log", "sig_entry", "DOUBLE PRECISION")
+    _ensure_column("decision_log", "sig_stop", "DOUBLE PRECISION")
+    _ensure_column("decision_log", "sig_target1", "DOUBLE PRECISION")
+    _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'off'")
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")
     _ensure_column("auto_trader_config", "portfolio_kelly_enabled", "BOOLEAN DEFAULT TRUE")

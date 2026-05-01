@@ -688,6 +688,12 @@ def _persist_decision() -> None:
             }
             _db_dl = _SL_dl()
             try:
+                # r68-C: cache signal levels on the row so the gate-outcome
+                # nightly job (services.gate_telemetry) can compute hindsight
+                # P&L without re-parsing the JSON blob.
+                _sig_e = sig_view.get("entry")
+                _sig_s = sig_view.get("stop_loss")
+                _sig_t1 = sig_view.get("target1")
                 _db_dl.add(_DL(
                     ticker=ticker,
                     kind=("option_call" if kind == "option" and entered_kind == "call"
@@ -701,6 +707,9 @@ def _persist_decision() -> None:
                     strategy=sig_view.get("strategy"),
                     trade_id=getattr(_DECISION_TLS, "entered_trade_id", None),
                     details_json=_json_dl.dumps(details, default=str),
+                    sig_entry=float(_sig_e) if isinstance(_sig_e, (int, float)) else None,
+                    sig_stop=float(_sig_s) if isinstance(_sig_s, (int, float)) else None,
+                    sig_target1=float(_sig_t1) if isinstance(_sig_t1, (int, float)) else None,
                 ))
                 _db_dl.commit()
             finally:
@@ -925,6 +934,11 @@ def get_config_dict() -> Dict[str, Any]:
             "option_contract_min_score_aggressive": float(getattr(cfg, "option_contract_min_score_aggressive", 55.0) or 55.0),
             # r60: universe source
             "universe_source": getattr(cfg, "universe_source", "russell1000") or "russell1000",
+            # r68-A: equity-snapshot freshness watchdog
+            "equity_snapshot_max_age_min": float(getattr(cfg, "equity_snapshot_max_age_min", 15.0) or 15.0),
+            # r69: setup-quality composite gate
+            "setup_quality_min": float(getattr(cfg, "setup_quality_min", 55.0) or 55.0),
+            "setup_quality_gate_enabled": bool(getattr(cfg, "setup_quality_gate_enabled", False)),
         }
     finally:
         db.close()
@@ -2342,39 +2356,61 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                  mode=_gate_mode,
                  formula=f"mode={_gate_mode} — last closed 1m bars agreed with BUY direction (close ≥ open)")
 
-    # r42 fix #1.5: prefetch the AI veto verdict OUTSIDE the entry lock so a
-    # 1-2s Claude round-trip doesn't stall every other ticker's entry path.
-    # The lock now holds only the gate-eval + DB-write critical section;
-    # the only concurrency hazard removed by the lock that this prefetch
-    # could re-introduce is "two threads ask Claude about the same signal
-    # in parallel" — which is fine (idempotent read, model output cached).
-    _ai_veto_prefetched: Optional[Dict[str, Any]] = None
+    # r67 fix: cheap confidence-threshold peek BEFORE the AI prefetch. The
+    # AI veto round-trip is ~$0.005 and 1-2s; running it on signals that
+    # will be rejected for low confidence is pure waste. Audit identified
+    # this as ~$9k/yr on rejected signals at current volume.
+    _conf_pre = signal.get("confidence")
     try:
-        from services import ai_judge as _aij_pf
-        if _aij_pf.entry_veto_mode() != "off":
-            _pf_db = SessionLocal()
-            try:
-                _ai_ctx_pf = _build_ai_context(ticker, _pf_db)
-            finally:
-                _pf_db.close()
-            _signal_view_pf = {
-                "ticker": ticker,
-                "signal_type": signal.get("signal_type"),
-                "confidence": signal.get("confidence"),
-                "timeframe": signal.get("timeframe"),
-                "entry": signal.get("entry"),
-                "stop_loss": signal.get("stop_loss"),
-                "target1": signal.get("target1"),
-                "strategy": signal.get("strategy"),
-                "reasoning": (signal.get("reasoning") or "")[:1500],
-            }
-            try:
-                _ai_veto_prefetched = _aij_pf.entry_veto(_signal_view_pf, _ai_ctx_pf)
-            except Exception as _pf_e:
-                logger.debug(f"ai_judge prefetch failed (will retry inside lock): {_pf_e}")
-                _ai_veto_prefetched = None
+        _conf_pre_f = float(_conf_pre) if _conf_pre is not None else 0.0
+    except (TypeError, ValueError):
+        _conf_pre_f = 0.0
+    _pre_thresh = 55.0  # safe floor — actual cfg threshold is checked again post-lock
+    try:
+        _pre_db = SessionLocal()
+        try:
+            _pre_cfg = _pre_db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            if _pre_cfg and getattr(_pre_cfg, "confidence_threshold", None) is not None:
+                _pre_thresh = float(_pre_cfg.confidence_threshold)
+        finally:
+            _pre_db.close()
     except Exception:
-        _ai_veto_prefetched = None
+        pass
+    if _conf_pre_f < _pre_thresh:
+        # Will be rejected by post-lock confidence gate anyway. Skip AI
+        # prefetch to save cost. Defer the gate_record/skip_inc to the
+        # canonical block inside the lock (otherwise audit shows two records).
+        _ai_veto_prefetched: Optional[Dict[str, Any]] = None
+    else:
+        # r42 fix #1.5: prefetch the AI veto verdict OUTSIDE the entry lock so a
+        # 1-2s Claude round-trip doesn't stall every other ticker's entry path.
+        _ai_veto_prefetched: Optional[Dict[str, Any]] = None
+        try:
+            from services import ai_judge as _aij_pf
+            if _aij_pf.entry_veto_mode() != "off":
+                _pf_db = SessionLocal()
+                try:
+                    _ai_ctx_pf = _build_ai_context(ticker, _pf_db)
+                finally:
+                    _pf_db.close()
+                _signal_view_pf = {
+                    "ticker": ticker,
+                    "signal_type": signal.get("signal_type"),
+                    "confidence": signal.get("confidence"),
+                    "timeframe": signal.get("timeframe"),
+                    "entry": signal.get("entry"),
+                    "stop_loss": signal.get("stop_loss"),
+                    "target1": signal.get("target1"),
+                    "strategy": signal.get("strategy"),
+                    "reasoning": (signal.get("reasoning") or "")[:1500],
+                }
+                try:
+                    _ai_veto_prefetched = _aij_pf.entry_veto(_signal_view_pf, _ai_ctx_pf)
+                except Exception as _pf_e:
+                    logger.debug(f"ai_judge prefetch failed (will retry inside lock): {_pf_e}")
+                    _ai_veto_prefetched = None
+        except Exception:
+            _ai_veto_prefetched = None
 
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_signal({ticker}): entry lock busy >30s, skipping")
@@ -2404,6 +2440,70 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # `ticker` already bound pre-lock above (r41 review fix A —
         # _confirm_1m_bar moved before lock acquisition to prevent slow
         # data-API calls from stalling parallel scanner threads).
+
+        # r68-A (r70 fix): equity-snapshot freshness watchdog. Triggers ONLY
+        # when the latest snapshot is from THIS session and stale relative to
+        # the recon cron's 5-min cadence — i.e., the cron is wedged mid-day.
+        # Earlier r68-A naively compared against any latest row, which meant
+        # every morning session blocked all entries until the first post-9:30
+        # snapshot landed (yesterday's close = ~17h "stale"). The right
+        # condition is: today's first snapshot exists AND its age > threshold.
+        try:
+            from datetime import datetime as _dt_w, timezone as _tz_w, timedelta as _td_w
+            from services.paper_trader import is_market_open as _imo_w
+            from zoneinfo import ZoneInfo as _ZI_w
+            _wd_cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            _snap_max_age_min = float(getattr(_wd_cfg, "equity_snapshot_max_age_min", 15) or 15) if _wd_cfg else 15.0
+            if _imo_w():
+                # Anchor "session start" to today 9:30 ET. Snapshots written
+                # AFTER this point count toward the watchdog; earlier rows are
+                # carry-over from prior sessions and ignored.
+                _now_et = _dt_w.now(_ZI_w("America/New_York"))
+                _session_start_et = _now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                _session_start_utc = _session_start_et.astimezone(_tz_w.utc).replace(tzinfo=None)
+                _last_today = (
+                    db.query(EquitySnapshot)
+                    .filter(EquitySnapshot.ts >= _session_start_utc)
+                    .order_by(EquitySnapshot.ts.desc())
+                    .first()
+                )
+                # Grace window: don't fire the watchdog in the first
+                # 2×cadence (=10min) after market open — gives the recon cron
+                # time to land its first row of the session before we declare
+                # it wedged.
+                _mins_since_open = (_now_et - _session_start_et).total_seconds() / 60.0
+                if _last_today is None and _mins_since_open > 10.0:
+                    _gate_record("stale_equity_snapshot", "fail",
+                                 last_today=None,
+                                 minutes_since_open=round(_mins_since_open, 1),
+                                 grace_min=10.0,
+                                 formula=f"no EquitySnapshot since today's open and {_mins_since_open:.1f}m elapsed (>10m grace) → recon cron wedged → reject")
+                    logger.error(
+                        f"AutoTrader skip {ticker}: no equity snapshot since "
+                        f"session open and {_mins_since_open:.0f}m elapsed — "
+                        f"recon cron wedged; fail-closed"
+                    )
+                    metrics.inc("autotrade_skip", reason="stale_equity_snapshot")
+                    return None
+                if _last_today is not None:
+                    _ts = _last_today.ts
+                    if _ts.tzinfo is None:
+                        _ts = _ts.replace(tzinfo=_tz_w.utc)
+                    _age_min = (_dt_w.now(_tz_w.utc) - _ts).total_seconds() / 60.0
+                    if _age_min > _snap_max_age_min:
+                        _gate_record("stale_equity_snapshot", "fail",
+                                     last_snapshot_age_min=round(_age_min, 1),
+                                     max_age_min=_snap_max_age_min,
+                                     formula=f"latest in-session snapshot age {_age_min:.1f}m > {_snap_max_age_min:.0f}m → recon cron stalled mid-session → reject")
+                        logger.error(
+                            f"AutoTrader skip {ticker}: equity-snapshot wedged "
+                            f"mid-session (age {_age_min:.1f}m > {_snap_max_age_min:.0f}m); fail-closed"
+                        )
+                        metrics.inc("autotrade_skip", reason="stale_equity_snapshot")
+                        return None
+        except Exception as _wd_e:
+            logger.debug(f"snapshot-freshness watchdog skipped: {_wd_e}")
+
         # r39 audit fix #8: hard freeze on losing streak (WR < 35%, n ≥ 5).
         # Different from `adaptive_risk_multiplier` shrinking — this is the
         # full stop. Operator must intervene (kill the streak's contributing
@@ -2461,7 +2561,24 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if signal.get("signal_type") != "BUY":
             metrics.inc("autotrade_skip", reason="non_buy_signal")
             return None  # long-only stock entries; puts are handled separately
-        confidence = float(signal.get("confidence") or 0)
+        # r67 fix: NaN confidence bypassed the gate (NaN < anything → False)
+        # and then propagated through the sizing stack to int(NaN) → ValueError
+        # → silent reject. Reject explicitly with a named reason.
+        import math as _math_nan_check
+        try:
+            confidence = float(signal.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = float("nan")
+        if _math_nan_check.isnan(confidence) or _math_nan_check.isinf(confidence):
+            _gate_record("malformed_signal", "fail",
+                         field="confidence", value=str(signal.get("confidence")),
+                         formula="confidence is NaN/Inf → reject (signal generator produced invalid number)")
+            logger.warning(
+                f"AutoTrader skip {signal.get('ticker')}: confidence is NaN/Inf "
+                f"(raw={signal.get('confidence')!r}) — malformed signal"
+            )
+            metrics.inc("autotrade_skip", reason="malformed_signal")
+            return None
         # r46 Tier 1: per-ticker confidence-threshold override.
         try:
             from services.ticker_profile import confidence_threshold as _tp_conf
@@ -2528,30 +2645,41 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                              halt_threshold=round(_halt_threshold, 2),
                              headroom=round(_combined - _halt_threshold, 2),
                              formula=f"combined ${_combined:.0f} > halt ${_halt_threshold:.0f} (-{dll*100:.1f}% × equity) → continue (headroom ${_combined - _halt_threshold:.0f})")
-            # r44 fix #0.12: auto-deleveraging trigger. At -4% session drop,
-            # trim 33% of every losing position; at -6% kill switch.
-            try:
-                from services.risk_manager import session_equity_drawdown_pct as _sed
-                sed = _sed()
-                if sed is not None:
-                    if sed >= 0.06:
-                        logger.critical(
-                            f"AUTO-DELEVERAGE: session drawdown {sed*100:.2f}% ≥ 6% — engaging kill switch"
-                        )
-                        try:
-                            kill(reason=f"auto-deleverage session_dd={sed*100:.2f}%", flatten=True, cancel_orders=True)
-                        except Exception:
-                            pass
-                        metrics.inc("autotrade_skip", reason="auto_deleverage")
-                        return None
-                    if sed >= 0.04:
-                        logger.warning(
-                            f"AUTO-DELEVERAGE: session drawdown {sed*100:.2f}% ≥ 4% — blocking new entries"
-                        )
-                        metrics.inc("autotrade_skip", reason="session_dd_4pct")
-                        return None
-            except Exception as _de:
-                logger.debug(f"session-DD check skipped: {_de}")
+        # r67 fix: auto-deleverage hoisted OUT of `if dll_static > 0` block.
+        # Previously zeroing daily_loss_limit_pct silently disabled the 6%
+        # kill switch — operator intent was "disable static cap, keep dynamic
+        # protections", but the nesting killed both.
+        try:
+            from services.risk_manager import session_equity_drawdown_pct as _sed
+            sed = _sed()
+            if sed is not None:
+                if sed >= 0.06:
+                    _gate_record("auto_deleverage", "fail",
+                                 session_dd_pct=round(sed * 100, 2), threshold_pct=6.0,
+                                 formula=f"session DD {sed*100:.2f}% ≥ 6% → KILL SWITCH (flatten + cancel)")
+                    logger.critical(
+                        f"AUTO-DELEVERAGE: session drawdown {sed*100:.2f}% ≥ 6% — engaging kill switch"
+                    )
+                    try:
+                        kill(reason=f"auto-deleverage session_dd={sed*100:.2f}%", flatten=True, cancel_orders=True)
+                    except Exception:
+                        pass
+                    metrics.inc("autotrade_skip", reason="auto_deleverage")
+                    return None
+                if sed >= 0.04:
+                    _gate_record("session_dd_4pct", "fail",
+                                 session_dd_pct=round(sed * 100, 2), threshold_pct=4.0,
+                                 formula=f"session DD {sed*100:.2f}% ≥ 4% → block new entries (existing trail)")
+                    logger.warning(
+                        f"AUTO-DELEVERAGE: session drawdown {sed*100:.2f}% ≥ 4% — blocking new entries"
+                    )
+                    metrics.inc("autotrade_skip", reason="session_dd_4pct")
+                    return None
+                _gate_record("session_dd_4pct", "pass",
+                             session_dd_pct=round(sed * 100, 2), threshold_pct=4.0,
+                             formula=f"session DD {sed*100:.2f}% < 4% → continue")
+        except Exception as _de:
+            logger.debug(f"session-DD check skipped: {_de}")
 
         # C1: Max concurrent positions guard.
         mcp = int(getattr(cfg, "max_concurrent_positions", 0) or 0)
@@ -2661,19 +2789,29 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         gen_at = signal.get("generated_at")
         if gen_at:
             try:
-                from datetime import datetime as _dt
+                from datetime import datetime as _dt, timezone as _tz
                 if isinstance(gen_at, str):
-                    gen_dt = _dt.fromisoformat(gen_at.replace("Z", "+00:00"))
+                    # r67 fix: previous code stripped tzinfo and compared to
+                    # utcnow(); a TZ-naive ISO string from a non-UTC host
+                    # over-stated age by the local-UTC offset. Normalize to
+                    # tz-aware UTC; assume naive timestamps ARE UTC.
+                    s = gen_at.replace("Z", "+00:00")
+                    gen_dt = _dt.fromisoformat(s)
+                    if gen_dt.tzinfo is None:
+                        gen_dt = gen_dt.replace(tzinfo=_tz.utc)
                 else:
                     gen_dt = gen_at
-                age_s = (_dt.utcnow() - gen_dt.replace(tzinfo=None)).total_seconds()
+                    if gen_dt.tzinfo is None:
+                        gen_dt = gen_dt.replace(tzinfo=_tz.utc)
+                age_s = (_dt.now(_tz.utc) - gen_dt).total_seconds()
                 if age_s > max_age_mins * 60:
                     logger.info(
                         f"AutoTrader skip {signal.get('ticker')}: signal age {age_s/60:.1f}m > {max_age_mins}m (stale)"
                     )
+                    metrics.inc("autotrade_skip", reason="signal_stale")
                     return None
-            except Exception:
-                pass
+            except Exception as _ts_e:
+                logger.debug(f"signal-freshness parse failed (fail-open): {_ts_e}")
         # Per-timeframe gate: don't auto-trade off 1mo/5m signals etc.
         allowed_tfs = {s.strip() for s in (cfg.signal_timeframes or "1h,4h,1d").split(",") if s.strip()}
         sig_tf = (signal.get("timeframe") or "").strip()
@@ -2771,13 +2909,16 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                         f"${entry-stop:.2f} < 0.8 × ATR(${_atr_sig:.2f}) — too tight"
                     )
                     metrics.inc("autotrade_event", event="stop_too_tight_atr")
+                    metrics.inc("autotrade_skip", reason="stop_too_tight_atr")
                     return None
         except Exception as _e:
-            # r39 audit fix #15: don't silently swallow gate errors. If the
-            # ATR-stop check itself crashes, we want to know — silent passes
-            # are exactly what hid the original liquidity-gate bug.
-            logger.warning(f"stop_too_tight_atr gate {ticker}: {_e}")
+            # r67 fix: was fail-open (continue trading on exception). Now
+            # fail-closed — a yfinance hiccup can produce live trades against
+            # stops we couldn't validate. Reject and surface the error.
+            logger.warning(f"stop_too_tight_atr gate {ticker}: {_e} — fail-closed reject")
             metrics.inc("autotrade_event", event="stop_too_tight_atr_error")
+            metrics.inc("autotrade_skip", reason="stop_too_tight_atr_error")
+            return None
 
         # Gap-open reject: if live price has drifted past _STALE_GAP_PCT from
         # the signal's entry, the targets/stop were computed for a different
@@ -2794,10 +2935,15 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                         f"(> {_STALE_GAP_PCT*100:.1f}% threshold)"
                     )
                     metrics.inc("autotrade_event", event="gap_open_reject")
+                    metrics.inc("autotrade_skip", reason="gap_open_reject")
                     return None
         except Exception as _e:
-            logger.warning(f"gap-open gate {ticker}: {_e}")
+            # r67 fix: fail-closed. A live-price fetch failure at the open
+            # is exactly when gap protection matters most.
+            logger.warning(f"gap-open gate {ticker}: {_e} — fail-closed reject")
             metrics.inc("autotrade_event", event="gap_open_gate_error")
+            metrics.inc("autotrade_skip", reason="gap_open_gate_error")
+            return None
 
         # Liquidity gate: require ≥ $10M median daily $-volume over the last
         # 20 trading days. Sub-threshold names produce wide spreads + slippage
@@ -2818,10 +2964,16 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                         f"${_dvol/1e6:.1f}M < $10M (illiquid)"
                     )
                     metrics.inc("autotrade_event", event="illiquid_skip")
+                    metrics.inc("autotrade_skip", reason="illiquid_skip")
                     return None
         except Exception as _e:
-            logger.warning(f"liquidity gate {ticker}: {_e}")
+            # r67 fix: fail-closed. Illiquid names can produce 5-15bps
+            # entry/exit slippage that quietly poisons R-multiples; we
+            # cannot validate liquidity ⇒ do not enter.
+            logger.warning(f"liquidity gate {ticker}: {_e} — fail-closed reject")
             metrics.inc("autotrade_event", event="liquidity_gate_error")
+            metrics.inc("autotrade_skip", reason="liquidity_gate_error")
+            return None
 
         # r39 audit fix #19: ticker-level ADX gate. SPY-ADX is checked in
         # adaptive_risk_multiplier (market regime), but the TICKER's own ADX
@@ -2853,6 +3005,86 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                                   else "ADX unavailable → continue (gate not applied)"))
         except Exception as _e:
             logger.warning(f"ticker-ADX gate {ticker}: {_e}")
+
+        # r69: setup-quality composite gate. Collapses 8 individual gates
+        # (confidence_threshold + bad_rr + bad_t1_geometry + tf_not_allowed
+        # + one_min_bar_disagrees + liquidity + ticker_chop + freshness) into
+        # ONE calibrated 0-100 score with one threshold. Audit consensus:
+        # "the highest-leverage refactor — collapses 8 gates into 1 with no
+        # edge loss." Default mode is SHADOW (record only); operator flips
+        # cfg.setup_quality_gate_enabled = True after empirical validation.
+        try:
+            from services.setup_quality import compute as _sq_compute
+            # Compute median $-volume for liquidity contribution (already cheap;
+            # data_fetcher caches the daily bars from the earlier liquidity gate).
+            _sq_dvol: Optional[float] = None
+            try:
+                from services.data_fetcher import fetch_ohlcv as _sq_fo
+                _sq_df = _sq_fo(ticker, "1d")
+                if _sq_df is not None and not _sq_df.empty and len(_sq_df) >= 5:
+                    _tail2 = _sq_df.tail(20)
+                    _typ_px2 = (_tail2["High"] + _tail2["Low"] + _tail2["Close"]) / 3.0
+                    _sq_dvol = float((_typ_px2 * _tail2["Volume"]).median() or 0.0)
+            except Exception:
+                _sq_dvol = None
+            # Signal age in minutes (re-uses the parsed gen_at from the
+            # freshness gate). Falls back to None if missing.
+            _sq_age_min: Optional[float] = None
+            try:
+                _sq_gen_at = signal.get("generated_at")
+                if _sq_gen_at:
+                    from datetime import datetime as _dt_sq, timezone as _tz_sq
+                    if isinstance(_sq_gen_at, str):
+                        _s = _sq_gen_at.replace("Z", "+00:00")
+                        _sq_gen_dt = _dt_sq.fromisoformat(_s)
+                        if _sq_gen_dt.tzinfo is None:
+                            _sq_gen_dt = _sq_gen_dt.replace(tzinfo=_tz_sq.utc)
+                    else:
+                        _sq_gen_dt = _sq_gen_at
+                        if _sq_gen_dt.tzinfo is None:
+                            _sq_gen_dt = _sq_gen_dt.replace(tzinfo=_tz_sq.utc)
+                    _sq_age_min = (_dt_sq.now(_tz_sq.utc) - _sq_gen_dt).total_seconds() / 60.0
+            except Exception:
+                _sq_age_min = None
+            _sq_max_age = float(max(10, min(90, 1 * tf_mins)))
+            _sq_result = _sq_compute(
+                confidence=confidence,
+                confidence_threshold=_eff_conf_thresh,
+                entry=entry, stop=stop, target1=t1,
+                rr_min=_rr_min,
+                adx=signal.get("adx"),
+                strategy=signal.get("strategy"),
+                one_min_bar_agrees=_bar_ok,
+                median_dvol=_sq_dvol,
+                signal_age_min=_sq_age_min,
+                signal_max_age_min=_sq_max_age,
+            )
+            _sq_score = float(_sq_result["score"])
+            _sq_min = float(getattr(cfg, "setup_quality_min", 55.0) or 55.0)
+            _sq_active = bool(getattr(cfg, "setup_quality_gate_enabled", False))
+            if _sq_active and _sq_score < _sq_min:
+                _gate_record("setup_quality_score", "fail",
+                             score=_sq_score, threshold=_sq_min,
+                             parts=_sq_result["parts"],
+                             contributions=_sq_result["contributions"],
+                             formula=f"composite score {_sq_score:.1f} < min {_sq_min:.1f} → reject  ::  {_sq_result['details']}")
+                logger.info(
+                    f"AutoTrader skip {ticker}: setup_quality_score "
+                    f"{_sq_score:.1f} < {_sq_min:.1f} [active mode]"
+                )
+                metrics.inc("autotrade_skip", reason="setup_quality_score")
+                return None
+            # Always record (shadow or pass-active) so operator can compare
+            # composite distributions vs individual-gate verdicts.
+            _gate_record("setup_quality_score", "pass" if _sq_score >= _sq_min else "shadow_below",
+                         score=_sq_score, threshold=_sq_min,
+                         active=_sq_active,
+                         parts=_sq_result["parts"],
+                         contributions=_sq_result["contributions"],
+                         pass_individual=_sq_result["pass_individual_gates"],
+                         formula=f"composite {_sq_score:.1f} {'≥' if _sq_score >= _sq_min else '<'} min {_sq_min:.1f} | mode={'active' if _sq_active else 'shadow'}  ::  {_sq_result['details']}")
+        except Exception as _sq_e:
+            logger.debug(f"setup_quality compute failed: {_sq_e}")
 
         # Earnings-calendar gate: reject entries on tickers with a scheduled
         # earnings release within 48h. The rule-based signal generator has no
@@ -2943,51 +3175,14 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         except Exception as _rr_e:
             logger.debug(f"regime_router check failed (fail-open): {_rr_e}")
 
-        # r53 Tier-3 B: per-source signal-edge auto-mute when WR<45%, n>=10.
-        # Hard short-circuit (vs the existing strategy_multiplier which
-        # only dampens sizing). Gated by cfg.source_mute_enabled (default
-        # off pending Signal.strategy backfill).
-        try:
-            if bool(getattr(cfg, "source_mute_enabled", False)):
-                _strat_mute_name = signal.get("strategy")
-                if _strat_mute_name:
-                    _scard_mute = strategy_scorecard(days=60, min_trades=10).get(_strat_mute_name)
-                    if _scard_mute:
-                        _wr_mute = float(_scard_mute.get("win_rate") or 1.0)
-                        _n_mute = int(_scard_mute.get("n") or 0)
-                        if _n_mute >= 10 and _wr_mute < 0.45:
-                            logger.info(
-                                f"AutoTrader skip {ticker}: strategy "
-                                f"'{_strat_mute_name}' AUTO-MUTED "
-                                f"(wr={_wr_mute:.2f}, n={_n_mute})"
-                            )
-                            metrics.inc("autotrade_skip", reason=f"source_mute_{_strat_mute_name}")
-                            return None
-        except Exception as _sm_e:
-            logger.debug(f"source_mute check failed (fail-open): {_sm_e}")
-
-        # r53 Tier-3 A: loss-fingerprint pre-trade veto. Reads aggregated
-        # post-mortem patterns from past losers and matches them against
-        # the new signal's pre-trade context. Mode-flagged shadow → active.
-        try:
-            _lp_mode = (getattr(cfg, "loss_pattern_mode", "off") or "off").strip().lower()
-            if _lp_mode in ("shadow", "active"):
-                from services.loss_patterns import loss_pattern_veto as _lp_veto
-                _lp_match = _lp_veto(signal, context={"sector": locals().get("sector")})
-                if _lp_match:
-                    metrics.inc(
-                        "autotrade_event",
-                        event=f"loss_pattern_match_{_lp_mode}",
-                    )
-                    logger.info(
-                        f"AutoTrader loss_pattern {ticker}: matched {_lp_match} "
-                        f"[mode={_lp_mode}]"
-                    )
-                    if _lp_mode == "active":
-                        metrics.inc("autotrade_skip", reason="loss_pattern_veto")
-                        return None
-        except Exception as _lp_e:
-            logger.debug(f"loss_pattern veto failed (fail-open): {_lp_e}")
+        # r67: source_mute_enabled and loss_pattern_veto deleted.
+        # source_mute was disabled-by-default since r53 ("pending strategy
+        # backfill") — never shipped. loss_pattern_veto was permanent shadow
+        # with no eval pipeline. Per r57's 14-day shadow rule and the audit
+        # consensus, dormant gates are deletion candidates not maintenance
+        # liabilities. The strategy_multiplier still dampens sizing for poor
+        # strategies; the calibration_gate still hard-rejects on per-bucket
+        # Wilson-LB.
 
         # One open auto-trade per ticker. Include `adopted` so the bot
         # doesn't enter a new trade on top of an externally-held position
@@ -3282,34 +3477,28 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             _cal_mult *= _ie_m(ticker=ticker)
         except Exception:
             pass
-        # r47 Tier P: composite r47 overlay (VIX9D/VIX3M term-regime, SKEW bias,
-        # VVIX anxiety, VRP, SPX 200d gate, HYG/LQD circuit breaker). Each
-        # overlay is gated by its own cfg flag; combined is clamped [0.4, 1.5].
-        # When the credit-spread CB is active, BUY direction returns 0.0 — we
-        # treat that as a veto on the entry below the sizing block.
+        # r67 simplified: r47 sizing overlay (term/skew/vvix/vrp/spx) DELETED.
+        # Audit consensus: 5-factor cross-asset sizing tilt cannot be validated
+        # at retail trade count; the multiplier stack was theater. Kept ONLY
+        # the credit-spread circuit-breaker as a hard veto on BUY direction
+        # when HYG-LQD widens beyond panic thresholds.
+        _r47_mult = 1.0
         try:
-            from services.r47_overlays import r47_sizing_overlay as _r47_ov
-            _direction = (signal.get("signal_type") or "BUY").upper()
-            _r47_mult, _r47_parts = _r47_ov(
-                _direction,
-                term_enabled=True,
-                skew_enabled=True,
-                vvix_enabled=True,
-                vrp_enabled=True,
-                spx_gate_enabled=bool(getattr(cfg, "spx_trend_gate_enabled", True)),
-                credit_cb_enabled=bool(getattr(cfg, "credit_spread_circuit_breaker_enabled", True)),
-            )
-            if _r47_mult <= 0.001:
-                # Hard veto from credit-spread circuit breaker on long side.
-                logger.info(
-                    f"AutoTrader skip {ticker}: r47 credit-spread circuit breaker active "
-                    f"(parts={_r47_parts})"
-                )
-                metrics.inc("autotrade_skip", reason="r47_credit_cb")
-                return None
+            if bool(getattr(cfg, "credit_spread_circuit_breaker_enabled", True)):
+                from services.r47_overlays import credit_spread_circuit_breaker_active as _cscb
+                if _cscb():
+                    _direction = (signal.get("signal_type") or "BUY").upper()
+                    if _direction == "BUY":
+                        _gate_record("r47_credit_cb", "fail",
+                                     direction=_direction,
+                                     formula="HYG-LQD credit spread widened beyond panic threshold → veto BUY")
+                        logger.info(
+                            f"AutoTrader skip {ticker}: credit-spread circuit breaker active (BUY veto)"
+                        )
+                        metrics.inc("autotrade_skip", reason="r47_credit_cb")
+                        return None
         except Exception as _r47_e:
-            logger.debug(f"r47 overlay skipped: {_r47_e}")
-            _r47_mult = 1.0
+            logger.debug(f"credit-spread CB check skipped: {_r47_e}")
         # r48 BACKLOG: factor-based composite (12-1 momentum, BAB, yield-curve,
         # oil regime, DXY, real-yield, FOMC, macro surprise, squeeze, opportunistic
         # insider). Clamped [0.6, 1.4]. Gated behind cfg.factor_strategies_enabled.

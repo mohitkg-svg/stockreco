@@ -380,6 +380,48 @@ TRADER_CHECKS: Dict[str, Dict[str, str]] = {
         "why": "Prevents double-entries on race conditions.",
         "fix": "Defensive — should never happen.",
     },
+    # r68-A: equity-snapshot freshness watchdog
+    "stale_equity_snapshot": {
+        "title": "Equity snapshot stale",
+        "what": "The most recent EquitySnapshot row is older than cfg.equity_snapshot_max_age_min (default 15min) during RTH.",
+        "why": "Reconciliation cron is wedged. Multiple downstream gates (account_drawdown, in_crisis_mode, book_var_99) silently read whatever the last row says — stale equity means the bot would trade at full size during a real drawdown.",
+        "fix": "Investigate the reconciliation cron job; confirm it's running every 5min during RTH. Self-clears once a fresh snapshot is written.",
+    },
+    # r67-C: signal freshness (tz-corrected)
+    "signal_stale": {
+        "title": "Signal too old",
+        "what": "Signal `generated_at` is older than max_age (= 1× timeframe minutes, capped at 90).",
+        "why": "An hour-old 1h signal is past its useful life; entry levels have drifted.",
+        "fix": "Re-run the signal scan; this is a freshness check, not a quality issue.",
+    },
+    # r67-B: malformed confidence
+    # (already in TRADER_CHECKS as malformed_signal — covers NaN/Inf bypass too.)
+    # r67-D: gate-error reasons (now fail-closed)
+    "stop_too_tight_atr_error": {
+        "title": "ATR stop-tightness check errored",
+        "what": "ATR fetch or computation raised an exception while validating stop distance.",
+        "why": "We can't validate the stop is wider than 0.8×ATR — fail-closed reject (was fail-open in r66, hid wick-stopout pathology).",
+        "fix": "Investigate yfinance / data_fetcher. Self-clears once ATR computes.",
+    },
+    "gap_open_gate_error": {
+        "title": "Gap-open check errored",
+        "what": "Live-price fetch failed while validating signal entry vs current price.",
+        "why": "We can't validate the entry isn't stale-by-gap — fail-closed reject (was fail-open in r66; especially dangerous at the open).",
+        "fix": "Investigate the live-price fetcher.",
+    },
+    "liquidity_gate_error": {
+        "title": "Liquidity check errored",
+        "what": "Daily-bar fetch failed while validating ≥$10M median $-volume over last 20 days.",
+        "why": "We can't validate the name is liquid — fail-closed reject (was fail-open in r66).",
+        "fix": "Investigate data_fetcher; self-clears once bars return.",
+    },
+    # r69: setup-quality composite
+    "setup_quality_score": {
+        "title": "Setup quality composite",
+        "what": "Weighted 0-100 composite over 8 dimensions: confidence headroom (30%), R:R net (20%), T1 geometry (10%), R:R geometry (5%), 1m bar agreement (10%), liquidity (10%), ADX (10%), freshness (5%). When cfg.setup_quality_gate_enabled = True, rejects when score < cfg.setup_quality_min (default 55).",
+        "why": "Audit consensus: 8 individual gates with hand-tuned thresholds and no joint optimization → one calibrated composite. Default shadow (records score, doesn't reject) until empirical validation.",
+        "fix": "Inspect /api/auto/decision-log for setup_quality_score breakdowns; tune cfg.setup_quality_min after 14 days of shadow.",
+    },
     # Geometry
     "bad_rr": {
         "title": "Risk/reward below floor",
@@ -550,6 +592,7 @@ GATE_ORDER_STOCK = [
     "one_min_bar_disagrees",     # 1m bar gate
     "entry_lock_timeout",
     "advisory_lock_held",
+    "stale_equity_snapshot",     # r68-A: reconciliation freshness watchdog
     "trading_frozen",
     "crisis_mode",
     "disabled",
@@ -559,24 +602,33 @@ GATE_ORDER_STOCK = [
     "below_confidence_threshold",
     # Risk / book gates (~2330-2400)
     "daily_loss_halt",
-    "auto_deleverage",
-    "session_dd_4pct",
+    "auto_deleverage",           # r67: hoisted out of dll-static block
+    "session_dd_4pct",           # r67: hoisted out of dll-static block
     "max_concurrent_cap",
     # Time-of-day filters (~2435-2450)
     "opening_filter",
     "closing_filter",
     # Signal validation (~2470-2520)
     "tf_not_allowed",
+    "signal_stale",              # r67-C: tz-corrected freshness gate
     "missing_levels",
     "bad_t1_geometry",
     "bad_rr",
+    "fat_finger_reject",
+    "stop_too_tight_atr",
+    "stop_too_tight_atr_error",  # r67-D: now fail-closed
+    "gap_open_reject",
+    "gap_open_gate_error",       # r67-D: now fail-closed
+    "illiquid_skip",
+    "liquidity_gate_error",      # r67-D: now fail-closed
     # Per-ticker / per-stock state (~2620-2780)
     "ticker_chop",
+    "setup_quality_score",       # r69: composite (8-gate collapse, default shadow)
     "earnings_gate_error",
     "macro_blackout",
     "macro_blackout_gate_error",
     "strategy_off_regime",
-    "loss_pattern_veto",
+    # r67: loss_pattern_veto + source_mute_* DELETED
     "correlation_cap",
     # Sizing / heat / book caps (~2820-2999)
     "ai_veto",
@@ -586,7 +638,7 @@ GATE_ORDER_STOCK = [
     "leverage_cap",
     "book_var_99",
     # Calibration / overlay / flow (~3050-3370)
-    "r47_credit_cb",
+    "r47_credit_cb",             # r67: simplified to credit-CB veto only (sizing portion deleted)
     "calibration_gate",
     "pre_fomc_quiet_hour",
     "spread_widening",

@@ -6,7 +6,7 @@ not here. Items below are genuinely open with explicit revisit triggers
 or gate conditions. If you can't find a clear "what would unlock this",
 move it to ❌ Rejected.
 
-Last cleaned: 2026-04-29 (post-r57, universe scanner DELETE PASS).
+Last cleaned: 2026-05-01 (post-r69, multi-agent gate audit DELETE PASS).
 
 ---
 
@@ -17,7 +17,7 @@ because they need ≥N closed trades / days of history first.
 
 | Item | Revisit trigger |
 |---|---|
-| **ML scorer graduation** (shadow → 10% live blend) | ≥200 closed trades with shadow predictions logged + AUC > 0.60 + monotonic calibration |
+| **ML scorer graduation** (shadow → 10% live blend) | r68-B shipped the eval pipeline (Brier/ECE/AUC nightly). Promotion = `MLEvalResult.ready_for_promotion = True` (Brier<0.245, ECE<0.05, AUC>0.55, n≥100). Operator flips `cfg.ml_scoring_enabled` after the row turns green. |
 | **LSTM / Transformer ML hybrid** | LightGBM 90+ days at 10% live blend with measurable lift |
 | **SHAP / LIME interpretability** | After ML scorer graduation |
 | **Optuna hyperparam tuning** | After ML scorer graduation |
@@ -41,7 +41,7 @@ that would make them ROI-positive haven't materialized.
 | **Pydantic migration of `consider_signal` internal dicts** | Incremental — pick one signal-consumer at a time. r52f added `PositionResponse`; r52g added `PnLReconciliationResponse`. Next natural slice: AutoTraderConfig response shape. |
 | **`atomic_append_note` migration of 20+ call sites** | Helper added in r53 (`execution_engine.atomic_append_note`). Migration of existing `t.note = (t.note or "") + "..."` sites is mechanical; do it incrementally. |
 | **Full option-premium backtest simulation** | r53 added `strategy_scorecard.asset_type_split` so stock vs option WR is visible. Once `IVHistory` has ≥30 days of capture, wire delta+gamma+theta integration through `_simulate(asset_type='option')`. |
-| **`Signal.strategy` backfill + auto-mute activation** | r53 wired `cfg.source_mute_enabled` (default off). Currently ~70% of trades have null strategy, so the mute can't see them. Backfill via `Signal.strategy = signal_meta['strategy']` migration, then flip the flag. |
+| **`Signal.strategy` backfill + auto-mute activation** | ❌ obsolete: r67 deleted source_mute gate path entirely (column kept for back-compat only). The strategy_multiplier still dampens sizing for poor strategies. |
 | **Validate r55 sub-scanner pools have meaningfully different tickers** | ❌ obsolete: r57 deleted the sub-scanners. |
 | **Tune `entry_1m_gate_mode` after live observation** | r55 default flipped to "relaxed" (2-of-3 majority). If the false-positive rate (= entries that immediately wick out) climbs above pre-r55 baseline, flip back to "strict". |
 | **Run r56 validation scripts after 30 days of data** | `backend/scripts/{analyze_score_divergence,gate_counterfactual,factor_ic_sweep}.py` close the long-standing shadow loops. Run weekly; promote/demote cfg knobs based on output. |
@@ -65,8 +65,10 @@ that would make them ROI-positive haven't materialized.
 | Flip `AI_NEWS_EXIT_MODE: shadow → active` | Same — entry-veto first, news-exit later |
 | Flip `AI_CONFIDENCE_MULT_MODE: shadow → active` | Same path |
 | Promote AI judge call sites from shadow to honored | After reviewing ≥200 decisions in `ai_decision_log` |
-| Promote `cfg.loss_pattern_mode: shadow → active` | After reviewing ≥1 week of `loss_pattern_match_shadow` events in metrics. Endpoint: `GET /api/admin/loss-patterns`. |
-| Promote `cfg.universe_scoring_v2: shadow → active` | After reviewing 5 trading days where score and score_v2 produce different top-N. Endpoint: candidate-pool API now returns both. |
+| ~~Promote `cfg.loss_pattern_mode: shadow → active`~~ | ❌ obsolete (r67): gate path removed from auto_trader; default forced to "off". `loss_pattern_summary` admin endpoint still works as a post-mortem viewer. |
+| ~~Promote `cfg.universe_scoring_v2: shadow → active`~~ | ❌ obsolete (r67): score_v2 had no producer (scanner refactor in r57 dropped the writer); default forced to "off". |
+| Flip `cfg.setup_quality_gate_enabled: false → true` (r69) | After 14 days of shadow-mode where the composite score is recorded alongside the existing 8-gate verdicts in DecisionLog. Compare distributions; if composite ≥55 captures ≥95% of the 8-gate ALLOWs without admitting more losers, flip. |
+| Use `/api/auto/gate-outcomes` to identify deletion candidates (r68-C) | Run weekly. Gates with mean_pnl_pct > 0 and n ≥ 10 are filtering winners — propose deletion in next revision. |
 | Enable additional universe scanners | Set `cfg.universe_scanners_enabled = "breakout,pead,sector_rel,vol_exp"` after evaluating each pool's source attribution in candidate-pool view for ≥30 trades per source. |
 | Enable `cfg.universe_tod_profiles_enabled` | After validating that the bot's existing 4-cron schedule (12/14:30/17/19:30 UTC) aligns with the time-of-day profiles. |
 | Re-run `POST /api/admin/backfill-realized-pl` | r53 fixed the broken sort-key in the BUY-fill matcher. The 3 rows backfilled in r52g (AAPL/SHOP/CRWV) may have matched the wrong fill; re-run idempotently and verify. |

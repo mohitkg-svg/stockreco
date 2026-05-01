@@ -4584,18 +4584,45 @@ function AutoTraderPanel({ reloadToken }) {
                   </label>
                 </div>
 
-                {/* Loss pattern mode select */}
+                {/* r68-A: Equity-snapshot freshness watchdog */}
                 <div>
-                  <label className="text-gray-500 block mb-1 text-xs">Loss-pattern veto mode</label>
-                  <select
-                    value={cfg.loss_pattern_mode ?? 'shadow'}
-                    onChange={e => updateCfg({ loss_pattern_mode: e.target.value })}
-                    className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-sm"
-                  >
-                    <option value="off">off (no veto, no logging)</option>
-                    <option value="shadow">shadow (log but don't veto)</option>
-                    <option value="active">active (veto on fingerprint match)</option>
-                  </select>
+                  <CfgField
+                    label="Equity-snapshot max age (min)"
+                    value={cfg.equity_snapshot_max_age_min ?? 15}
+                    suffix="min"
+                    onCommit={v => updateCfg({ equity_snapshot_max_age_min: Number(v) })} />
+                  <div className="text-[11px] app-text-muted mt-1 leading-snug">
+                    r68-A: Auto-trader rejects new entries during RTH when the
+                    most recent EquitySnapshot row is older than this many
+                    minutes — prevents trading at full size when reconciliation
+                    is wedged and downstream DD/crisis gates would read stale.
+                  </div>
+                </div>
+                {/* r69: Setup-quality composite gate */}
+                <div className="pt-3 border-t app-border-soft">
+                  <div className="text-[11px] uppercase tracking-wide app-text-muted font-semibold mb-2">
+                    r69 — Setup-quality composite (collapses 8 gates → 1)
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <CfgField label="Setup-quality min score"
+                              value={cfg.setup_quality_min ?? 55}
+                              suffix="0-100"
+                              onCommit={v => updateCfg({ setup_quality_min: Number(v) })} />
+                    <label className="flex items-start gap-2 cursor-pointer text-sm">
+                      <input type="checkbox" checked={!!cfg.setup_quality_gate_enabled}
+                             onChange={e => updateCfg({ setup_quality_gate_enabled: e.target.checked })}
+                             className="accent-blue-500 mt-1" />
+                      <span>
+                        <strong>Active mode</strong>
+                        <span className="text-[11px] app-text-muted block">
+                          Reject when score below threshold. Default OFF (shadow only — score logged but doesn't block); flip after 14d of comparing composite vs individual-gate verdicts.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                  <div className="text-[11px] app-text-muted leading-snug mt-2">
+                    Weighted composite over 8 dimensions: confidence-headroom (30%) + R:R net (20%) + T1 geom (10%) + R:R geom (5%) + 1m bar (10%) + liquidity (10%) + ADX (10%) + freshness (5%).
+                  </div>
                 </div>
 
                 {/* Option floor configs (r58 promoted from hardcoded) */}
@@ -4919,11 +4946,182 @@ function TransparencyPanel() {
               onClick={() => setTab('decisions')}
               className={`text-xs px-3 py-1 rounded-md ${tab === 'decisions' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
             >Decision Log</button>
+            <button
+              onClick={() => setTab('outcomes')}
+              className={`text-xs px-3 py-1 rounded-md ${tab === 'outcomes' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
+              title="r68-C: per-gate hindsight P&L over rejected signals (5d forward). Gates with mean > 0 are filtering winners."
+            >Gate Outcomes</button>
+            <button
+              onClick={() => setTab('mleval')}
+              className={`text-xs px-3 py-1 rounded-md ${tab === 'mleval' ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40' : 'app-text-muted hover:app-text-primary'}`}
+              title="r68-B: nightly ML scorer eval (Brier/ECE/AUC). Tells you whether ML is ready for promotion."
+            >ML Eval</button>
           </div>
         )}
       </div>
       {open && tab === 'scanner' && <ScannerRunsTab defs={defs} />}
       {open && tab === 'decisions' && <DecisionLogTab defs={defs} />}
+      {open && tab === 'outcomes' && <GateOutcomesTab defs={defs} />}
+      {open && tab === 'mleval' && <MlEvalTab />}
+    </div>
+  );
+}
+
+function GateOutcomesTab({ defs }) {
+  const [days, setDays] = useState(30);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [recomputing, setRecomputing] = useState(false);
+  const refresh = () => {
+    setLoading(true);
+    api.get(`/api/trading/auto/gate-outcomes?days=${days}`)
+      .then(setData)
+      .catch(() => setData({ rows: [] }))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { refresh(); }, [days]);
+  const recomputeNow = () => {
+    setRecomputing(true);
+    api.post('/api/trading/auto/gate-outcomes/recompute', {})
+      .then(() => refresh())
+      .catch(() => {})
+      .finally(() => setRecomputing(false));
+  };
+  const rows = data?.rows ?? [];
+  return (
+    <div className="space-y-3">
+      <div className="text-[11px] app-text-muted leading-relaxed">
+        For each rejected signal we compute the realized 5-day forward P&amp;L (entry → first stop/target hit, else day-5 close) the trade WOULD have produced. Aggregated per gate. <strong>Gates with mean P&amp;L &gt; 0 (n ≥ 10) are filtering winners and become deletion candidates.</strong>
+      </div>
+      <div className="flex items-center gap-3 text-xs">
+        <label className="app-text-muted">Window:</label>
+        <select value={days} onChange={e => setDays(Number(e.target.value))}
+                className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs">
+          <option value="7">7 days</option>
+          <option value="14">14 days</option>
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+        </select>
+        <button onClick={refresh} disabled={loading}
+                className="px-2 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700">
+          {loading ? '…' : 'Refresh'}
+        </button>
+        <button onClick={recomputeNow} disabled={recomputing}
+                className="px-2 py-1 rounded bg-blue-600/20 border border-blue-500/40 text-blue-300 hover:bg-blue-600/40">
+          {recomputing ? 'Recomputing…' : 'Recompute pending'}
+        </button>
+      </div>
+      {loading ? (
+        <div className="text-xs app-text-muted">Loading…</div>
+      ) : rows.length === 0 ? (
+        <div className="text-xs app-text-muted italic">
+          No gate outcomes yet. Hindsight rows are computed nightly at 04:00 UTC for rejected signals 5-14 days old. Click "Recompute pending" to backfill now.
+        </div>
+      ) : (
+        <table className="w-full text-xs">
+          <thead className="text-[10px] uppercase app-text-muted border-b border-gray-700">
+            <tr>
+              <th className="text-left py-1">Gate</th>
+              <th className="text-right">n rejected</th>
+              <th className="text-right">Mean PnL %</th>
+              <th className="text-right">Median PnL %</th>
+              <th className="text-right">Win rate</th>
+              <th className="text-left pl-3">Verdict</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => {
+              const cls = r.verdict === 'deletion_candidate' ? 'text-red-400'
+                       : r.verdict === 'marginal' ? 'text-amber-400'
+                       : 'app-text-primary';
+              return (
+                <tr key={r.reason} className="border-b border-gray-800/40">
+                  <td className="py-1 font-mono">
+                    <CheckDefinitionTooltip reason={r.reason} source="trader" defs={defs}>
+                      {r.reason}
+                    </CheckDefinitionTooltip>
+                  </td>
+                  <td className="text-right tabular-nums">{r.n}</td>
+                  <td className={`text-right tabular-nums ${r.mean_pnl_pct > 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                    {r.mean_pnl_pct > 0 ? '+' : ''}{r.mean_pnl_pct}%
+                  </td>
+                  <td className="text-right tabular-nums">{r.median_pnl_pct}%</td>
+                  <td className="text-right tabular-nums">{(r.win_rate * 100).toFixed(0)}%</td>
+                  <td className={`pl-3 ${cls}`}>{r.verdict}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function MlEvalTab() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const refresh = () => {
+    setLoading(true);
+    api.get('/api/ml/eval-summary')
+      .then(setData)
+      .catch(() => setData({ error: 'no eval rows yet' }))
+      .finally(() => setLoading(false));
+  };
+  useEffect(() => { refresh(); }, []);
+  const runNow = () => {
+    setRunning(true);
+    api.post('/api/ml/eval-now', {})
+      .then(setData)
+      .catch(() => {})
+      .finally(() => setRunning(false));
+  };
+  return (
+    <div className="space-y-3">
+      <div className="text-[11px] app-text-muted leading-relaxed">
+        r68-B: nightly ML scorer evaluation over the last 60d of closed labels.
+        Promotion thresholds: <strong>Brier &lt; 0.245, ECE &lt; 0.05, AUC &gt; 0.55, n ≥ 100</strong>.
+        When all four hold, <code>ready_for_promotion = true</code> — operator flips <code>cfg.ml_scoring_enabled = True</code>.
+      </div>
+      <div className="flex items-center gap-3 text-xs">
+        <button onClick={refresh} disabled={loading}
+                className="px-2 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700">
+          {loading ? '…' : 'Refresh'}
+        </button>
+        <button onClick={runNow} disabled={running}
+                className="px-2 py-1 rounded bg-blue-600/20 border border-blue-500/40 text-blue-300 hover:bg-blue-600/40">
+          {running ? 'Running…' : 'Run eval now'}
+        </button>
+      </div>
+      {data?.error ? (
+        <div className="text-xs app-text-muted italic">{data.error}. The nightly job runs at 03:30 UTC; click "Run eval now" to compute immediately.</div>
+      ) : data ? (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+          <div className="surface-soft rounded p-3">
+            <div className="text-[10px] uppercase app-text-muted">n closed</div>
+            <div className="text-xl tabular-nums">{data.n ?? '–'}</div>
+          </div>
+          <div className="surface-soft rounded p-3">
+            <div className="text-[10px] uppercase app-text-muted">Brier ↓</div>
+            <div className="text-xl tabular-nums">{data.brier ?? '–'}</div>
+          </div>
+          <div className="surface-soft rounded p-3">
+            <div className="text-[10px] uppercase app-text-muted">ECE ↓</div>
+            <div className="text-xl tabular-nums">{data.ece ?? '–'}</div>
+          </div>
+          <div className="surface-soft rounded p-3">
+            <div className="text-[10px] uppercase app-text-muted">AUC ↑</div>
+            <div className="text-xl tabular-nums">{data.auc ?? '–'}</div>
+          </div>
+          <div className={`col-span-2 md:col-span-4 rounded p-3 border ${data.ready_for_promotion ? 'bg-emerald-600/10 border-emerald-500/40 text-emerald-300' : 'bg-amber-500/10 border-amber-500/40 text-amber-300'}`}>
+            <div className="text-xs">
+              <strong>{data.ready_for_promotion ? '✅ Ready for promotion' : '⏸ Not yet ready'}</strong>
+              <span className="ml-2 app-text-muted">computed_at {data.computed_at}</span>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

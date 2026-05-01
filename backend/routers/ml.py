@@ -107,3 +107,24 @@ def calibration(days: int = Query(14, ge=1, le=180)):
         return {"buckets": out, "n_total": len(rows)}
     finally:
         db.close()
+
+
+@router.get("/eval-summary")
+def eval_summary():
+    """r68-B: latest nightly ML eval result (Brier / ECE / AUC + ready flag).
+    Run automatically at 03:30 UTC by services.ml_eval.evaluate. Returns the
+    most recent persisted row from MLEvalResult, or 404 if eval has never
+    run."""
+    from services import ml_eval
+    out = ml_eval.latest_result()
+    if not out:
+        raise HTTPException(status_code=404, detail="no ml_eval rows yet — wait for nightly run or POST /api/ml/eval-now")
+    return out
+
+
+@router.post("/eval-now")
+def eval_now(days: int = Query(60, ge=7, le=365)):
+    """r68-B: run the ML eval immediately (operator-triggered) instead of
+    waiting for the nightly cron."""
+    from services import ml_eval
+    return ml_eval.evaluate(days=days)

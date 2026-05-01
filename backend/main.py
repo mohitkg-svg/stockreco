@@ -611,6 +611,24 @@ async def lifespan(app: FastAPI):
             id="auto_trader_calibration",
             max_instances=1, coalesce=True, misfire_grace_time=3600,
         )
+        # r68-B: Nightly ML scorer eval (Brier / ECE / AUC).
+        from services import ml_eval as _mle
+        scheduler.add_job(
+            _mle.evaluate,
+            trigger=_Cron(hour=3, minute=30),
+            id="ml_scorer_eval",
+            kwargs={"days": 60},
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
+        # r68-C: Nightly gate-outcome hindsight telemetry.
+        from services import gate_telemetry as _gt
+        scheduler.add_job(
+            _gt.recompute,
+            trigger=_Cron(hour=4, minute=0),
+            id="gate_outcome_telemetry",
+            kwargs={"max_rows": 500},
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+        )
     except Exception as _e:
         logger.warning(f"calibration job not scheduled: {_e}")
     # Analyst ratings refresh, 4×/day. Aligned with universe scanner slots so

@@ -204,27 +204,9 @@ def aggressor_flow_gate(ticker: str, direction: str, threshold: float = 0.30) ->
     return False
 
 
-def tape_acceleration_factor(ticker: str) -> Optional[float]:
-    """Andersen-Bollerslev 1997: trade-rate acceleration = urgency.
-    Returns ratio (last-fifth-of-window trade count) / (prior-four-fifths
-    trade rate). >1.4 = accelerating; <0.7 = decelerating."""
-    try:
-        from services.alpaca_tape import fetch_live_window
-        df = fetch_live_window(ticker, lookback_minutes=5)
-        if df is None or df.empty or len(df) < 30:
-            return None
-        n = len(df)
-        last_fifth = df.tail(n // 5)
-        prior = df.head(n - len(last_fifth))
-        if len(prior) <= 0 or len(last_fifth) <= 0:
-            return None
-        rate_last = len(last_fifth) / max(1, len(last_fifth))
-        rate_prior = len(prior) / max(1, 4 * len(last_fifth))
-        if rate_prior <= 0:
-            return None
-        return rate_last / rate_prior
-    except Exception:
-        return None
+# r67: tape_acceleration_factor deleted — was buggy (rate_last numerator and
+# denominator were identical, always returned 0.25). Dead-code masquerading
+# as a signal. No callers in production code; only the existence test.
 
 
 def vwap_band_reversion_signal(d) -> Optional[Dict[str, Any]]:

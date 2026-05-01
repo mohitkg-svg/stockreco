@@ -203,7 +203,16 @@ Conservative first-month profile. JSON to send:
   "portfolio_max_net_delta_pct": 0.50,       // 50% of equity in net-delta
   "ai_daily_usd_cap": 20.0,                  // alert when ai_cost_today > $20
   "ml_drift_brier_alert_threshold": 0.05,    // alert when live brier vs trained > 0.05
-  "index_inclusion_tickers": ""              // comma-separated tickers eligible for Russell/MSCI nudge
+  "index_inclusion_tickers": "",             // comma-separated tickers eligible for Russell/MSCI nudge
+
+  // ── r68/r69: telemetry + composite knobs ──
+  "equity_snapshot_max_age_min": 15.0,       // r68-A: fail-closed reject during RTH if EquitySnapshot is older
+  "setup_quality_min": 55.0,                 // r69: composite gate threshold (0-100)
+  "setup_quality_gate_enabled": false,       // r69: SHADOW by default — flip after 14d eval
+
+  // ── r67: shadow flags forced to off (per 14-day kill date) ──
+  "loss_pattern_mode": "off",                // r67: gate path REMOVED; column kept for back-compat
+  "universe_scoring_v2": "off"               // r67: had no producer; column kept for back-compat
 }
 ```
 
@@ -245,6 +254,21 @@ data accumulates. Verify each is working:
 
 If any of these don't activate within 1 RTH session of expected
 conditions, that's a "stop the line" event — kill the bot and investigate.
+
+### r67-r69 verification (post-deploy, before flipping `enabled=true`)
+
+| System | Activation requirement | Verification |
+|---|---|---|
+| **r68-A** equity-snapshot watchdog | reconciliation cron writes EquitySnapshot every 5min during RTH | `autotrade_skip{reason=stale_equity_snapshot}` should NEVER increment in healthy state. If it does → reconcile cron is wedged. |
+| **r68-B** ML eval scheduled job | first run at 03:30 UTC | `GET /api/ml/eval-summary` returns a row within 1 day; `POST /api/ml/eval-now` works on demand |
+| **r68-C** Gate-outcome telemetry | first run at 04:00 UTC; needs 5+ days of DecisionLog history | `GET /api/auto/gate-outcomes?days=30` returns rows after first week. Inspect Transparency panel → "Gate Outcomes" tab. |
+| **r69** setup_quality_score (shadow) | every consider_signal evaluation post-deploy | Inspect any DecisionLog row's `gate_log` JSON for a `setup_quality_score` entry with `score`, `parts`, `contributions`. Mode = "shadow" until operator flips. |
+| **r67-A** auto_deleverage hoist | session DD ≥ 4% during RTH while `daily_loss_limit_pct=0` | `autotrade_skip{reason=session_dd_4pct}` increments (was previously disabled when static cap was 0). |
+| **r67-B** NaN confidence reject | malformed signal injected | `autotrade_skip{reason=malformed_signal}` increments instead of silent ValueError. |
+| **r67-C** TZ-aware freshness | non-UTC host with naive timestamp | `autotrade_skip{reason=signal_stale}` no longer fires inappropriately on 1h signals. |
+| **r67-D** fail-closed exception paths | yfinance hiccup | `autotrade_skip{reason=stop_too_tight_atr_error|gap_open_gate_error|liquidity_gate_error}` fires (was silently passing through before). |
+| **r67-E** confidence gate before AI | low-confidence signal (`confidence < threshold`) | AI veto call rate drops on rejected signals. Inspect `ai_decision_log` count per day vs prior baseline. |
+| **r67-F** dormant code deleted | static check | `tape_acceleration_factor` no longer in `services.order_flow`; `loss_pattern_veto` no longer in skip-reason aggregation; `source_mute_*` no longer in skip reasons. |
 
 ---
 

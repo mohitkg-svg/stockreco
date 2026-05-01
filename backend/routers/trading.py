@@ -78,6 +78,11 @@ class AutoTraderConfigRequest(BaseModel):
     option_contract_min_score_aggressive: Optional[float] = Field(None, ge=0, le=200)
     # r60: scanner universe source toggle
     universe_source: Optional[str] = Field(None, pattern="^(russell1000|sp500)$")
+    # r68-A: equity-snapshot freshness watchdog
+    equity_snapshot_max_age_min: Optional[float] = Field(None, ge=1, le=120)
+    # r69: setup-quality composite gate
+    setup_quality_min: Optional[float] = Field(None, ge=0, le=100)
+    setup_quality_gate_enabled: Optional[bool] = None
 
 
 class KillSwitchRequest(BaseModel):
@@ -942,6 +947,30 @@ def auto_check_definitions():
     auto-trader check. UI uses this for tooltips and the legend panel."""
     from services.check_definitions import all_definitions
     return all_definitions()
+
+
+@router.get("/auto/gate-outcomes")
+def auto_gate_outcomes(days: int = 30):
+    """r68-C: per-gate hindsight P&L over rejected signals. Operator's
+    deletion-decision tool — gates whose rejected signals have positive
+    mean P&L over a 5-day forward horizon (n>=10) are filtering winners
+    and become deletion candidates.
+
+    Computed nightly at 04:00 UTC by services.gate_telemetry.recompute.
+    """
+    from services import gate_telemetry as _gt
+    return {
+        "days": days,
+        "rows": _gt.aggregate_by_gate(days=days),
+    }
+
+
+@router.post("/auto/gate-outcomes/recompute")
+def auto_gate_outcomes_recompute(max_rows: int = 500):
+    """r68-C: operator-triggered immediate recompute of pending hindsight
+    rows (instead of waiting for the nightly job)."""
+    from services import gate_telemetry as _gt
+    return _gt.recompute(max_rows=max_rows)
 
 
 @router.get("/auto/candidate-events")

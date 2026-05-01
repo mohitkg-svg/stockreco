@@ -1785,7 +1785,7 @@ class TestR48Backlog(unittest.TestCase):
         for fn in ("update_spread_ema", "spread_widening_defer",
                    "aggressor_flow_imbalance", "aggressor_flow_gate",
                    "detect_block_lean", "detect_sweep",
-                   "tape_acceleration_factor", "vwap_band_reversion_signal",
+                   "vwap_band_reversion_signal",
                    "round_number_proximity_fade", "opening_drive_bias",
                    "quote_stuffing_score"):
             self.assertTrue(hasattr(order_flow, fn), f"missing: {fn}")

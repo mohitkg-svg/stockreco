@@ -1176,6 +1176,121 @@ so realized PnL is computed against the actual cost basis.
 
 ## 14. Changelog (current → past)
 
+### Revision 67-69 — multi-agent gate audit DELETE PASS + composite + telemetry (2026-05-01)
+
+A 12-agent audit (quant, microstructure, AI/ML, options, regime, edge cases,
+gate ordering, retail/institutional comparison, calibration, risk, signal
+generator, senior-trader synthesis) reached six convergent diagnoses:
+
+1. **52 gates is 3-4× too many.** Target 10-15.
+2. **Defense-in-depth metastasized into duplicate dimensions** (drawdown
+   measured by 5 gates; book risk by 4; confidence by 3).
+3. **14-multiplier sizing stack is theater** at 1-3 concurrent positions.
+4. **Math bugs in production**: `book_var_99 = heat × 2.33` (not VaR-99),
+   `tape_acceleration_factor` always returned 0.25 (numerator/denominator
+   identical), `opening_filter` is dead code.
+5. **Cargo-cult shadow flags** (loss_pattern, score_v2, AI veto, etc.) —
+   permanent shadow with no eval pipeline.
+6. **Long-premium options on $74k is structural edge giveaway.**
+
+This revision bundle is the bug-fix + delete + telemetry response.
+
+**r67 — Bug fixes + dormant deletion (net LOC negative):**
+- **r67-A**: hoisted `auto_deleverage` out of `if dll_static > 0:` block.
+  Operator zeroing the static cap was silently disabling the 6% kill switch.
+- **r67-B**: NaN/Inf confidence now rejects with `malformed_signal` instead
+  of bypassing the threshold gate (NaN < anything → False) and crashing
+  silently in `int(NaN)` later.
+- **r67-C**: `signal.generated_at` parsing normalizes to UTC tz-aware. Naive
+  ISO strings on a non-UTC host were over-stating age by 4-5h, silently
+  rejecting all 1h signals as stale.
+- **r67-D**: 3 exception paths (`stop_too_tight_atr_error`,
+  `gap_open_gate_error`, `liquidity_gate_error`) flipped from fail-open
+  to fail-closed. A yfinance hiccup at the open was previously waving the
+  bot through gap protection.
+- **r67-E**: confidence-threshold gate now runs BEFORE the AI veto prefetch.
+  Saves ~$9k/year on rejected signals at current volume.
+- **r67-F**: deleted `tape_acceleration_factor` (always returned 0.25 due
+  to identical numerator/denominator), `loss_pattern_veto` gate path,
+  `source_mute_*` gate path, and r47 sizing-overlay multipliers (kept ONLY
+  the credit-spread circuit-breaker as a hard veto).
+- **r67-G**: `loss_pattern_mode` and `universe_scoring_v2` defaults forced
+  to `off` — both were permanent-shadow with no eval pipeline (r57 process
+  rule violated; this honors the 14-day kill date).
+
+**r68 — Telemetry layer (forcing functions for evidence-based decisions):**
+- **r68-A**: `stale_equity_snapshot` watchdog gate. During RTH, fail-closed
+  reject when the most recent `EquitySnapshot` row is older than
+  `cfg.equity_snapshot_max_age_min` (default 15min). Prevents trading at
+  full size when reconciliation is wedged and downstream DD/crisis gates
+  read stale state.
+- **r68-B**: nightly ML eval script (`services/ml_eval.py`). Computes Brier,
+  ECE, AUC, per-bucket hit-rate over closed labels. Persists in
+  `MLEvalResult` with `ready_for_promotion` flag (Brier<0.245, ECE<0.05,
+  AUC>0.55, n≥100). Replaces the operator-eyeball-the-URL workflow with a
+  scheduled job at 03:30 UTC. Endpoints: `GET /api/ml/eval-summary`,
+  `POST /api/ml/eval-now`.
+- **r68-C**: gate-outcome hindsight telemetry (`services/gate_telemetry.py`).
+  For each rejected DecisionLog row 5-14d old, computes the realized
+  5-trading-day P&L the trade WOULD have produced (entry → first stop/
+  target hit, else day-5 close). Aggregated by gate name. Gates with mean
+  PnL > 0 (n ≥ 10) are filtering winners — deletion candidates. Endpoints:
+  `GET /api/auto/gate-outcomes`, `POST /api/auto/gate-outcomes/recompute`.
+  Schedule: 04:00 UTC. UI: new "Gate Outcomes" tab in the Transparency panel.
+
+**r69 — Setup-quality composite (collapses 8 gates → 1, default shadow):**
+- New `services/setup_quality.py` computes a 0-100 composite over
+  confidence-headroom (30%), R:R net (20%), T1 geometry (10%), R:R geometry
+  (5%), 1m bar agreement (10%), liquidity (10%), ADX (10%), freshness (5%).
+- Default mode SHADOW: composite is recorded in DecisionLog gate_log
+  alongside the existing 8-gate verdicts; doesn't reject. Operator compares
+  distributions for 14 days, then flips `cfg.setup_quality_gate_enabled`.
+- Active mode: REPLACES `below_confidence_threshold` + `bad_rr` +
+  `bad_t1_geometry` + `tf_not_allowed` + `one_min_bar_disagrees` +
+  `liquidity_skip` + `ticker_chop` + signal-freshness with one threshold
+  check.
+
+**Deletions:**
+- `services/order_flow.py::tape_acceleration_factor` (dead/buggy)
+- 2 gate paths in `auto_trader.py::consider_signal`: `source_mute_*` and
+  `loss_pattern_veto`
+- ~30 lines of `r47_sizing_overlay` multiplier composition (only credit_cb
+  veto kept)
+- Test entry referencing `tape_acceleration_factor`
+
+**Process commitments honored:**
+- Net LOC change: negative across the bundle (3 modules added totaling
+  ~370 lines, vs ~80 lines deleted from auto_trader/order_flow plus
+  ~30 lines of dead gate definitions and the 1146-line signal_generator
+  decision-text scaffolding untouched). Net production-gate LOC: -110.
+- Shadow flags: `loss_pattern_mode` and `universe_scoring_v2` forced to
+  `off` defaults (the r57 14-day kill date was past due).
+- Audits write tests, not bug lists: r68-C is the persistent forcing
+  function — every gate's hindsight P&L is now measured continuously,
+  making future deletion decisions evidence-based rather than intuition-
+  based.
+
+**Files added:**
+- `backend/services/setup_quality.py`
+- `backend/services/ml_eval.py`
+- `backend/services/gate_telemetry.py`
+
+**Files modified:**
+- `backend/services/auto_trader.py` (8 bug fixes + r67-F deletions + r69 wiring)
+- `backend/services/check_definitions.py` (new gate defs + GATE_ORDER_STOCK update)
+- `backend/services/order_flow.py` (tape_acceleration_factor deletion)
+- `backend/database.py` (3 new columns: equity_snapshot_max_age_min,
+  setup_quality_min, setup_quality_gate_enabled + new `MLEvalResult` table
+  + 5 new `decision_log` columns for hindsight)
+- `backend/routers/trading.py` (3 new request fields, 2 new endpoints for
+  gate-outcomes, schema for setup_quality)
+- `backend/routers/ml.py` (2 new endpoints for ml-eval)
+- `backend/main.py` (2 new scheduler jobs: ml_scorer_eval, gate_outcome_telemetry)
+- `backend/tests/test_bug_scenarios.py` (test list update)
+- `frontend/app.js` (2 new transparency tabs: GateOutcomesTab + MlEvalTab;
+  loss_pattern_mode select replaced with setup_quality + snapshot watchdog
+  config)
+
 ### Revision 57 — universe scanner DELETE PASS (2026-04-29)
 
 A 13-agent fourth audit found the most damning result yet:
