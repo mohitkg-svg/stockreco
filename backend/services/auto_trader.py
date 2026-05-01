@@ -446,7 +446,9 @@ metrics.inc = _patched_metrics_inc
 
 def _begin_decision(ticker: str, kind: str, signal: Optional[Dict[str, Any]] = None) -> None:
     """Reset the thread-local capture state for a new evaluation.
-    r58: optionally capture signal_view for richer DecisionLog rows."""
+    r63: capture FULL signal levels (entry, stop, target1, R:R, ATR) so
+    the Decision Log audit panel can show the operator exactly what
+    setup was being evaluated when the gate fired."""
     _DECISION_TLS.ticker = (ticker or "").upper()
     _DECISION_TLS.kind = kind  # "stock" | "option"
     _DECISION_TLS.last_skip_reason = None
@@ -454,10 +456,23 @@ def _begin_decision(ticker: str, kind: str, signal: Optional[Dict[str, Any]] = N
     _DECISION_TLS.entered_kind = None  # "call" | "put" | None
     _DECISION_TLS.entered_trade_id = None
     if signal:
+        # r63: keep a richer signal snapshot in TLS — the persist function
+        # will fold this into the details_json column.
         _DECISION_TLS.signal_view = {
             "confidence": signal.get("confidence"),
+            "signal_type": signal.get("signal_type"),
             "timeframe": signal.get("timeframe"),
             "strategy": signal.get("strategy"),
+            "entry": signal.get("entry"),
+            "stop_loss": signal.get("stop_loss"),
+            "target1": signal.get("target1"),
+            "target2": signal.get("target2"),
+            "target3": signal.get("target3"),
+            "atr": signal.get("atr"),
+            "rvol": signal.get("rvol"),
+            "rs_20d": signal.get("rs_20d"),
+            "adx": signal.get("adx"),
+            "sector": signal.get("sector"),
         }
     else:
         _DECISION_TLS.signal_view = None
@@ -579,9 +594,58 @@ def _persist_decision() -> None:
         # r58 transparency: also append to DecisionLog so the Decision
         # Transparency UI can show every per-ticker evaluation, not
         # just the latest verdict on tickers in the candidate_pool.
+        # r63: build a rich `details_json` blob with signal levels +
+        # market context + the full check_definition for the failing
+        # gate, so the UI can render a per-row audit panel.
         try:
+            import json as _json_dl
             from database import SessionLocal as _SL_dl, DecisionLog as _DL
             sig_view = getattr(_DECISION_TLS, "signal_view", None) or {}
+            # Compute R:R if we have the levels (helpful for the audit UI)
+            rr_net = None
+            try:
+                e = sig_view.get("entry")
+                s = sig_view.get("stop_loss")
+                t1 = sig_view.get("target1")
+                if e and s and t1 and (e - s) > 0:
+                    # 12 bps round-trip cost approximation matches consider_signal
+                    rr_net = round((t1 - e - 0.0012 * e) / (e - s), 3)
+            except Exception:
+                pass
+            # Resolve the human-friendly definition for the failing reason.
+            check_def = None
+            if reason:
+                try:
+                    from services.check_definitions import lookup as _ck_lookup
+                    check_def = _ck_lookup(reason, source="trader")
+                except Exception:
+                    pass
+            # Snapshot context (equity, regime, open trades) for the audit panel.
+            ctx = {}
+            try:
+                from services import paper_trader as _pt_ctx
+                from services.regime_router import classify_regime as _cr_ctx
+                acct = _pt_ctx.get_account()
+                if acct:
+                    ctx["equity"] = float(acct.get("equity") or 0)
+                    ctx["buying_power"] = float(acct.get("buying_power") or 0)
+                ctx["open_trades"] = count_open_auto_trades()
+                try:
+                    ctx["regime"] = _cr_ctx()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            details = {
+                "ticker": ticker,
+                "kind": kind,
+                "decision": decision,
+                "reason": reason,
+                "signal": {k: v for k, v in sig_view.items() if v is not None},
+                "rr_net": rr_net,
+                "context": ctx,
+                "check_definition": check_def,
+            }
             _db_dl = _SL_dl()
             try:
                 _db_dl.add(_DL(
@@ -596,6 +660,7 @@ def _persist_decision() -> None:
                     timeframe=sig_view.get("timeframe"),
                     strategy=sig_view.get("strategy"),
                     trade_id=getattr(_DECISION_TLS, "entered_trade_id", None),
+                    details_json=_json_dl.dumps(details, default=str),
                 ))
                 _db_dl.commit()
             finally:

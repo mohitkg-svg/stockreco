@@ -4984,12 +4984,186 @@ function ScanRunDetail({ detail, defs }) {
   );
 }
 
+// r63: per-decision audit panel — full breakdown of signal, gate that
+// fired, definition, context. Replaces the brief tooltip with a
+// stickier, more comprehensive view.
+function DecisionDetail({ row, defs }) {
+  const d = row.details || {};
+  const sig = d.signal || {};
+  const ctx = d.context || {};
+  const check = d.check_definition || (() => {
+    if (!row.reason || !defs) return null;
+    if (defs.trader?.[row.reason]) return defs.trader[row.reason];
+    if (row.reason.startsWith('bear_conf_')) return defs.families?.['bear_conf_*_below_*'];
+    if (row.reason.startsWith('bull_conf_')) return defs.families?.['bull_conf_*_below_*'];
+    if (row.reason.startsWith('source_mute_')) return defs.families?.['source_mute_*'];
+    return null;
+  })();
+  const decisionMeaning = (() => {
+    const dec = row.decision || '';
+    if (dec === 'entered' || dec.startsWith('entered_')) {
+      const opt = dec.replace('entered_', '');
+      return {
+        label: '✅ ENTERED',
+        cls: 'text-emerald-400',
+        what: opt && opt !== 'entered'
+          ? `An option ${opt}-play order was submitted to Alpaca for this ticker.`
+          : 'A stock long order was submitted to Alpaca for this ticker.',
+      };
+    }
+    if (dec === 'skipped') {
+      return {
+        label: '⛔ SKIPPED',
+        cls: 'text-amber-300',
+        what: 'A signal was generated but at least one gate in the entry pipeline rejected it. The reason below names the dominant gate that fired first.',
+      };
+    }
+    if (dec === 'no_signal') {
+      return {
+        label: '⚪ NO SIGNAL',
+        cls: 'app-text-muted',
+        what: 'signal_generator did not produce a tradable signal on this timeframe — the indicator stack came back NEUTRAL/HOLD or with insufficient evidence. No gate even ran. Most timeframes in any given pass produce no_signal — this is normal.',
+      };
+    }
+    if (dec === 'error') {
+      return {
+        label: '❌ ERROR',
+        cls: 'text-red-400',
+        what: 'An exception was raised mid-evaluation. Check the logs for the underlying error.',
+      };
+    }
+    return { label: dec, cls: '', what: '—' };
+  })();
+  const sigEntries = Object.entries(sig).filter(([_, v]) => v !== null && v !== undefined);
+  const ctxEntries = Object.entries(ctx).filter(([_, v]) => v !== null && v !== undefined);
+  return (
+    <div className="surface-soft rounded-md p-3 space-y-3 text-xs">
+      {/* Decision summary */}
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold mb-1">
+            Decision for {row.ticker} ({row.kind})
+          </div>
+          <div className={`text-base font-bold ${decisionMeaning.cls}`}>{decisionMeaning.label}</div>
+          <div className="app-text-secondary leading-relaxed mt-1 max-w-2xl">
+            {decisionMeaning.what}
+          </div>
+        </div>
+        <div className="text-right text-[10px] app-text-muted">
+          {row.ts ? new Date(row.ts).toLocaleString() : '—'}
+        </div>
+      </div>
+
+      {/* Signal data */}
+      {sigEntries.length > 0 && (
+        <div className="border-t app-border-soft pt-2">
+          <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold mb-1">
+            Signal data
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-x-4 gap-y-1">
+            {sigEntries.map(([k, v]) => {
+              const fmt = (val) => {
+                if (typeof val === 'number') {
+                  if (k === 'confidence') return val.toFixed(0);
+                  if (k.startsWith('rs_') || k === 'rvol' || k === 'adx' || k === 'atr') return val.toFixed(3);
+                  if (k === 'entry' || k.startsWith('stop') || k.startsWith('target')) return `$${val.toFixed(2)}`;
+                  return val;
+                }
+                return String(val);
+              };
+              return (
+                <div key={k} className="flex justify-between gap-2">
+                  <span className="app-text-muted">{k}:</span>
+                  <span className="font-mono">{fmt(v)}</span>
+                </div>
+              );
+            })}
+            {d.rr_net !== null && d.rr_net !== undefined && (
+              <div className="flex justify-between gap-2">
+                <span className="app-text-muted" title="Net (target - entry - costs) / (entry - stop). Floor is cfg.rr_min (default 1.3).">R:R (net):</span>
+                <span className="font-mono">{Number(d.rr_net).toFixed(2)}:1</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Reason / failing gate (if skipped) */}
+      {row.decision === 'skipped' && row.reason && (
+        <div className="border-t app-border-soft pt-2">
+          <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold mb-1">
+            Failing gate
+          </div>
+          <div className="font-mono text-amber-300 mb-1">{row.reason}</div>
+          {check && (
+            <div className="space-y-1 app-text-secondary">
+              <div><strong>Title:</strong> {check.title}</div>
+              <div><strong>What it does:</strong> {check.what}</div>
+              <div><strong>Why it exists:</strong> {check.why}</div>
+              <div><strong>How to fix:</strong> <span className="text-emerald-300">{check.fix}</span></div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Context snapshot */}
+      {ctxEntries.length > 0 && (
+        <div className="border-t app-border-soft pt-2">
+          <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold mb-1">
+            Market context (at decision time)
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-1">
+            {ctxEntries.map(([k, v]) => {
+              const fmt = (val) => {
+                if (typeof val === 'number') {
+                  if (k === 'equity' || k === 'buying_power') return `$${val.toFixed(0)}`;
+                  return val;
+                }
+                return String(val);
+              };
+              return (
+                <div key={k} className="flex justify-between gap-2">
+                  <span className="app-text-muted">{k}:</span>
+                  <span className="font-mono">{fmt(v)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Gate-stack overview */}
+      <div className="border-t app-border-soft pt-2">
+        <details>
+          <summary className="cursor-pointer text-[10px] app-text-muted uppercase tracking-wider font-semibold hover:app-text-primary">
+            All gates this kind of evaluation could hit (~52)
+          </summary>
+          <div className="mt-2 space-y-0.5 app-text-secondary text-[11px]">
+            {defs?.trader && Object.entries(defs.trader).map(([name, def]) => {
+              const isFailing = name === row.reason;
+              return (
+                <div key={name} className={isFailing ? 'text-amber-300 font-semibold' : ''}>
+                  <span className="font-mono mr-2">
+                    {isFailing ? '⛔' : '·'} {name}
+                  </span>
+                  <span className="app-text-muted">— {def.title}</span>
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+}
+
 function DecisionLogTab({ defs }) {
   const [rows, setRows] = useState([]);
   const [tickerFilter, setTickerFilter] = useState('');
   const [decisionFilter, setDecisionFilter] = useState('');
   const [loading, setLoading] = useState(false);
   const [lastLoadAt, setLastLoadAt] = useState(null);
+  const [expandedId, setExpandedId] = useState(null);
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -5016,8 +5190,9 @@ function DecisionLogTab({ defs }) {
       <div className="text-[11px] app-text-muted leading-relaxed mb-2 flex items-center justify-between flex-wrap gap-2">
         <span>
           Each row = one consider_signal / consider_call_play / consider_put_play evaluation.
-          Filter by ticker (e.g., AAPL) or decision (entered / skipped). Hover any reason for a definition.
-          Auto-refreshes every 15s.
+          <strong className="app-text-primary"> Click any row</strong> to expand the full audit:
+          signal data, failing gate with definition (what / why / how-to-fix), market context,
+          and the complete gate-stack overview. Auto-refreshes every 15s.
         </span>
         {lastLoadAt && (
           <span className="text-[10px] font-mono">
@@ -5074,8 +5249,14 @@ function DecisionLogTab({ defs }) {
             </thead>
             <tbody className="font-mono">
               {rows.map(r => (
-                <tr key={r.id} className="border-b app-border-soft/40">
+                <React.Fragment key={r.id}>
+                <tr
+                  onClick={() => setExpandedId(id => id === r.id ? null : r.id)}
+                  className="border-b app-border-soft/40 cursor-pointer hover:bg-white/5"
+                  title="Click for full per-decision audit (signal data, failing gate, definition, context)"
+                >
                   <td className="py-1 pr-2 app-text-muted">
+                    <span className="inline-block w-3 mr-1">{expandedId === r.id ? '▼' : '▶'}</span>
                     {r.ts ? new Date(r.ts).toLocaleTimeString() : '—'}
                   </td>
                   <td className="pr-2"><strong>{r.ticker}</strong></td>
@@ -5084,11 +5265,7 @@ function DecisionLogTab({ defs }) {
                     {r.decision}
                   </td>
                   <td className="pr-2 text-amber-300">
-                    {r.reason ? (
-                      <CheckDefinitionTooltip reason={r.reason} source="trader" defs={defs}>
-                        {r.reason}
-                      </CheckDefinitionTooltip>
-                    ) : <span className="app-text-muted">—</span>}
+                    {r.reason ? r.reason : <span className="app-text-muted">—</span>}
                   </td>
                   <td className="pr-2 app-text-secondary">
                     {r.confidence != null ? Number(r.confidence).toFixed(0) : '—'}
@@ -5098,6 +5275,14 @@ function DecisionLogTab({ defs }) {
                     {r.strategy ?? '—'}
                   </td>
                 </tr>
+                {expandedId === r.id && (
+                  <tr className="border-b app-border-soft/40">
+                    <td colSpan={8} className="py-2 px-2 bg-white/3">
+                      <DecisionDetail row={r} defs={defs} />
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
               ))}
             </tbody>
           </table>

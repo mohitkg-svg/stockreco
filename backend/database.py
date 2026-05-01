@@ -567,6 +567,11 @@ class DecisionLog(Base):
     strategy = Column(String, nullable=True)
     # Optional FK-ish reference to the AutoTrade that resulted (when entered).
     trade_id = Column(Integer, nullable=True, index=True)
+    # r63: rich per-decision audit. JSON blob with signal levels (entry,
+    # stop, target1, R:R, ATR), context snapshot (equity, open_trades,
+    # regime, in_blackout), and the check_definition for the dominant
+    # reason. Lets the Decision Log UI render a full per-row audit panel.
+    details_json = Column(Text, nullable=True)
 
 
 class BestStrategyPerTicker(Base):
@@ -1163,6 +1168,8 @@ def create_tables():
     _ensure_column("auto_trader_config", "option_contract_min_score_aggressive", "DOUBLE PRECISION DEFAULT 55.0")
     # r60: universe-source toggle (russell1000 | sp500)
     _ensure_column("auto_trader_config", "universe_source", "VARCHAR DEFAULT 'russell1000'")
+    # r63: DecisionLog rich audit JSON (signal + context + definition)
+    _ensure_column("decision_log", "details_json", "TEXT")
     _ensure_column("auto_trader_config", "loss_pattern_mode", "VARCHAR DEFAULT 'shadow'")
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")

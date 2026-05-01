@@ -909,18 +909,29 @@ def auto_decision_log(limit: int = 100, ticker: Optional[str] = None,
         if decision:
             q = q.filter(DecisionLog.decision == decision)
         rows = q.order_by(DecisionLog.ts.desc()).limit(int(limit)).all()
-        return [{
-            "id": r.id,
-            "ts": r.ts.isoformat() if r.ts else None,
-            "ticker": r.ticker,
-            "kind": r.kind,
-            "decision": r.decision,
-            "reason": r.reason,
-            "confidence": r.confidence,
-            "timeframe": r.timeframe,
-            "strategy": r.strategy,
-            "trade_id": r.trade_id,
-        } for r in rows]
+        import json as _json_dl
+        out = []
+        for r in rows:
+            details = None
+            if r.details_json:
+                try:
+                    details = _json_dl.loads(r.details_json)
+                except Exception:
+                    details = None
+            out.append({
+                "id": r.id,
+                "ts": r.ts.isoformat() if r.ts else None,
+                "ticker": r.ticker,
+                "kind": r.kind,
+                "decision": r.decision,
+                "reason": r.reason,
+                "confidence": r.confidence,
+                "timeframe": r.timeframe,
+                "strategy": r.strategy,
+                "trade_id": r.trade_id,
+                "details": details,
+            })
+        return out
     finally:
         db.close()
 
