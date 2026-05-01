@@ -5132,27 +5132,99 @@ function DecisionDetail({ row, defs }) {
         </div>
       )}
 
-      {/* Gate-stack overview */}
+      {/* Confidence breakdown (r64) — show WHY confidence was X */}
+      {sig.reasoning && (
+        <div className="border-t app-border-soft pt-2">
+          <div className="text-[10px] app-text-muted uppercase tracking-wider font-semibold mb-1">
+            How signal_generator arrived at confidence={sig.confidence}
+          </div>
+          <div className="text-[11px] app-text-secondary leading-relaxed">
+            signal_generator runs ~50 weighted contributors (indicator stack,
+            patterns, S/R levels, RVOL/RS/ADX, fundamentals, sector breadth,
+            ML, news/sentiment). Each fires a ✅/❌/⚠️ contributor below; the
+            net evidence is mapped to a base confidence, then multiplied by
+            up to 14 regime-aware factors (clamped to 0.7-1.4×).
+          </div>
+          <div className="mt-2 max-h-[200px] overflow-y-auto bg-white/3 rounded p-2 border app-border-soft">
+            <pre className="text-[10px] leading-relaxed whitespace-pre-wrap font-mono">
+              {sig.reasoning}
+            </pre>
+          </div>
+        </div>
+      )}
+
+      {/* Gate-stack with proper passed/failed/not-run distinction (r64) */}
       <div className="border-t app-border-soft pt-2">
         <details>
           <summary className="cursor-pointer text-[10px] app-text-muted uppercase tracking-wider font-semibold hover:app-text-primary">
-            All gates this kind of evaluation could hit (~52)
+            Gate sequence ({row.kind === 'stock' ? 'consider_signal' : row.kind === 'option_put' ? 'consider_put_play' : row.kind === 'option_call' ? 'consider_call_play' : 'consider_event'}) — order matters: short-circuits at first reject
           </summary>
-          <div className="mt-2 space-y-0.5 app-text-secondary text-[11px]">
-            {defs?.trader && Object.entries(defs.trader).map(([name, def]) => {
-              const isFailing = name === row.reason;
-              return (
-                <div key={name} className={isFailing ? 'text-amber-300 font-semibold' : ''}>
-                  <span className="font-mono mr-2">
-                    {isFailing ? '⛔' : '·'} {name}
-                  </span>
-                  <span className="app-text-muted">— {def.title}</span>
-                </div>
-              );
-            })}
-          </div>
+          <GateSequence row={row} defs={defs} />
         </details>
       </div>
+    </div>
+  );
+}
+
+function GateSequence({ row, defs }) {
+  // Resolve canonical gate order from definitions endpoint.
+  const orderKey = row.kind === 'stock' ? 'stock'
+                  : row.kind === 'option_call' ? 'option_call'
+                  : 'option_put';
+  const order = defs?.gate_order?.[orderKey] || [];
+  const reason = row.reason;
+  // Find the index of the failing gate in the canonical order. Note
+  // parametrized reasons (bear_conf_X_below_Y) get matched against the
+  // family wildcard.
+  let failIdx = -1;
+  for (let i = 0; i < order.length; i++) {
+    const g = order[i];
+    if (g === reason) { failIdx = i; break; }
+    if (g.includes('*') && reason && reason.startsWith(g.split('*')[0])) {
+      failIdx = i; break;
+    }
+  }
+  const resolveDef = (g) => {
+    if (defs?.trader?.[g]) return defs.trader[g];
+    if (g.includes('*')) return defs?.families?.[g];
+    return null;
+  };
+  const decisionEntered = (row.decision || '').startsWith('entered');
+  return (
+    <div className="mt-2 space-y-0.5 app-text-secondary text-[11px]">
+      <div className="text-[10px] app-text-muted mb-1">
+        ✅ passed (gate ran and didn't reject) · ⛔ FAILED (the gate that fired) · ⚪ not evaluated (short-circuited)
+      </div>
+      {order.map((g, i) => {
+        const def = resolveDef(g);
+        let icon, cls;
+        if (decisionEntered) {
+          // Entered → all gates passed
+          icon = '✅'; cls = 'text-emerald-400/70';
+        } else if (failIdx === -1) {
+          // Reason not matched in canonical order — show all neutral
+          icon = '·'; cls = 'app-text-muted';
+        } else if (i < failIdx) {
+          icon = '✅'; cls = 'text-emerald-400/70';
+        } else if (i === failIdx) {
+          icon = '⛔'; cls = 'text-amber-300 font-semibold';
+        } else {
+          icon = '⚪'; cls = 'app-text-muted opacity-60';
+        }
+        return (
+          <div key={g} className={cls}>
+            <span className="font-mono mr-2 inline-block w-4">{icon}</span>
+            <span className="font-mono mr-2">{g}</span>
+            {def && <span className="app-text-muted">— {def.title}</span>}
+          </div>
+        );
+      })}
+      {failIdx === -1 && reason && (
+        <div className="mt-2 text-[10px] app-text-muted italic">
+          Note: reason "{reason}" isn't in the canonical stock-gate order list.
+          May be a parametrized family or a route-specific gate (option side, manage loop, etc).
+        </div>
+      )}
     </div>
   );
 }

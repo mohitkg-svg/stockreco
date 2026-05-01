@@ -456,8 +456,11 @@ def _begin_decision(ticker: str, kind: str, signal: Optional[Dict[str, Any]] = N
     _DECISION_TLS.entered_kind = None  # "call" | "put" | None
     _DECISION_TLS.entered_trade_id = None
     if signal:
-        # r63: keep a richer signal snapshot in TLS — the persist function
-        # will fold this into the details_json column.
+        # r63/r64: keep a richer signal snapshot in TLS — the persist
+        # function folds this into details_json. r64: also capture
+        # `reasoning` (the multi-line breakdown of which contributors
+        # fired and at what weight) so the UI audit panel can show how
+        # signal_generator arrived at the confidence score.
         _DECISION_TLS.signal_view = {
             "confidence": signal.get("confidence"),
             "signal_type": signal.get("signal_type"),
@@ -473,6 +476,10 @@ def _begin_decision(ticker: str, kind: str, signal: Optional[Dict[str, Any]] = N
             "rs_20d": signal.get("rs_20d"),
             "adx": signal.get("adx"),
             "sector": signal.get("sector"),
+            # r64: confidence-breakdown text — newline-joined contributors
+            # like "✅ Price above SMA200 (long-term uptrend)\n🤖 ML P(win)=0.62 (×1.05)\n..."
+            "reasoning": signal.get("reasoning"),
+            "patterns": signal.get("patterns"),
         }
     else:
         _DECISION_TLS.signal_view = None

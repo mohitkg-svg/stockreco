@@ -533,6 +533,116 @@ def lookup(reason: str, source: str = "trader") -> Dict[str, Any]:
     return _autotrade_event_check(reason)
 
 
+# r64: canonical gate ORDER for each evaluation kind. consider_signal
+# (stock) fires gates top-down and short-circuits at the first reject.
+# The Decision Log audit panel uses this list to render ✅ (passed
+# BEFORE the failing gate), ⛔ (the failing gate), ⚪ (didn't run because
+# of short-circuit AFTER the failing gate).
+GATE_ORDER_STOCK = [
+    # Pre-flight state (auto-trader.py:2090-2298)
+    "malformed_signal",
+    "bp_breaker",
+    "broker_down",
+    "account_blocked",
+    "pdt_lockout",
+    "db_down",
+    "non_buy_signal",            # signal_type != BUY
+    "one_min_bar_disagrees",     # 1m bar gate
+    "entry_lock_timeout",
+    "advisory_lock_held",
+    "trading_frozen",
+    "crisis_mode",
+    "disabled",
+    "killed",
+    "pdt_limit",
+    "broker_not_enabled",
+    "below_confidence_threshold",
+    # Risk / book gates (~2330-2400)
+    "daily_loss_halt",
+    "auto_deleverage",
+    "session_dd_4pct",
+    "max_concurrent_cap",
+    # Time-of-day filters (~2435-2450)
+    "opening_filter",
+    "closing_filter",
+    # Signal validation (~2470-2520)
+    "tf_not_allowed",
+    "missing_levels",
+    "bad_t1_geometry",
+    "bad_rr",
+    # Per-ticker / per-stock state (~2620-2780)
+    "ticker_chop",
+    "earnings_gate_error",
+    "macro_blackout",
+    "macro_blackout_gate_error",
+    "strategy_off_regime",
+    "loss_pattern_veto",
+    "correlation_cap",
+    # Sizing / heat / book caps (~2820-2999)
+    "ai_veto",
+    "adaptive_zero",
+    "account_drawdown",
+    "earnings_cluster",
+    "leverage_cap",
+    "book_var_99",
+    # Calibration / overlay / flow (~3050-3370)
+    "r47_credit_cb",
+    "calibration_gate",
+    "pre_fomc_quiet_hour",
+    "spread_widening",
+    "aggressor_flow",
+    "halt_suspect",
+    "idempotency_conflict",
+]
+GATE_ORDER_OPTION_PUT = [
+    "malformed_signal",
+    "bp_breaker",
+    "broker_down",
+    "account_blocked",
+    "pdt_lockout",
+    "db_down",
+    "no_bear_thesis",
+    "bear_conf_*_below_*",        # parametrized family
+    "iv_rank_graded_veto",
+    "iv_crush_sidestep",
+    "macro_blackout",
+    "earnings_gate_error",
+    "leverage_cap",
+    "book_var_99",
+    "portfolio_greeks_cap",
+    "option_slippage_abandon",
+    "idempotency_conflict",
+]
+GATE_ORDER_OPTION_CALL = [
+    "malformed_signal",
+    "bp_breaker",
+    "broker_down",
+    "account_blocked",
+    "pdt_lockout",
+    "db_down",
+    "no_bull_thesis",
+    "bull_conf_*_below_*",
+    "iv_rank_graded_veto",
+    "iv_crush_sidestep",
+    "macro_blackout",
+    "earnings_gate_error",
+    "leverage_cap",
+    "book_var_99",
+    "portfolio_greeks_cap",
+    "option_slippage_abandon",
+    "idempotency_conflict",
+]
+
+
+def gate_order_for(kind: str) -> list:
+    """Return the canonical gate firing order for a given decision kind."""
+    if kind in ("option_put", "option"):
+        return GATE_ORDER_OPTION_PUT
+    if kind == "option_call":
+        return GATE_ORDER_OPTION_CALL
+    return GATE_ORDER_STOCK
+
+
 def all_definitions() -> Dict[str, Any]:
     """Return everything as JSON for the UI to render tooltips."""
     return {
@@ -542,5 +652,11 @@ def all_definitions() -> Dict[str, Any]:
             "bear_conf_*_below_*": _bear_conf("bear_conf_X_below_Y"),
             "bull_conf_*_below_*": _bull_conf("bull_conf_X_below_Y"),
             "source_mute_*": _source_mute("source_mute_<strategy>"),
+        },
+        # r64: canonical gate firing order per decision kind.
+        "gate_order": {
+            "stock": GATE_ORDER_STOCK,
+            "option_put": GATE_ORDER_OPTION_PUT,
+            "option_call": GATE_ORDER_OPTION_CALL,
         },
     }
