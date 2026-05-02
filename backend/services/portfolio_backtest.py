@@ -302,15 +302,6 @@ def run_portfolio_backtest(
     per_sector_exposure_max: Dict[str, int] = {}
 
     for d in dates:
-        # Mark open positions to market at today's close for equity tracking
-        todays_unrealized = 0.0
-        for tr in open_trades:
-            df = data.get(tr.ticker)
-            if df is None or d not in df.index:
-                continue
-            close = float(df["Close"].at[d])
-            todays_unrealized += (close - tr.entry_price) * tr.shares * (1 if tr.direction == "BUY" else -1)
-
         # Close-out check: did any open trades hit target/stop today?
         # Overnight-gap modeling: if today's OPEN gapped through the stop (or
         # target), the realistic fill was at the OPEN, not the stop price. In
@@ -468,6 +459,17 @@ def run_portfolio_backtest(
                     sum(1 for t in open_trades if (t.sector or "?") == sector)
                 )
 
+        # Mark remaining open positions to market AFTER close-outs and new
+        # entries. Counting trades that closed today here would double-count
+        # them — their P&L is already in `equity` via line ~377 (closed_trades
+        # path). Only positions still open at end-of-day belong in unrealized.
+        todays_unrealized = 0.0
+        for tr in open_trades:
+            df = data.get(tr.ticker)
+            if df is None or d not in df.index:
+                continue
+            close = float(df["Close"].at[d])
+            todays_unrealized += (close - tr.entry_price) * tr.shares * (1 if tr.direction == "BUY" else -1)
         equity_curve.append((d.strftime("%Y-%m-%d"), round(equity + todays_unrealized, 2)))
 
     # Compute stats

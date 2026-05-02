@@ -45,6 +45,56 @@ _BAD_THRESHOLD = -30.0
 _STRONG_BAD_THRESHOLD = -50.0
 
 
+# Yahoo-blocked-egress fallback: ~60 of the most actively-traded US tickers
+# mapped to GICS sector. Used only when yfinance returns nothing (Cloud Run
+# IPs are routinely blocked by Yahoo). Keeps `_sector_of()` non-null for the
+# sector-concentration cap. Replace this with a proper paid fundamentals API
+# (FMP/Polygon/AlphaVantage) and delete the fallback when ready.
+_SECTOR_FALLBACK: Dict[str, str] = {
+    # Technology
+    "AAPL": "Technology", "MSFT": "Technology", "NVDA": "Technology",
+    "GOOGL": "Technology", "GOOG": "Technology", "META": "Technology",
+    "AMD": "Technology", "AVGO": "Technology", "ORCL": "Technology",
+    "CRM": "Technology", "ADBE": "Technology", "INTC": "Technology",
+    "QCOM": "Technology", "CSCO": "Technology", "IBM": "Technology",
+    "TXN": "Technology", "MU": "Technology", "NOW": "Technology",
+    # Communication Services
+    "NFLX": "Communication Services", "DIS": "Communication Services",
+    "TMUS": "Communication Services", "CMCSA": "Communication Services",
+    # Consumer Discretionary
+    "AMZN": "Consumer Discretionary", "TSLA": "Consumer Discretionary",
+    "HD": "Consumer Discretionary", "MCD": "Consumer Discretionary",
+    "NKE": "Consumer Discretionary", "LOW": "Consumer Discretionary",
+    "SBUX": "Consumer Discretionary", "BKNG": "Consumer Discretionary",
+    # Consumer Staples
+    "WMT": "Consumer Staples", "COST": "Consumer Staples",
+    "PG": "Consumer Staples", "KO": "Consumer Staples",
+    "PEP": "Consumer Staples", "MO": "Consumer Staples",
+    # Financial Services
+    "JPM": "Financial Services", "BAC": "Financial Services",
+    "WFC": "Financial Services", "GS": "Financial Services",
+    "MS": "Financial Services", "C": "Financial Services",
+    "BLK": "Financial Services", "AXP": "Financial Services",
+    "V": "Financial Services", "MA": "Financial Services",
+    "SCHW": "Financial Services", "BRK-B": "Financial Services",
+    # Healthcare
+    "UNH": "Healthcare", "JNJ": "Healthcare", "LLY": "Healthcare",
+    "PFE": "Healthcare", "MRK": "Healthcare", "ABBV": "Healthcare",
+    "TMO": "Healthcare", "ABT": "Healthcare", "DHR": "Healthcare",
+    "BMY": "Healthcare", "AMGN": "Healthcare", "GILD": "Healthcare",
+    # Energy
+    "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
+    "SLB": "Energy", "EOG": "Energy",
+    # Industrials
+    "BA": "Industrials", "CAT": "Industrials", "HON": "Industrials",
+    "UPS": "Industrials", "GE": "Industrials", "RTX": "Industrials",
+    # Real Estate / Utilities / Materials
+    "AMT": "Real Estate", "PLD": "Real Estate",
+    "NEE": "Utilities", "DUK": "Utilities", "SO": "Utilities",
+    "LIN": "Materials", "FCX": "Materials",
+}
+
+
 # Fields that contribute to the change-detection hash. Excludes the
 # computed quality_score (derives from these) and the timestamps.
 _HASH_FIELDS = (
@@ -70,15 +120,26 @@ def _safe(v) -> Optional[float]:
 
 
 def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
-    """Pull fundamentals for a single ticker via yfinance."""
+    """Pull fundamentals for a single ticker via yfinance.
+
+    Cloud egress workaround: yfinance hits Yahoo Finance, which aggressively
+    rate-limits/blocks GCP/AWS IPs. When the .info call returns empty (or
+    raises), fall back to a static sector dict for known mega-caps so the
+    portfolio backtester's per-sector cap stays meaningful. Numeric fields
+    stay None — the quality_score multiplier degrades to neutral, but
+    sector concentration enforcement keeps working.
+    """
+    info: Dict[str, Any] = {}
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info or {}
     except Exception as e:
         logger.debug(f"fundamentals: yf.Ticker({ticker}) failed: {e}")
-        return None
     if not info:
-        return None
+        fallback_sector = _SECTOR_FALLBACK.get(ticker.upper())
+        if fallback_sector is None:
+            return None
+        info = {"sector": fallback_sector}
     # yfinance keys are inconsistent; pull both common spellings.
     return {
         "ticker": ticker.upper(),
