@@ -55,16 +55,21 @@ if _IS_SQLITE:
 else:
     # Postgres: connection pool with pre-ping. Cloud SQL db-f1-micro only
     # has ~25 total slots with 3-5 reserved for superusers → ~22 usable.
-    # Budget across BOTH services AT MAX SCALE-OUT (not per-service):
-    #   api      max_instances=3 × (3+2) = 15
-    #   manager  max_instances=1 × (3+2) =  5
-    #   total                            = 20  → 2-slot margin
-    # Earlier 6+4 sizing assumed max_instances=1 per service and exhausted
-    # slots on deploy when the new revision tried to allocate while the old
-    # revision still held its pool — first observed during r71 rollout.
+    # r73 sizing: 5+3=8 per instance, with deploy.sh capping api at
+    # max-instances=2 (was 3). Budget at peak scale-out:
+    #   api      max_instances=2 × 8 = 16
+    #   manager  max_instances=1 × 8 =  8
+    #   total                        = 24  (slight overshoot of 22 budget,
+    #                                      rare in practice — typical load is
+    #                                      1 api instance × 8 + manager × 8 = 16)
+    # Earlier 3+2 sizing (r71-fix) fit the budget perfectly but exhausted
+    # internally under normal scheduler load (manage every 20s + scan + alt
+    # data refresh) — pool exhaustion before reaching Cloud SQL's limit.
+    # Real fix is PgBouncer in front of Cloud SQL (BACKLOG); this sizing is
+    # the practical compromise until that ships.
     _engine_kwargs["pool_pre_ping"] = True
-    _engine_kwargs["pool_size"] = 3
-    _engine_kwargs["max_overflow"] = 2
+    _engine_kwargs["pool_size"] = 5
+    _engine_kwargs["max_overflow"] = 3
     _engine_kwargs["pool_recycle"] = 3600
     _engine_kwargs["pool_timeout"] = 30
 
