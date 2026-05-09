@@ -63,6 +63,14 @@ logger = logging.getLogger(__name__)
 # scanner finds the highest "edge".
 COMMISSION_BPS = float(os.getenv("BT_COMMISSION_BPS", "1.0"))   # 0.01% per side (most brokers free now)
 SLIPPAGE_BPS   = float(os.getenv("BT_SLIPPAGE_BPS",   "5.0"))   # 0.05% per side baseline (typical retail spread)
+# Adverse selection: empirical effective-spread - realized-spread gap for
+# retail systematic systems on liquid US equities, ~2-5 bps. Applied on
+# ENTRY side only — the entry is where you're the active liquidity-taker
+# vs. a counterparty with better short-term info; exits (target hits / stop
+# triggers) are reactive and are already conservatively priced by the
+# OPEN-on-gap rule below. References: Hasbrouck (1991), Glosten-Milgrom.
+# Set BT_ADVERSE_BPS=0 to revert to the pre-r72 backtest cost model.
+ADVERSE_BPS    = float(os.getenv("BT_ADVERSE_BPS",    "3.0"))
 COST_PER_SIDE  = (COMMISSION_BPS + SLIPPAGE_BPS) / 10000.0      # → 0.06% per side, 0.12% round-trip
 # Cap per-side cost so a pathological ADV/vol combo can't single-handedly
 # eat 5% per side — that's an indicator something else is wrong.
@@ -162,8 +170,14 @@ def _apply_costs(price: float, side: str, direction: str,
       • SELL exit  → +cost  (you cover slightly higher)
     `dyn_bps` is the additional liquidity-aware slippage from
     `_dynamic_slip_bps`, capped along with the baseline at MAX_COST_PER_SIDE.
+
+    Entry side additionally pays ADVERSE_BPS (default 3 bps) — empirical
+    effective-spread-minus-realized-spread gap that the dynamic slip model
+    doesn't capture. Exit side is unchanged.
     """
     cost = COST_PER_SIDE + (dyn_bps / 10000.0)
+    if side == "entry":
+        cost += ADVERSE_BPS / 10000.0
     if cost > MAX_COST_PER_SIDE:
         cost = MAX_COST_PER_SIDE
     if direction == "BUY":
