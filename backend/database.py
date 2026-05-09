@@ -147,6 +147,12 @@ class Signal(Base):
     strategy = Column(String, nullable=True)  # which strategy produced this signal
     generated_at = Column(DateTime, default=datetime.utcnow)
     is_new = Column(Boolean, default=True)
+    # Per-signal factor capture (populated by auto_trader at consider_signal time
+    # only — NEUTRAL signals and signals never considered for entry stay NULL).
+    # Composite is the clamped product [0.6, 1.4]; JSON has the per-factor breakdown.
+    # Used downstream by /api/admin/factor-ic for IC + n + sign-of-edge per factor.
+    factor_score_composite = Column(Float, nullable=True)
+    factor_scores_json = Column(Text, nullable=True)
 
 
 class AutoTraderConfig(Base):
@@ -1228,6 +1234,9 @@ def create_tables():
     _ensure_column("auto_trader_config", "source_mute_enabled", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "theta_adjusted_rr_enabled", "BOOLEAN DEFAULT TRUE")
     _ensure_column("auto_trader_config", "portfolio_kelly_enabled", "BOOLEAN DEFAULT TRUE")
+    # Per-signal factor capture for downstream IC analysis.
+    _ensure_column("signals", "factor_score_composite", "DOUBLE PRECISION")
+    _ensure_column("signals", "factor_scores_json", "TEXT")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:

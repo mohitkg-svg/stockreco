@@ -3506,7 +3506,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         try:
             from services.factors import factor_composite as _fc
             if bool(getattr(cfg, "factor_strategies_enabled", True)):
-                _factor_mult, _ = _fc(
+                _factor_mult, _factor_parts = _fc(
                     ticker,
                     sector=sector,
                     pe_ratio=signal.get("trailing_pe") or signal.get("pe"),
@@ -3514,8 +3514,28 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 )
             else:
                 _factor_mult = 1.0
+                _factor_parts = None
         except Exception:
             _factor_mult = 1.0
+            _factor_parts = None
+        # Persist per-factor breakdown to the Signal row for downstream IC
+        # analysis (see /api/admin/factor-ic). No-op if signal_id is None or
+        # we already failed above; failures here MUST NOT affect the trade
+        # decision path.
+        if signal_id is not None and _factor_parts is not None:
+            try:
+                import json as _factor_json
+                _fdb = SessionLocal()
+                try:
+                    _fdb.query(Signal).filter(Signal.id == signal_id).update({
+                        "factor_score_composite": float(_factor_mult),
+                        "factor_scores_json": _factor_json.dumps(_factor_parts),
+                    })
+                    _fdb.commit()
+                finally:
+                    _fdb.close()
+            except Exception as _persist_err:
+                logger.debug(f"factor_scores persist skipped: {_persist_err}")
         # r57: scanner_conviction_multiplier removed. The ±15% nudge from
         # an un-validated v2 percentile rank wasn't moving the needle and
         # added bug surface. If/when v2 ranking proves out empirically,

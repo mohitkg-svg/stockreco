@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from routers._auth import require_api_key
-from database import SessionLocal, AutoTrade
+from database import SessionLocal, AutoTrade, Signal
 
 router = APIRouter(
     prefix="/api/admin",
@@ -526,6 +526,85 @@ def backfill_realized_pl():
         }
     finally:
         db.close()
+
+
+@router.get("/factor-ic")
+def factor_ic(days: int = 90, min_n: int = 10):
+    """Per-factor Information Coefficient over closed trades in the last
+    `days` days. Joins AutoTrade.signal_id → Signal.factor_scores_json,
+    parses each per-factor value, and computes Spearman rank correlation
+    against realized P&L%.
+
+    Read-only, additive — does not affect trading.
+
+    `min_n`: factors with fewer than this many closed-trade observations
+    are reported but the IC is suppressed (returns null) since rank
+    correlation is meaningless on tiny samples.
+
+    Returns: {window_days, total_trades, factors: {<name>: {n, ic, mean_value, mean_pl_pct}}}
+    """
+    import json as _json
+    import pandas as _pd
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(AutoTrade.realized_pl, AutoTrade.entry_price, AutoTrade.qty,
+                     Signal.factor_scores_json)
+            .join(Signal, Signal.id == AutoTrade.signal_id)
+            .filter(AutoTrade.closed_at >= cutoff)
+            .filter(AutoTrade.realized_pl.isnot(None))
+            .filter(AutoTrade.entry_price.isnot(None))
+            .filter(AutoTrade.qty.isnot(None))
+            .filter(Signal.factor_scores_json.isnot(None))
+            .all()
+        )
+    finally:
+        db.close()
+
+    per_factor: dict = {}
+    for realized_pl, entry_price, qty, fjson in rows:
+        notional = (entry_price or 0) * (qty or 0)
+        if not notional:
+            continue
+        pl_pct = float(realized_pl) / notional
+        try:
+            parts = _json.loads(fjson)
+        except Exception:
+            continue
+        for fname, fval in parts.items():
+            try:
+                v = float(fval)
+            except Exception:
+                continue
+            per_factor.setdefault(fname, {"vals": [], "pls": []})
+            per_factor[fname]["vals"].append(v)
+            per_factor[fname]["pls"].append(pl_pct)
+
+    out: dict = {}
+    for fname, d in per_factor.items():
+        n = len(d["vals"])
+        entry = {
+            "n": n,
+            "ic": None,
+            "mean_value": (sum(d["vals"]) / n) if n else None,
+            "mean_pl_pct": (sum(d["pls"]) / n) if n else None,
+        }
+        if n >= min_n:
+            try:
+                ic = _pd.Series(d["vals"]).corr(_pd.Series(d["pls"]), method="spearman")
+                entry["ic"] = None if (ic is None or _pd.isna(ic)) else round(float(ic), 4)
+            except Exception:
+                pass
+        out[fname] = entry
+
+    return {
+        "window_days": days,
+        "min_n": min_n,
+        "total_trades": len(rows),
+        "factors": out,
+    }
 
 
 @router.post("/record-equity-snapshot")
