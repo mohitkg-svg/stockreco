@@ -120,15 +120,22 @@ def _safe(v) -> Optional[float]:
 
 
 def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
-    """Pull fundamentals for a single ticker via yfinance.
+    """Pull fundamentals for a single ticker.
 
-    Cloud egress workaround: yfinance hits Yahoo Finance, which aggressively
-    rate-limits/blocks GCP/AWS IPs. When the .info call returns empty (or
-    raises), fall back to a static sector dict for known mega-caps so the
-    portfolio backtester's per-sector cap stays meaningful. Numeric fields
-    stay None — the quality_score multiplier degrades to neutral, but
-    sector concentration enforcement keeps working.
+    Tries FMP first when `FMP_API_KEY` is configured (Cloud-Run-safe, paid).
+    Falls back to yfinance + a static sector dict for known mega-caps so the
+    portfolio backtester's per-sector cap keeps working when both sources are
+    unavailable.
     """
+    try:
+        from services import fmp_client
+        if fmp_client.is_enabled():
+            row = fmp_client.get_fundamentals(ticker)
+            if row is not None:
+                return row
+    except Exception as e:
+        logger.debug(f"fundamentals: FMP fetch {ticker} failed, falling back: {e}")
+
     info: Dict[str, Any] = {}
     try:
         import yfinance as yf

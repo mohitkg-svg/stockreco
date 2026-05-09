@@ -212,7 +212,7 @@ def reset_equity_peak(req: ResetPeakRequest):
     logger.critical("ADMIN reset_equity_peak invoked")
     from database import SessionLocal as _SL_rp, EquitySnapshot as _ES_rp
     from datetime import datetime as _dt_rp
-    from services import paper_trader as _pt_rp
+    from services import alpaca_client as _pt_rp
 
     db = _SL_rp()
     try:
@@ -285,7 +285,7 @@ def reconcile_pending_trades():
     """
     logger.warning("ADMIN reconcile_pending_trades invoked")
     from database import SessionLocal as _SL_rp, AutoTrade as _AT_rp
-    from services import paper_trader as _pt_rp
+    from services import alpaca_client as _pt_rp
     from datetime import datetime as _dt_rp
     db = _SL_rp()
     promoted: list = []
@@ -388,7 +388,7 @@ def backfill_realized_pl():
     """
     logger.warning("ADMIN backfill_realized_pl invoked")
     from database import SessionLocal as _SL_b, AutoTrade as _AT_b
-    from services import paper_trader as _pt_b
+    from services import alpaca_client as _pt_b
     db = _SL_b()
     patched = []
     skipped = []

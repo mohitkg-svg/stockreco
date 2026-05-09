@@ -418,7 +418,7 @@ def _post_mortem_async(trade_id: int) -> None:
 from services.risk_math import signal_idempotency_key as _signal_idempotency_key  # noqa: F401
 
 from database import SessionLocal, AutoTrade, AutoTraderConfig, Signal, WatchlistStock
-from services import paper_trader, live_quotes
+from services import alpaca_client, live_quotes
 from services import post_mortem as post_mortem_svc
 from services import metrics
 
@@ -660,7 +660,7 @@ def _persist_decision() -> None:
             # Snapshot context (equity, regime, open trades) for the audit panel.
             ctx = {}
             try:
-                from services import paper_trader as _pt_ctx
+                from services import alpaca_client as _pt_ctx
                 from services.regime_router import classify_regime as _cr_ctx
                 acct = _pt_ctx.get_account()
                 if acct:
@@ -1066,7 +1066,7 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
     # filter, wiping every working order in the Alpaca account — including
     # operator/IRA/manual hedges. Now we cancel ONLY bot-owned order ids
     # tracked on AutoTrade rows (parent_order_id, stop_order_id, tp_order_id).
-    if cancel_orders and paper_trader.is_enabled():
+    if cancel_orders and alpaca_client.is_enabled():
         try:
             db_c = SessionLocal()
             try:
@@ -1079,7 +1079,7 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
                             _bot_order_ids.add(oid)
                 for oid in _bot_order_ids:
                     try:
-                        paper_trader.cancel_order(oid)
+                        alpaca_client.cancel_order(oid)
                         cancelled += 1
                     except Exception as ce:
                         logger.warning(f"kill(): cancel order {oid} failed: {ce}")
@@ -1088,7 +1088,7 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
         except Exception as e:
             logger.error(f"kill(): cancel_bot_orders failed: {e}")
 
-    if flatten and paper_trader.is_enabled():
+    if flatten and alpaca_client.is_enabled():
         try:
             # Only flatten POSITIONS that map to a bot AutoTrade row;
             # operator-side positions (manual scalps, hedges) are not ours
@@ -1104,7 +1104,7 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
                 db_p.close()
             for tk in bot_tickers:
                 try:
-                    res = paper_trader.close_position(tk)
+                    res = alpaca_client.close_position(tk)
                     if "error" not in res:
                         flattened.append(tk)
                 except Exception as fe:
@@ -1208,10 +1208,10 @@ def detect_unexpected_positions() -> Dict[str, Any]:
     have an open stock auto-trade for, something exogenous happened and
     the operator needs to know immediately. Run every hour.
     """
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         return {"unexpected": []}
     try:
-        alpaca_positions = paper_trader.get_positions() or []
+        alpaca_positions = alpaca_client.get_positions() or []
     except Exception as e:
         logger.warning(f"detect_unexpected_positions: Alpaca fetch failed: {e}")
         return {"unexpected": [], "error": str(e)}
@@ -1284,10 +1284,10 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
 
     Returns `{adopted: [...], closed_external: [...]}` for operator review.
     """
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         return {"adopted": [], "closed_external": [], "note": "broker disabled"}
     try:
-        alpaca_positions = paper_trader.get_positions() or []
+        alpaca_positions = alpaca_client.get_positions() or []
     except Exception as e:
         logger.warning(f"sync_positions_from_alpaca: Alpaca fetch failed: {e}")
         return {"adopted": [], "closed_external": [], "error": str(e)}
@@ -1371,7 +1371,7 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
                 _terminal = False
                 try:
                     if r.parent_order_id:
-                        c = paper_trader._get_client()
+                        c = alpaca_client._get_client()
                         po = c.get_order_by_id(r.parent_order_id)
                         ps = str(getattr(po, "status", "") or "").lower()
                         if any(s in ps for s in ("rejected", "canceled", "cancelled", "expired")):
@@ -1553,7 +1553,7 @@ def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
       3. Compute fresh stop/T1/T2/T3 from CURRENT price + ATR (not the
          original adoption entry — that's a sunk anchor; new trail
          needs to bracket today's price).
-      4. Submit a real broker stop-loss order via `paper_trader._get_client()`.
+      4. Submit a real broker stop-loss order via `alpaca_client._get_client()`.
       5. Update the row: `status="open"`, `current_stop`, `target1/2/3`,
          `stop_order_id`, append `note`.
       6. The manage loop's next tick will pick the row up and run the
@@ -1566,7 +1566,7 @@ def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
     Returns: `{ok, trade_id, ticker, current_price, levels, stop_order_id}`
     on success, or `{ok: False, reason}` on failure.
     """
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         return {"ok": False, "reason": "broker disabled"}
 
     ticker = ticker.strip().upper()
@@ -1585,7 +1585,7 @@ def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
 
         # Verify Alpaca still has the position
         try:
-            alpaca_positions = paper_trader.get_positions() or []
+            alpaca_positions = alpaca_client.get_positions() or []
         except Exception as e:
             return {"ok": False, "reason": f"alpaca fetch failed: {e}"}
         alpaca_pos = next(
@@ -1637,7 +1637,7 @@ def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
         try:
             from alpaca.trading.requests import StopOrderRequest
             from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
-            c = paper_trader._get_client()
+            c = alpaca_client._get_client()
             sell_side = _OS.SELL if is_long else _OS.BUY
             stop_res = c.submit_order(order_data=StopOrderRequest(
                 symbol=ticker, qty=int(live_qty), side=sell_side,
@@ -2023,7 +2023,7 @@ def status_snapshot() -> Dict[str, Any]:
     db = SessionLocal()
     try:
         cfg = get_config(db)
-        acct = paper_trader.get_account()
+        acct = alpaca_client.get_account()
         equity = float(acct["equity"]) if acct else 0.0
         alloc = _open_allocations(db)
         stock_budget = equity * cfg.stock_pct_of_equity
@@ -2280,7 +2280,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     # If Alpaca disables your account (suspected wash-trading, AML flag,
     # regulatory), the bot would just keep submitting rejected orders.
     try:
-        _acct_blk = paper_trader.get_account()
+        _acct_blk = alpaca_client.get_account()
         if _acct_blk and (
             _acct_blk.get("trading_blocked") or _acct_blk.get("account_blocked")
             or _acct_blk.get("transfers_blocked")
@@ -2450,7 +2450,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # condition is: today's first snapshot exists AND its age > threshold.
         try:
             from datetime import datetime as _dt_w, timezone as _tz_w, timedelta as _td_w
-            from services.paper_trader import is_market_open as _imo_w
+            from services.alpaca_client import is_market_open as _imo_w
             from zoneinfo import ZoneInfo as _ZI_w
             from database import EquitySnapshot as _ES_w
             _wd_cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
@@ -2556,7 +2556,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     return None
             except Exception as _pe:
                 logger.warning(f"PDT gate check failed (falling open): {_pe}")
-        if not paper_trader.is_enabled():
+        if not alpaca_client.is_enabled():
             metrics.inc("autotrade_skip", reason="broker_not_enabled")
             return None
         if signal.get("signal_type") != "BUY":
@@ -2610,12 +2610,12 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             # r44 fix #0.11: dynamic daily-loss limit (max(static, 3×avg-daily-PnL)).
             from services.risk_manager import dynamic_daily_loss_limit_pct as _dll_dyn
             dll = _dll_dyn(static_pct=dll_static)
-            _acct_probe = paper_trader.get_account()
+            _acct_probe = alpaca_client.get_account()
             _equity_probe = float(_acct_probe["equity"]) if _acct_probe else 0.0
             _rpnl = realized_pnl_today()
             _unr = 0.0
             try:
-                _open_pos = paper_trader.get_positions() or []
+                _open_pos = alpaca_client.get_positions() or []
                 _unr = sum(float(p.get("unrealized_pl") or 0.0) for p in _open_pos)
             except Exception:
                 _unr = 0.0
@@ -2712,7 +2712,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # the per-trade risk cap (which bounds any single trade) with a
         # book-wide cap that prevents 15 simultaneous 2% trades = 30% heat.
         try:
-            _heat_acct = paper_trader.get_account()
+            _heat_acct = alpaca_client.get_account()
             _heat_equity = float(_heat_acct["equity"]) if _heat_acct else 0.0
         except Exception:
             _heat_equity = 0.0
@@ -3274,7 +3274,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             # the book. Cap total $-at-risk in any one sector to 4% of equity.
             # Skips when acct isn't available (tested elsewhere).
             try:
-                _sector_acct = paper_trader.get_account()
+                _sector_acct = alpaca_client.get_account()
                 _sector_equity = float(_sector_acct["equity"]) if _sector_acct else 0.0
                 if _sector_equity > 0:
                     sector_rows = db.query(AutoTrade).filter(
@@ -3345,7 +3345,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # § BUDGET + SIZING — multiplier stack, heat-aware throttle, qty calc
         # ════════════════════════════════════════════════════════════════════
         # Check budget
-        acct = paper_trader.get_account()
+        acct = alpaca_client.get_account()
         if not acct:
             return None
         equity = float(acct["equity"])
@@ -3811,7 +3811,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # below the 1m halt minimum.
         try:
             if (bool(getattr(cfg, "halt_detect_enabled", True))
-                    and paper_trader.is_market_open()):
+                    and alpaca_client.is_market_open()):
                 _q = live_quotes.get_stock_quote(ticker) or {}
                 _qts = float(_q.get("ts") or 0)
                 import time as _t_halt
@@ -3837,7 +3837,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         _eot = (getattr(cfg, "entry_order_type", None) or "market").lower()
         _entry_type = "market"
         _limit_px = None
-        if _eot == "limit_at_mid" and paper_trader.is_market_open():
+        if _eot == "limit_at_mid" and alpaca_client.is_market_open():
             try:
                 q = live_quotes.get_stock_quote(ticker) or {}
                 bid = float(q.get("bid") or 0)
@@ -3856,7 +3856,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             except Exception:
                 _limit_px = None
 
-        res = paper_trader.submit_bracket_order(
+        res = alpaca_client.submit_bracket_order(
             symbol=ticker,
             qty=qty,
             side="buy",
@@ -4040,7 +4040,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                          formula="cfg.trade_options = false → put-play hunt skipped")
             metrics.inc("autotrade_skip", reason="trade_options_off")
             return None
-        if not paper_trader.is_enabled():
+        if not alpaca_client.is_enabled():
             _gate_record("broker_not_enabled", "fail", formula="Alpaca client not initialized")
             metrics.inc("autotrade_skip", reason="broker_not_enabled")
             return None
@@ -4206,7 +4206,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             return None
 
         # Budget check
-        acct = paper_trader.get_account()
+        acct = alpaca_client.get_account()
         if not acct:
             return None
         equity = float(acct["equity"])
@@ -4311,14 +4311,14 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         occ = top["symbol"]
 
         # Alpaca rejects option MARKET orders outside RTH (code 42210000).
-        if not paper_trader.is_market_open():
+        if not alpaca_client.is_market_open():
             logger.info(f"AutoTrader skip PUT {ticker} {occ}: market closed")
             return None
 
         # EOD guard: refuse new option entries within 45 min of close. Prevents
         # NFLX-style loss where a short-dated put was opened near close and
         # held overnight, then closed next morning after theta + gap risk.
-        _mtc = paper_trader.minutes_to_close()
+        _mtc = alpaca_client.minutes_to_close()
         if _mtc is not None and _mtc <= 45.0:
             logger.info(f"AutoTrader skip PUT {ticker} {occ}: {_mtc:.0f}m to close (EOD guard)")
             metrics.inc("autotrade_event", event="eod_guard_put")
@@ -4329,7 +4329,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # post-open) and AMKR / CNTA at minute 17–18 all blew up on entry
         # slippage; the 15-min guard wasn't enough. OPRA spreads stay 200%+
         # wide for ~30 minutes post-bell on most names.
-        _mso = paper_trader.minutes_since_open()
+        _mso = alpaca_client.minutes_since_open()
         if _mso is not None and _mso < 30.0:
             logger.info(f"AutoTrader skip PUT {ticker} {occ}: only {_mso:.0f}m since open (opening-bell guard)")
             metrics.inc("autotrade_event", event="opening_guard_put")
@@ -4343,7 +4343,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
         # r53 fix: pass requested_premium so the slippage-abandon gate can
         # reject fills > 1.25× requested.
-        res = paper_trader.submit_option_entry_with_cross_fallback(
+        res = alpaca_client.submit_option_entry_with_cross_fallback(
             occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
             requested_premium=float(top["premium"]),
         )
@@ -4518,7 +4518,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                          formula="cfg.trade_calls = false → call-play hunt skipped (operator hasn't enabled calls)")
             metrics.inc("autotrade_skip", reason="trade_calls_off")
             return None
-        if not paper_trader.is_enabled():
+        if not alpaca_client.is_enabled():
             _gate_record("broker_not_enabled", "fail", formula="Alpaca client not initialized")
             metrics.inc("autotrade_skip", reason="broker_not_enabled")
             return None
@@ -4576,7 +4576,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # BUY is the whole point of the mode.
         if existing_stock and not aggressive:
             try:
-                acct = paper_trader.get_account()
+                acct = alpaca_client.get_account()
                 eq = float(acct["equity"]) if acct else 0.0
                 stock_budget = eq * cfg.stock_pct_of_equity
                 per_ticker_cap = stock_budget * 0.30
@@ -4692,7 +4692,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             return None
 
         # Budget check — shares the same option bucket as puts.
-        acct = paper_trader.get_account()
+        acct = alpaca_client.get_account()
         if not acct:
             return None
         equity = float(acct["equity"])
@@ -4792,12 +4792,12 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
 
         occ = top["symbol"]
 
-        if not paper_trader.is_market_open():
+        if not alpaca_client.is_market_open():
             logger.info(f"AutoTrader skip CALL {ticker} {occ}: market closed")
             return None
 
         # EOD guard: mirror of put-side — no new option entries in final 45m.
-        _mtc = paper_trader.minutes_to_close()
+        _mtc = alpaca_client.minutes_to_close()
         if _mtc is not None and _mtc <= 45.0:
             logger.info(f"AutoTrader skip CALL {ticker} {occ}: {_mtc:.0f}m to close (EOD guard)")
             metrics.inc("autotrade_event", event="eod_guard_call")
@@ -4806,7 +4806,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # Opening-bell guard — mirror of put-side. r53: extended 15 → 30 min.
         # First 30 min has the widest spreads; VTWO/CNTA/AMKR all blew up on
         # entry slippage at minute 17–18 post-open.
-        _mso = paper_trader.minutes_since_open()
+        _mso = alpaca_client.minutes_since_open()
         if _mso is not None and _mso < 30.0:
             logger.info(f"AutoTrader skip CALL {ticker} {occ}: only {_mso:.0f}m since open (opening-bell guard)")
             metrics.inc("autotrade_event", event="opening_guard_call")
@@ -4820,7 +4820,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
         # r53 fix: pass requested_premium so the slippage-abandon gate can
         # reject fills > 1.25× requested.
-        res = paper_trader.submit_option_entry_with_cross_fallback(
+        res = alpaca_client.submit_option_entry_with_cross_fallback(
             occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
             requested_premium=float(top["premium"]),
         )
@@ -5076,7 +5076,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
         except Exception:
             pass
 
-    pos = paper_trader.get_option_position(t.symbol)
+    pos = alpaca_client.get_option_position(t.symbol)
     cur_premium = pos["current_price"] if pos and pos.get("current_price") else None
 
     # CALL vs PUT detection — single source of truth in
@@ -5135,7 +5135,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                     # error, so we DON'T raise an alert and we DON'T advance
                     # state — letting the runner ride past T1 with no trim
                     # until RTH resumes.
-                    if not paper_trader.is_market_open():
+                    if not alpaca_client.is_market_open():
                         logger.info(
                             f"AutoTrader {'PUT' if is_put else 'CALL'} {t.ticker} T1 hit @ "
                             f"underlying {px:.2f} but OUTSIDE RTH — deferring option trim "
@@ -5146,7 +5146,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                 if half >= 1:
                     # r42 fix #2.2: marketable limit on option trim — saves
                     # ~5-15% of premium vs the prior market order.
-                    trim = paper_trader.submit_option_exit_marketable_limit(
+                    trim = alpaca_client.submit_option_exit_marketable_limit(
                         occ_symbol=t.symbol, qty=half, side="sell",
                     )
                     trim_ok = (
@@ -5422,7 +5422,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
 
     if exit_reason:
         # r42 fix #2.2: marketable limit on full option exit, fallback to market.
-        sell = paper_trader.submit_option_exit_marketable_limit(
+        sell = alpaca_client.submit_option_exit_marketable_limit(
             occ_symbol=t.symbol, qty=int(t.qty), side="sell",
         )
         if "error" in sell:
@@ -5540,7 +5540,7 @@ def manage_open_positions() -> Dict[str, Any]:
         _bootstrap_db = SessionLocal()
         try:
             cfg = get_config(_bootstrap_db)
-            if not cfg.enabled or not paper_trader.is_enabled():
+            if not cfg.enabled or not alpaca_client.is_enabled():
                 return summary
             # Snapshot only the fields we read inside the loop — detached from session.
             cfg_snapshot = {
@@ -5594,7 +5594,7 @@ def manage_open_positions() -> Dict[str, Any]:
         except Exception as _crisis_e:
             logger.debug(f"manage-tick crisis check skipped: {_crisis_e}")
 
-        c = paper_trader._get_client()
+        c = alpaca_client._get_client()
         for trade_id in trade_ids:
             db = SessionLocal()
             try:
@@ -5616,12 +5616,22 @@ def manage_open_positions() -> Dict[str, Any]:
                             _hte_s = _hne_s(t.ticker)
                             if _hte_s is not None and _hte_s <= 1.0 and t.qty and t.qty >= 2 and not t.hit_t1:
                                 _half = max(1, int(t.qty // 2))
-                                from alpaca.trading.requests import MarketOrderRequest as _MOR_e
                                 from alpaca.trading.enums import OrderSide as _OS_e, TimeInForce as _TIF_e
-                                _trim_e = paper_trader._get_client().submit_order(order_data=_MOR_e(
-                                    symbol=t.ticker, qty=_half,
-                                    side=_OS_e.SELL, time_in_force=_TIF_e.DAY,
-                                ))
+                                if not alpaca_client.is_market_open():
+                                    _epx = _current_price(t.ticker) or float(t.entry_price or 0)
+                                    from alpaca.trading.requests import LimitOrderRequest as _LOR_e
+                                    _req_e = _LOR_e(
+                                        symbol=t.ticker, qty=_half,
+                                        side=_OS_e.SELL, time_in_force=_TIF_e.DAY,
+                                        limit_price=round(_epx, 2), extended_hours=True,
+                                    )
+                                else:
+                                    from alpaca.trading.requests import MarketOrderRequest as _MOR_e
+                                    _req_e = _MOR_e(
+                                        symbol=t.ticker, qty=_half,
+                                        side=_OS_e.SELL, time_in_force=_TIF_e.DAY,
+                                    )
+                                _trim_e = alpaca_client._get_client().submit_order(order_data=_req_e)
                                 if _trim_e is not None:
                                     t.qty = t.qty - _half
                                     t.note = (t.note or "") + f" | EARNINGS PRE-FLATTEN: trimmed {_half} ({_hte_s:.1f}h to print)"
@@ -5724,7 +5734,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                 try:
                                     # Manage-tick cancels — fire-and-forget,
                                     # don't add 4s latency per call.
-                                    paper_trader.cancel_order(t.parent_order_id, wait_for_terminal=False)
+                                    alpaca_client.cancel_order(t.parent_order_id, wait_for_terminal=False)
                                 except Exception:
                                     pass
                                 t.status = "closed_unfilled"
@@ -5743,16 +5753,30 @@ def manage_open_positions() -> Dict[str, Any]:
                                 try:
                                     # Manage-tick cancels — fire-and-forget,
                                     # don't add 4s latency per call.
-                                    paper_trader.cancel_order(t.parent_order_id, wait_for_terminal=False)
+                                    alpaca_client.cancel_order(t.parent_order_id, wait_for_terminal=False)
                                 except Exception:
                                     pass
-                                cross = paper_trader.submit_bracket_order(
+                                        
+                                _cross_type = "market"
+                                _cross_tif = "gtc"
+                                _cross_eh = False
+                                _cross_limit_px = None
+                                
+                                if not alpaca_client.is_market_open():
+                                    _cross_type = "limit"
+                                    _cross_tif = "day"
+                                    _cross_eh = True
+                                    _cross_limit_px = round(t.requested_entry or 0, 2)
+                                    
+                                cross = alpaca_client.submit_bracket_order(
                                     symbol=t.ticker, qty=int(t.qty), side="buy",
-                                    entry_type="market",
+                                    entry_type=_cross_type,
+                                    limit_price=_cross_limit_px,
                                     take_profit=t.target3 or t.target2 or t.target1,
                                     stop_loss=float(t.stop_loss),
-                                    time_in_force="gtc",
+                                    time_in_force=_cross_tif,
                                     client_order_id=f"at-cross-{__import__('uuid').uuid4().hex[:12]}",
+                                    extended_hours=_cross_eh,
                                 )
                                 if "error" not in cross:
                                     t.parent_order_id = cross.get("id") or t.parent_order_id
@@ -5770,7 +5794,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                 f"cancelling remainder + resizing bracket legs"
                             )
                             try:
-                                paper_trader.cancel_order(t.parent_order_id, wait_for_terminal=False)
+                                alpaca_client.cancel_order(t.parent_order_id, wait_for_terminal=False)
                             except Exception as e:
                                 logger.warning(f"partial-fill cancel remainder failed for {t.ticker}: {e}")
                             t.qty = int(filled_qty)
@@ -5803,7 +5827,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                 t.qty = int(broker_filled)
                                 # Resize SL/TP children to match the actually-held qty.
                                 from alpaca.trading.requests import ReplaceOrderRequest
-                                _client = paper_trader._get_client()
+                                _client = alpaca_client._get_client()
                                 for _leg_id in (legs.get("stop_id"), legs.get("tp_id")):
                                     if _leg_id and _client:
                                         try:
@@ -6241,12 +6265,21 @@ def manage_open_positions() -> Dict[str, Any]:
                                             trim_qty = 0 if _t1_frac <= 0.0 else max(1, int(t.qty * _t1_frac))
                                             if trim_qty >= 1:
                                                 try:
-                                                    from alpaca.trading.requests import MarketOrderRequest
                                                     from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
-                                                    trim_res = c.submit_order(order_data=MarketOrderRequest(
-                                                        symbol=t.ticker, qty=trim_qty,
-                                                        side=_OS.SELL, time_in_force=_TIF.DAY,
-                                                    ))
+                                                    if not alpaca_client.is_market_open():
+                                                        from alpaca.trading.requests import LimitOrderRequest as _LOR
+                                                        _req = _LOR(
+                                                            symbol=t.ticker, qty=trim_qty,
+                                                            side=_OS.SELL, time_in_force=_TIF.DAY,
+                                                            limit_price=round(px, 2), extended_hours=True,
+                                                        )
+                                                    else:
+                                                        from alpaca.trading.requests import MarketOrderRequest as _MOR
+                                                        _req = _MOR(
+                                                            symbol=t.ticker, qty=trim_qty,
+                                                            side=_OS.SELL, time_in_force=_TIF.DAY,
+                                                        )
+                                                    trim_res = c.submit_order(order_data=_req)
                                                     trim_ok = trim_res is not None
                                                 except Exception as _te:
                                                     logger.warning(f"F3 partial-trim submit failed for {t.ticker}: {_te}")
@@ -6291,18 +6324,27 @@ def manage_open_positions() -> Dict[str, Any]:
                                                             and (t.asset_type or "stock") == "stock"
                                                         ):
                                                             _add = max(1, int(0.25 * float(t.original_qty)))
-                                                            from alpaca.trading.requests import MarketOrderRequest as _MOR_p
                                                             from alpaca.trading.enums import OrderSide as _OS_p, TimeInForce as _TIF_p
-                                                            paper_trader._get_client().submit_order(order_data=_MOR_p(
-                                                                symbol=t.ticker, qty=_add,
-                                                                side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
-                                                            ))
+                                                            if not alpaca_client.is_market_open():
+                                                                from alpaca.trading.requests import LimitOrderRequest as _LOR_p
+                                                                _req = _LOR_p(
+                                                                    symbol=t.ticker, qty=_add,
+                                                                    side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
+                                                                    limit_price=round(px, 2), extended_hours=True,
+                                                                )
+                                                            else:
+                                                                from alpaca.trading.requests import MarketOrderRequest as _MOR_p
+                                                                _req = _MOR_p(
+                                                                    symbol=t.ticker, qty=_add,
+                                                                    side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
+                                                                )
+                                                            alpaca_client._get_client().submit_order(order_data=_req)
                                                             t.qty = (t.qty or 0) + _add
                                                             # r47 fix #T0f (P1-8): resize SL leg to match new qty
                                                             # so the added shares aren't naked until next manage tick.
                                                             try:
                                                                 if t.stop_order_id:
-                                                                    paper_trader.replace_order_by_id(t.stop_order_id, qty=int(t.qty))
+                                                                    alpaca_client.replace_order_by_id(t.stop_order_id, qty=int(t.qty))
                                                             except Exception as _resize_e:
                                                                 logger.warning(f"pyramid SL resize {t.ticker} failed: {_resize_e}")
                                                             t.note = (t.note or "") + f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})"
@@ -6318,12 +6360,21 @@ def manage_open_positions() -> Dict[str, Any]:
                                             trim_qty = max(1, int(t.qty * _t2_frac))
                                             if trim_qty < t.qty:
                                                 try:
-                                                    from alpaca.trading.requests import MarketOrderRequest
                                                     from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
-                                                    trim_res = c.submit_order(order_data=MarketOrderRequest(
-                                                        symbol=t.ticker, qty=trim_qty,
-                                                        side=_OS.SELL, time_in_force=_TIF.DAY,
-                                                    ))
+                                                    if not alpaca_client.is_market_open():
+                                                        from alpaca.trading.requests import LimitOrderRequest as _LOR
+                                                        _req = _LOR(
+                                                            symbol=t.ticker, qty=trim_qty,
+                                                            side=_OS.SELL, time_in_force=_TIF.DAY,
+                                                            limit_price=round(px, 2), extended_hours=True,
+                                                        )
+                                                    else:
+                                                        from alpaca.trading.requests import MarketOrderRequest as _MOR
+                                                        _req = _MOR(
+                                                            symbol=t.ticker, qty=trim_qty,
+                                                            side=_OS.SELL, time_in_force=_TIF.DAY,
+                                                        )
+                                                    trim_res = c.submit_order(order_data=_req)
                                                     trim_ok = trim_res is not None
                                                 except Exception as _te:
                                                     logger.warning(f"T2 partial-trim submit failed for {t.ticker}: {_te}")

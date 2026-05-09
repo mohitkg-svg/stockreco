@@ -257,6 +257,27 @@ def _ai_budget_check() -> bool:
     n = _ai_call_counter.get(day, 0)
     if n >= _AI_DAILY_CALL_CAP:
         return False
+        
+    # Hard stop on daily USD cost
+    from services.config import AI_JUDGE_MODEL
+    cost_info = ai_cost_today_usd(model_hint=AI_JUDGE_MODEL)
+    current_cost = cost_info.get("cost_estimate_usd", 0.0)
+    
+    try:
+        from database import SessionLocal, AutoTraderConfig
+        db = SessionLocal()
+        try:
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            usd_cap = float(cfg.ai_daily_usd_cap) if cfg and cfg.ai_daily_usd_cap is not None else 20.0
+        finally:
+            db.close()
+    except Exception:
+        usd_cap = 20.0
+        
+    if current_cost >= usd_cap:
+        logger.warning(f"ai_judge: daily AI USD cap ${usd_cap} reached (current ${current_cost:.4f}); abstaining")
+        return False
+
     _ai_call_counter[day] = n + 1
     return True
 

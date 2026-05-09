@@ -4,7 +4,7 @@ The same Python image runs in two distinct Cloud Run services
 differentiated by the `RUN_MODE` env var:
 
   * `RUN_MODE=api` (default): HTTP traffic, scanner schedules, signal
-    generation, alt-data refresh jobs. Min 1 / max 3 instances.
+    generation, alt-data refresh jobs. Min 1 / max 2 instances.
     Frontend SPA is served from `/`. Scheduler runs scan + alt-data jobs.
 
   * `RUN_MODE=manager`: internal-ingress only. Runs the 20-second
@@ -48,7 +48,7 @@ from contextlib import asynccontextmanager
 
 # ----- Load backend/.env BEFORE any service import ------------------------
 # Nothing in the stack pulls python-dotenv, so .env on disk was being ignored
-# (live_quotes / paper_trader read os.getenv at import time and would silently
+# (live_quotes / alpaca_client read os.getenv at import time and would silently
 # disable themselves). This 10-line parser handles `KEY=value`, `KEY="quoted"`,
 # and `# comments` — enough for our 4 keys; we don't need full bash semantics.
 def _load_dotenv(path: str) -> None:
@@ -576,12 +576,31 @@ async def lifespan(app: FastAPI):
         # scheduled_scan.
         scheduler.add_job(
             _sc.detect_events,
-            trigger=_Cron(hour="9-16", minute="*/2", timezone=_NY_TZ),
+            trigger=_Cron(hour="4-16", minute="*/2", timezone=_NY_TZ),
             id="event_detector",
             max_instances=1, coalesce=True, misfire_grace_time=60,
         )
     except Exception as _e:
         logger.warning(f"scanner job not scheduled: {_e}")
+
+    # FMP SEC filings poll — backstop for the push webhook. The webhook
+    # (POST /api/webhooks/fmp/sec) is low-latency but has no replay; if FMP's
+    # outbound delivery hiccups we'd silently miss filings. Polling the FMP
+    # RSS feed every 5 min during pre-market + RTH catches anything the push
+    # missed. Process-local dedupe inside fmp_client keeps webhook + poll from
+    # double-inserting the same filing.
+    try:
+        from services import fmp_client as _fmp
+        from apscheduler.triggers.cron import CronTrigger as _Cron
+        if _fmp.is_enabled():
+            scheduler.add_job(
+                _fmp.poll_sec_filings_into_events,
+                trigger=_Cron(hour="4-16", minute="*", timezone=_NY_TZ),
+                id="fmp_sec_filings_poll",
+                max_instances=1, coalesce=True, misfire_grace_time=120,
+            )
+    except Exception as _e:
+        logger.warning(f"fmp_sec_filings_poll job not scheduled: {_e}")
 
     # Ground-up Tier 2: weekly best-strategy-per-ticker recompute.
     # Walk-forward backtest across every tracked ticker; persist the winning
@@ -900,6 +919,50 @@ def _log_frontend_error(payload: dict):
         pass
     return {"ok": True}
 
+
+from fastapi import Request
+
+@app.post(
+    "/api/webhooks/fmp/sec",
+    include_in_schema=False,
+    dependencies=[Depends(require_api_key)],
+)
+async def fmp_sec_webhook(request: Request):
+    """Low-latency Webhook listener for Financial Modeling Prep (FMP) / Polygon SEC filings.
+    Instantly creates a CandidateEvent when a Form 4 (Insider Trade) or 8-K (Earnings) drops.
+    This allows the event-driven scan to react to news before RTH open."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "bad_payload"}
+        
+    ticker = payload.get("ticker") or payload.get("symbol")
+    form_type = payload.get("formType") or payload.get("form_type")
+    
+    if not ticker or not form_type:
+        return {"status": "ignored"}
+        
+    try:
+        from database import SessionLocal, CandidateEvent
+        import json
+        db = SessionLocal()
+        try:
+            # Depending on form type, map to an event kind
+            kind = "INSIDER_BUY" if "4" in str(form_type) else "PEAD" if "8" in str(form_type) else None
+            if kind:
+                # Create the event to be picked up by the 2-minute event detector cron
+                from datetime import datetime, timedelta
+                ev = CandidateEvent(kind=kind, ticker=ticker.upper(), score=80.0, features=json.dumps(payload), expires_at=datetime.utcnow() + timedelta(minutes=60))
+                db.add(ev)
+                db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"Failed to process SEC webhook: {e}")
+        return {"status": "error"}
+        
+    return {"status": "ok"}
+
 # ----- Real-money safety banner (A3) --------------------------------------
 # Flipping `ALPACA_LIVE=1` alone is one keystroke away from live trading; a
 # stray env var in a deploy, a typo, or a copy-pasted .env moves real money.
@@ -931,7 +994,7 @@ if _ALPACA_LIVE:
     # Audit fix #3: verify broker connectivity at boot. A silent None
     # return from _get_client() (e.g., creds mounted but malformed) would
     # otherwise let the app boot healthy and silently fail every order.
-    from services import paper_trader as _pt_boot
+    from services import alpaca_client as _pt_boot
     _boot_client = _pt_boot._get_client()
     if _boot_client is None:
         raise RuntimeError(
@@ -1072,7 +1135,7 @@ def health():
     try:
         if stream_stale_secs is not None and stream_stale_secs > 30:
             from services import alerts as _alerts
-            from services import paper_trader as _pt_clk
+            from services import alpaca_client as _pt_clk
             if _pt_clk.is_market_open():
                 _alerts.alert(
                     severity="warning",

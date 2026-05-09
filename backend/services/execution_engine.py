@@ -18,7 +18,7 @@ import threading
 
 from sqlalchemy.orm import Session
 
-from services import paper_trader, metrics
+from services import alpaca_client, metrics
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,7 @@ def atomic_increment_target_touch(db: Session, trade_id: int) -> int:
 
 def get_legs(parent_id: str) -> List[Any]:
     """Return child orders (TP + SL) of a bracket parent."""
-    c = paper_trader._get_client()
+    c = alpaca_client._get_client()
     if not c:
         return []
     try:
@@ -192,7 +192,7 @@ def replace_stop(stop_order_id: str, new_stop: float) -> Optional[str]:
     last = _rsc_get(stop_order_id)
     if last is not None and abs(last - rounded) < 0.005:
         return stop_order_id
-    c = paper_trader._get_client()
+    c = alpaca_client._get_client()
     if not c:
         logger.warning(f"replace_stop {stop_order_id}: no broker client — keeping old stop")
         return None
@@ -236,7 +236,7 @@ def replace_tp(tp_order_id: str, new_limit: float) -> Optional[str]:
     last = _rsc_get(tp_order_id)
     if last is not None and abs(last - rounded) < 0.005:
         return tp_order_id
-    c = paper_trader._get_client()
+    c = alpaca_client._get_client()
     if not c:
         logger.warning(f"replace_tp {tp_order_id}: no broker client — keeping old TP")
         return None
@@ -300,7 +300,7 @@ def force_close_trade(
         # the UI, force-stop-out, etc. Cancelling by symbol is idempotent
         # and covers parent-order-id, bracket legs, and operator orders.
         try:
-            cancel_res = paper_trader.cancel_all_orders(symbol=t.ticker)
+            cancel_res = alpaca_client.cancel_all_orders(symbol=t.ticker)
             if isinstance(cancel_res, dict) and cancel_res.get("error"):
                 logger.warning(f"reverse-close cancel_all_orders {t.ticker}: {cancel_res['error']}")
         except Exception as e:
@@ -314,7 +314,7 @@ def force_close_trade(
             _t_settle.sleep(0.5)
         except Exception:
             pass
-        res = paper_trader.close_position(t.ticker)
+        res = alpaca_client.close_position(t.ticker)
         if "error" in res:
             from services.alerts import alert as _raise_alert
             _raise_alert(
@@ -329,7 +329,7 @@ def force_close_trade(
                 if t.current_stop and t.qty:
                     from alpaca.trading.requests import StopOrderRequest
                     from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
-                    c = paper_trader._get_client()
+                    c = alpaca_client._get_client()
                     c.submit_order(order_data=StopOrderRequest(
                         symbol=t.ticker, qty=int(t.qty), side=_OS.SELL,
                         time_in_force=_TIF.GTC, stop_price=float(t.current_stop),
@@ -354,7 +354,7 @@ def force_close_trade(
         # r43 fix #2.7: use marketable-limit-with-cross-fallback on emergency
         # option closes too — saves spread on the common case while still
         # guaranteeing flatten via the 20s market-cross fallback.
-        sell = paper_trader.submit_option_exit_with_cross_fallback(
+        sell = alpaca_client.submit_option_exit_with_cross_fallback(
             occ_symbol=t.symbol, qty=int(t.qty), side="sell",
             cross_after_seconds=20.0,
         )
@@ -370,7 +370,7 @@ def force_close_trade(
             t.note = (t.note or "") + f" | FORCE_CLOSE_FAILED: {sell['error']}"
             db.commit()
             return
-        pos = paper_trader.get_option_position(t.symbol)
+        pos = alpaca_client.get_option_position(t.symbol)
         if pos and pos.get("current_price") is not None and t.entry_price:
             # r48 BACKLOG #concurrency-P1-11: atomic SQL accumulator (option side).
             atomic_accumulate_realized_pl(

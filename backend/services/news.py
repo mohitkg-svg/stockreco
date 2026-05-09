@@ -162,7 +162,7 @@ def fetch_alpaca_news(
 
 def _parse_published_at(raw: str) -> Optional[datetime]:
     """Alpaca returns ISO 8601 with 'Z' or +00:00. Return a naive UTC datetime
-    (the app's convention throughout auto_trader / paper_trader)."""
+    (the app's convention throughout auto_trader / alpaca_client)."""
     if not raw:
         return None
     try:
@@ -437,12 +437,12 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
                 elif action == "trim":
                     # Trim half of remaining qty at market.
                     try:
-                        from services import paper_trader
+                        from services import alpaca_client
                         if t.asset_type == "stock":
                             half = max(1, int((t.qty or 0) // 2))
                             from alpaca.trading.requests import MarketOrderRequest
                             from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
-                            c = paper_trader._get_client()
+                            c = alpaca_client._get_client()
                             res2 = c.submit_order(order_data=MarketOrderRequest(
                                 symbol=t.ticker, qty=half,
                                 side=_OS.SELL, time_in_force=_TIF.DAY,
@@ -476,7 +476,7 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
                                         )
                         elif t.asset_type == "option":
                             half = max(1, int((t.qty or 0) // 2))
-                            res2 = paper_trader.submit_simple_option_order(
+                            res2 = alpaca_client.submit_simple_option_order(
                                 occ_symbol=t.symbol, qty=half, side="sell",
                                 order_type="market", time_in_force="day",
                             )

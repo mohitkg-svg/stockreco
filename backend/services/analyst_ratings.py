@@ -29,7 +29,18 @@ _MIN_ANALYSTS = 3  # below this we don't trust the consensus
 
 
 def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
-    """Pull rating block for a single ticker via yfinance. None on failure."""
+    """Pull rating block for a single ticker.
+
+    FMP first when configured (Cloud-Run-safe); yfinance fallback otherwise.
+    """
+    try:
+        from services import fmp_client
+        if fmp_client.is_enabled():
+            row = fmp_client.get_analyst_consensus(ticker)
+            if row is not None:
+                return row
+    except Exception as e:
+        logger.debug(f"analyst_ratings: FMP fetch {ticker} failed, falling back: {e}")
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info or {}

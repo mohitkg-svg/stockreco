@@ -18,7 +18,7 @@ from models import PositionResponse, PnLReconciliationResponse
 logger = logging.getLogger(__name__)
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
-from services import paper_trader, auto_trader
+from services import alpaca_client, auto_trader
 from routers._auth import require_api_key
 
 # All trading endpoints require X-API-Key auth (when APP_API_KEY is set).
@@ -166,9 +166,9 @@ def equity_curve(lookback_days: int = 30):
 
 @router.get("/account")
 def account():
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured (APCA env vars missing)")
-    a = paper_trader.get_account()
+    a = alpaca_client.get_account()
     if not a:
         raise HTTPException(status_code=502, detail="Could not fetch account from Alpaca")
     return a
@@ -186,11 +186,11 @@ def pnl_reconciliation():
     instead of cross-referencing the position cards, the closed-trades
     ledger, and Alpaca's portfolio history.
     """
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
     import os
     import requests
-    a = paper_trader.get_account()
+    a = alpaca_client.get_account()
     if not a:
         raise HTTPException(status_code=502, detail="Could not fetch account")
     equity = float(a.get("equity") or 0)
@@ -249,7 +249,7 @@ def pnl_reconciliation():
     finally:
         db.close()
 
-    positions = paper_trader.get_positions() or []
+    positions = alpaca_client.get_positions() or []
     unrealized_total = sum(float(p.get("unrealized_pl") or 0) for p in positions)
     unrealized_stocks = sum(
         float(p.get("unrealized_pl") or 0)
@@ -294,9 +294,9 @@ def positions():
     AutoTrade row. r52 fix: prior code returned only Alpaca's native
     fields, so the UI position cards rendered blank Stop / Targets cells
     even though the bot tracked them."""
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
-    rows = paper_trader.get_positions() or []
+    rows = alpaca_client.get_positions() or []
     if not rows:
         return rows
     from database import SessionLocal as _SL_pos, AutoTrade as _AT_pos
@@ -370,9 +370,9 @@ def orders(status: str = "all", limit: int = 50):
     AutoTrade row's entry_price (for bot-managed trades) or against the
     current open position's avg_entry_price (for adopted/manual rows).
     """
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
-    raw = paper_trader.get_orders(status=status, limit=limit) or []
+    raw = alpaca_client.get_orders(status=status, limit=limit) or []
     if not raw:
         return raw
 
@@ -403,7 +403,7 @@ def orders(status: str = "all", limit: int = 50):
     # Fallback: open Alpaca positions cover adopted positions where the
     # AutoTrade row has no entry_price.
     try:
-        for p in (paper_trader.get_positions() or []):
+        for p in (alpaca_client.get_positions() or []):
             sym = (p.get("symbol") or "").upper()
             if sym and sym not in entry_by_key and p.get("avg_entry_price"):
                 entry_by_key[sym] = float(p["avg_entry_price"])
@@ -515,7 +515,7 @@ def move_stop(req: MoveStopRequest):
         if (row.asset_type or "stock").lower() == "stock" and row.stop_order_id:
             try:
                 from alpaca.trading.requests import ReplaceOrderRequest
-                c = paper_trader._get_client()
+                c = alpaca_client._get_client()
                 if c:
                     replaced = c.replace_order_by_id(
                         row.stop_order_id,
@@ -531,11 +531,11 @@ def move_stop(req: MoveStopRequest):
                 try:
                     from alpaca.trading.requests import StopOrderRequest
                     from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
-                    c = paper_trader._get_client()
+                    c = alpaca_client._get_client()
                     if c and row.qty:
                         # Cancel any working stops first
                         try:
-                            paper_trader.cancel_all_orders(symbol=sym)
+                            alpaca_client.cancel_all_orders(symbol=sym)
                         except Exception:
                             pass
                         new_o = c.submit_order(order_data=StopOrderRequest(
@@ -565,10 +565,10 @@ def move_stop(req: MoveStopRequest):
 
 @router.post("/order")
 def submit_order(req: OrderRequest):
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
     # Resolve extended_hours (auto = true only during pre/post-market and
-    # only on DAY-TIF limit orders — paper_trader does the final legality
+    # only on DAY-TIF limit orders — alpaca_client does the final legality
     # check too).
     _eh_in = (req.extended_hours or "auto").lower()
     if _eh_in in ("true", "on"):
@@ -579,10 +579,10 @@ def submit_order(req: OrderRequest):
         extended_hours = (
             req.entry_type.lower() == "limit"
             and req.time_in_force.lower() == "day"
-            and not paper_trader.is_market_open()
+            and not alpaca_client.is_market_open()
         )
 
-    res = paper_trader.submit_bracket_order(
+    res = alpaca_client.submit_bracket_order(
         symbol=req.symbol,
         qty=req.qty,
         side=req.side,
@@ -608,7 +608,7 @@ def cancel_order(order_id: str):
     # of injection-y characters reaching the broker layer.
     if not _ORDER_ID_RE.match(order_id):
         raise HTTPException(status_code=400, detail="Invalid order ID format")
-    res = paper_trader.cancel_order(order_id)
+    res = alpaca_client.cancel_order(order_id)
     if "error" in res:
         raise HTTPException(status_code=400, detail=res["error"])
     return res
@@ -625,11 +625,11 @@ def cancel_all_orders(symbol: Optional[str] = None):
     showing stale buy/sell entries. Does NOT close filled positions — use
     /close/{symbol} or /close-all for that.
     """
-    if not paper_trader.is_enabled():
+    if not alpaca_client.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
     if symbol is not None and not _TICKER_RE.match(symbol):
         raise HTTPException(status_code=400, detail="Invalid ticker")
-    res = paper_trader.cancel_all_orders(symbol=symbol)
+    res = alpaca_client.cancel_all_orders(symbol=symbol)
     if "error" in res:
         raise HTTPException(status_code=502, detail=res["error"])
     return res
@@ -685,7 +685,7 @@ def close_position(symbol: str):
                     raise HTTPException(status_code=502, detail=f"force_close failed: {e}")
             return {"status": "closed", "count": len(rows), "summary": summary}
         # No bot-managed row: fall back to broker-only close.
-        res = paper_trader.close_position(sym_u)
+        res = alpaca_client.close_position(sym_u)
         if "error" in res:
             raise HTTPException(status_code=400, detail=res["error"])
         return res
@@ -696,7 +696,7 @@ def close_position(symbol: str):
 @router.post("/close-all")
 def close_all():
     """Close every open position; reconciles AutoTrade rows for bot-managed
-    positions. r47 fix #T0b-1: prior code only called paper_trader."""
+    positions. r47 fix #T0b-1: prior code only called alpaca_client."""
     from database import SessionLocal, AutoTrade
     from services.execution_engine import force_close_trade
     db = SessionLocal()
@@ -717,7 +717,7 @@ def close_all():
         # Catch any non-bot positions that exist at the broker (manual /
         # adopted-untracked) — flatten them too.
         try:
-            res = paper_trader.close_all_positions()
+            res = alpaca_client.close_all_positions()
             if isinstance(res, dict) and res.get("error"):
                 summary.setdefault("broker_errors", []).append(res["error"])
         except Exception as e:

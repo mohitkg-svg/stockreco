@@ -36,7 +36,18 @@ _earnings_cache: dict[str, tuple[Optional[float], float]] = {}
 
 
 def _fetch_next_earnings_ts(ticker: str) -> Optional[float]:
-    """Return the next upcoming earnings date as a UTC unix timestamp, or None."""
+    """Return the next upcoming earnings date as a UTC unix timestamp, or None.
+
+    FMP first when configured (Cloud-Run-safe); yfinance fallback otherwise.
+    """
+    try:
+        from services import fmp_client
+        if fmp_client.is_enabled():
+            ts = fmp_client.get_next_earnings_ts(ticker)
+            if ts is not None:
+                return ts
+    except Exception as e:
+        logger.debug(f"earnings: FMP next-earnings {ticker} failed: {e}")
     try:
         import yfinance as yf
         from curl_cffi import requests as _cc
@@ -86,8 +97,18 @@ def recent_earnings_catalyst(ticker: str, days_back: int = 10) -> bool:
     """Ground-up Tier 2: True if the ticker had an earnings print within the
     last `days_back` days. Post-earnings momentum (PEAD) is a real factor —
     a recent catalyst strengthens a BUY setup. Inverse for SELL.
+
+    FMP first when configured; yfinance fallback otherwise.
     """
     ticker = ticker.upper()
+    try:
+        from services import fmp_client
+        if fmp_client.is_enabled():
+            res = fmp_client.has_recent_earnings(ticker, days_back=days_back)
+            if res is not None:
+                return res
+    except Exception as e:
+        logger.debug(f"earnings: FMP recent-catalyst {ticker} failed: {e}")
     now = time.time()
     cached = _earnings_cache.get(ticker)
     if cached and now < cached[1]:

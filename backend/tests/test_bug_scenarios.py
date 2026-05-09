@@ -1017,8 +1017,8 @@ class TestRealizedPlAccumulation(unittest.TestCase):
                 opened_at=datetime.utcnow() - timedelta(minutes=20),
             )
             db.add(t); db.commit(); db.refresh(t)
-            with _patch("services.paper_trader.cancel_order"), \
-                 _patch("services.paper_trader.close_position",
+            with _patch("services.alpaca_client.cancel_order"), \
+                 _patch("services.alpaca_client.close_position",
                         return_value={"id": "ok", "symbol": "TEST", "side": "sell", "qty": 33, "status": "filled"}), \
                  _patch("services.auto_trader._current_price", return_value=108.0):
                 summary = {"closed": 0}
@@ -1682,14 +1682,14 @@ class TestR47NewStrategiesPresent(unittest.TestCase):
 
 class TestR47AccountBlockedFields(unittest.TestCase):
     """r47 T0d-1: account_blocked / transfers_blocked must appear in the
-    paper_trader.get_account() dict — r46 added gates on these but the
+    alpaca_client.get_account() dict — r46 added gates on these but the
     keys were never populated."""
     def test_get_account_keys_when_no_client(self):
-        from services import paper_trader
+        from services import alpaca_client
         # no Alpaca creds in test → returns None; ensure surface is documented
         # by inspecting the dict assembly path via lambda eval (no live call).
         import inspect
-        src = inspect.getsource(paper_trader.get_account)
+        src = inspect.getsource(alpaca_client.get_account)
         self.assertIn("account_blocked", src)
         self.assertIn("transfers_blocked", src)
 
@@ -1732,8 +1732,8 @@ class TestR48Backlog(unittest.TestCase):
     def test_marketable_limit_option_entries(self):
         """r48 BACKLOG #options-P0-2: option entries route through the new
         marketable-limit-with-cross-fallback primitive."""
-        from services import paper_trader
-        self.assertTrue(hasattr(paper_trader, "submit_option_entry_with_cross_fallback"))
+        from services import alpaca_client
+        self.assertTrue(hasattr(alpaca_client, "submit_option_entry_with_cross_fallback"))
 
     def test_greeks_persistence_columns(self):
         """r48 BACKLOG #options-P0-4: AutoTrade has entry_delta/gamma/theta/vega/iv."""
@@ -1859,6 +1859,188 @@ class TestR48Backlog(unittest.TestCase):
         self.assertTrue(opex_eligible("SPY"))
         self.assertTrue(opex_eligible("AAPL"))
         self.assertFalse(opex_eligible("CNTA"))
+
+
+class TestFmpIntegration(unittest.TestCase):
+    """FMP REST client + FMP-first / yfinance-fallback wiring across the
+    fundamentals/earnings/analyst_ratings services. Premium plan endpoints.
+
+    Failure modes exercised:
+      * Missing FMP_API_KEY → is_enabled=False, no network call, fallback runs
+      * FMP returns None for one ticker → caller falls back to yfinance
+      * FMP transport / JSON error → caller falls back to yfinance
+      * SEC poll dedupes the same filing across consecutive ticks
+      * FMP-derived analyst row matches the shape analyst_ratings.upsert wants
+    """
+
+    def setUp(self):
+        _reset_db()
+        # Force the key off so is_enabled() is the gate we trust in tests.
+        self._prev_key = os.environ.pop("FMP_API_KEY", None)
+        # Reset module-level dedup state between tests (otherwise tests bleed).
+        from services import fmp_client
+        fmp_client._cache.clear()
+        with fmp_client._seen_filings_lock:
+            fmp_client._seen_filings.clear()
+
+    def tearDown(self):
+        if self._prev_key is not None:
+            os.environ["FMP_API_KEY"] = self._prev_key
+
+    def test_disabled_when_key_unset(self):
+        from services import fmp_client
+        self.assertFalse(fmp_client.is_enabled())
+        self.assertIsNone(fmp_client.get_fundamentals("AAPL"))
+        self.assertIsNone(fmp_client.get_next_earnings_ts("AAPL"))
+        self.assertIsNone(fmp_client.has_recent_earnings("AAPL"))
+        self.assertIsNone(fmp_client.get_analyst_consensus("AAPL"))
+        self.assertEqual(fmp_client.get_recent_sec_filings("8-K"), [])
+
+    def test_enabled_when_key_set(self):
+        from services import fmp_client
+        os.environ["FMP_API_KEY"] = "test-key-xyz"
+        try:
+            self.assertTrue(fmp_client.is_enabled())
+        finally:
+            os.environ.pop("FMP_API_KEY", None)
+
+    def test_fundamentals_falls_back_to_yfinance_when_fmp_returns_none(self):
+        """When FMP_API_KEY is set but the FMP composite fetch returns None
+        (delisted ticker, premium-tier endpoint not available, etc.), the
+        fundamentals._fetch_one path must continue down the yfinance branch
+        rather than returning None and starving the score multiplier."""
+        import yfinance
+        from services import fundamentals as fnd
+        os.environ["FMP_API_KEY"] = "test-key"
+        try:
+            with patch("services.fmp_client.get_fundamentals", return_value=None), \
+                 patch.object(yfinance, "Ticker") as mock_yf:
+                mock_yf.return_value.info = {
+                    "sector": "Technology", "marketCap": 3.4e12,
+                    "trailingPE": 28.5, "profitMargins": 0.25,
+                }
+                row = fnd._fetch_one("AAPL")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["sector"], "Technology")
+            self.assertEqual(row["pe_ratio"], 28.5)
+        finally:
+            os.environ.pop("FMP_API_KEY", None)
+
+    def test_fundamentals_uses_fmp_when_returned(self):
+        import yfinance
+        from services import fundamentals as fnd
+        os.environ["FMP_API_KEY"] = "test-key"
+        fmp_payload = {
+            "ticker": "MSFT", "sector": "Technology",
+            "industry": "Software", "market_cap": 3.0e12,
+            "shares_outstanding": None, "pe_ratio": 36.2, "pe_forward": None,
+            "peg_ratio": 2.1, "price_to_book": 12.0, "price_to_sales": 13.5,
+            "ev_to_ebitda": 25.0, "revenue_growth_yoy": 0.18,
+            "earnings_growth_yoy": 0.20, "profit_margin": 0.36,
+            "operating_margin": 0.42, "return_on_equity": 0.40,
+            "return_on_assets": 0.18, "debt_to_equity": 0.40,
+            "current_ratio": 1.8, "free_cash_flow": 5.0, "dividend_yield": 0.008,
+            "beta": 0.9, "short_pct_float": 0.012, "short_ratio": 1.5,
+        }
+        try:
+            # If FMP returns, the yfinance branch must not run — patch Ticker
+            # to raise and verify the row still comes through.
+            with patch("services.fmp_client.get_fundamentals", return_value=fmp_payload), \
+                 patch.object(yfinance, "Ticker",
+                              side_effect=AssertionError("yfinance should not be hit when FMP succeeds")):
+                row = fnd._fetch_one("MSFT")
+            self.assertEqual(row["ticker"], "MSFT")
+            self.assertEqual(row["pe_ratio"], 36.2)
+        finally:
+            os.environ.pop("FMP_API_KEY", None)
+
+    def test_earnings_uses_fmp_first(self):
+        from services import earnings
+        os.environ["FMP_API_KEY"] = "test-key"
+        try:
+            with patch("services.fmp_client.get_next_earnings_ts", return_value=1234567890.0):
+                ts = earnings._fetch_next_earnings_ts("AAPL")
+            self.assertEqual(ts, 1234567890.0)
+        finally:
+            os.environ.pop("FMP_API_KEY", None)
+
+    def test_analyst_consensus_shape_compatible_with_pipeline(self):
+        """The dict returned by fmp_client.get_analyst_consensus must satisfy
+        the keys analyst_ratings._upsert reads (mean / key / analyst_count /
+        target_*). Otherwise the persisted row would silently miss fields."""
+        from services import fmp_client, analyst_ratings as ar
+        os.environ["FMP_API_KEY"] = "test-key"
+        try:
+            # Mock the underlying _get to return realistic FMP shapes.
+            def fake_get(url, params=None, ttl_sec=0):
+                if "upgrades-downgrades-consensus" in url:
+                    return [{"strongBuy": 5, "buy": 10, "hold": 3,
+                             "sell": 1, "strongSell": 1, "consensus": "Buy"}]
+                if "price-target-consensus" in url:
+                    return [{"targetConsensus": 250.0, "targetHigh": 300.0, "targetLow": 200.0}]
+                return None
+            with patch("services.fmp_client._get", side_effect=fake_get):
+                row = fmp_client.get_analyst_consensus("AAPL")
+            self.assertEqual(row["ticker"], "AAPL")
+            self.assertEqual(row["analyst_count"], 20)
+            # Mean: (1*5 + 2*10 + 3*3 + 4*1 + 5*1) / 20 = 43/20 = 2.15
+            self.assertAlmostEqual(row["mean"], 2.15, places=2)
+            self.assertEqual(row["target_mean"], 250.0)
+            self.assertEqual(row["key"], "buy")
+            # Upsert path uses these keys — none should KeyError.
+            ar._upsert(row)
+            persisted = ar.get_rating("AAPL")
+            self.assertEqual(persisted["analyst_count"], 20)
+            self.assertAlmostEqual(persisted["target_mean"], 250.0)
+        finally:
+            os.environ.pop("FMP_API_KEY", None)
+
+    def test_sec_filings_poll_dedupes_same_filing_across_ticks(self):
+        """Two consecutive poll runs returning the same filing must result
+        in exactly one CandidateEvent row — the second tick recognizes the
+        filing's `link` in the seen-set and skips. This is what protects the
+        push webhook + RSS poll from double-firing on the same filing."""
+        from services import fmp_client
+        from database import SessionLocal, CandidateEvent
+        os.environ["FMP_API_KEY"] = "test-key"
+        try:
+            sample_8k = [{
+                "symbol": "AAPL", "ticker": "AAPL",
+                "link": "https://sec.gov/Archives/edgar/data/1/0000-0000.htm",
+                "acceptedDate": "2026-05-09 12:00:00",
+                "title": "8-K filing",
+            }]
+            with patch("services.fmp_client.get_recent_sec_filings",
+                       side_effect=lambda form_type, limit=50:
+                       sample_8k if form_type == "8-K" else []):
+                first = fmp_client.poll_sec_filings_into_events()
+                second = fmp_client.poll_sec_filings_into_events()
+            self.assertEqual(first["inserted"], 1)
+            self.assertEqual(second["inserted"], 0)
+            self.assertGreaterEqual(second["skipped"], 1)
+            db = SessionLocal()
+            try:
+                rows = db.query(CandidateEvent).filter(
+                    CandidateEvent.ticker == "AAPL",
+                    CandidateEvent.kind == "PEAD",
+                ).all()
+                self.assertEqual(len(rows), 1)
+            finally:
+                db.close()
+        finally:
+            os.environ.pop("FMP_API_KEY", None)
+
+    def test_sec_filings_poll_skips_when_disabled(self):
+        from services import fmp_client
+        # No FMP_API_KEY set in this test — poll must short-circuit, not raise.
+        out = fmp_client.poll_sec_filings_into_events()
+        self.assertEqual(out, {"checked": 0, "inserted": 0, "skipped": 0})
+
+    def test_form_to_event_kind_routing(self):
+        from services import fmp_client
+        self.assertEqual(fmp_client._form_to_event_kind("4"), "INSIDER_BUY")
+        self.assertEqual(fmp_client._form_to_event_kind("8-K"), "PEAD")
+        self.assertIsNone(fmp_client._form_to_event_kind("10-K"))
 
 
 if __name__ == "__main__":

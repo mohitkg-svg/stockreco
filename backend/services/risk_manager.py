@@ -116,8 +116,8 @@ def decay_in_flight_bp_if_stale() -> None:
             return
         _in_flight_bp_last_check_ts = now
     try:
-        from services import paper_trader
-        acct = paper_trader.get_account()
+        from services import alpaca_client
+        acct = alpaca_client.get_account()
         if not acct:
             return
         cur_bp = float(acct.get("buying_power") or 0)
@@ -262,7 +262,7 @@ def dynamic_daily_loss_limit_pct(static_pct: float = 0.03) -> float:
     try:
         from database import SessionLocal as _SL_dl, AutoTrade as _AT_dl
         from datetime import datetime as _dt_dl, timedelta as _td_dl
-        from services import paper_trader as _pt_dl
+        from services import alpaca_client as _pt_dl
         acct = _pt_dl.get_account()
         equity = float(acct["equity"]) if acct else 0.0
         if equity <= 0:
@@ -302,7 +302,7 @@ def session_equity_drawdown_pct() -> Optional[float]:
     data unavailability.
     """
     try:
-        from services import paper_trader as _pt_sed
+        from services import alpaca_client as _pt_sed
         acct = _pt_sed.get_account()
         if not acct:
             return None
@@ -323,7 +323,7 @@ def realized_portfolio_vol_annualized() -> Optional[float]:
     Returns None when insufficient data (cold start).
     """
     try:
-        from services import paper_trader as _pt_vol
+        from services import alpaca_client as _pt_vol
         acct = _pt_vol.get_account()
         if not acct:
             return None
@@ -418,7 +418,7 @@ def account_drawdown_multiplier(lookback_days: int = 60) -> float:
 
     r46 fix #0.2: now reads from the persisted EquitySnapshot table
     (populated every 5 min by `record_equity_snapshot`). Prior code
-    called `paper_trader.get_portfolio_history()` which doesn't exist —
+    called `alpaca_client.get_portfolio_history()` which doesn't exist —
     fell through to `last_equity` (single-session DD) and the graduated
     60d tier system was effectively single-day session DD, silently
     degrading the r44 fix.
@@ -454,7 +454,7 @@ def account_drawdown_multiplier(lookback_days: int = 60) -> float:
         logger.debug(f"account_drawdown_multiplier (snapshot path): {e}")
     # Cold-start fallback: session DD via last_equity. Same shape as before.
     try:
-        from services import paper_trader as _pt_dd
+        from services import alpaca_client as _pt_dd
         acct = _pt_dd.get_account()
         if not acct:
             return 1.0
@@ -554,7 +554,7 @@ def record_equity_snapshot() -> None:
     """
     try:
         from database import SessionLocal as _SL_es, EquitySnapshot as _ES_es
-        from services import paper_trader as _pt_es
+        from services import alpaca_client as _pt_es
         from datetime import datetime as _dt_es
         acct = _pt_es.get_account()
         if not acct:
@@ -761,7 +761,7 @@ def book_leverage_pct(equity: float) -> float:
     if equity <= 0:
         return 0.0
     try:
-        from services import paper_trader as _pt_lev
+        from services import alpaca_client as _pt_lev
         positions = _pt_lev.get_positions() or []
         notional = sum(abs(float(p.get("qty") or 0) * float(p.get("current_price") or 0)) for p in positions)
         return notional / equity
@@ -852,7 +852,7 @@ def adaptive_risk_multiplier() -> float:
     try:
         from database import SessionLocal as _SL, AutoTrade as _AT
         from datetime import datetime as _dt, timedelta as _td
-        from services import paper_trader as _pt
+        from services import alpaca_client as _pt
         _acct = _pt.get_account()
         equity = float(_acct["equity"]) if _acct else 0.0
         if equity > 0:

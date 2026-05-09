@@ -986,7 +986,7 @@ class TickerProfile(Base):
 class EquitySnapshot(Base):
     """r46 fix #0.2: persisted equity timeseries so multi-day drawdown
     tracking actually works. Prior code referenced
-    `paper_trader.get_portfolio_history()` which doesn't exist; the
+    `alpaca_client.get_portfolio_history()` which doesn't exist; the
     fallback used last_equity (1-day session DD) as a stand-in for 60-day
     DD, silently degrading the graduated DD multiplier from r44 #1.2.
 

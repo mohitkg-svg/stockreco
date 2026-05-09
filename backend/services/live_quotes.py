@@ -262,30 +262,40 @@ async def _handle_trade(trade) -> None:
             try:
                 _rows = _db_t.query(_AT_t).filter(
                     _AT_t.ticker == sym,
-                    _AT_t.status == "open",
-                    _AT_t.current_stop.isnot(None),
+                    _AT_t.status == "open"
                 ).all()
-                threat_fired = False
+                action_fired = False
                 for _row in _rows:
-                    if not _row.current_stop:
-                        continue
                     is_put = (
                         _row.asset_type == "option"
                         and isinstance(_row.symbol, str)
                         and len(_row.symbol) > 12
                         and _row.symbol[-9] == "P"
                     )
-                    cs = float(_row.current_stop)
-                    if is_put:
-                        threat_band = cs * 0.9975
-                        threat = px >= threat_band
-                    else:
-                        threat_band = cs * 1.0025
-                        threat = px <= threat_band
-                    if threat:
-                        threat_fired = True
-                        break
-                if threat_fired:
+                    
+                    # 1. Stop-loss threat check
+                    if _row.current_stop:
+                        cs = float(_row.current_stop)
+                        if is_put:
+                            threat = px >= cs * 0.9975
+                        else:
+                            threat = px <= cs * 1.0025
+                        if threat:
+                            action_fired = True
+                            break
+                            
+                    # 2. Target/Profit opportunity check (T1/T2/T3)
+                    li = _row.level_index or 0
+                    targets = [_row.target1, _row.target2, _row.target3]
+                    next_target = targets[li % 3] if li < 3 else None
+                    if next_target:
+                        nt = float(next_target)
+                        opportunity = (px <= nt) if is_put else (px >= nt)
+                        if opportunity:
+                            action_fired = True
+                            break
+
+                if action_fired:
                     # Global single-flight: only one fast-path manage at a time
                     # to prevent correlated drawdowns from firing N concurrent
                     # manage_open_positions runs (broker breaker risk).
@@ -301,7 +311,7 @@ async def _handle_trade(trade) -> None:
                                 # to direct synchronous call (manage already
                                 # uses its own DB connections / locks).
                                 _at_t.manage_open_positions()
-                            logger.info(f"stop-threat fast-path fired for {sym} @ {px}")
+                            logger.info(f"manage fast-path fired for {sym} @ {px} (stop/target hit)")
                         finally:
                             # Release after a brief delay so the manage loop
                             # has a chance to start without a follow-up tick
@@ -497,55 +507,67 @@ async def _news_worker():
     if not key or not secret:
         logger.info("news-stream: APCA creds missing — skipping")
         return
-    try:
-        from alpaca.data.live import NewsDataStream  # type: ignore[attr-defined]
-    except Exception:
-        # alpaca-py 0.21.1 doesn't export NewsDataStream yet. REST poll path
-        # (services.news.poll_watchlist, running every 2min via APScheduler)
-        # keeps news ingestion working until the SDK adds the class.
-        logger.info("news-stream: NewsDataStream not in this alpaca-py version — using REST poll instead")
-        return
 
-    async def _handle_news(n):
-        # Alpaca's news-stream event → same shape as the REST article (id,
-        # headline, summary, source, author, created_at, symbols, url).
-        try:
-            from services import news as news_svc
-            item = {
-                "id": getattr(n, "id", None),
-                "headline": getattr(n, "headline", "") or "",
-                "summary": getattr(n, "summary", "") or "",
-                "source": getattr(n, "source", "") or "",
-                "author": getattr(n, "author", "") or "",
-                "url": getattr(n, "url", "") or "",
-                "created_at": (getattr(n, "created_at", None).isoformat() + "Z") if getattr(n, "created_at", None) else None,
-                "symbols": getattr(n, "symbols", []) or [],
-            }
-            if not item["id"] or not item["headline"]:
-                return
-            result = news_svc.ingest([item])
-            if result.get("inserted"):
-                logger.info(f"news-stream: {item['symbols'][0] if item['symbols'] else '?'}: {item['headline'][:80]}")
-                # Broadcast to /ws/quotes subscribers so the UI can push a toast / refresh the panel.
-                await _broadcast({
-                    "type": "news",
-                    "symbol": (item["symbols"][0] if item["symbols"] else None),
-                    "headline": item["headline"],
-                    "created_at": item["created_at"],
-                })
-        except Exception as e:
-            logger.debug(f"news-stream handler error: {e}")
+    import json
+    import websockets
 
     backoff = 5
     while True:
         try:
-            client = NewsDataStream(key, secret)
-            # Subscribe to all-symbols ('*') so any watchlist change auto-covers.
-            # Alpaca's news feed supports '*' as a wildcard.
-            client.subscribe_news(_handle_news, "*")
-            logger.info("news-stream: connected, subscribed to '*'")
-            await asyncio.get_running_loop().run_in_executor(None, client.run)
-            backoff = 5
+            async with websockets.connect("wss://stream.data.alpaca.markets/v1beta1/news") as ws:
+                # Auth
+                auth_msg = {"action": "auth", "key": key, "secret": secret}
+                await ws.send(json.dumps(auth_msg))
+                auth_reply = json.loads(await ws.recv())
+                
+                if not auth_reply or auth_reply[0].get("T") != "success":
+                    logger.warning(f"news-stream auth failed: {auth_reply}")
+                    await asyncio.sleep(backoff)
+                    continue
+                
+                # Subscribe to all news
+                sub_msg = {"action": "subscribe", "news": ["*"]}
+                await ws.send(json.dumps(sub_msg))
+                sub_reply = json.loads(await ws.recv())
+                
+                if not sub_reply or sub_reply[0].get("T") != "subscription":
+                    logger.warning(f"news-stream subscribe failed: {sub_reply}")
+                    await asyncio.sleep(backoff)
+                    continue
+
+                logger.info("news-stream: connected, subscribed to '*' via raw WebSocket")
+                backoff = 5
+                
+                while True:
+                    msg = await ws.recv()
+                    events = json.loads(msg)
+                    for n in events:
+                        if n.get("T") == "n":
+                            try:
+                                from services import news as news_svc
+                                item = {
+                                    "id": str(n.get("id")),
+                                    "headline": n.get("headline", ""),
+                                    "summary": n.get("summary", ""),
+                                    "source": n.get("source", ""),
+                                    "author": n.get("author", ""),
+                                    "url": n.get("url", ""),
+                                    "created_at": n.get("created_at"),
+                                    "symbols": n.get("symbols", []),
+                                }
+                                if not item["id"] or not item["headline"]:
+                                    continue
+                                result = news_svc.ingest([item])
+                                if result.get("inserted"):
+                                    logger.info(f"news-stream: {item['symbols'][0] if item['symbols'] else '?'}: {item['headline'][:80]}")
+                                    await _broadcast({
+                                        "type": "news",
+                                        "symbol": (item["symbols"][0] if item["symbols"] else None),
+                                        "headline": item["headline"],
+                                        "created_at": item["created_at"],
+                                    })
+                            except Exception as e:
+                                logger.debug(f"news-stream handler error: {e}")
         except Exception as e:
             logger.warning(f"news-stream error, reconnecting in {backoff}s: {e}")
             await asyncio.sleep(backoff)

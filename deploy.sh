@@ -105,6 +105,13 @@ fi
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   ENV_VARS="${ENV_VARS},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
 fi
+# Financial Modeling Prep key (fundamentals + earnings + analyst ratings +
+# SEC filings poll). Same conditional pattern: unset local → preserve Cloud
+# Run value across deploys; when fmp_client.is_enabled() returns False the
+# yfinance fallback paths take over.
+if [ -n "${FMP_API_KEY:-}" ]; then
+  ENV_VARS="${ENV_VARS},FMP_API_KEY=${FMP_API_KEY}"
+fi
 # AI judge call-site modes. Only forwarded when explicitly set, so the
 # default off-everywhere stays put unless you flip the env var.
 for _m in AI_ENTRY_VETO_MODE AI_NEWS_EXIT_MODE AI_CONFIDENCE_MULT_MODE; do
