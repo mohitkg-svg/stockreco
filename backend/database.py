@@ -54,15 +54,17 @@ if _IS_SQLITE:
     _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
 else:
     # Postgres: connection pool with pre-ping. Cloud SQL db-f1-micro only
-    # has ~25 total slots with 3-5 reserved for superusers. With dual-service
-    # deploy (api + manager both connect to the same instance), per-service
-    # ceiling must be sized so 2× per-service ≤ 22 (25 − 3 reserved). Picked
-    # 6 + 4 = 10 per service → 20 total, leaves a 2-slot margin for psql
-    # admin sessions or migration runners to land without tripping
-    # "remaining connection slots reserved".
+    # has ~25 total slots with 3-5 reserved for superusers → ~22 usable.
+    # Budget across BOTH services AT MAX SCALE-OUT (not per-service):
+    #   api      max_instances=3 × (3+2) = 15
+    #   manager  max_instances=1 × (3+2) =  5
+    #   total                            = 20  → 2-slot margin
+    # Earlier 6+4 sizing assumed max_instances=1 per service and exhausted
+    # slots on deploy when the new revision tried to allocate while the old
+    # revision still held its pool — first observed during r71 rollout.
     _engine_kwargs["pool_pre_ping"] = True
-    _engine_kwargs["pool_size"] = 6
-    _engine_kwargs["max_overflow"] = 4
+    _engine_kwargs["pool_size"] = 3
+    _engine_kwargs["max_overflow"] = 2
     _engine_kwargs["pool_recycle"] = 3600
     _engine_kwargs["pool_timeout"] = 30
 
