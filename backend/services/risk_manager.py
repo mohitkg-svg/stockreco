@@ -1349,7 +1349,10 @@ def strategy_multiplier(
         card = strategy_scorecard(days=60, min_trades=5, asset_type=asset_type)
         entry = card.get(strategy_name)
         if entry and (entry.get("n") or entry.get("trades") or 0) >= 20:
-            m = float(entry["multiplier"])
+            # r81 fix: defensive read-side clamp — write-side already clamps
+            # [0.5, 1.3] in auto_trader.strategy_scorecard but a manually-
+            # edited DB row could exceed those bounds.
+            m = max(0.5, min(1.3, float(entry["multiplier"])))
         else:
             m = 1.0
     except Exception:
@@ -1378,7 +1381,9 @@ def calibration_multiplier(confidence: float) -> float:
             # from 1.0; below that, a single big winner can permanently
             # 1.5× every signal in that bucket for 60 days.
             if row and (getattr(row, "n", 0) or 0) >= 20:
-                m = float(row.multiplier)
+                # r81 fix: defensive read-side clamp [0.5, 1.3] — matches
+                # the write-side bounds in auto_trader.compute_confidence_calibration.
+                m = max(0.5, min(1.3, float(row.multiplier)))
                 _calibration_cache[bucket] = (m, now + _CALIBRATION_CACHE_TTL)
                 return m
         finally:

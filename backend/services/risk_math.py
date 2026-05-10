@@ -46,18 +46,27 @@ def clamp_multiplier_stack(
     strategy_mult: float,
     vix_mult: float,
     ceiling: Optional[float] = None,
+    ai_mult: float = 1.0,
+    upstream_mult: float = 1.0,
 ) -> Tuple[float, float, bool]:
-    """Multiply the 5 factors, clamp to ceiling. Returns (raw, clamped, was_clamped).
+    """Multiply all factors, clamp to ceiling. Returns (raw, clamped, was_clamped).
 
     Critical-audit fix #1 lived at this shape — five full-at-max factors
     compounded to ~4.7× before the ceiling was added, turning a 2% risk
     cap into 9.4% per trade. Ceiling of 2.0× preserves ~60% of upside
     while hard-capping downside.
+
+    r81 fix: added ``ai_mult`` and ``upstream_mult`` so the ceiling binds
+    on the *total* compound product — not just the 6-factor sub-stack.
+    Previously the upstream chain (adapt × dd × vt × regime × cal × r47
+    × factor / beta) was multiplied *outside* the ceiling, letting a
+    low-β ticker with high vol-target silently exceed the 2× cap.
     """
     from services.config import RISK_MULT_CEILING
     if ceiling is None:
         ceiling = RISK_MULT_CEILING
-    raw = confidence_mult * kelly_mult * calibration_mult * strategy_mult * vix_mult
+    raw = (confidence_mult * kelly_mult * calibration_mult
+           * strategy_mult * vix_mult * ai_mult * upstream_mult)
     clamped = min(raw, ceiling)
     return raw, clamped, raw > ceiling
 

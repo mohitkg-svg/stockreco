@@ -3625,9 +3625,13 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # an un-validated v2 percentile rank wasn't moving the needle and
         # added bug surface. If/when v2 ranking proves out empirically,
         # restore via a separate validated multiplier.
-        risk_budget = (equity * cfg.max_risk_per_trade_pct
-                       * _adapt * _dd_mult * _vt_mult
-                       * _regime_xa * _cal_mult * _r47_mult * _factor_mult) / _beta
+        # r81 fix: upstream_mult captures adapt/dd/vt/regime/cal/r47/factor/beta
+        # so it participates in the RISK_MULT_CEILING clamp below, preventing
+        # the upstream chain from silently exceeding the 2× cap on low-β or
+        # high vol-target tickers.
+        _upstream_mult = (_adapt * _dd_mult * _vt_mult
+                          * _regime_xa * _cal_mult * _r47_mult * _factor_mult) / _beta
+        risk_budget = equity * cfg.max_risk_per_trade_pct
         # Profit-max: scale risk budget with confidence headroom above threshold.
         # Signals that clear the gate by a wide margin deserve a bigger bet.
         conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
@@ -3745,12 +3749,20 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         except Exception as _e:
             logger.debug(f"ai_judge confidence_multiplier wrapper failed: {_e}")
 
-        from services.config import RISK_MULT_CEILING as _MULT_CEILING
-        # r39 audit fix #13: removed dead duplicate `raw_stack` and
-        # `effective_risk_budget` assignments — first lines were silently
-        # overwritten by the second (without ai_mult / heat_mult).
-        raw_stack = conf_mult * kelly_mult * cal_mult * strat_mult * vix_mult * ai_mult
-        clamped_stack = min(raw_stack, _MULT_CEILING)
+        # r81 fix: route through clamp_multiplier_stack so there's one
+        # canonical ceiling implementation. The upstream_mult (adapt/dd/vt/
+        # regime/cal/r47/factor/beta) is now inside the ceiling — previously
+        # it was multiplied outside, letting low-β + high vol-target exceed 2×.
+        from services.risk_math import clamp_multiplier_stack as _clamp_stack
+        raw_stack, clamped_stack, _was_clamped = _clamp_stack(
+            confidence_mult=conf_mult,
+            kelly_mult=kelly_mult,
+            calibration_mult=cal_mult,
+            strategy_mult=strat_mult,
+            vix_mult=vix_mult,
+            ai_mult=ai_mult,
+            upstream_mult=_upstream_mult,
+        )
         # Heat-aware throttle: applies AFTER the multiplier-stack ceiling so
         # the heat-throttle still pulls things smaller even when other
         # factors maxed out the 2× cap. This is a downward-only adjustment
@@ -3774,12 +3786,13 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 f"AutoTrader {ticker}: portfolio_kelly throttle {pk_mult:.2f}× "
                 f"(60d expectancy/Sharpe argues for smaller book)"
             )
-        if raw_stack > _MULT_CEILING:
+        from services.config import RISK_MULT_CEILING as _MULT_CEILING
+        if _was_clamped:
             logger.info(
                 f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
-                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} strat={strat_mult:.2f} vix={vix_mult:.2f})"
                 f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} "
-                f"strat={strat_mult:.2f} vix={vix_mult:.2f} ai={ai_mult:.2f})"
+                f"strat={strat_mult:.2f} vix={vix_mult:.2f} ai={ai_mult:.2f} "
+                f"upstream={_upstream_mult:.2f})"
             )
         if heat_mult < 1.0:
             logger.info(
@@ -6502,31 +6515,42 @@ def manage_open_positions() -> Dict[str, Any]:
                                                             and (t.asset_type or "stock") == "stock"
                                                         ):
                                                             _add = max(1, int(0.25 * float(t.original_qty)))
-                                                            from alpaca.trading.enums import OrderSide as _OS_p, TimeInForce as _TIF_p
-                                                            if not alpaca_client.is_market_open():
-                                                                from alpaca.trading.requests import LimitOrderRequest as _LOR_p
-                                                                _req = _LOR_p(
-                                                                    symbol=t.ticker, qty=_add,
-                                                                    side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
-                                                                    limit_price=round(px, 2), extended_hours=True,
-                                                                )
+                                                            # r81 fix: cap pyramid so total qty doesn't
+                                                            # exceed original_qty × RISK_MULT_CEILING,
+                                                            # preventing the scale-in from silently
+                                                            # exceeding the risk ceiling.
+                                                            from services.config import RISK_MULT_CEILING as _PYR_CEIL
+                                                            _max_total = int(float(t.original_qty) * _PYR_CEIL)
+                                                            _cur_qty = int(t.qty or 0)
+                                                            _add = min(_add, max(0, _max_total - _cur_qty))
+                                                            if _add < 1:
+                                                                _atomic_append_note(db, t.id, " | PYRAMID: skipped (would exceed RISK_MULT_CEILING)")
                                                             else:
-                                                                from alpaca.trading.requests import MarketOrderRequest as _MOR_p
-                                                                _req = _MOR_p(
-                                                                    symbol=t.ticker, qty=_add,
-                                                                    side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
-                                                                )
-                                                            alpaca_client._get_client().submit_order(order_data=_req)
-                                                            t.qty = (t.qty or 0) + _add
-                                                            # r47 fix #T0f (P1-8): resize SL leg to match new qty
-                                                            # so the added shares aren't naked until next manage tick.
-                                                            try:
-                                                                if t.stop_order_id:
-                                                                    alpaca_client.replace_order_by_id(t.stop_order_id, qty=int(t.qty))
-                                                            except Exception as _resize_e:
-                                                                logger.warning(f"pyramid SL resize {t.ticker} failed: {_resize_e}")
-                                                            _atomic_append_note(db, t.id, f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})")
-                                                            metrics.inc("autotrade_event", event="pyramid_t1")
+                                                                from alpaca.trading.enums import OrderSide as _OS_p, TimeInForce as _TIF_p
+                                                                if not alpaca_client.is_market_open():
+                                                                    from alpaca.trading.requests import LimitOrderRequest as _LOR_p
+                                                                    _req = _LOR_p(
+                                                                        symbol=t.ticker, qty=_add,
+                                                                        side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
+                                                                        limit_price=round(px, 2), extended_hours=True,
+                                                                    )
+                                                                else:
+                                                                    from alpaca.trading.requests import MarketOrderRequest as _MOR_p
+                                                                    _req = _MOR_p(
+                                                                        symbol=t.ticker, qty=_add,
+                                                                        side=_OS_p.BUY, time_in_force=_TIF_p.DAY,
+                                                                    )
+                                                                alpaca_client._get_client().submit_order(order_data=_req)
+                                                                t.qty = (t.qty or 0) + _add
+                                                                # r47 fix #T0f (P1-8): resize SL leg to match new qty
+                                                                # so the added shares aren't naked until next manage tick.
+                                                                try:
+                                                                    if t.stop_order_id:
+                                                                        alpaca_client.replace_order_by_id(t.stop_order_id, qty=int(t.qty))
+                                                                except Exception as _resize_e:
+                                                                    logger.warning(f"pyramid SL resize {t.ticker} failed: {_resize_e}")
+                                                                _atomic_append_note(db, t.id, f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})")
+                                                                metrics.inc("autotrade_event", event="pyramid_t1")
                                                     except Exception as _py_e:
                                                         logger.warning(f"pyramid {t.ticker} failed: {_py_e}")
                                         # Profit-max: T2 partial profit — trim half the remaining

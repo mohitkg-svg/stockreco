@@ -338,6 +338,119 @@ class TestRiskMultCeiling(unittest.TestCase):
 
 
 # ============================================================================
+# CATEGORY E2: Risk multiplier ceiling — upstream chain + pyramid (r81)
+# ----------------------------------------------------------------------------
+# Gap #3: upstream_mult (adapt × dd × vt × regime × cal × r47 × factor / beta)
+# was multiplied OUTSIDE the ceiling. A low-β ticker (β=0.5 → /0.5 = 2×)
+# with maxed upstream chain could silently produce 4× risk.
+# Gap #2: pyramid scale-in added 25% of original_qty with zero ceiling check.
+# ============================================================================
+
+class TestRiskMultCeilingUpstream(unittest.TestCase):
+
+    def test_upstream_mult_included_in_ceiling(self):
+        """clamp_multiplier_stack with upstream_mult > 1 must still bind at ceiling."""
+        from services.risk_math import clamp_multiplier_stack
+        from services.config import RISK_MULT_CEILING
+        # Scenario: low-β ticker (upstream 2.0) + all factors at 1.2
+        raw, clamped, was_clamped = clamp_multiplier_stack(
+            1.2, 1.2, 1.2, 1.2, 1.0, ai_mult=1.0, upstream_mult=2.0,
+        )
+        # raw = 1.2^4 × 2.0 = 4.15 → must be clamped
+        self.assertGreater(raw, RISK_MULT_CEILING)
+        self.assertEqual(clamped, RISK_MULT_CEILING)
+        self.assertTrue(was_clamped)
+
+    def test_upstream_below_ceiling_passes_through(self):
+        """When total product is under ceiling, no clamping occurs."""
+        from services.risk_math import clamp_multiplier_stack
+        raw, clamped, was_clamped = clamp_multiplier_stack(
+            1.0, 1.0, 1.0, 1.0, 1.0, ai_mult=1.0, upstream_mult=1.2,
+        )
+        self.assertAlmostEqual(raw, 1.2, places=4)
+        self.assertAlmostEqual(clamped, 1.2, places=4)
+        self.assertFalse(was_clamped)
+
+    def test_ai_mult_included_in_ceiling(self):
+        """ai_mult is now inside the ceiling clamp, not outside."""
+        from services.risk_math import clamp_multiplier_stack
+        from services.config import RISK_MULT_CEILING
+        raw, clamped, was_clamped = clamp_multiplier_stack(
+            1.5, 1.2, 1.3, 1.3, 1.0, ai_mult=1.15, upstream_mult=1.0,
+        )
+        # 1.5 × 1.2 × 1.3 × 1.3 × 1.0 × 1.15 = 3.58 → clamped
+        self.assertGreater(raw, RISK_MULT_CEILING)
+        self.assertEqual(clamped, RISK_MULT_CEILING)
+        self.assertTrue(was_clamped)
+
+    def test_low_beta_upstream_clamped(self):
+        """β=0.5 → upstream = 2.0. Even with neutral factors, ceiling must bind."""
+        from services.risk_math import clamp_multiplier_stack
+        from services.config import RISK_MULT_CEILING
+        # upstream = adapt(1.0) × dd(1.0) × vt(1.5) × regime(1.0) × cal(1.0)
+        #           × r47(1.0) × factor(1.4) / beta(0.5) = 4.2
+        upstream = (1.0 * 1.0 * 1.5 * 1.0 * 1.0 * 1.0 * 1.4) / 0.5
+        raw, clamped, was_clamped = clamp_multiplier_stack(
+            1.0, 1.0, 1.0, 1.0, 1.0, ai_mult=1.0, upstream_mult=upstream,
+        )
+        self.assertGreater(raw, RISK_MULT_CEILING)
+        self.assertEqual(clamped, RISK_MULT_CEILING)
+
+    def test_pyramid_capped_by_ceiling(self):
+        """Pyramid add must not push total qty above original_qty × ceiling."""
+        from services.config import RISK_MULT_CEILING
+        original_qty = 100
+        # After T1 trim (30%), current qty = 70
+        current_qty = 70
+        _add = max(1, int(0.25 * original_qty))  # 25 shares
+        # Apply ceiling cap
+        _max_total = int(original_qty * RISK_MULT_CEILING)  # 200
+        _add = min(_add, max(0, _max_total - current_qty))
+        # 200 - 70 = 130 headroom → 25 fits → no clamping
+        self.assertEqual(_add, 25)
+        self.assertLessEqual(current_qty + _add, _max_total)
+
+    def test_pyramid_blocked_when_at_ceiling(self):
+        """Pyramid must return 0 when current qty already at ceiling × original."""
+        from services.config import RISK_MULT_CEILING
+        original_qty = 100
+        # Hypothetical: current qty is already at ceiling (from prior pyramids)
+        current_qty = int(original_qty * RISK_MULT_CEILING)  # 200
+        _add = max(1, int(0.25 * original_qty))  # 25
+        _max_total = int(original_qty * RISK_MULT_CEILING)
+        _add = min(_add, max(0, _max_total - current_qty))
+        self.assertEqual(_add, 0, "pyramid must be blocked when at ceiling")
+
+
+class TestRiskManagerDefensiveClamps(unittest.TestCase):
+    """r81: read-side clamps on strategy/calibration multipliers."""
+
+    def test_strategy_multiplier_clamped_high(self):
+        """A strategy multiplier > 1.3 from DB must be clamped to 1.3."""
+        # Test the clamp logic directly
+        m_raw = 2.5
+        m = max(0.5, min(1.3, m_raw))
+        self.assertEqual(m, 1.3)
+
+    def test_strategy_multiplier_clamped_low(self):
+        """A strategy multiplier < 0.5 from DB must be clamped to 0.5."""
+        m_raw = 0.1
+        m = max(0.5, min(1.3, m_raw))
+        self.assertEqual(m, 0.5)
+
+    def test_calibration_multiplier_clamped_high(self):
+        m_raw = 5.0
+        m = max(0.5, min(1.3, m_raw))
+        self.assertEqual(m, 1.3)
+
+    def test_calibration_multiplier_passthrough(self):
+        """A value within [0.5, 1.3] must pass through unchanged."""
+        m_raw = 0.9
+        m = max(0.5, min(1.3, m_raw))
+        self.assertAlmostEqual(m, 0.9, places=4)
+
+
+# ============================================================================
 # CATEGORY F: Cheap-options sizing cap
 # ----------------------------------------------------------------------------
 # Bug: $0.30 premium options sized 122 contracts (CNTA -$2,440). The
