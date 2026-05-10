@@ -763,6 +763,14 @@ async def lifespan(app: FastAPI):
     try:
         from services.risk_manager import record_equity_snapshot
         from apscheduler.triggers.cron import CronTrigger as _CronES
+        # r80: seed a snapshot immediately on lifespan boot so account_drawdown
+        # multiplier + crisis_mode detection have data to read from minute 0,
+        # not after a 25-min cold-start window. record_equity_snapshot is a
+        # no-op when alpaca creds aren't set, so it's safe to call here.
+        try:
+            record_equity_snapshot()
+        except Exception as _e_seed:
+            logger.warning(f"equity_snapshot seed at boot failed (non-fatal): {_e_seed}")
         # r47 fix #T0d-4: prior cron used UTC `hour="13-20"` (= 9-16 ET in
         # EDT, but 8-15 ET in EST). For ~4 months/year (Nov-Mar) the recorder
         # stopped firing at 15:00 ET — missing the 15:00-16:00 close window

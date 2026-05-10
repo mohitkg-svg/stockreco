@@ -1647,8 +1647,23 @@ def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
             # an adopted position used to get a GTC stop that survives the
             # weekend — defeating the day-TIF safety on the rest of the
             # book. Match the policy.
+            #
+            # r80 round-2 refinement: Alpaca rejects DAY-TIF stop orders
+            # submitted outside RTH. If we're in pre-market or after-hours
+            # (or within last 60 min of session, when a DAY stop would
+            # expire imminently and leave the position naked overnight),
+            # fall back to GTC. The bracket_tif=day weekend-gap guarantee
+            # only applies to brackets opened DURING the session anyway.
             _adopt_tif_str = str(getattr(cfg, "bracket_tif", "day") or "day").lower()
-            _adopt_tif = _TIF.DAY if _adopt_tif_str == "day" else _TIF.GTC
+            _use_day_tif = _adopt_tif_str == "day"
+            try:
+                _is_open_now = alpaca_client.is_market_open()
+                _mtc = alpaca_client.minutes_to_close()
+                if not _is_open_now or (_mtc is not None and _mtc < 60):
+                    _use_day_tif = False  # GTC fallback outside RTH
+            except Exception:
+                _use_day_tif = False  # be conservative on any error
+            _adopt_tif = _TIF.DAY if _use_day_tif else _TIF.GTC
             stop_res = c.submit_order(order_data=StopOrderRequest(
                 symbol=ticker, qty=int(live_qty), side=sell_side,
                 time_in_force=_adopt_tif, stop_price=round(new_stop, 2),

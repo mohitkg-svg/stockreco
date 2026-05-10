@@ -92,7 +92,12 @@ def _safe_rest_read(fn, *args, timeout: float = _REST_TIMEOUT_SEC,
             )
         except Exception as e:
             last_exc = e
-            err_s = str(e).lower()
+            # r80 round-2 hardening: defensive str() — some SDK exceptions
+            # have broken __str__/__repr__; treat as non-transient if so.
+            try:
+                err_s = (str(e) or "").lower()
+            except Exception:
+                err_s = ""
             if any(t in err_s for t in (
                 "429", "500", "502", "503", "504",
                 "timeout", "timed out", "connection",
@@ -150,8 +155,11 @@ def is_market_open() -> bool:
         c = _get_client()
         if not c:
             return False
-        clk = c.get_clock()
-        is_open = bool(clk.is_open)
+        # r80 round-2: wrap with timeout. A network stall on /v2/clock
+        # would otherwise hold _market_clock_inflight clear() forever
+        # and block every subsequent caller's wait(timeout=5).
+        clk = _safe_rest_read(c.get_clock, timeout=3.0)
+        is_open = bool(clk.is_open) if clk is not None else False
     except Exception as e:
         logger.warning(f"get_clock failed: {e}")
         is_open = False
