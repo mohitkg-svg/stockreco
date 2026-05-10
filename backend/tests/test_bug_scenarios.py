@@ -2217,6 +2217,124 @@ class TestR77LiveMoneyP0Fixes(unittest.TestCase):
             "it). Sync SQLAlchemy on `async def` blocks the event loop."
         )
 
+    def test_no_realized_pl_read_modify_write_in_auto_trader(self):
+        """r79-A: every `t.realized_pl = (t.realized_pl or 0) + delta`
+        site is a lost-update race when manage tick + WS fast-path + AI
+        exit hit the same trade. The execution_engine helper
+        atomic_accumulate_realized_pl uses a single-round-trip SQL
+        UPDATE with COALESCE, which is race-safe."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        # The buggy pattern in any of its common forms
+        patterns = [
+            't.realized_pl = (t.realized_pl or 0) +',
+            't.realized_pl = (t.realized_pl or 0.0) +',
+        ]
+        offenders = [p for p in patterns if p in src]
+        self.assertEqual(
+            offenders, [],
+            "auto_trader.py contains realized_pl read-modify-write — "
+            f"patterns: {offenders}. Use _atomic_acc_pl(db, t.id, delta)."
+        )
+
+    def test_no_note_concat_read_modify_write_in_auto_trader(self):
+        """r79-B: same race-condition class as realized_pl. `t.note =
+        (t.note or '') + suffix` lost-updates on concurrent writers."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        offenders_n = src.count('t.note = (t.note or "")')
+        self.assertEqual(
+            offenders_n, 0,
+            f"auto_trader.py has {offenders_n} `t.note = (t.note or \"\") + ...` "
+            "sites. Use _atomic_append_note(db, t.id, suffix)."
+        )
+
+    def test_sector_heat_uses_original_qty(self):
+        """r79-C: sector-heat aggregation must read original_qty, not
+        the mutable qty. Otherwise a T1 trim halves sr.qty and frees a
+        sector slot while the runner is still exposed."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        anchor = src.find("sector_heat = 0.0")
+        self.assertGreater(anchor, 0, "sector_heat block not found")
+        block = src[anchor: anchor + 1500]
+        self.assertIn(
+            "original_qty", block,
+            "sector_heat block must reference original_qty so trims "
+            "don't free sector capacity prematurely."
+        )
+
+    def test_option_error_paths_set_idempotency_key(self):
+        """r79-D: option PUT/CALL error-path AutoTrade INSERTs used to
+        miss `idempotency_key=`, so two consecutive submit failures on
+        the same signal would create two error rows instead of being
+        deduped. With the column UNIQUE allowing multi-NULL, retry
+        storms could quietly fill the table."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        for tag in ('"option submit failed', '"call submit failed'):
+            anchor = src.find(tag)
+            self.assertGreater(anchor, 0, f"error-path INSERT for {tag} missing")
+            # Look back for the AutoTrade(...) ctor in the ~800 chars before.
+            before = src[max(0, anchor - 1000): anchor]
+            self.assertIn(
+                "idempotency_key=", before,
+                f"error-path INSERT near {tag!r} doesn't set idempotency_key"
+            )
+
+    def test_all_backend_python_files_parse(self):
+        """r79-F: blanket guard against the 'stray 2-char prefix on a line'
+        corruption class we kept hitting during this audit cycle (random
+        2-3 character prefixes appearing before keywords or docstring
+        opens). Compile every .py file under backend/. If anything fails
+        to parse, this test fires before deploy.sh's regression gate."""
+        import py_compile
+        backend_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..")
+        )
+        broken = []
+        for root, _, files in os.walk(backend_root):
+            if "__pycache__" in root or "/tests/" in root:
+                continue
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(root, fn)
+                try:
+                    py_compile.compile(path, doraise=True)
+                except py_compile.PyCompileError as e:
+                    broken.append((path, str(e).splitlines()[0] if str(e) else ""))
+        self.assertEqual(
+            broken, [],
+            f"Backend Python files with syntax errors: {broken}"
+        )
+
+    def test_logger_defined_before_first_use_in_auto_trader(self):
+        """r79-E: `logger = logging.getLogger(__name__)` must be at the
+        module top, before ANY function that calls logger.* is defined.
+        Originally logger was at line ~728 and _pg_advisory_entry_lock
+        at line ~99 referenced it — fine in the current call sequence
+        but a load-order trap waiting for the next reorder."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            lines = f.read().split("\n")
+        first_logger_def = None
+        for i, ln in enumerate(lines):
+            if ln.startswith("logger = logging.getLogger("):
+                first_logger_def = i + 1
+                break
+        self.assertIsNotNone(first_logger_def, "logger never defined")
+        # Should be in the first ~100 lines (after imports), not deep in the file.
+        self.assertLess(
+            first_logger_def, 100,
+            f"logger defined at line {first_logger_def}; should be near "
+            "top-of-module so any helper above can call logger.* safely."
+        )
+
     def test_no_duplicate_for_loop_or_def_lines_in_main(self):
         """r77-A bis: same root cause — a reschedule / rename pass that
         leaves the old line above the new line. Two consecutive `for ...:`

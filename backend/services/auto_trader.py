@@ -30,6 +30,11 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
+
+# r79 fix: logger defined here at module top (was at line 728), so any
+# helpers defined above 728 — including _pg_advisory_entry_lock — can
+# call logger without a NameError or load-order trap.
+logger = logging.getLogger(__name__)
 import hashlib
 from pydantic import BaseModel
 
@@ -724,8 +729,6 @@ from services.options_analyzer import suggest_options_for_signal
 from services.data_fetcher import get_current_price as fetch_current_price
 from services.earnings import inside_earnings_window, hours_to_next_earnings
 from services.alerts import alert as _raise_alert
-
-logger = logging.getLogger(__name__)
 
 
 # ---------- Config ---------------------------------------------------------
@@ -3285,11 +3288,18 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     for sr in sector_rows:
                         se = sr.entry_price or sr.requested_entry or 0.0
                         ss_ = sr.current_stop or sr.stop_loss or 0.0
+                        # r79 fix: use original_qty so sector heat reflects the
+                        # ORIGINAL deployed risk, not the post-trim residual.
+                        # Without this, a T1 trim halves sr.qty and frees a
+                        # sector slot prematurely — the runner is still
+                        # exposed to the same direction; sector concentration
+                        # is unchanged from the bot's risk perspective.
+                        sr_qty = sr.original_qty or sr.qty or 0
                         if sr.asset_type == "stock" and se > 0 and ss_ > 0:
                             # r47 fix #T0f-1 (sector heat companion): same short-side fix
-                            sector_heat += abs(float(se) - float(ss_)) * (sr.qty or 0)
+                            sector_heat += abs(float(se) - float(ss_)) * sr_qty
                         elif sr.asset_type == "option" and se > 0:
-                            sector_heat += float(se) * 100 * (sr.qty or 0)
+                            sector_heat += float(se) * 100 * sr_qty
                     new_heat = max(0.0, risk_per_share) * 1  # conservative — single-share for the gate
                     sector_heat_cap = _sector_equity * 0.04   # 4% of equity per sector
                     if sector_heat + new_heat >= sector_heat_cap:
@@ -4360,6 +4370,18 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                     f"ask ${res.get('ask','?')} max ${res.get('max_allowed','?')}"
                 )
                 return None
+            # r79 fix: stamp idempotency_key on the error row too. Without
+            # it, the same failing signal regenerated on the next scan
+            # silently inserts another error row instead of being deduped.
+            try:
+                _err_idem = _signal_idempotency_key(
+                    ticker, "BUY",
+                    timeframe=str(thesis.get("timeframe") or "option"),
+                    entry=float(top["premium"]),
+                    occ_symbol=occ,
+                )
+            except Exception:
+                _err_idem = None
             db.add(AutoTrade(
                 ticker=ticker, symbol=occ, asset_type="option", side="buy",
                 qty=qty, requested_entry=top["premium"],
@@ -4367,6 +4389,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                 current_stop=top["effective_stop_premium"],
                 target1=thesis["target1"], target2=thesis["target2"],
                 target3=thesis.get("target3"), level_index=0,
+                idempotency_key=_err_idem,
                 status="error",
                 note=f"option submit failed: {res['error']}",
             ))
@@ -4833,6 +4856,18 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                     f"ask ${res.get('ask','?')} max ${res.get('max_allowed','?')}"
                 )
                 return None
+            # r79 fix: idempotency_key on call-path error row too (mirrors
+            # PUT error path). Otherwise a transient submit failure silently
+            # creates a new error row on every rescan instead of dedup.
+            try:
+                _err_idem = _signal_idempotency_key(
+                    ticker, "BUY",
+                    timeframe=str(thesis.get("timeframe") or "option"),
+                    entry=float(top["premium"]),
+                    occ_symbol=occ,
+                )
+            except Exception:
+                _err_idem = None
             db.add(AutoTrade(
                 ticker=ticker, symbol=occ, asset_type="option", side="buy",
                 qty=qty, requested_entry=top["premium"],
@@ -4840,6 +4875,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                 current_stop=top["effective_stop_premium"],
                 target1=thesis["target1"], target2=thesis["target2"],
                 target3=thesis.get("target3"), level_index=0,
+                idempotency_key=_err_idem,
                 status="error",
                 note=f"call submit failed: {res['error']}",
             ))
@@ -4946,6 +4982,8 @@ from services.execution_engine import (
     replace_stop as _replace_stop,
     replace_tp as _replace_tp,
     _replace_stop_cache,  # re-exported for any introspection use
+    atomic_accumulate_realized_pl as _atomic_acc_pl,
+    atomic_append_note as _atomic_append_note,
 )
 
 
@@ -5001,8 +5039,9 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                 filled_qty = int(getattr(parent, "filled_qty", 0) or 0)
                 if filled_qty > 0:
                     t.qty = float(filled_qty)
-                    t.note = (t.note or "") + (
-                        f" | OPTION PARTIAL FILL: using {filled_qty} of original qty"
+                    _atomic_append_note(
+                        db, t.id,
+                        f" | OPTION PARTIAL FILL: using {filled_qty} of original qty",
                     )
             except Exception as _e:
                 logger.debug(f"option partial-fill qty update {t.symbol}: {_e}")
@@ -5020,7 +5059,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
         elif any(s in pstatus for s in ("canceled", "rejected", "expired")):
             t.status = "closed_manual"
             t.closed_at = datetime.utcnow()
-            t.note = (t.note or "") + f" | option parent {pstatus}"
+            _atomic_append_note(db, t.id, f" | option parent {pstatus}")
             db.commit()
             summary["closed"] += 1
         return
@@ -5156,15 +5195,20 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                         and str(trim.get("status", "")).lower() not in ("rejected", "canceled", "expired")
                     )
                     if trim_ok:
+                        # r79: realized_pl + note now use atomic SQL helpers so
+                        # manage tick + WS fast-path + AI exit can't lost-update
+                        # the values when racing on the same trade row.
                         if cur_premium is not None and t.entry_price:
                             partial_pl = (cur_premium - t.entry_price) * half * 100
-                            t.realized_pl = (t.realized_pl or 0) + partial_pl
+                            _atomic_acc_pl(db, t.id, partial_pl)
                         t.qty = t.qty - half
                         t.hit_t1 = True
-                        t.note = (t.note or "") + (
+                        _atomic_append_note(
+                            db, t.id,
                             f" | PARTIAL: trimmed {half} contracts at T1 (px={px:.2f}); "
-                            f"runner = {int(t.qty)} contracts"
+                            f"runner = {int(t.qty)} contracts",
                         )
+                        db.refresh(t)
                         logger.info(
                             f"AutoTrader {'PUT' if is_put else 'CALL'} {t.ticker} partial-trim {half} @ "
                             f"underlying {px:.2f}; runner {int(t.qty)} contracts"
@@ -5207,10 +5251,11 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                 t.current_stop = new_stop
             t.level_index = li + 1
             tag = ["T1", "T2", "T3"][target_idx]
-            t.note = (t.note or "") + (
+            _atomic_append_note(
+                db, t.id,
                 f" | underlying {tag} hit @ {px:.2f}, u-stop→{new_stop}"
                 if tightened else
-                f" | underlying {tag} hit @ {px:.2f} (u-stop unchanged)"
+                f" | underlying {tag} hit @ {px:.2f} (u-stop unchanged)",
             )
             # Push-notify the UI via the live-quotes WebSocket channel.
             try:
@@ -5235,7 +5280,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                         f"underlying T3 breached @ {px:.2f}; recalc",
                         new_targets,
                     )
-                    t.note = (t.note or "") + f" | recalc T1-3: {new_targets}"
+                    _atomic_append_note(db, t.id, f" | recalc T1-3: {new_targets}")
             db.commit()
             summary["trailed"] += 1
             logger.info(
@@ -5451,7 +5496,7 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
             logger.warning(f"option {t.symbol}: runner P/L calc skipped: {_e} (kept partial PL={float(t.realized_pl or 0):.2f})")
         t.status = final_status or "closed_manual"
         t.closed_at = datetime.utcnow()
-        t.note = (t.note or "") + f" | EXIT: {exit_reason}"
+        _atomic_append_note(db, t.id, f" | EXIT: {exit_reason}")
         # r44 fix #0.3: backfill MLPrediction outcome on every close path.
         try:
             _backfill_ml_outcome(db, t)
@@ -5634,7 +5679,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                 _trim_e = alpaca_client._get_client().submit_order(order_data=_req_e)
                                 if _trim_e is not None:
                                     t.qty = t.qty - _half
-                                    t.note = (t.note or "") + f" | EARNINGS PRE-FLATTEN: trimmed {_half} ({_hte_s:.1f}h to print)"
+                                    _atomic_append_note(db, t.id, f" | EARNINGS PRE-FLATTEN: trimmed {_half} ({_hte_s:.1f}h to print)")
                                     db.commit()
                                     metrics.inc("autotrade_event", event="earnings_pre_flatten")
                         except Exception as _ef:
@@ -5739,7 +5784,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                     pass
                                 t.status = "closed_unfilled"
                                 t.closed_at = datetime.utcnow()
-                                t.note = (t.note or "") + " | UNFILLED: limit timed out"
+                                _atomic_append_note(db, t.id, " | UNFILLED: limit timed out")
                                 db.commit()
                                 _release_bp(float(t.qty) * float(t.requested_entry or 0))
                                 metrics.inc("autotrade_event", event="closed_unfilled")
@@ -5780,7 +5825,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                 )
                                 if "error" not in cross:
                                     t.parent_order_id = cross.get("id") or t.parent_order_id
-                                    t.note = (t.note or "") + f" | CROSSED to market after {age_s:.0f}s unfilled"
+                                    _atomic_append_note(db, t.id, f" | CROSSED to market after {age_s:.0f}s unfilled")
                                     db.commit()
                                 else:
                                     logger.warning(f"limit-cross resubmit failed for {t.ticker}: {cross.get('error')}")
@@ -5798,7 +5843,7 @@ def manage_open_positions() -> Dict[str, Any]:
                             except Exception as e:
                                 logger.warning(f"partial-fill cancel remainder failed for {t.ticker}: {e}")
                             t.qty = int(filled_qty)
-                            t.note = (t.note or "") + f" | PARTIAL FILL: using {int(filled_qty)} of original qty"
+                            _atomic_append_note(db, t.id, f" | PARTIAL FILL: using {int(filled_qty)} of original qty")
                             db.commit()
                     if t.status == "pending" and pstatus == "filled":
                         # r39 audit critical-1: previously this block was wrapped
@@ -5937,10 +5982,11 @@ def manage_open_positions() -> Dict[str, Any]:
                                                 if _new_id:
                                                     t.stop_order_id = _new_id
                                                     t.current_stop = t.stop_loss
-                                        t.note = (t.note or "") + (
+                                        _atomic_append_note(
+                                            db, t.id,
                                             f" | slippage {slip:+.2f} ({atr_units:.2f}×ATR) "
                                             f"shifted T1-3+stop from {old_t} to "
-                                            f"({t.target1},{t.target2},{t.target3},{t.stop_loss})"
+                                            f"({t.target1},{t.target2},{t.target3},{t.stop_loss})",
                                         )
                                         _record_target_history(
                                             t,
@@ -5963,7 +6009,7 @@ def manage_open_positions() -> Dict[str, Any]:
                     ):
                         t.status = "closed_manual"
                         t.closed_at = datetime.utcnow()
-                        t.note = (t.note or "") + f" | parent {pstatus}"
+                        _atomic_append_note(db, t.id, f" | parent {pstatus}")
                         t.target_touch_count = 0
                         _target_touch_counts.pop(t.id, None)
                         db.commit()
@@ -6000,7 +6046,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                             )
                                         t.status = "closed_stop"
                                         t.closed_at = datetime.utcnow()
-                                        t.note = (t.note or "") + f" | SL filled @ {_fill_px:.2f} (manage-tick reconcile)"
+                                        _atomic_append_note(db, t.id, f" | SL filled @ {_fill_px:.2f} (manage-tick reconcile)")
                                         t.target_touch_count = 0
                                         _target_touch_counts.pop(t.id, None)
                                         # Release BP and clean replace_stop cache.
@@ -6045,7 +6091,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                             stop_price=new_stop_price,
                                         ))
                                         t.stop_order_id = str(new_sl.id)
-                                        t.note = (t.note or "") + f" | SL invariant: resubmitted stop @ {new_stop_price}"
+                                        _atomic_append_note(db, t.id, f" | SL invariant: resubmitted stop @ {new_stop_price}")
                                         db.commit()
                                         metrics.inc("autotrade_event", event="sl_resubmitted")
                                     except Exception as _re:
@@ -6205,9 +6251,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                             )
                                             t.level_index = li + 1
                                             t.hit_t1 = True
-                                            t.note = (t.note or "") + (
+                                            _atomic_append_note(
+                                                db, t.id,
                                                 f" | T1 hit @ {px:.2f}, BE skipped (T1 too tight); "
-                                                f"chandelier active"
+                                                f"chandelier active",
                                             )
                                             t.target_touch_count = 0
                                             _target_touch_counts.pop(t.id, None)
@@ -6286,9 +6333,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     trim_ok = False
                                                 if trim_ok:
                                                     realized_partial = (px - float(t.entry_price)) * trim_qty
-                                                    t.realized_pl = (t.realized_pl or 0.0) + round(realized_partial, 2)
+                                                    _atomic_acc_pl(db, t.id, round(realized_partial, 2))
                                                     t.qty = t.qty - trim_qty
-                                                    t.note = (t.note or "") + (
+                                                    _atomic_append_note(
+                                                        db, t.id,
                                                         f" | PARTIAL: trimmed {trim_qty} shares at T1 "
                                                         f"(px={px:.2f}, +${realized_partial:.2f}); "
                                                         f"runner = {t.qty} shares"
@@ -6347,7 +6395,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                                                     alpaca_client.replace_order_by_id(t.stop_order_id, qty=int(t.qty))
                                                             except Exception as _resize_e:
                                                                 logger.warning(f"pyramid SL resize {t.ticker} failed: {_resize_e}")
-                                                            t.note = (t.note or "") + f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})"
+                                                            _atomic_append_note(db, t.id, f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})")
                                                             metrics.inc("autotrade_event", event="pyramid_t1")
                                                     except Exception as _py_e:
                                                         logger.warning(f"pyramid {t.ticker} failed: {_py_e}")
@@ -6381,9 +6429,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     trim_ok = False
                                                 if trim_ok:
                                                     realized_partial = (px - float(t.entry_price)) * trim_qty
-                                                    t.realized_pl = (t.realized_pl or 0.0) + round(realized_partial, 2)
+                                                    _atomic_acc_pl(db, t.id, round(realized_partial, 2))
                                                     t.qty = t.qty - trim_qty
-                                                    t.note = (t.note or "") + (
+                                                    _atomic_append_note(
+                                                        db, t.id,
                                                         f" | PARTIAL: trimmed {trim_qty} shares at T2 "
                                                         f"(px={px:.2f}, +${realized_partial:.2f}); "
                                                         f"runner = {t.qty} shares"
@@ -6406,7 +6455,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                             if target_idx == 0:
                                                 t.hit_t1 = True
                                             tag = ["T1", "T2", "T3"][target_idx]
-                                            t.note = (t.note or "") + f" | {tag} hit @ {px:.2f}, stop→{new_stop}"
+                                            _atomic_append_note(db, t.id, f" | {tag} hit @ {px:.2f}, stop→{new_stop}")
                                             # Push-notify UI
                                             try:
                                                 from services import live_quotes as _lq
@@ -6439,7 +6488,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                                         f"T3 breached @ {px:.2f}; recalc from price",
                                                         new_targets,
                                                     )
-                                                    t.note = (t.note or "") + f" | recalc T1-3: {new_targets}"
+                                                    _atomic_append_note(db, t.id, f" | recalc T1-3: {new_targets}")
                                                     # r43 fix #0.5: replace broker TP leg to match new T3.
                                                     if t.tp_order_id and new_targets[2]:
                                                         _new_tp = _replace_tp(t.tp_order_id, float(new_targets[2]))
@@ -6448,9 +6497,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                             elif target_idx == 2:
                                                 # Past the first recompute —
                                                 # just let chandelier trail.
-                                                t.note = (t.note or "") + (
+                                                _atomic_append_note(
+                                                    db, t.id,
                                                     f" | level_index ≥ 3, chandelier-only trail "
-                                                    f"(no more target recompute)"
+                                                    f"(no more target recompute)",
                                                 )
                                             _touch_clear(t, db)
                                             summary["trailed"] += 1
@@ -6519,9 +6569,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                     t.stop_order_id = _new_tid
                                     old_stop = t.current_stop
                                     t.current_stop = new_trail_stop
-                                    t.note = (t.note or "") + (
+                                    _atomic_append_note(
+                                        db, t.id,
                                         f" | {source} trail → stop {new_trail_stop} "
-                                        f"(from {old_stop})"
+                                        f"(from {old_stop})",
                                     )
                                     db.commit()
                                     summary["trailed"] += 1

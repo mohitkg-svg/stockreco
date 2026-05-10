@@ -1846,6 +1846,15 @@ function StockChart({
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
       .then(data => {
         if (cancelled || !chartRef.current || !seriesRef.current.candle) return;
+        // r79: defensive null-guard. Delisted ticker, halt-resume, or a
+        // backend hiccup can produce {candles: null} or {candles: []};
+        // calling .map on null unmounts the entire AnalysisView and the
+        // operator goes blind during a fast move. Bail cleanly instead.
+        if (!data || !Array.isArray(data.candles)) {
+          setLoading(false);
+          setError("No chart data available");
+          return;
+        }
         const { candle, volume, indicators } = seriesRef.current;
         const candleBars = data.candles.map(c => ({
           time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,
