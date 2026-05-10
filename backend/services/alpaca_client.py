@@ -183,8 +183,10 @@ def minutes_to_close() -> Optional[float]:
     if not c:
         return None
     try:
-        clk = c.get_clock()
-        if not clk.is_open:
+        # r80c: timeout-wrap. A network stall on /v2/clock used to
+        # block promote_adopted + EOD-flatten paths indefinitely.
+        clk = _safe_rest_read(c.get_clock, timeout=3.0)
+        if clk is None or not clk.is_open:
             return None
         import datetime as _dt
         now = _dt.datetime.now(_dt.timezone.utc)
@@ -206,8 +208,9 @@ def minutes_since_open() -> Optional[float]:
     if not c:
         return None
     try:
-        clk = c.get_clock()
-        if not clk.is_open:
+        # r80c: timeout-wrap.
+        clk = _safe_rest_read(c.get_clock, timeout=3.0)
+        if clk is None or not clk.is_open:
             return None
         import datetime as _dt
         # If market is open, the previous open is `next_open - 24h * trading_days_back`.
@@ -788,10 +791,15 @@ def submit_option_entry_with_cross_fallback(
         try:
             c = _get_client()
             if c:
-                o = c.get_order_by_id(order_id)
-                status = str(getattr(o, "status", "")).lower()
-                if "filled" in status:
-                    return first
+                # r80c: timeout-wrap. Without this, a 30s broker stall
+                # on get_order_by_id used to block the entire deadline
+                # loop, then market-cross blindly even though the limit
+                # may have filled — 2× the qty.
+                o = _safe_rest_read(c.get_order_by_id, order_id, timeout=2.0)
+                if o is not None:
+                    status = str(getattr(o, "status", "")).lower()
+                    if "filled" in status:
+                        return first
         except Exception:
             break
     try:
@@ -808,14 +816,16 @@ def submit_option_entry_with_cross_fallback(
         try:
             c = _get_client()
             if c:
-                o = c.get_order_by_id(order_id)
-                _final_status = str(getattr(o, "status", "")).lower()
-                if "filled" in _final_status:
-                    logger.info(
-                        f"submit_option_entry: {occ_symbol} limit filled during "
-                        f"cancel race; skipping market cross."
-                    )
-                    return first
+                # r80c: timeout-wrap.
+                o = _safe_rest_read(c.get_order_by_id, order_id, timeout=2.0)
+                if o is not None:
+                    _final_status = str(getattr(o, "status", "")).lower()
+                    if "filled" in _final_status:
+                        logger.info(
+                            f"submit_option_entry: {occ_symbol} limit filled during "
+                            f"cancel race; skipping market cross."
+                        )
+                        return first
         except Exception:
             pass
     except Exception:

@@ -1045,12 +1045,19 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
     flipped the flag.
     """
     # r53: hold the entry lock so no in-flight consider_signal can race
-    # past the killed-flag check while we're flattening. Block up to 10s
+    # past the killed-flag check while we're flattening. Block briefly
     # for in-flight to complete; if it doesn't, proceed anyway (kill
     # priority > entry).
-    _kill_holds_entry_lock = _entry_lock.acquire(timeout=10.0)
+    #
+    # r80c: cut from 10s to 2s. Under panic, kills happen because
+    # something is BLEEDING money. Waiting 10s for an in-flight
+    # consider_signal (which itself can be 1-2s on AI veto prefetch)
+    # is unacceptable. The killed flag is also re-checked late inside
+    # consider_signal so a signal racing past the lock would still hit
+    # the flag check before submitting.
+    _kill_holds_entry_lock = _entry_lock.acquire(timeout=2.0)
     if not _kill_holds_entry_lock:
-        logger.warning("kill(): entry lock not acquired in 10s; proceeding anyway")
+        logger.warning("kill(): entry lock not acquired in 2s; proceeding anyway (kill > entry)")
 
     db = SessionLocal()
     flattened: List[str] = []
@@ -5816,7 +5823,26 @@ def manage_open_positions() -> Dict[str, Any]:
                         _manage_option_trade(t, c, db, summary)
                         continue
 
-                    parent = c.get_order_by_id(t.parent_order_id)
+                    # r80c: timeout-wrapped. Without this, a single hung
+                    # get_order_by_id call would block the entire manage
+                    # tick (sequential per-trade processing), causing
+                    # missed exit windows on other open positions.
+                    try:
+                        parent = alpaca_client._safe_rest_read(
+                            c.get_order_by_id, t.parent_order_id, timeout=3.0,
+                        )
+                    except Exception as _e_gob:
+                        logger.warning(
+                            f"manage tick get_order_by_id({t.parent_order_id}) "
+                            f"failed for {t.ticker}: {_e_gob} — skipping this tick"
+                        )
+                        continue
+                    if parent is None:
+                        logger.warning(
+                            f"manage tick get_order_by_id({t.parent_order_id}) "
+                            f"returned None for {t.ticker} — skipping this tick"
+                        )
+                        continue
                     # r53d fix: alpaca-py 0.21.1 serializes OrderStatus.FILLED
                     # as "OrderStatus.FILLED" (str()), not "filled". The strict
                     # equality at line ~4886 (`pstatus == "filled"`) was
@@ -6161,6 +6187,28 @@ def manage_open_positions() -> Dict[str, Any]:
                                         f"{t.ticker}: stop leg gone ({sl_status}); resubmit in progress",
                                         ticker=t.ticker, trade_id=t.id,
                                     )
+                                    # r80c: if market is closed, the SL
+                                    # resubmit will 422 (Alpaca rejects
+                                    # orphan stops post-hours). Spamming
+                                    # resubmit + alert every manage tick
+                                    # for 15h overnight just floods alerts
+                                    # without protecting the position.
+                                    # Alert once + skip resubmit; the
+                                    # next-open manage tick re-attempts
+                                    # naturally.
+                                    if not alpaca_client.is_market_open():
+                                        logger.warning(
+                                            f"{t.ticker} SL resubmit deferred: "
+                                            f"market closed; will retry at next open"
+                                        )
+                                        metrics.inc(
+                                            "autotrade_event",
+                                            event="sl_resubmit_deferred_closed",
+                                        )
+                                        # Don't increment the failure
+                                        # counter — this isn't a failure,
+                                        # it's a deferral.
+                                        continue
                                     from alpaca.trading.requests import StopOrderRequest
                                     from alpaca.trading.enums import OrderSide, TimeInForce
                                     new_stop_price = round(float(t.current_stop or t.stop_loss), 2)
