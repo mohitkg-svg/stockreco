@@ -21,6 +21,7 @@ the API. Importing them keeps backend + frontend honest about which
 literal values are valid where.
 """
 from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import datetime
 
@@ -318,3 +319,13 @@ class PnLReconciliationResponse(BaseModel):
     n_open: int
     top_losers: List[PnLReconRow] = []
     top_winners: List[PnLReconRow] = []
+
+
+class FMPWebhookPayload(BaseModel):
+    """Schema for the /api/webhooks/fmp/sec endpoint."""
+    model_config = ConfigDict(extra="allow")
+
+    symbol: Optional[str] = None
+    ticker: Optional[str] = None
+    formType: Optional[str] = Field(None, alias="formType")
+    form_type: Optional[str] = Field(None, alias="form_type")

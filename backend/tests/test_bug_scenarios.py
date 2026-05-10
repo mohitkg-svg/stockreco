@@ -2151,6 +2151,72 @@ class TestR77LiveMoneyP0Fixes(unittest.TestCase):
             "cron silently never registers."
         )
 
+    def test_news_ai_trim_uses_lock_and_fresh_session(self):
+        """r77-D: AI news_exit `trim` branch was modifying t.qty + db.commit()
+        on the outer dispatch session without acquiring _ai_news_lock — the
+        manage_open_positions loop trailing a stop on the same trade would
+        race-write the qty (one thread overwrites the other's commit, the
+        broker-vs-DB share count diverges, and the SL leg can fire on
+        wrong qty). Mirror the close branch: lock + fresh SessionLocal."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "news.py"), "r") as f:
+            src = f.read()
+        # Anchor on the trim branch and pull the next ~5kB of source.
+        anchor = src.find('action == "trim"')
+        self.assertGreater(anchor, 0, "trim branch not found")
+        block = src[anchor: anchor + 5000]
+        # Stop at the next sibling-level `elif action ==` or the outer
+        # `finally:` of dispatch — whichever comes first.
+        for end_marker in ('elif action ==', '\n    finally:'):
+            i = block.find(end_marker, 50)
+            if i > 0:
+                block = block[:i]
+                break
+        self.assertIn(
+            "_ai_news_lock", block,
+            "trim branch must acquire _ai_news_lock to serialize against "
+            "manage_open_positions"
+        )
+        self.assertIn(
+            "ldb = SessionLocal()", block,
+            "trim branch must use a fresh session, not the outer db"
+        )
+        self.assertIn(
+            "ldb.commit()", block,
+            "trim branch should commit to the fresh session, not the outer db"
+        )
+        # The buggy patterns must be gone — they'd indicate the outer
+        # session is still being mutated.
+        self.assertNotIn(
+            "t.qty = (t.qty or 0) - half", block,
+            "trim branch still references outer t.qty — race-condition "
+            "regression. Use t_local on the fresh ldb session."
+        )
+
+    def test_fmp_sec_webhook_is_sync_def(self):
+        """r77-E: fmp_sec_webhook used to be `async def` but did sync
+        SQLAlchemy work — that blocks the asyncio event loop. FastAPI runs
+        sync `def` handlers in its threadpool automatically, which is the
+        right shape for sync-DB work."""
+        main_path = os.path.join(os.path.dirname(__file__), "..", "main.py")
+        with open(main_path, "r") as f:
+            src = f.read()
+        # Find the route decorator and inspect the function signature
+        # immediately after.
+        idx = src.find('"/api/webhooks/fmp/sec"')
+        self.assertGreater(idx, 0, "FMP webhook route decorator not found")
+        # Look ahead ~400 chars for the def signature.
+        snippet = src[idx: idx + 600]
+        self.assertIn(
+            "def fmp_sec_webhook", snippet,
+            "FMP webhook handler not found near its decorator"
+        )
+        self.assertNotIn(
+            "async def fmp_sec_webhook", snippet,
+            "FMP webhook handler must be sync `def` (FastAPI threadpools "
+            "it). Sync SQLAlchemy on `async def` blocks the event loop."
+        )
+
     def test_no_duplicate_for_loop_or_def_lines_in_main(self):
         """r77-A bis: same root cause — a reschedule / rename pass that
         leaves the old line above the new line. Two consecutive `for ...:`

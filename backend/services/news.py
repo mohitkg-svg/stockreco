@@ -435,62 +435,101 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
                             except Exception:
                                 pass
                 elif action == "trim":
-                    # Trim half of remaining qty at market.
+                    # r77 fix: mirror the close branch — acquire the manage
+                    # lock and use a fresh SessionLocal so a concurrent
+                    # stop-trail or T1 trim in manage_open_positions can't
+                    # lost-update t.qty against the outer dispatch session.
+                    # Without this, two threads could each commit a halved
+                    # qty and the broker-vs-DB share count would diverge.
+                    _got_lock = False
                     try:
-                        from services import alpaca_client
-                        if t.asset_type == "stock":
-                            half = max(1, int((t.qty or 0) // 2))
-                            from alpaca.trading.requests import MarketOrderRequest
-                            from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
-                            c = alpaca_client._get_client()
-                            res2 = c.submit_order(order_data=MarketOrderRequest(
-                                symbol=t.ticker, qty=half,
-                                side=_OS.SELL, time_in_force=_TIF.DAY,
-                            ))
-                            if res2 is not None:
-                                t.qty = (t.qty or 0) - half
-                                t.note = (t.note or "") + (
-                                    f" | AI news_trim: -{half} shares ({res.get('reason', '')[:120]})"
+                        if _ai_news_lock is not None:
+                            _got_lock = _ai_news_lock.acquire(timeout=10.0)
+                            if not _got_lock:
+                                logger.warning(
+                                    f"news: AI-trim skipped for {ticker} #{t.id}: "
+                                    f"could not acquire manage lock in 10s"
                                 )
-                                db.commit()
-                                logger.info(
-                                    f"AI news_exit TRIM {ticker} #{t.id}: -{half} shares"
+                                continue
+                        ldb = SessionLocal()
+                        try:
+                            t_local = ldb.query(AutoTrade).filter(
+                                AutoTrade.id == t.id
+                            ).first()
+                            if not t_local or t_local.status not in ("pending", "open"):
+                                continue
+                            from services import alpaca_client
+                            if t_local.asset_type == "stock":
+                                half = max(1, int((t_local.qty or 0) // 2))
+                                from alpaca.trading.requests import MarketOrderRequest
+                                from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+                                c = alpaca_client._get_client()
+                                if c is None:
+                                    continue
+                                res2 = c.submit_order(order_data=MarketOrderRequest(
+                                    symbol=t_local.ticker, qty=half,
+                                    side=_OS.SELL, time_in_force=_TIF.DAY,
+                                ))
+                                if res2 is not None:
+                                    t_local.qty = (t_local.qty or 0) - half
+                                    t_local.note = (t_local.note or "") + (
+                                        f" | AI news_trim: -{half} shares "
+                                        f"({res.get('reason', '')[:120]})"
+                                    )
+                                    ldb.commit()
+                                    logger.info(
+                                        f"AI news_exit TRIM {ticker} #{t_local.id}: "
+                                        f"-{half} shares"
+                                    )
+                                    # r39 audit critical-4: must resize the broker
+                                    # SL leg to remaining qty, else when the stop
+                                    # fires Alpaca rejects (only have half the
+                                    # shares) or the position flips short
+                                    # depending on broker semantics. Same fix as
+                                    # F3/T2 trims; news-driven trim was missing it.
+                                    if t_local.stop_order_id and t_local.qty > 0:
+                                        try:
+                                            from alpaca.trading.requests import ReplaceOrderRequest
+                                            c.replace_order_by_id(
+                                                t_local.stop_order_id,
+                                                order_data=ReplaceOrderRequest(
+                                                    qty=int(t_local.qty)
+                                                ),
+                                            )
+                                        except Exception as _re:
+                                            logger.warning(
+                                                f"news: AI-trim SL-resize failed "
+                                                f"for {ticker} #{t_local.id}: {_re}"
+                                            )
+                            elif t_local.asset_type == "option":
+                                half = max(1, int((t_local.qty or 0) // 2))
+                                res2 = alpaca_client.submit_simple_option_order(
+                                    occ_symbol=t_local.symbol, qty=half, side="sell",
+                                    order_type="market", time_in_force="day",
                                 )
-                                # r39 audit critical-4: must resize the broker SL leg
-                                # to remaining qty. Otherwise when the stop fires,
-                                # Alpaca rejects (only have half the shares) — or,
-                                # depending on broker semantics, the position flips
-                                # short. This is the same fix the F3/T2 trims
-                                # already perform; news-driven trim was missing it.
-                                if t.stop_order_id and t.qty > 0:
-                                    try:
-                                        from alpaca.trading.requests import ReplaceOrderRequest
-                                        c.replace_order_by_id(
-                                            t.stop_order_id,
-                                            order_data=ReplaceOrderRequest(qty=int(t.qty)),
-                                        )
-                                    except Exception as _re:
-                                        logger.warning(
-                                            f"news: AI-trim SL-resize failed for "
-                                            f"{ticker} #{t.id}: {_re}"
-                                        )
-                        elif t.asset_type == "option":
-                            half = max(1, int((t.qty or 0) // 2))
-                            res2 = alpaca_client.submit_simple_option_order(
-                                occ_symbol=t.symbol, qty=half, side="sell",
-                                order_type="market", time_in_force="day",
-                            )
-                            if isinstance(res2, dict) and "error" not in res2:
-                                t.qty = (t.qty or 0) - half
-                                t.note = (t.note or "") + (
-                                    f" | AI news_trim: -{half} contracts ({res.get('reason', '')[:120]})"
-                                )
-                                db.commit()
-                                logger.info(
-                                    f"AI news_exit TRIM {ticker} #{t.id}: -{half} contracts"
-                                )
+                                if isinstance(res2, dict) and "error" not in res2:
+                                    t_local.qty = (t_local.qty or 0) - half
+                                    t_local.note = (t_local.note or "") + (
+                                        f" | AI news_trim: -{half} contracts "
+                                        f"({res.get('reason', '')[:120]})"
+                                    )
+                                    ldb.commit()
+                                    logger.info(
+                                        f"AI news_exit TRIM {ticker} "
+                                        f"#{t_local.id}: -{half} contracts"
+                                    )
+                        finally:
+                            ldb.close()
                     except Exception as e:
-                        logger.warning(f"news: AI-driven trim failed for {ticker} #{t.id}: {e}")
+                        logger.warning(
+                            f"news: AI-driven trim failed for {ticker} #{t.id}: {e}"
+                        )
+                    finally:
+                        if _got_lock and _ai_news_lock is not None:
+                            try:
+                                _ai_news_lock.release()
+                            except Exception:
+                                pass
     finally:
         db.close()
 

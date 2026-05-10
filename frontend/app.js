@@ -1662,7 +1662,6 @@ function StockChart({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [srLevels, setSrLevels] = useState([]);
-  const [chartData, setChartData] = useState(null);
   // Cache the last-fetched chart data so toggling hideIndicators can redraw
   // without re-hitting the backend.
   const lastDataRef = useRef(null);
@@ -1800,7 +1799,6 @@ function StockChart({
 
   useEffect(() => {
     if (!ticker || !chartRef.current) return;
-    if (!ticker) return;
     setLoading(true); setError(null);
     // Abort in-flight fetches when ticker/timeframe changes mid-flight, so we
     // don't apply stale data to the new chart context (or write to a destroyed
@@ -1814,30 +1812,6 @@ function StockChart({
     // a 1d-bar timestamp on a chart now showing 5m bars — lightweight-charts
     // either rejects or inserts at the wrong location.
     lastCandleRef.current = null;
-    const _debounceMs = 160;
-    const _fetchTimer = setTimeout(() => {
-      fetch(`${API_BASE}/api/analysis/${ticker}/chart?timeframe=${timeframe}`, { signal: ac.signal, headers: authHeaders() })
-        .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
-        .then(data => {
-          if (cancelled) return;
-          lastDataRef.current = data;
-          setChartData(data);
-        })
-        .catch(e => {
-          if (cancelled || ac.signal.aborted) return;
-          setError(String(e));
-          setLoading(false);
-        });
-    }, _debounceMs);
-    return () => {
-      cancelled = true;
-      clearTimeout(_fetchTimer);
-      ac.abort();
-    };
-  }, [ticker, timeframe]);
-
-  useEffect(() => {
-    if (!chartData || !chartRef.current || !seriesRef.current.candle) return;
     // Helper: removePriceLine on every line we tracked, clearing the registry.
     const clearPriceLines = () => {
       const c = seriesRef.current?.candle;
@@ -1872,7 +1846,6 @@ function StockChart({
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
       .then(data => {
         if (cancelled || !chartRef.current || !seriesRef.current.candle) return;
-    const data = chartData;
         const { candle, volume, indicators } = seriesRef.current;
         const candleBars = data.candles.map(c => ({
           time: c.time, open: c.open, high: c.high, low: c.low, close: c.close,

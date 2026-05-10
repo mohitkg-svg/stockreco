@@ -920,39 +920,40 @@ def _log_frontend_error(payload: dict):
     return {"ok": True}
 
 
-from fastapi import Request
-
 @app.post(
     "/api/webhooks/fmp/sec",
     include_in_schema=False,
     dependencies=[Depends(require_api_key)],
 )
-async def fmp_sec_webhook(request: Request):
-    """Low-latency Webhook listener for Financial Modeling Prep (FMP) / Polygon SEC filings.
-    Instantly creates a CandidateEvent when a Form 4 (Insider Trade) or 8-K (Earnings) drops.
-    This allows the event-driven scan to react to news before RTH open."""
-    try:
-        payload = await request.json()
-    except Exception:
+def fmp_sec_webhook(payload: dict):
+    """Low-latency Webhook listener for FMP / Polygon SEC filings.
+    Instantly creates a CandidateEvent when a Form 4 (Insider Trade) or
+    8-K (Earnings) drops, so the event-driven scan can react before RTH.
+
+    r77 fix: declared `def` (not `async def`) so FastAPI auto-runs the
+    handler in its threadpool — the SQLAlchemy session below is sync and
+    would block the asyncio event loop on the prior `async def` form.
+    Pydantic auto-parses the request body into the `payload: dict` arg.
+    """
+    if not isinstance(payload, dict):
         return {"status": "bad_payload"}
-        
     ticker = payload.get("ticker") or payload.get("symbol")
     form_type = payload.get("formType") or payload.get("form_type")
-    
     if not ticker or not form_type:
         return {"status": "ignored"}
-        
     try:
         from database import SessionLocal, CandidateEvent
         import json
         db = SessionLocal()
         try:
-            # Depending on form type, map to an event kind
             kind = "INSIDER_BUY" if "4" in str(form_type) else "PEAD" if "8" in str(form_type) else None
             if kind:
-                # Create the event to be picked up by the 2-minute event detector cron
                 from datetime import datetime, timedelta
-                ev = CandidateEvent(kind=kind, ticker=ticker.upper(), score=80.0, features=json.dumps(payload), expires_at=datetime.utcnow() + timedelta(minutes=60))
+                ev = CandidateEvent(
+                    kind=kind, ticker=str(ticker).upper(), score=80.0,
+                    features=json.dumps(payload),
+                    expires_at=datetime.utcnow() + timedelta(minutes=60),
+                )
                 db.add(ev)
                 db.commit()
         finally:
@@ -960,7 +961,6 @@ async def fmp_sec_webhook(request: Request):
     except Exception as e:
         logger.warning(f"Failed to process SEC webhook: {e}")
         return {"status": "error"}
-        
     return {"status": "ok"}
 
 # ----- Real-money safety banner (A3) --------------------------------------
