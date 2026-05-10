@@ -112,6 +112,10 @@ fi
 if [ -n "${FMP_API_KEY:-}" ]; then
   ENV_VARS="${ENV_VARS},FMP_API_KEY=${FMP_API_KEY}"
 fi
+# Polygon options tier.
+if [ -n "${POLYGON_API_KEY:-}" ]; then
+  ENV_VARS="${ENV_VARS},POLYGON_API_KEY=${POLYGON_API_KEY}"
+fi
 # AI judge call-site modes. Only forwarded when explicitly set, so the
 # default off-everywhere stays put unless you flip the env var.
 for _m in AI_ENTRY_VETO_MODE AI_NEWS_EXIT_MODE AI_CONFIDENCE_MULT_MODE; do
@@ -137,6 +141,17 @@ ENV_VARS="${ENV_VARS},ALPACA_OPTIONS_STREAM=${ALPACA_OPTIONS_STREAM:-0}"
 # the managed Postgres instance. Hardcoded here so deploys never drop the
 # mount; if you move to a different instance, edit CSQL_INSTANCE below.
 CSQL_INSTANCE="${CSQL_INSTANCE:-$PROJECT:us-central1:stockrecs-db}"
+
+# Verify database tier to prevent connection pool exhaustion during cutover
+# Only checks and automatically patches if going LIVE.
+if gcloud sql instances describe stockrecs-db --format="value(settings.tier)" > /dev/null 2>&1; then
+  DB_TIER=$(gcloud sql instances describe stockrecs-db --format="value(settings.tier)")
+  if [ "$DB_TIER" = "db-f1-micro" ] && [ "${ALPACA_LIVE:-0}" = "1" ]; then
+    echo "⚠️  WARNING: Upgrading Cloud SQL instance from db-f1-micro to db-g1-small."
+    echo "    This is required to survive connection spikes during deployment cutovers with real money."
+    gcloud sql instances patch stockrecs-db --tier=db-g1-small --quiet
+  fi
+fi
 
 gcloud run deploy "$SERVICE" \
   --source . \

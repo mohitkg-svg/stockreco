@@ -94,6 +94,10 @@ STOCK_UNIVERSE_FILE=/data/sp500_constituents.txt   # one ticker per line
 # === ANTHROPIC (for AI judge + chat) ===
 ANTHROPIC_API_KEY=<your-key>
 
+# === POLYGON.IO (Tier-1 Options Greeks) ===
+# Required for real-time Greeks if trading options live
+POLYGON_API_KEY=<your-polygon-key>
+
 # === AI JUDGE MODES ===
 # Promote ONLY entry_veto on day 1 (it's been in shadow longest);
 # keep the other two in shadow for 2 more weeks of fresh live data.

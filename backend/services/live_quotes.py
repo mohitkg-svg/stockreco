@@ -212,6 +212,60 @@ def update_option_quote(
 
 
 # ------------------------------------------------------------------
+# Fast-Path Sync Offloader
+# ------------------------------------------------------------------
+def _evaluate_stop_threat_sync(sym: str, px: float) -> None:
+    """Runs the database query and triggering logic synchronously on a background thread."""
+    try:
+        from database import SessionLocal as _SL_t, AutoTrade as _AT_t
+        _db_t = _SL_t()
+        try:
+            _rows = _db_t.query(_AT_t).filter(
+                _AT_t.ticker == sym,
+                _AT_t.status == "open"
+            ).all()
+            action_fired = False
+            for _row in _rows:
+                is_put = (
+                    _row.asset_type == "option"
+                    and isinstance(_row.symbol, str)
+                    and len(_row.symbol) > 12
+                    and _row.symbol[-9] == "P"
+                )
+                if _row.current_stop:
+                    cs = float(_row.current_stop)
+                    threat = (px >= cs * 0.9975) if is_put else (px <= cs * 1.0025)
+                    if threat:
+                        action_fired = True
+                        break
+                
+                li = _row.level_index or 0
+                targets = [_row.target1, _row.target2, _row.target3]
+                next_target = targets[li % 3] if li < 3 else None
+                if next_target:
+                    nt = float(next_target)
+                    opportunity = (px <= nt) if is_put else (px >= nt)
+                    if opportunity:
+                        action_fired = True
+                        break
+
+            if action_fired:
+                if _threat_path_lock.acquire(blocking=False):
+                    try:
+                        from services import auto_trader as _at_t
+                        _at_t.manage_open_positions()
+                        logger.info(f"manage fast-path fired for {sym} @ {px} (stop/target hit)")
+                    finally:
+                        # In a pure thread, we can just release directly or sleep briefly to bounce
+                        import time
+                        time.sleep(2.0)
+                        _threat_path_lock.release()
+        finally:
+            _db_t.close()
+    except Exception as _e:
+        logger.debug(f"stop-threat fast-path skipped for {sym}: {_e}")
+
+# ------------------------------------------------------------------
 # Alpaca stream worker
 # ------------------------------------------------------------------
 async def _handle_trade(trade) -> None:
@@ -257,71 +311,11 @@ async def _handle_trade(trade) -> None:
         last_threat = _last_threat_check.get(sym, 0.0)
         if time.time() - last_threat >= 5.0:
             _last_threat_check[sym] = time.time()
-            from database import SessionLocal as _SL_t, AutoTrade as _AT_t
-            _db_t = _SL_t()
-            try:
-                _rows = _db_t.query(_AT_t).filter(
-                    _AT_t.ticker == sym,
-                    _AT_t.status == "open"
-                ).all()
-                action_fired = False
-                for _row in _rows:
-                    is_put = (
-                        _row.asset_type == "option"
-                        and isinstance(_row.symbol, str)
-                        and len(_row.symbol) > 12
-                        and _row.symbol[-9] == "P"
-                    )
-                    
-                    # 1. Stop-loss threat check
-                    if _row.current_stop:
-                        cs = float(_row.current_stop)
-                        if is_put:
-                            threat = px >= cs * 0.9975
-                        else:
-                            threat = px <= cs * 1.0025
-                        if threat:
-                            action_fired = True
-                            break
-                            
-                    # 2. Target/Profit opportunity check (T1/T2/T3)
-                    li = _row.level_index or 0
-                    targets = [_row.target1, _row.target2, _row.target3]
-                    next_target = targets[li % 3] if li < 3 else None
-                    if next_target:
-                        nt = float(next_target)
-                        opportunity = (px <= nt) if is_put else (px >= nt)
-                        if opportunity:
-                            action_fired = True
-                            break
-
-                if action_fired:
-                    # Global single-flight: only one fast-path manage at a time
-                    # to prevent correlated drawdowns from firing N concurrent
-                    # manage_open_positions runs (broker breaker risk).
-                    if _threat_path_lock.acquire(blocking=False):
-                        try:
-                            from services import auto_trader as _at_t
-                            try:
-                                asyncio.get_running_loop().run_in_executor(
-                                    None, _at_t.manage_open_positions
-                                )
-                            except RuntimeError:
-                                # No running loop on this WS thread; fall back
-                                # to direct synchronous call (manage already
-                                # uses its own DB connections / locks).
-                                _at_t.manage_open_positions()
-                            logger.info(f"manage fast-path fired for {sym} @ {px} (stop/target hit)")
-                        finally:
-                            # Release after a brief delay so the manage loop
-                            # has a chance to start without a follow-up tick
-                            # immediately re-acquiring.
-                            try:
-                                asyncio.get_running_loop().call_later(2.0, _threat_path_lock.release)
-                            except Exception:
-                                _threat_path_lock.release()
-            finally:
-                _db_t.close()
+            
+            # Offload DB hit so the websocket loop isn't blocked
+            asyncio.get_running_loop().run_in_executor(
+                None, _evaluate_stop_threat_sync, sym, px
+            )
     except Exception as _e:
         logger.debug(f"stop-threat fast-path skipped for {sym}: {_e}")
 
@@ -557,7 +551,8 @@ async def _news_worker():
                                 }
                                 if not item["id"] or not item["headline"]:
                                     continue
-                                result = news_svc.ingest([item])
+                                # Offload ingest DB call to executor
+                                result = await asyncio.get_running_loop().run_in_executor(None, news_svc.ingest, [item])
                                 if result.get("inserted"):
                                     logger.info(f"news-stream: {item['symbols'][0] if item['symbols'] else '?'}: {item['headline'][:80]}")
                                     await _broadcast({

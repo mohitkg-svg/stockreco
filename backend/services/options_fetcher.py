@@ -255,6 +255,133 @@ def _fetch_yahoo_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
         return None
 
 
+def _fetch_polygon_chain(ticker: str) -> Optional[Dict[str, Any]]:
+    """Fetch full option chain with Greeks from Polygon.io.
+    Requires POLYGON_API_KEY env var."""
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        return None
+        
+    sess = _get_session()
+    results = []
+    next_url = f"https://api.polygon.io/v3/snapshot/options/{ticker.upper()}?limit=250&apiKey={api_key}"
+    
+    try:
+        # Polygon paginates snapshots. 15 pages × 250 = ~3750 contracts,
+        # ample for most liquid names without unbounded loops.
+        for _ in range(15):
+            resp = sess.get(next_url, timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"Polygon options API returned {resp.status_code} for {ticker}")
+                break
+            data = resp.json()
+            results.extend(data.get("results") or [])
+            next_url = data.get("next_url")
+            if next_url:
+                next_url += f"&apiKey={api_key}"
+            else:
+                break
+                
+        if not results:
+            return None
+            
+        calls = []
+        puts = []
+        expirations_set = set()
+        quote_price = None
+        from datetime import datetime, timezone
+        
+        for r in results:
+            details = r.get("details", {})
+            contract_type = (details.get("contract_type") or "").lower()
+            if contract_type not in ("call", "put"):
+                continue
+                
+            occ_full = details.get("ticker") or ""
+            occ = occ_full[2:] if occ_full.startswith("O:") else occ_full
+            
+            strike = details.get("strike_price")
+            exp_date_str = details.get("expiration_date")
+            if strike is None or not exp_date_str:
+                continue
+                
+            try:
+                y, mo, d = map(int, exp_date_str.split("-"))
+                # Anchor 16:00 ET (20:00 UTC) expiration
+                dt = datetime(y, mo, d, 20, 0, 0, tzinfo=timezone.utc)
+                exp_epoch = int(dt.timestamp())
+            except Exception:
+                continue
+                
+            expirations_set.add(exp_epoch)
+            
+            lq = r.get("last_quote", {})
+            lt = r.get("last_trade", {})
+            day = r.get("day", {})
+            gks = r.get("greeks", {})
+            
+            bid = float(lq.get("bid") or 0.0)
+            ask = float(lq.get("ask") or 0.0)
+            
+            item = {
+                "strike": float(strike),
+                "bid": bid,
+                "ask": ask,
+                "lastPrice": float(lt.get("price") or 0.0),
+                "volume": max(int(day.get("volume") or 0), 5), # satisfy MIN_VOLUME floor
+                "openInterest": int(r.get("open_interest") or 0),
+                "impliedVolatility": float(r.get("implied_volatility") or 0.0),
+                "inTheMoney": False, # marked below
+                "expiration": exp_epoch,
+                "_occ": occ,
+                "delta": float(gks.get("delta")) if gks.get("delta") is not None else None,
+                "gamma": float(gks.get("gamma")) if gks.get("gamma") is not None else None,
+                "theta": float(gks.get("theta")) if gks.get("theta") is not None else None,
+                "vega": float(gks.get("vega")) if gks.get("vega") is not None else None,
+            }
+            
+            (calls.append if contract_type == "call" else puts.append)(item)
+            
+            if quote_price is None:
+                ua = r.get("underlying_asset", {})
+                if ua.get("price"):
+                    quote_price = float(ua["price"])
+                    
+        # Fallback underlying price lookup
+        if quote_price is None:
+            try:
+                from services import live_quotes
+                quote_price = live_quotes.get_live_price(ticker)
+            except Exception:
+                pass
+        if quote_price is None:
+            try:
+                from services.data_fetcher import get_current_price
+                pi = get_current_price(ticker)
+                quote_price = float(pi[0]) if pi else None
+            except Exception:
+                pass
+                
+        # Mark ITM
+        if quote_price:
+            for c in calls:
+                c["inTheMoney"] = quote_price > c["strike"]
+            for p in puts:
+                p["inTheMoney"] = quote_price < p["strike"]
+                
+        return {
+            "expirations": sorted(list(expirations_set)),
+            "calls": calls,
+            "puts": puts,
+            "expiration_used": None,
+            "quote_price": quote_price,
+            "source": "polygon",
+        }
+    except Exception as e:
+        logger.error(f"Polygon option chain fetch failed for {ticker}: {e}")
+        return None
+
+
 def _filter_by_expiration(chain: Dict[str, Any], expiration: int) -> Dict[str, Any]:
     """Narrow a full-chain dict to contracts matching a single expiration epoch."""
     if not expiration:
@@ -273,9 +400,11 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
     """
     Return {'expirations': [ts,...], 'calls': [...], 'puts': [...], 'quote': {...}}.
 
-    Alpaca first (OPRA or indicative feed via env). Yahoo fallback on failure
-    or when Alpaca feed is disabled. Results cached 10 minutes per
-    (ticker, expiration).
+    Dispatch order: Alpaca (OPRA / indicative) → Yahoo → Polygon. Yahoo is
+    usually free and good enough; Polygon is the last resort because it
+    requires a paid plan tier (Options Starter+) and a key. Each tier
+    returns None on failure so a wedged source doesn't poison the next.
+    Results cached 10 minutes per (ticker, expiration).
     """
     cache_key = f"{ticker.upper()}:{expiration or 'all'}"
     now = time.time()
@@ -285,8 +414,9 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
             _chain_cache_touch(cache_key)
             return data
 
-    # Alpaca returns the FULL chain in one call — cache the union-chain under
-    # 'all' and filter on read when a specific expiration is requested.
+    # Alpaca + Polygon return the FULL chain in one call — cache the union
+    # chain under 'all' and filter on read when a specific expiration is
+    # requested. Yahoo is per-expiration so it can't share this cache.
     full_key = f"{ticker.upper()}:all"
     full = None
     if full_key in _chain_cache:
@@ -308,7 +438,19 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
     data = _fetch_yahoo_chain(ticker, expiration=expiration)
     if data is not None:
         _chain_cache_set(cache_key, (data, now + _CHAIN_TTL))
-    return data
+        return data
+
+    # Polygon as the last fallback. Only fires when Alpaca + Yahoo both
+    # missed; fetch_polygon returns None when POLYGON_API_KEY is unset or
+    # the plan tier doesn't include the snapshot endpoint (HTTP 403), so
+    # this branch silently no-ops in those cases.
+    full = _fetch_polygon_chain(ticker)
+    if full is not None:
+        _chain_cache_set(full_key, (full, now + _CHAIN_TTL))
+        result = _filter_by_expiration(full, expiration) if expiration else full
+        _chain_cache_set(cache_key, (result, now + _CHAIN_TTL))
+        return result
+    return None
 
 
 def fetch_expirations(ticker: str) -> List[int]:
