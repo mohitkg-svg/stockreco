@@ -6533,46 +6533,145 @@ function TradingPanel({ ticker, reloadToken }) {
     });
   };
 
-  // r80: KILL button — persistent kill switch + flatten in one shot.
-  // Different from Close-All: kill engages the persistent flag (stops
-  // the bot from re-entering anything) AND flattens current positions.
-  // Use this when something is *wrong* with the bot, not just to close
-  // a single bad day.
-  const killBot = () => {
+  // r82 (B10/B11): KILL button — fires IMMEDIATELY on a single confirm()
+  // dialog (no 4-second deferred-undo: an operator hitting KILL is panicking
+  // because the bot is bleeding money, and tab-close used to silently
+  // cancel the staged setTimeout). Includes:
+  //   - synchronous confirm() so the operator commits in one click
+  //   - persistent localStorage 'killIntent' so a tab close mid-flight
+  //     re-fires on next load (network-isolated tab eventually gets back)
+  //   - retry 3× with 250ms backoff
+  //   - sendBeacon() final fallback so even closing the tab still POSTs
+  //   - any non-200 stays as a sticky red banner until acked
+  const KILL_INTENT_KEY = 'killIntent.v1';
+  const killBot = async () => {
     if (busy['kill']) return;
     const openCount = (positions || []).length;
-    const label = openCount > 0
-      ? `KILL bot + flatten ${openCount} open position${openCount === 1 ? '' : 's'} — undo within 4s`
-      : 'KILL bot (engage persistent kill switch) — undo within 4s';
-    stageAction({
-      label, delayMs: 4000, kind: 'warn',
-      onConfirm: async () => {
-        setBusyKey('kill', true); setActionError(null); setActionInfo(null);
-        try {
-          const res = await api.post('/api/trading/kill', {
-            reason: 'operator_emergency_ui',
-            flatten: true,
-            cancel_orders: true,
-          });
-          const flatN = Array.isArray(res?.flattened) ? res.flattened.length : (res?.flattened ?? 0);
-          const cancelN = res?.cancelled ?? res?.canceled ?? 0;
-          toast({
-            msg: `KILL engaged: flattened ${flatN}, canceled ${cancelN}`,
-            kind: 'success', duration: 6000,
-          });
-          pushNotification({
-            severity: 'critical', category: 'manual_kill',
-            message: `Operator killed bot via UI: flattened ${flatN}`,
-          });
-          await load();
-          setTimeout(() => { try { load(); } catch (_) {} }, 1500);
-        } catch (e) {
-          setActionError(`KILL failed: ${friendlyError(e)}`);
-          toast({ msg: `KILL failed: ${friendlyError(e)}`, kind: 'error', duration: 8000 });
-        } finally { setBusyKey('kill', false); }
-      },
+    const msg = openCount > 0
+      ? `KILL bot and flatten ${openCount} open position${openCount === 1 ? '' : 's'}? This is IMMEDIATE — no undo.`
+      : 'KILL bot (engage persistent kill switch)? This is IMMEDIATE — no undo.';
+    // confirm() is synchronous + blocking; only returns true on explicit OK.
+    let proceed = false;
+    try { proceed = window.confirm(msg); } catch (_) { proceed = false; }
+    if (!proceed) return;
+
+    const body = {
+      reason: 'operator_emergency_ui',
+      flatten: true,
+      cancel_orders: true,
+    };
+
+    // Persist intent BEFORE network — so a tab close mid-fire is recoverable.
+    try { localStorage.setItem(KILL_INTENT_KEY, JSON.stringify({ ts: Date.now(), body })); } catch (_) {}
+    // Push the audit-trail notification BEFORE the POST so the local record
+    // exists even if the operator closes the tab during the request.
+    pushNotification({
+      severity: 'critical', category: 'manual_kill',
+      message: `Operator clicked KILL (UI). Intent persisted; firing now.`,
     });
+
+    setBusyKey('kill', true); setActionError(null); setActionInfo(null);
+    let lastErr = null;
+    let success = null;
+    // Retry 3× with backoff. Each attempt times out at 6s. After all
+    // attempts, fall back to sendBeacon (commits even on tab unload).
+    for (let attempt = 0; attempt < 3 && !success; attempt++) {
+      try {
+        // Use AbortController so a hung request doesn't block the next try.
+        const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const tid = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, 6000) : null;
+        const res = await api.post('/api/trading/kill', body, ctrl ? { signal: ctrl.signal } : undefined);
+        if (tid) clearTimeout(tid);
+        success = res;
+      } catch (e) {
+        lastErr = e;
+        // 250ms, 500ms backoff
+        await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+      }
+    }
+    if (!success) {
+      // sendBeacon final fallback. Fire-and-forget; commits even if user
+      // closes the tab. Header-based auth doesn't survive sendBeacon, so
+      // we encode the API key as a query parameter — temporary defense
+      // until the backend issues an ephemeral kill-token (B47 follow-up).
+      try {
+        const k = (typeof getApiKey === 'function') ? (getApiKey() || '') : '';
+        const blob = new Blob([JSON.stringify(body)], { type: 'application/json' });
+        const url = '/api/trading/kill' + (k ? ('?_k=' + encodeURIComponent(k)) : '');
+        const ok = (typeof navigator !== 'undefined' && navigator.sendBeacon)
+          ? navigator.sendBeacon(url, blob)
+          : false;
+        if (ok) {
+          toast({
+            msg: 'KILL queued via sendBeacon (network was degraded). Verify in a moment.',
+            kind: 'warning', duration: 12000,
+          });
+          // Leave killIntent in storage so the next page load also re-fires.
+          setBusyKey('kill', false);
+          return;
+        }
+      } catch (_) {}
+      // Out of options. Keep killIntent in storage so a future load retries.
+      setActionError(`KILL FAILED after 3 retries: ${friendlyError(lastErr)} — intent persisted; check Alpaca dashboard NOW.`);
+      toast({
+        msg: 'KILL FAILED — check Alpaca dashboard immediately. Intent persisted; reload to retry.',
+        kind: 'error', duration: 30000,
+      });
+      setBusyKey('kill', false);
+      return;
+    }
+
+    // Success path.
+    try { localStorage.removeItem(KILL_INTENT_KEY); } catch (_) {}
+    const flatN = Array.isArray(success?.flattened) ? success.flattened.length : (success?.flattened ?? 0);
+    const cancelN = success?.cancelled ?? success?.canceled ?? 0;
+    // Surface partial-success state (broker errors) as a sticky red banner.
+    const errs = success?.errors || success?.broker_errors || [];
+    if (Array.isArray(errs) && errs.length > 0) {
+      setActionError(`KILL partial: flattened ${flatN}, canceled ${cancelN}, errors=${errs.length} — verify in Alpaca.`);
+      toast({
+        msg: `KILL PARTIAL: ${errs.length} broker error(s) — verify in Alpaca.`,
+        kind: 'error', duration: 20000,
+      });
+    } else {
+      toast({
+        msg: `KILL engaged: flattened ${flatN}, canceled ${cancelN}`,
+        kind: 'success', duration: 6000,
+      });
+    }
+    pushNotification({
+      severity: 'critical', category: 'manual_kill',
+      message: `KILL engaged via UI: flattened ${flatN}, errors=${Array.isArray(errs) ? errs.length : 0}`,
+    });
+    setBusyKey('kill', false);
+    try { await load(); } catch (_) {}
+    setTimeout(() => { try { load(); } catch (_) {} }, 1500);
   };
+
+  // r82 (B11): on mount, replay any persisted kill intent. If the operator
+  // killed-and-tab-closed during a network hiccup, the next page load
+  // will re-fire the kill (idempotent server-side).
+  React.useEffect(() => {
+    let raw = null;
+    try { raw = localStorage.getItem(KILL_INTENT_KEY); } catch (_) { return; }
+    if (!raw) return;
+    let intent = null;
+    try { intent = JSON.parse(raw); } catch (_) { try { localStorage.removeItem(KILL_INTENT_KEY); } catch (_) {} return; }
+    // Don't auto-fire if intent is older than 1h (treat as stale).
+    if (!intent?.ts || (Date.now() - intent.ts) > 3600 * 1000) {
+      try { localStorage.removeItem(KILL_INTENT_KEY); } catch (_) {}
+      return;
+    }
+    (async () => {
+      try {
+        const res = await api.post('/api/trading/kill', intent.body || { reason: 'replay_intent', flatten: true, cancel_orders: true });
+        try { localStorage.removeItem(KILL_INTENT_KEY); } catch (_) {}
+        toast({ msg: `KILL intent replayed (was queued from prior session). flattened=${(res?.flattened?.length ?? res?.flattened ?? 0)}`, kind: 'warning', duration: 12000 });
+      } catch (e) {
+        toast({ msg: `Persisted KILL intent replay FAILED: ${friendlyError(e)} — verify in Alpaca.`, kind: 'error', duration: 20000 });
+      }
+    })();
+  }, []);
 
   // r53g: Close-All button — flatten every open position via the
   // existing /api/trading/close-all backend (which routes bot-managed

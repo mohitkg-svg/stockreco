@@ -1062,6 +1062,25 @@ class AIDecisionLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+class AICallBudget(Base):
+    """r82 (B33): DB-backed daily call counter for Claude AI cost capping.
+
+    Replaces the prior per-process in-memory dict in ai_judge.py and
+    chat.py. With Cloud Run max-instances=2 + cold-restarts, the in-memory
+    counter could be exceeded by Nx; bills could run away on a feedback
+    bug or leaked key. This row uses INSERT ... ON CONFLICT DO UPDATE
+    for atomic increment across instances.
+
+    PK is (date, channel) — channel is "ai_judge" or "chat".
+    """
+    __tablename__ = "ai_call_budget"
+    date = Column(String, primary_key=True)               # YYYY-MM-DD UTC
+    channel = Column(String, primary_key=True)            # "ai_judge" | "chat"
+    count = Column(Integer, nullable=False, default=0)
+    cost_usd = Column(Float, nullable=False, default=0.0)
+    last_call_at = Column(DateTime, default=datetime.utcnow)
+
+
 def _ensure_column(table: str, column: str, ddl: str):
     """Tiny SQLite migration helper — ALTER TABLE ADD COLUMN if missing.
 
@@ -1090,8 +1109,43 @@ def _mig_001_init(_conn):
     pass
 
 
+def _mig_002_idempotency_unique(conn):
+    """r82: enforce UNIQUE on auto_trades.idempotency_key at the DB level.
+
+    The model column declares `unique=True, index=True` but the column was
+    added post-hoc via `_ensure_column("auto_trades", "idempotency_key", "VARCHAR")`
+    which never adds an index/uniqueness. With two Cloud Run instances racing
+    on the same signal, both can pass the in-process dedup query and both
+    insert — duplicate position. A partial unique index lets multiple NULLs
+    coexist (matches Postgres NULL-not-distinct convention).
+    """
+    from sqlalchemy import text
+    # Postgres syntax; on SQLite the partial-index syntax is also supported.
+    try:
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_auto_trades_idempotency_key "
+            "ON auto_trades(idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL"
+        ))
+    except Exception:
+        # If a duplicate already exists, surface but don't crash boot — the
+        # operator must reconcile the duplicate before retry.
+        raise
+
+
+def _mig_003_auto_trades_status_index(conn):
+    """r82: index hot manage-tick lookups on (status, ticker)."""
+    from sqlalchemy import text
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_auto_trades_status_ticker "
+        "ON auto_trades(status, ticker)"
+    ))
+
+
 _MIGRATIONS = [
     (1, "init schema_migrations table", _mig_001_init),
+    (2, "unique idempotency_key (partial)", _mig_002_idempotency_unique),
+    (3, "index auto_trades(status, ticker)", _mig_003_auto_trades_status_index),
 ]
 
 
@@ -1112,9 +1166,20 @@ def _apply_migrations():
         try:
             with engine.begin() as conn:
                 fn(conn)
-                conn.execute(text(
-                    "INSERT INTO schema_migrations (version, description) VALUES (:v, :d)"
-                ), {"v": version, "d": desc})
+                # r82: ON CONFLICT DO NOTHING so multi-instance boot doesn't
+                # crash the second instance with a UNIQUE violation when both
+                # race the same migration. Postgres-only syntax; on SQLite
+                # the OR IGNORE variant is equivalent.
+                if engine.dialect.name == "sqlite":
+                    conn.execute(text(
+                        "INSERT OR IGNORE INTO schema_migrations (version, description) "
+                        "VALUES (:v, :d)"
+                    ), {"v": version, "d": desc})
+                else:
+                    conn.execute(text(
+                        "INSERT INTO schema_migrations (version, description) "
+                        "VALUES (:v, :d) ON CONFLICT (version) DO NOTHING"
+                    ), {"v": version, "d": desc})
         except Exception as e:
             import logging as _lg
             _lg.getLogger(__name__).error(f"migration v{version} ({desc}) FAILED: {e}")
@@ -1131,11 +1196,14 @@ def create_tables():
     _ensure_column("auto_trades", "target3", "FLOAT")
     _ensure_column("auto_trades", "level_index", "INTEGER DEFAULT 0")
     _ensure_column("auto_trades", "targets_history", "TEXT")
-    _ensure_column("watchlist", "auto_trade_enabled", "BOOLEAN DEFAULT 1")
+    # r82: 'BOOLEAN DEFAULT 1' is valid SQLite but Postgres rejects it
+    # ("argument of DEFAULT must be type boolean, not type integer"). Use
+    # the SQL-standard literal so the helper works on both backends.
+    _ensure_column("watchlist", "auto_trade_enabled", "BOOLEAN DEFAULT TRUE")
     _ensure_column("auto_trader_config", "signal_timeframes", "VARCHAR DEFAULT '1h,4h,1d'")
     _ensure_column("auto_trader_config", "stop_atr_mult", "FLOAT DEFAULT 2.0")
     _ensure_column("auto_trader_config", "chandelier_atr_mult", "FLOAT DEFAULT 3.0")
-    _ensure_column("auto_trader_config", "dry_run", "BOOLEAN DEFAULT 0")
+    _ensure_column("auto_trader_config", "dry_run", "BOOLEAN DEFAULT FALSE")  # r82: was 'DEFAULT 0' (Postgres-incompatible)
     _ensure_column("auto_trader_config", "max_per_sector", "INTEGER DEFAULT 3")
     _ensure_column("auto_trades", "idempotency_key", "VARCHAR")
     _ensure_column("auto_trades", "high_water_mark", "FLOAT")

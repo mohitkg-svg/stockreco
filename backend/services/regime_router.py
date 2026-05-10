@@ -71,8 +71,13 @@ def classify_regime() -> Optional[str]:
 
 def _classify_raw() -> Optional[str]:
     """One-shot classification without hysteresis."""
+    # r82: prior code did `from services.market_context import vix as _vix` and
+    # `from services.indicators import adx` — neither symbol exists. Both
+    # ImportErrors were swallowed by the broad except → the regime classifier
+    # silently returned None on every call → TREND/CHOP/HIGH_VOL stack-switching
+    # was entirely dead and `is_strategy_allowed_in_regime` always fail-opened.
     try:
-        from services.market_context import vix as _vix
+        from services.market_context import current_vix as _vix
         v = _vix()
         if v is not None and v >= 22:
             return "HIGH_VOL"
@@ -80,14 +85,20 @@ def _classify_raw() -> Optional[str]:
         v = None
     try:
         from services.data_fetcher import fetch_ohlcv
-        from services.indicators import adx as _adx_ind
+        from services.indicators import compute_indicators as _ci
         df = fetch_ohlcv("SPY", "1d")
         if df is None or len(df) < 30:
             return None
-        adx_series = _adx_ind(df, period=14)
-        if adx_series is None:
+        df_ind = _ci(df)
+        if "ADX_14" not in df_ind.columns:
             return None
-        spy_adx = float(adx_series.iloc[-1])
+        adx_val = df_ind["ADX_14"].iloc[-1]
+        if adx_val is None or (hasattr(adx_val, "__float__") is False):
+            return None
+        import math as _m
+        spy_adx = float(adx_val)
+        if _m.isnan(spy_adx):
+            return None
     except Exception:
         return None
     if spy_adx >= 25:

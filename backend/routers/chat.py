@@ -19,18 +19,25 @@ from services.config import CHAT_MODEL as _MODEL, CHAT_MAX_TOKENS as _MAX_TOKENS
 
 logger = logging.getLogger(__name__)
 
-# r44 fix Wave 6: per-day chat call counter (process-local, UTC-keyed).
+# r44 fix Wave 6: per-day chat call counter.
 _CHAT_DAILY_CALL_CAP = int(os.getenv("CHAT_DAILY_CALL_CAP", "500"))
+# r82 (B33): kept the in-memory dict only for backwards-compatible reads
+# elsewhere; the authoritative counter is now in DB (ai_call_budget table).
 _chat_call_counter: Dict[str, int] = {}
 
 
 def _chat_budget_check() -> bool:
+    """r82 (B33): cross-instance atomic counter via ai_call_budget table.
+    The prior per-process dict was exceeded by Nx with multi-instance
+    Cloud Run + cold restarts."""
+    from services.ai_call_budget import bump_and_check as _bump_and_check
+    ok, count_after = _bump_and_check("chat", _CHAT_DAILY_CALL_CAP)
+    if not ok:
+        logger.warning(f"chat: daily call cap {_CHAT_DAILY_CALL_CAP} reached (count={count_after}); refusing")
+        return False
     from datetime import datetime as _dt_cb
     day = _dt_cb.utcnow().strftime("%Y-%m-%d")
-    n = _chat_call_counter.get(day, 0)
-    if n >= _CHAT_DAILY_CALL_CAP:
-        return False
-    _chat_call_counter[day] = n + 1
+    _chat_call_counter[day] = count_after
     return True
 
 router = APIRouter(

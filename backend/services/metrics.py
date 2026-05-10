@@ -173,8 +173,13 @@ def register_metrics_endpoint(app) -> None:
     if not _ENABLED:
         logger.info("prometheus_client not installed — /metrics endpoint disabled")
         return
-    from fastapi import Response
+    from fastapi import Depends, Response
+    # r82: gate behind APP_API_KEY. Cloud Run uses --allow-unauthenticated;
+    # without this guard /metrics leaked autotrade event volume + skip
+    # reasons to anyone scraping the public URL — useful intel for an
+    # attacker timing an account takeover for max damage.
+    from routers._auth import require_api_key
 
-    @app.get("/metrics", include_in_schema=False)
+    @app.get("/metrics", include_in_schema=False, dependencies=[Depends(require_api_key)])
     def metrics_endpoint():
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

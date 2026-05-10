@@ -151,6 +151,11 @@ def is_market_open() -> bool:
             if _market_clock_cache and now < _market_clock_cache[1]:
                 return _market_clock_cache[0]
         # Fall through: do our own fetch as a last resort.
+    # r82: pre-initialize is_open so the finally-block read is safe even when
+    # the early `return False` (line: `if not c`) path bypasses both branches
+    # of the inner try/except. Prior code used `'is_open' in dir()` which
+    # checks module attribute names, not local variables — wrong namespace.
+    is_open = False
     try:
         c = _get_client()
         if not c:
@@ -165,8 +170,7 @@ def is_market_open() -> bool:
         is_open = False
     finally:
         with _market_clock_lock:
-            _market_clock_cache = (is_open if 'is_open' in dir() else False,
-                                   _t.time() + 30.0)
+            _market_clock_cache = (is_open, _t.time() + 30.0)
         try:
             _market_clock_inflight.set()
         except Exception:
@@ -517,7 +521,9 @@ def cancel_all_orders(symbol: Optional[str] = None) -> Dict[str, Any]:
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)
-        orders = c.get_orders(filter=req)
+        # r82: wrap with timeout. KILL flow during a network stall used to
+        # hang here forever, leaving the operator unable to flatten.
+        orders = _safe_rest_read(lambda: c.get_orders(filter=req), timeout=8.0) or []
     except Exception as e:
         logger.error(f"cancel_all_orders list failed: {e}")
         return {"error": str(e)}
@@ -527,7 +533,9 @@ def cancel_all_orders(symbol: Optional[str] = None) -> Dict[str, Any]:
     cancelled, failed = [], []
     for o in targeted:
         try:
-            c.cancel_order_by_id(str(o.id))
+            # r82: bound each cancel with a short timeout so a single hung
+            # leg doesn't block the rest of the kill loop.
+            _safe_rest_read(lambda: c.cancel_order_by_id(str(o.id)), timeout=4.0)
             cancelled.append({"id": str(o.id), "symbol": o.symbol, "side": str(o.side)})
         except Exception as e:
             # Already-terminal orders throw 422 — treat as no-op, not failure.
@@ -561,7 +569,11 @@ def close_position(symbol: str) -> Dict[str, Any]:
     if not c:
         return {"error": "Alpaca client not initialized"}
     try:
-        o = c.close_position(symbol.upper())
+        # r82: timeout-wrap so an emergency flatten can't hang on a wedged
+        # connection. close_position is non-idempotent — no retry on timeout.
+        o = _safe_rest_read(lambda: c.close_position(symbol.upper()), timeout=8.0)
+        if o is None:
+            return {"error": "close_position timed out"}
         return {
             "id": str(o.id),
             "symbol": o.symbol,

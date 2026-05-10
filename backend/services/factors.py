@@ -255,11 +255,13 @@ def fomc_surprise_factor() -> float:
     equity drag carries over; Dovish = SPY +1%+ → tailwind. This is a
     cheap proxy for the proper Fed Funds futures-implied surprise."""
     try:
-        from services.macro_calendar import _FOMC_DATES
+        # r82: prior code iterated string set then compared `date == str`
+        # — always False. Use the parallel date-object set.
+        from services.macro_calendar import _FOMC_DATE_OBJS
         from datetime import datetime as _dt, timedelta as _td
         from zoneinfo import ZoneInfo as _ZI
         now_et = _dt.now(_ZI("America/New_York"))
-        for d in _FOMC_DATES:
+        for d in _FOMC_DATE_OBJS:
             try:
                 if (now_et.date() == d) or ((now_et.date() - d).days == 1):
                     from services.data_fetcher import fetch_ohlcv

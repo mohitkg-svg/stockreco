@@ -90,8 +90,8 @@ gcloud run deploy "$SERVICE" \
 # auto-restarts the container. This is the whole point of putting the
 # manager in its own service.
 gcloud beta run services update "$SERVICE" --region "$REGION" \
-  --liveness-probe="httpGet.path=/api/health,initialDelaySeconds=30,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" \
-  --startup-probe="httpGet.path=/api/health,initialDelaySeconds=10,periodSeconds=5,timeoutSeconds=5,failureThreshold=12" \
+  --liveness-probe="httpGet.path=/api/healthz,initialDelaySeconds=30,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" \
+  --startup-probe="httpGet.path=/api/healthz,initialDelaySeconds=10,periodSeconds=5,timeoutSeconds=5,failureThreshold=12" \
   2>/dev/null || echo "(liveness-probe flags unavailable; non-fatal)"
 
 # The manager service is internal-ingress only — it doesn't accept public

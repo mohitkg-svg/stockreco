@@ -1472,11 +1472,24 @@ class TestNR7Strategy(unittest.TestCase):
 
 class TestAIBudgetCheck(unittest.TestCase):
     def test_budget_check_blocks_after_cap(self):
+        # r82 (B33): the counter is now persisted in the ai_call_budget
+        # table (was per-process in-memory). Ensure the schema exists and
+        # the row for today is clean so a re-run starts at 0.
+        _reset_db()  # ensures ai_call_budget table is present
         from services import ai_judge
-        # Save and reset state.
+        from database import SessionLocal
+        from sqlalchemy import text as _sa_text
+        from datetime import datetime as _dt_tb, timezone as _tz_tb
+        _today = _dt_tb.now(_tz_tb.utc).strftime("%Y-%m-%d")
         orig_cap = ai_judge._AI_DAILY_CALL_CAP
         orig_counter = dict(ai_judge._ai_call_counter)
+        _db = SessionLocal()
         try:
+            try:
+                _db.execute(_sa_text("DELETE FROM ai_call_budget WHERE date = :d AND channel = 'ai_judge'"), {"d": _today})
+                _db.commit()
+            except Exception:
+                _db.rollback()
             ai_judge._AI_DAILY_CALL_CAP = 3
             ai_judge._ai_call_counter.clear()
             self.assertTrue(ai_judge._ai_budget_check())
@@ -1487,6 +1500,12 @@ class TestAIBudgetCheck(unittest.TestCase):
             ai_judge._AI_DAILY_CALL_CAP = orig_cap
             ai_judge._ai_call_counter.clear()
             ai_judge._ai_call_counter.update(orig_counter)
+            try:
+                _db.execute(_sa_text("DELETE FROM ai_call_budget WHERE date = :d AND channel = 'ai_judge'"), {"d": _today})
+                _db.commit()
+            except Exception:
+                _db.rollback()
+            _db.close()
 
 
 class TestAdminTickerValidation(unittest.TestCase):

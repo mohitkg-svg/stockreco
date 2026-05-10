@@ -245,6 +245,111 @@ scheduler = BackgroundScheduler(
     },
 )
 
+
+def _install_singleton_wrapper_on_scheduler(_sched) -> None:
+    """r82 (B35): monkey-patch ``add_job`` so every cron callable is wrapped
+    with the Postgres advisory-lock singleton (defined further up). This
+    avoids editing all 25 add_job call sites individually. The wrapper
+    no-ops on SQLite and on jobs explicitly marked ``singleton_lock=False``
+    via metadata.
+
+    Some jobs MUST run on every instance (e.g., per-instance health
+    counter resets) — those should be exempted by passing
+    ``kwargs=dict(_singleton=False)`` to add_job (none today).
+    """
+    _orig_add_job = _sched.add_job
+
+    def _patched_add_job(func, *args, **kwargs):
+        # Allow opt-out via the _singleton kwarg sentinel.
+        if kwargs.pop("_singleton", True) is False:
+            return _orig_add_job(func, *args, **kwargs)
+        # job_id resolution mirrors APScheduler's: explicit `id` kwarg
+        # wins; otherwise use callable's __name__.
+        jid = kwargs.get("id") or getattr(func, "__name__", "anon_job")
+        wrapped = _with_singleton_lock(jid)(func)
+        # Preserve the original __name__ so APScheduler's logging is
+        # unchanged.
+        try:
+            wrapped.__name__ = getattr(func, "__name__", jid)
+        except Exception:
+            pass
+        return _orig_add_job(wrapped, *args, **kwargs)
+
+    _sched.add_job = _patched_add_job
+
+
+_install_singleton_wrapper_on_scheduler(scheduler)
+
+# r82 (B35): cross-instance scheduler singleton wrapper. With Cloud Run
+# max-instances=2, APScheduler's MemoryJobStore runs every cron in BOTH
+# instances. Most jobs aren't catastrophic if doubled, but: ML outcome
+# backfill duplicates rows; fundamentals fetcher hits Yahoo rate-limit;
+# wsb_scraper doubles Reddit budget; news poll runs twice. We wrap each
+# cron with a Postgres advisory lock so only one instance runs each tick.
+# On SQLite (dev/test) the wrapper is a no-op since SQLite is single-writer.
+def _with_singleton_lock(job_id: str):
+    """Return a wrapper that runs the inner callable only when this
+    instance acquires a Postgres advisory lock keyed by job_id. The lock
+    is released when the inner callable returns (or raises). If another
+    instance holds the lock, the wrapper logs at DEBUG and returns None.
+    """
+    import functools as _ft
+    import hashlib as _hl
+
+    # Stable 64-bit signed int from the job_id (Postgres advisory locks
+    # take a bigint).
+    _h = int(_hl.sha1(job_id.encode("utf-8")).hexdigest()[:15], 16)
+    # Fit in signed bigint range
+    if _h >= 2**63:
+        _h -= 2**63
+    _key = _h
+
+    def _wrap(fn):
+        @_ft.wraps(fn)
+        def _runner(*args, **kwargs):
+            try:
+                from database import SessionLocal, engine
+            except Exception:
+                # No DB — run unwrapped (dev mode).
+                return fn(*args, **kwargs)
+            if engine.dialect.name != "postgresql":
+                # SQLite / other — no advisory lock support; safe to run
+                # unwrapped (single-instance dev).
+                return fn(*args, **kwargs)
+            db = SessionLocal()
+            try:
+                from sqlalchemy import text as _sa_text
+                got = db.execute(
+                    _sa_text("SELECT pg_try_advisory_lock(:k)"),
+                    {"k": _key},
+                ).scalar()
+                if not got:
+                    logger.debug(f"scheduler: '{job_id}' skipped (lock held by other instance)")
+                    return None
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    try:
+                        db.execute(
+                            _sa_text("SELECT pg_advisory_unlock(:k)"),
+                            {"k": _key},
+                        )
+                        db.commit()
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"scheduler singleton wrapper for '{job_id}' errored: {e}; running unwrapped")
+                return fn(*args, **kwargs)
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        return _runner
+
+    return _wrap
+
+
 # r47 fix #T1-1 / observability P0-5: surface scheduler-level job failures
 # and misfires as alerts. Without this, a deploy bug (typo, import error)
 # can silently drop a critical job for hours; jobs that fail before their
@@ -410,6 +515,59 @@ def _scheduled_manage():
         _record_manage_tick()
 
 
+def _health_watchdog_tick():
+    """r82 (B49): emits stream_stale + manage_loop_stuck alerts every 60s.
+
+    Was previously inline in /api/health. Moving it here means a wedged DB
+    can't cascade into a Cloud Run liveness restart loop. The watchdog
+    runs in the scheduler executor (not the request thread), so a hung
+    alert insert blocks only the next watchdog tick — not the probe.
+    """
+    import time as _time_w
+    try:
+        from services import alerts as _alerts_w
+    except Exception:
+        return
+    # Stream staleness alert
+    try:
+        latest_q_ts = max(
+            (q.get("ts", 0) for q in live_quotes.all_stock_quotes().values()),
+            default=0,
+        )
+        if latest_q_ts > 0:
+            stale = _time_w.time() - latest_q_ts
+            if stale > 30:
+                try:
+                    from services import alpaca_client as _pt_clk_w
+                    if _pt_clk_w.is_market_open():
+                        _alerts_w.alert(
+                            severity="warning",
+                            category="stream_stale",
+                            message=f"Alpaca WS quotes stale {stale:.0f}s during RTH — positions may not be priced live",
+                        )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Manage-loop staleness (manager-mode only)
+    _is_manager_w = (os.getenv("RUN_MODE") or "api").strip().lower() == "manager"
+    if _is_manager_w:
+        try:
+            last_m = _app_health.get("last_manage_at")
+            if last_m:
+                from datetime import datetime as _dt_w, timezone as _tz_w
+                last_dt = _dt_w.fromisoformat(last_m.replace("Z", "+00:00")) if isinstance(last_m, str) else last_m
+                stale_m = (_dt_w.now(_tz_w.utc) - last_dt).total_seconds()
+                if stale_m > 120:
+                    _alerts_w.alert(
+                        severity="error",
+                        category="manage_loop_stuck",
+                        message=f"Manage loop hasn't ticked in {stale_m:.0f}s — positions may not be tracked",
+                    )
+        except Exception:
+            pass
+
+
 def _ml_outcome_backfill():
     """For each MLPrediction without an outcome, look up the most recent
     closed AutoTrade for the same (ticker, signal_type, ~created_at window)
@@ -464,6 +622,18 @@ def _ml_outcome_backfill():
 async def lifespan(app: FastAPI):
     create_tables()
 
+    # r82 (B9): re-arm the in-memory KILL flag from the persisted cfg.killed
+    # row IMMEDIATELY after schema creation so a Cloud Run cold-start cannot
+    # leave the bot un-killed. If the DB is unreachable on boot, this also
+    # fail-closes (assumes killed) until operator intervenes via /unkill.
+    try:
+        from services import auto_trader as _at_boot
+        _killed_at_boot = _at_boot.hydrate_killed_flag_from_db()
+        if _killed_at_boot:
+            logger.critical("BOOT: in-memory KILL flag re-armed from DB cfg.killed")
+    except Exception as _e:
+        logger.error(f"BOOT: hydrate_killed_flag_from_db failed: {_e}")
+
     # Dual-service architecture (RUN_MODE):
     #   "api"     — DEFAULT. Registers everything EXCEPT the manage loop +
     #               reconciliation. Handles HTTP, scanner, signal generation,
@@ -514,6 +684,14 @@ async def lifespan(app: FastAPI):
             auto_trader.auto_reconcile_positions()
         except Exception as _e:
             logger.warning(f"boot reconciliation failed: {_e}")
+        # r82 (B49): manager-side health watchdog — emits manage_loop_stuck.
+        try:
+            scheduler.add_job(
+                _health_watchdog_tick, "interval", seconds=60, id="health_watchdog",
+                max_instances=1, coalesce=True, misfire_grace_time=30,
+            )
+        except Exception as _e:
+            logger.warning(f"health_watchdog not scheduled: {_e}")
         scheduler.start()
         _app_health["scheduler_started"] = True
         logger.info("Manager service started — manage every 20s, reconcile every 60min")
@@ -838,6 +1016,21 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         logger.warning(f"ml jobs not scheduled: {_e}")
+
+    # r82 (B49): dedicated health-watchdog cron. Runs every 60s, emits
+    # alerts for stream staleness and (on the manager service) manage-loop
+    # staleness. Was previously inline in the /api/health handler — that
+    # caused Cloud Run liveness restarts during DB outages because the
+    # alert insert hung the probe. The watchdog is wrapped by the
+    # singleton-lock decorator (B35), so only one instance fires it.
+    try:
+        scheduler.add_job(
+            _health_watchdog_tick, "interval", seconds=60, id="health_watchdog",
+            max_instances=1, coalesce=True, misfire_grace_time=30,
+        )
+    except Exception as _e:
+        logger.warning(f"health_watchdog not scheduled: {_e}")
+
     scheduler.start()
     _app_health["scheduler_started"] = True
     logger.info("Scheduler started — auto-scan 15m, auto-trader manage 60s")
@@ -1100,6 +1293,8 @@ app.include_router(backtest.router)
 app.include_router(options.router)
 app.include_router(stream.router)
 app.include_router(trading.router)
+# r82 (B11): kill endpoint sub-router with sendBeacon-friendly auth.
+app.include_router(trading.kill_router)
 app.include_router(news.router)
 app.include_router(alerts_router.router)
 app.include_router(chat_router.router)
@@ -1112,6 +1307,17 @@ app.include_router(ai_judge_router.router)
 app.include_router(admin_router.router)
 
 
+@app.get("/api/healthz")
+def healthz():
+    """r82 (B49): trivial liveness probe — returns 200 in microseconds with
+    NO DB, broker, or stream calls. This is the endpoint Cloud Run's
+    liveness probe should hit (configure via deploy.sh). The richer
+    /api/health stays for operator inspection but its DB calls + broker
+    clock can stall the probe and trigger restart loops during DB outages.
+    """
+    return {"ok": True}
+
+
 @app.get("/api/health")
 def health():
     """Health includes subsystem flags so deploys can detect partial-boot states.
@@ -1121,6 +1327,11 @@ def health():
     Extended (G1): surfaces last-scan / last-manage timestamps, today's realized
     PnL, stream staleness, and the kill-switch state so one curl gives you the
     "is it trading correctly right now?" answer without poking 5 endpoints.
+
+    r82 (B49): alert emission moved out of this handler to a dedicated 60s
+    `_health_watchdog_tick` cron — the prior pattern caused Cloud Run
+    liveness restarts during DB outages because the alert insert (run
+    inside this handler) hung the probe past its 5s timeout.
     """
     import time as _time
     from datetime import datetime, timedelta, timezone as _tz
@@ -1135,21 +1346,6 @@ def health():
         )
         if latest_q_ts > 0:
             stream_stale_secs = round(_time.time() - latest_q_ts, 1)
-    except Exception:
-        pass
-
-    # Stale-stream alert: fire once when quotes stop flowing for >30s during RTH.
-    # Operator needs to know BEFORE positions go unmanaged.
-    try:
-        if stream_stale_secs is not None and stream_stale_secs > 30:
-            from services import alerts as _alerts
-            from services import alpaca_client as _pt_clk
-            if _pt_clk.is_market_open():
-                _alerts.alert(
-                    severity="warning",
-                    category="stream_stale",
-                    message=f"Alpaca WS quotes stale {stream_stale_secs:.0f}s during RTH — positions may not be priced live",
-                )
     except Exception:
         pass
 
@@ -1221,18 +1417,12 @@ def health():
     except Exception:
         pass
 
-    # If manager hasn't ticked in >120s, alert. Manage cadence is 20s so
-    # 120s = 6 missed ticks — clearly something's wrong.
-    if _is_manager_proc and manage_stale_secs is not None and manage_stale_secs > 120:
-        try:
-            from services import alerts as _alerts2
-            _alerts2.alert(
-                severity="error",
-                category="manage_loop_stuck",
-                message=f"Manage loop hasn't ticked in {manage_stale_secs:.0f}s — positions may not be tracked",
-            )
-        except Exception:
-            pass
+    # r82 (B49): alert emission for manage-loop staleness moved out of this
+    # handler. The watchdog cron `_health_watchdog_tick` (registered below)
+    # checks the same condition every 60s and emits via services.alerts.
+    # Keeping the alert here meant a Cloud Run liveness probe could trigger
+    # an Alert insert into a wedged DB → probe times out → container
+    # restart → fresh container hits the same wedged DB → restart loop.
 
     degraded = (
         not _app_health["scheduler_started"]

@@ -1091,6 +1091,11 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
     else:
         return _neutral_signal(ticker, timeframe, "Mixed signals — no clear directional bias")
 
+    # r82: stamp generated_at on every actionable signal so the live-path
+    # freshness gate in consider_signal can actually fire. Without this the
+    # gate's `if gen_at:` check sees None and skips entirely — a 90-min-old
+    # signal with stale entry/stop levels would still execute.
+    from datetime import datetime as _dt_sg, timezone as _tz_sg
     return {
         "ticker": ticker,
         "timeframe": timeframe,
@@ -1107,6 +1112,7 @@ def generate_signal(ticker: str, timeframe: str, df: pd.DataFrame) -> Dict[str, 
         # F4: surface ADX so _apply_backtest_to_signal can regime-gate the
         # strategy pool (drop BREAKOUTs in chop, MEANREV in strong trend).
         "adx": float(adx) if adx else None,
+        "generated_at": _dt_sg.now(_tz_sg.utc).isoformat(),
     }
 
 
@@ -1125,6 +1131,7 @@ def _neutral_signal(ticker: str, timeframe: str, reason: str) -> Dict[str, Any]:
     `reason` flows through to the UI (signal "reasoning" pane) so
     operators can see why a particular ticker was passed over.
     """
+    from datetime import datetime as _dt_ns, timezone as _tz_ns
     return {
         "ticker": ticker,
         "timeframe": timeframe,
@@ -1138,6 +1145,8 @@ def _neutral_signal(ticker: str, timeframe: str, reason: str) -> Dict[str, Any]:
         "reasoning": reason,
         "patterns": "[]",
         "strategy": "Composite (multi-factor)",
+        # r82: include generated_at uniformly so callers can rely on the field.
+        "generated_at": _dt_ns.now(_tz_ns.utc).isoformat(),
     }
 
 

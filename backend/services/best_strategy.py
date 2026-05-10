@@ -54,6 +54,13 @@ def recompute_all() -> Dict[str, Any]:
                 df = fetch_ohlcv(ticker, "1d")
                 if df is None or df.empty or len(df) < 252:
                     continue
+                # r82: stamp ticker on df.attrs so per-ticker strategies
+                # (e.g., _vix_spike_reversion which is restricted to SPY/QQQ)
+                # can identify the underlying.
+                try:
+                    df.attrs["ticker"] = ticker
+                except Exception:
+                    pass
                 multi = run_multi_strategy(df, timeframe="1d")
                 if not multi.get("results"):
                     continue

@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from services import alpaca_client, auto_trader
-from routers._auth import require_api_key
+from routers._auth import require_api_key, require_api_key_kill
 
 # All trading endpoints require X-API-Key auth (when APP_API_KEY is set).
 # Attached at router-level so every GET/POST/DELETE inherits it. GETs are
@@ -29,6 +29,16 @@ router = APIRouter(
     prefix="/api/trading",
     tags=["trading"],
     dependencies=[Depends(require_api_key)],
+)
+
+# r82 (B11): kill endpoint lives on its own sub-router so the router-level
+# require_api_key dep doesn't reject sendBeacon requests (which can't set
+# X-API-Key header). The kill_router uses require_api_key_kill which also
+# accepts `?_k=...` query param. main.py registers BOTH routers.
+kill_router = APIRouter(
+    prefix="/api/trading",
+    tags=["trading-kill"],
+    dependencies=[Depends(require_api_key_kill)],
 )
 
 
@@ -203,8 +213,14 @@ def pnl_reconciliation():
         key = os.getenv("APCA_API_KEY_ID")
         sec = os.getenv("APCA_API_SECRET_KEY")
         if key and sec:
+            # r82 fix: was hardcoded to paper-api.alpaca.markets — with
+            # ALPACA_LIVE=1 this hit the paper endpoint with LIVE keys,
+            # leaking creds via DNS to the wrong host AND reading the
+            # wrong account's history.
+            _is_live = os.getenv("ALPACA_LIVE", "0").strip() == "1"
+            _base = "https://api.alpaca.markets" if _is_live else "https://paper-api.alpaca.markets"
             r = requests.get(
-                "https://paper-api.alpaca.markets/v2/account/portfolio/history?period=1A&timeframe=1D",
+                f"{_base}/v2/account/portfolio/history?period=1A&timeframe=1D",
                 headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
                 timeout=8,
             )
@@ -567,6 +583,53 @@ def move_stop(req: MoveStopRequest):
 def submit_order(req: OrderRequest):
     if not alpaca_client.is_enabled():
         raise HTTPException(status_code=503, detail="Paper trading not configured")
+
+    # r82: server-side risk recheck. The auto-trader's risk gates
+    # (kill-flag, daily-loss-halt, BP breaker, max_pct_of_equity, single-
+    # trade-notional cap) were entirely bypassed by direct POSTs. With
+    # ALPACA_LIVE=1 a leaked API key + this endpoint = arbitrary-size order.
+    try:
+        from services import auto_trader as _at_gate, risk_manager as _rm_gate
+        from database import SessionLocal as _SL_gate, AutoTraderConfig as _ATC_gate
+        _g_db = _SL_gate()
+        try:
+            _g_cfg = _g_db.query(_ATC_gate).filter(_ATC_gate.id == 1).first()
+            # KILL flag — refuse any direct order while killed.
+            if _g_cfg and bool(getattr(_g_cfg, "killed", False)):
+                raise HTTPException(status_code=423, detail="trading killed; use /unkill first")
+            # Hard cap: notional must be < 25% of equity per single direct submit.
+            try:
+                _acct = alpaca_client.get_account() or {}
+                _equity = float(_acct.get("equity") or 0)
+                _ref_px = float(req.limit_price or req.stop_loss or req.take_profit or 0) or None
+                if _ref_px is None:
+                    # market order — fall back to last live quote
+                    from services import position_manager as _pm_gate
+                    _live = _pm_gate.current_price(req.symbol, max_age_sec=30.0)
+                    _ref_px = float(_live or 0) or None
+                if _equity > 0 and _ref_px and _ref_px > 0:
+                    _notional = float(req.qty) * _ref_px
+                    if _notional > 0.25 * _equity:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"order notional ${_notional:,.0f} exceeds 25% of equity (${_equity:,.0f})",
+                        )
+            except HTTPException:
+                raise
+            except Exception as _eq_e:
+                # If we can't determine equity, be conservative and refuse.
+                raise HTTPException(status_code=503, detail=f"equity check failed: {_eq_e}")
+            # BP breaker / broker-down — skip new entries.
+            if _rm_gate.bp_breaker_active() or _rm_gate.broker_down():
+                raise HTTPException(status_code=503, detail="bp/broker breaker active; retry later")
+        finally:
+            _g_db.close()
+    except HTTPException:
+        raise
+    except Exception as _ge:
+        # Fail closed on any unexpected error in the gate itself.
+        raise HTTPException(status_code=503, detail=f"risk recheck failed: {_ge}")
+
     # Resolve extended_hours (auto = true only during pre/post-market and
     # only on DAY-TIF limit orders — alpaca_client does the final legality
     # check too).
@@ -1256,12 +1319,16 @@ def auto_trade_rationale(trade_id: int):
 
 # -------- Kill switch --------
 
-@router.post("/kill")
+@kill_router.post("/kill")
 def kill_switch(req: KillSwitchRequest):
     """
     Emergency halt — disables auto-trader AND (by default) flattens every
     open position + cancels every working order. The kill state is persisted
     in AutoTraderConfig so a process restart does NOT silently re-arm.
+
+    r82 (B11): registered on `kill_router` so the auth dep allows `?_k=...`
+    query-param fallback for navigator.sendBeacon (which can't set
+    custom headers). All other endpoints still require X-API-Key header.
 
     Response shape:
       {"killed": true, "flattened": [...], "cancelled": N, "reason": "..."}

@@ -13,7 +13,11 @@ __pycache__/
 # Logs
 backend/logs/
 
-# SQLite WAL files (runtime state)
+# SQLite databases (r82: was previously only ignoring -shm/-wal/.bak —
+# the actual *.db file was therefore committed; backend/stockapp.db
+# leaked trade history + AutoTraderConfig + broker order IDs into git
+# history. Use `git rm --cached backend/stockapp.db` to drop tracking.)
+*.db
 *.db-shm
 *.db-wal
 *.db.bak

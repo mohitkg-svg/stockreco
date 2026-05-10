@@ -240,25 +240,19 @@ def _news_spike_fade(d: pd.DataFrame) -> Dict:
 
     Regime: chop.
     """
-    if "ATR_14" not in d.columns or "VOL_SMA20" not in d.columns:
-        empty = pd.Series(False, index=d.index)
-        return {"name": "News Spike Fade", "description": "—", "regime": "chop",
-                "entry_long": empty, "entry_short": empty}
-    bar_range = (d["High"] - d["Low"]).abs()
-    big_bar = bar_range >= 1.5 * d["ATR_14"]
-    rvol = d["Volume"] / d["VOL_SMA20"]
-    rvol_spike = rvol >= 3.0
-    # Fade direction: bar closed at the extreme = exhaustion
-    bar_color_up = d["Close"] > d["Open"]
-    bar_color_dn = d["Close"] < d["Open"]
-    long_e = big_bar & rvol_spike & bar_color_dn   # huge red bar with spike → fade up
-    short_e = big_bar & rvol_spike & bar_color_up   # huge green bar with spike → fade down
+    # r82: DISABLED. The docstring promised a news-timestamp filter would
+    # be layered in signal_generator; no such filter exists. The strategy
+    # therefore fades any 1.5×ATR + RVOL≥3 bar — many of which are
+    # catalyst-driven moves that continue. Knife-catching without news
+    # context has negative empirical edge. Re-enable only when the news
+    # filter is actually wired (and behind an explicit cfg flag).
+    empty = pd.Series(False, index=d.index)
     return {
         "name": "News Spike Fade",
-        "description": "Fade ≥ 1.5×ATR bar with RVOL ≥ 3 (mean-reversion of spike)",
+        "description": "DISABLED (r82): missing news-timestamp filter",
         "regime": "chop",
-        "entry_long": long_e.fillna(False),
-        "entry_short": short_e.fillna(False),
+        "entry_long": empty,
+        "entry_short": empty,
     }
 
 
@@ -580,6 +574,20 @@ def _vix_spike_reversion(d: pd.DataFrame) -> Dict:
     """
     empty = pd.Series(False, index=d.index)
     long_e = pd.Series(False, index=d.index)
+    # r82: docstring claims caller filters by ticker via the `regime` field,
+    # but no such filter exists in signal_generator. Without the gate, every
+    # ticker in the watchlist fires a long on its last bar during a VIX
+    # spike — mass long entries on a market panic day. Hard-code the
+    # whitelist here so the safety can't be lost by upstream refactors.
+    _SPX_TICKERS = {"SPY", "QQQ", "IVV", "VOO"}
+    _ticker = (d.attrs.get("ticker") if hasattr(d, "attrs") else None) or ""
+    if str(_ticker).upper() not in _SPX_TICKERS:
+        return {
+            "name": "VIX 5σ Spike Reversion",
+            "description": "Long SPY/QQQ next session after VIX +5σ spike (filtered to index ETFs)",
+            "regime": "any",
+            "entry_long": empty, "entry_short": empty,
+        }
     try:
         from services.r47_overlays import vix_spike_signal
         sig = vix_spike_signal()

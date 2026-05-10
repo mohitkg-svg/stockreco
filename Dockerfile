@@ -20,7 +20,11 @@ RUN pip install --prefix=/install -r requirements.txt
 # shipped in the repo under `.venv/.../alpaca/common/websocket.py` is
 # vendored into the site-packages install.
 COPY alpaca_websocket_patch.py ./alpaca_websocket_patch.py
-RUN python alpaca_websocket_patch.py /install/lib/python3.12/site-packages/alpaca/common/websocket.py || true
+# r82: was `|| true` — silently no-op'd if alpaca-py upgraded its layout,
+# leaving runtime to fail on first WS connect (extra_headers kwarg). Fail
+# the build if the patch can't apply; alpaca-py is pinned in requirements.txt
+# so the path is stable.
+RUN python alpaca_websocket_patch.py /install/lib/python3.12/site-packages/alpaca/common/websocket.py
 
 # ---------- Runtime ----------
 FROM python:3.12-slim

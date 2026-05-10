@@ -43,6 +43,13 @@ _FOMC_2027 = [
 ]
 _FOMC_DATES = set(_FOMC_2026 + _FOMC_2027)
 
+# r82: a parallel set of date objects for callers that compare against
+# datetime.date values directly. The string-set above is kept because at
+# least one consumer (macro_calendar.py itself, line 154) does
+# `if d.isoformat() in _FOMC_DATES`. Both forms now coexist.
+from datetime import date as _date_fomc
+_FOMC_DATE_OBJS = {_date_fomc.fromisoformat(s) for s in _FOMC_DATES}
+
 # FRED series IDs for fetching actuals after release. None = no FRED fetch.
 _FRED_SERIES = {
     "CPI": "CPIAUCSL",        # CPI All Urban

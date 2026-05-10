@@ -49,6 +49,40 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
     return None
 
 
+def require_api_key_kill(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> None:
+    """r82 (B11): kill-endpoint auth — accepts X-API-Key header (preferred)
+    OR `?_k=...` query parameter (fallback for navigator.sendBeacon, which
+    cannot set custom headers). The query-param path leaks the key into
+    Cloud Run access logs but the kill endpoint is the one place where
+    "ensure delivery" wins over "no header logging" — every other endpoint
+    still uses require_api_key().
+
+    TODO B47: replace with a short-lived ephemeral kill-token issued by an
+    auth-protected /api/kill/issue-token endpoint so the long-lived API
+    key isn't passed in the URL even on this endpoint.
+    """
+    expected = _expected_key()
+    if expected is None:
+        return None
+    candidate = x_api_key
+    if not candidate:
+        # sendBeacon path: pull from query string. Use request.query_params
+        # to avoid having to add a Query() parameter (which would change the
+        # endpoint signature).
+        try:
+            candidate = request.query_params.get("_k") or None
+        except Exception:
+            candidate = None
+    if not candidate:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key (header or _k query param)")
+    if not hmac.compare_digest(candidate.strip(), expected):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return None
+
+
 def auth_configured() -> bool:
     """True if APP_API_KEY is set — used by /api/health to surface config."""
     return _expected_key() is not None

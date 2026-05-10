@@ -196,8 +196,27 @@ def _is_partial_bar(df) -> bool:
         from zoneinfo import ZoneInfo as _ZI
         last_ts = df.index[-1]
         now_et = datetime.utcnow().replace(tzinfo=_ZI("UTC")).astimezone(_ZI("America/New_York"))
+        # r82 fix: pandas Timestamps with tz=None still have tz_convert as an
+        # attribute, but calling it on a naive timestamp raises TypeError —
+        # which the outer except swallowed → returned False → partial bar
+        # treated as CLOSED → score_candidate anchored on iloc[-1] (the
+        # in-progress bar) instead of iloc[-2] → look-ahead leak. Alpaca's
+        # data_fetcher path strips tz info, making this the common case.
+        # Localize to UTC first if naive.
         if hasattr(last_ts, "tz_convert"):
-            ts_et = last_ts.tz_convert("America/New_York")
+            try:
+                if getattr(last_ts, "tz", None) is None and getattr(last_ts, "tzinfo", None) is None:
+                    last_ts = last_ts.tz_localize("UTC")
+                ts_et = last_ts.tz_convert("America/New_York")
+            except Exception:
+                # Final fallback via pydatetime path
+                if hasattr(last_ts, "to_pydatetime"):
+                    d = last_ts.to_pydatetime()
+                    if d.tzinfo is None:
+                        d = d.replace(tzinfo=_ZI("UTC"))
+                    ts_et = d.astimezone(_ZI("America/New_York"))
+                else:
+                    return False
         elif hasattr(last_ts, "to_pydatetime"):
             d = last_ts.to_pydatetime()
             if d.tzinfo is None:

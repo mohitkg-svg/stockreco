@@ -123,10 +123,21 @@ for _m in AI_ENTRY_VETO_MODE AI_NEWS_EXIT_MODE AI_CONFIDENCE_MULT_MODE; do
     ENV_VARS="${ENV_VARS},${_m}=${!_m}"
   fi
 done
-# CORS: Cloud Run URL is unknown until deploy — allow any origin by default
-# (the X-API-Key gate is the real access control). Tighten after first deploy
-# by setting CORS_ALLOW_ORIGINS to the exact Cloud Run URL.
-ENV_VARS="${ENV_VARS},CORS_ALLOW_ORIGINS=*"
+# CORS: r82 — was unconditionally setting CORS_ALLOW_ORIGINS=* on every
+# deploy, which silently overwrote any tightened value previously set on
+# Cloud Run. LIVE_CHECKLIST requires this NOT be * in prod. We now require
+# CORS_ALLOW_ORIGINS to be set in backend/.env (or the shell). For LIVE
+# mode we additionally refuse '*' explicitly.
+if [ -z "${CORS_ALLOW_ORIGINS:-}" ]; then
+  echo "❌ CORS_ALLOW_ORIGINS must be set (e.g. https://stockrecs-xxx.a.run.app)" >&2
+  echo "   Add it to backend/.env or export it in your shell." >&2
+  exit 1
+fi
+if [ "${ALPACA_LIVE:-0}" = "1" ] && [ "${CORS_ALLOW_ORIGINS}" = "*" ]; then
+  echo "❌ Refusing to deploy LIVE with CORS_ALLOW_ORIGINS='*'." >&2
+  exit 1
+fi
+ENV_VARS="${ENV_VARS},CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS}"
 # Algo Trader Plus feature flags — sticky so deploys don't wipe them:
 #   ALPACA_DATA_FEED=sip         SIP consolidated tape (bars + live stream)
 #   ALPACA_OPTIONS_FEED=indicative  Options snapshots (AT+ tier supports this)
@@ -168,15 +179,19 @@ gcloud run deploy "$SERVICE" \
   --add-cloudsql-instances "$CSQL_INSTANCE" \
   --update-env-vars "$ENV_VARS"
 
-# Cloud Run liveness probe — auto-restart instance if /api/health returns
-# non-200 for 3 consecutive checks. /api/health is unauthenticated by
+# Cloud Run liveness probe — auto-restart instance if /api/healthz returns
+# non-200 for 3 consecutive checks. r82 (B49): switched from /api/health to
+# /api/healthz (a trivial 200-returner with NO DB / broker calls). The
+# previous /api/health did 2 DB queries + broker call + alert emit, which
+# could hang on a wedged DB and trigger restart loops. /api/healthz is
+# unauthenticated by
 # design (read-only health). Probe runs against an internal port and
 # does not consume our public quota.
 # These flags require gcloud beta + a recent Cloud Run version. The
 # subcommand may fail on older clients — non-fatal, just warn.
 gcloud beta run services update "$SERVICE" --region "$REGION" \
-  --liveness-probe="httpGet.path=/api/health,initialDelaySeconds=20,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" \
-  --startup-probe="httpGet.path=/api/health,initialDelaySeconds=10,periodSeconds=5,timeoutSeconds=5,failureThreshold=12" \
+  --liveness-probe="httpGet.path=/api/healthz,initialDelaySeconds=20,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" \
+  --startup-probe="httpGet.path=/api/healthz,initialDelaySeconds=10,periodSeconds=5,timeoutSeconds=5,failureThreshold=12" \
   2>/dev/null || echo "(liveness-probe flags unavailable; install gcloud beta or update — non-fatal)"
 
 URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"

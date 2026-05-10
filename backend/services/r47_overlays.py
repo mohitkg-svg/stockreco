@@ -276,11 +276,13 @@ def in_pre_fomc_quiet_hour(window_minutes: int = 60) -> bool:
     + slippage spike in the last hour pre-event; we defer non-urgent
     entries so we don't pay through-the-spread before the move."""
     try:
-        from services.macro_calendar import _FOMC_DATES
+        # r82: was iterating _FOMC_DATES (set of strings); _dt.combine(str, ...)
+        # raised TypeError, swallowed → gate always returned False (dead).
+        from services.macro_calendar import _FOMC_DATE_OBJS
         from datetime import datetime as _dt, timedelta as _td
         from zoneinfo import ZoneInfo as _ZI
         now_et = _dt.now(_ZI("America/New_York"))
-        for d in _FOMC_DATES:
+        for d in _FOMC_DATE_OBJS:
             try:
                 # FOMC releases typically 14:00 ET on day d
                 dt_et = _dt.combine(d, _dt.min.time(), tzinfo=_ZI("America/New_York")).replace(hour=14)

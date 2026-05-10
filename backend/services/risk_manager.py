@@ -366,14 +366,18 @@ def realized_portfolio_vol_annualized() -> Optional[float]:
 
 def vol_target_multiplier(target_annual_vol: float = 0.12) -> float:
     """r44 fix #1.1: scale entries so book annualized vol ≈ target.
-    Returns 1.0 when realized vol unknown. Clamped [0.5, 1.5] so a single
-    fat-tail event doesn't double the size on the next signal.
+    Returns 1.0 when realized vol unknown.
+
+    r82: clamp is now [0.5, 1.0] (downside-only). The prior [0.5, 1.5]
+    band scaled UP in low realized vol — exactly when blow-up risk peaks
+    (low-vol regimes precede crisis events). Vol targeting is meant to
+    REDUCE size in storms, not amplify it in calms.
     """
     rv = realized_portfolio_vol_annualized()
     if rv is None or rv <= 0:
         return 1.0
     raw = target_annual_vol / rv
-    return float(max(0.5, min(1.5, raw)))
+    return float(max(0.5, min(1.0, raw)))
 
 
 # r46 fix #0.6: track which DD tier we're in to fire one-shot alerts on

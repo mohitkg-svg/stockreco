@@ -65,6 +65,41 @@ from concurrent.futures import ThreadPoolExecutor
 # On SQLite (test environment) it's a no-op since SQLite is single-writer.
 _entry_lock = threading.Lock()
 
+# r82 (B9): in-memory KILL flag. Set as the FIRST line of kill() before any
+# DB session opens, so a wedged DB (the typical reason to kill) cannot
+# block the kill semantics. consider_signal / manage_open_positions check
+# this flag first thing — if set, they refuse to act regardless of what
+# the DB-persisted cfg.killed shows. The DB write still happens (audit
+# trail, persistence across restart) but is best-effort.
+_KILLED = threading.Event()
+
+
+def is_killed_in_memory() -> bool:
+    """r82 (B9): true if the in-memory KILL flag is set. Cheap to call from
+    every hot path (no DB round-trip)."""
+    return _KILLED.is_set()
+
+
+def set_killed_flag(reason: Optional[str] = None) -> None:
+    """r82 (B9): set the in-memory KILL flag. Idempotent. Called by kill()
+    BEFORE any DB write, and by the boot-hydration helper that re-arms the
+    flag from cfg.killed after a process restart."""
+    _KILLED.set()
+    try:
+        logger.critical(f"in-memory KILL flag SET (reason={reason!r})")
+    except Exception:
+        pass
+
+
+def clear_killed_flag() -> None:
+    """r82 (B9): clear the in-memory KILL flag. Called by unkill() AFTER
+    the DB row is updated."""
+    _KILLED.clear()
+    try:
+        logger.warning("in-memory KILL flag CLEARED")
+    except Exception:
+        pass
+
 
 @contextmanager
 def _pg_advisory_entry_lock(ticker: str, timeout_sec: float = 5.0):
@@ -1044,6 +1079,14 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
     the in-flight signal already passed the killed check before kill()
     flipped the flag.
     """
+    # r82 (B9): FIRST THING — set the in-memory KILL flag. This is the only
+    # action in kill() that doesn't depend on the DB. consider_signal /
+    # manage_open_positions check this flag and refuse to act, so even
+    # if every DB / broker / lock op below stalls forever the bot stops
+    # opening NEW positions immediately. The DB write below persists the
+    # state across restarts and produces the audit trail.
+    set_killed_flag(reason)
+
     # r53: hold the entry lock so no in-flight consider_signal can race
     # past the killed-flag check while we're flattening. Block briefly
     # for in-flight to complete; if it doesn't, proceed anyway (kill
@@ -1069,6 +1112,12 @@ def kill(reason: Optional[str] = None, flatten: bool = True, cancel_orders: bool
         cfg.killed_at = datetime.utcnow()
         cfg.killed_reason = (reason or "unspecified")[:255]
         db.commit()
+    except Exception as _db_kill_err:
+        # r82 (B9): DB write may fail (the very condition kill is meant to
+        # handle). The in-memory flag is already set; log and continue with
+        # broker-side flatten. Persistence will be re-attempted on next
+        # consider_signal via reconcile_killed_state().
+        logger.error(f"kill(): DB persist failed (in-memory flag still set): {_db_kill_err}")
     finally:
         db.close()
 
@@ -1202,9 +1251,34 @@ def unkill(reason: Optional[str] = None) -> Dict[str, Any]:
         db.commit()
     finally:
         db.close()
+    # r82 (B9): clear the in-memory flag AFTER the DB row is updated so a
+    # crash mid-unkill leaves the system in a SAFE state (still killed).
+    clear_killed_flag()
     logger.warning(f"AUTO-TRADER UNKILLED reason={reason!r} (enabled still False — re-arm via /auto/config)")
     metrics.inc("autotrade_event", event="unkilled")
     return {"killed": False, "enabled": False, "reason": reason}
+
+
+def hydrate_killed_flag_from_db() -> bool:
+    """r82 (B9): on process boot, re-arm the in-memory KILL flag from
+    cfg.killed so a Cloud Run cold-start doesn't silently un-kill the bot.
+    Called from main.py startup. Returns True if killed."""
+    try:
+        db = SessionLocal()
+        try:
+            cfg = get_config(db)
+            if cfg and bool(getattr(cfg, "killed", False)):
+                set_killed_flag(getattr(cfg, "killed_reason", None) or "boot_hydrate")
+                return True
+        finally:
+            db.close()
+    except Exception as e:
+        # If we can't reach the DB on boot, fail-CLOSED: assume killed.
+        # Operator can clear via /api/trading/unkill once DB is up.
+        logger.error(f"hydrate_killed_flag_from_db failed; defaulting to KILLED: {e}")
+        set_killed_flag("boot_hydrate_db_unreachable")
+        return True
+    return False
 
 
 def detect_unexpected_positions() -> Dict[str, Any]:
@@ -1585,6 +1659,11 @@ def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
 
     db = SessionLocal()
     try:
+        # r82 fix: cfg was referenced at the SL-submission block (bracket_tif read)
+        # but never assigned in the function body — every promote call raised
+        # NameError, swallowed by the surrounding try/except. Adopted positions
+        # were therefore NEVER given a bot-managed SL. Load cfg up front.
+        cfg = get_config(db)
         row = db.query(AutoTrade).filter(
             AutoTrade.ticker == ticker,
             AutoTrade.status == "adopted",
@@ -2213,6 +2292,13 @@ def consider_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     Mark-consumed semantics: every path calls scanner.mark_consumed so
     the same event isn't re-processed on the next 2-min tick.
     """
+    # r82 (B9): in-memory KILL check before doing any work.
+    if is_killed_in_memory():
+        try:
+            metrics.inc("autotrade_skip", reason="killed_inmem")
+        except Exception:
+            pass
+        return None
     from services import scanner as _sc
     eid = event.get("id")
     ticker = event.get("ticker")
@@ -2285,6 +2371,16 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     # ════════════════════════════════════════════════════════════════════
     # § PRE-FLIGHT — circuit breakers, kill flag, freeze, signal validation
     # ════════════════════════════════════════════════════════════════════
+    # r82 (B9): in-memory KILL flag check is FIRST, before any DB / broker /
+    # validator call. This guarantees a wedged DB cannot prevent the kill
+    # from blocking new entries. The DB-persisted check still runs further
+    # down for defense-in-depth.
+    if is_killed_in_memory():
+        try:
+            metrics.inc("autotrade_skip", reason="killed_inmem")
+        except Exception:
+            pass
+        return None
     # r53l: capture per-thread skip-reason for the candidate pool. Begin
     # decision tracking AFTER signal validation so a malformed signal
     # doesn't poison the pool row.
@@ -4112,6 +4208,13 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
     checks don't race against stock-side entries draining the same equity.
     r53 (Tier-1 #6): also acquires Postgres advisory lock for cross-instance.
     """
+    # r82 (B9): in-memory KILL check before any work.
+    if is_killed_in_memory():
+        try:
+            metrics.inc("autotrade_skip", reason="killed_inmem")
+        except Exception:
+            pass
+        return None
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_put_play({ticker}): entry lock busy >30s, skipping")
         metrics.inc("autotrade_event", event="entry_lock_timeout")
@@ -4604,6 +4707,13 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         (avoid stacking correlated long exposure on the same underlying).
       • Earnings within 48h (same IV-crush risk as puts).
     """
+    # r82 (B9): in-memory KILL check before any work.
+    if is_killed_in_memory():
+        try:
+            metrics.inc("autotrade_skip", reason="killed_inmem")
+        except Exception:
+            pass
+        return None
     if not _entry_lock.acquire(timeout=30.0):
         logger.warning(f"consider_call_play({ticker}): entry lock busy >30s, skipping")
         metrics.inc("autotrade_event", event="entry_lock_timeout")
@@ -5305,12 +5415,17 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
                             _atomic_acc_pl(db, t.id, partial_pl)
                         t.qty = t.qty - half
                         t.hit_t1 = True
+                        # r82: commit the qty/hit_t1 mutations BEFORE _atomic_append_note
+                        # (which writes via separate UPDATE) and skip db.refresh — the
+                        # prior order let refresh() reload from DB, reverting the
+                        # uncommitted ORM mutations and causing repeated re-trims on
+                        # every subsequent manage tick.
+                        db.commit()
                         _atomic_append_note(
                             db, t.id,
                             f" | PARTIAL: trimmed {half} contracts at T1 (px={px:.2f}); "
                             f"runner = {int(t.qty)} contracts",
                         )
-                        db.refresh(t)
                         logger.info(
                             f"AutoTrader {'PUT' if is_put else 'CALL'} {t.ticker} partial-trim {half} @ "
                             f"underlying {px:.2f}; runner {int(t.qty)} contracts"
@@ -6180,7 +6295,11 @@ def manage_open_positions() -> Dict[str, Any]:
                                         except Exception:
                                             pass
                                         try:
-                                            _backfill_ml_outcome(t, db)
+                                            # r82 fix: arg order was (t, db) — function signature is
+                                            # (db, t). Inside, db.query() was called against a row →
+                                            # AttributeError, swallowed. SL-fill closes never backfilled
+                                            # ML outcomes, biasing calibration toward TP fills only.
+                                            _backfill_ml_outcome(db, t)
                                         except Exception:
                                             pass
                                         db.commit()
@@ -6478,6 +6597,13 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     realized_partial = (px - float(t.entry_price)) * trim_qty
                                                     _atomic_acc_pl(db, t.id, round(realized_partial, 2))
                                                     t.qty = t.qty - trim_qty
+                                                    # r82: commit qty mutation immediately. Prior code
+                                                    # relied on a downstream commit inside `if _new_tid:`
+                                                    # (chandelier trail success). When the broker
+                                                    # rejected the SL replace, the trim mutation was
+                                                    # never committed → next manage tick reloaded old
+                                                    # qty and re-trimmed → progressive over-liquidation.
+                                                    db.commit()
                                                     _atomic_append_note(
                                                         db, t.id,
                                                         f" | PARTIAL: trimmed {trim_qty} shares at T1 "
@@ -6542,11 +6668,24 @@ def manage_open_positions() -> Dict[str, Any]:
                                                                     )
                                                                 alpaca_client._get_client().submit_order(order_data=_req)
                                                                 t.qty = (t.qty or 0) + _add
+                                                                # r82: commit added qty immediately. Same pattern
+                                                                # as T1/T2 trim — broker has the extra shares,
+                                                                # DB must reflect it before the next manage tick
+                                                                # reads `t.qty` for risk-cap accounting.
+                                                                db.commit()
                                                                 # r47 fix #T0f (P1-8): resize SL leg to match new qty
                                                                 # so the added shares aren't naked until next manage tick.
+                                                                # r82: alpaca_client has no `replace_order_by_id` wrapper —
+                                                                # it's a method on the TradingClient instance. Prior call
+                                                                # raised AttributeError every time (silently swallowed),
+                                                                # leaving pyramided shares NAKED until the next manage tick.
                                                                 try:
                                                                     if t.stop_order_id:
-                                                                        alpaca_client.replace_order_by_id(t.stop_order_id, qty=int(t.qty))
+                                                                        from alpaca.trading.requests import ReplaceOrderRequest as _ROR_p
+                                                                        alpaca_client._get_client().replace_order_by_id(
+                                                                            t.stop_order_id,
+                                                                            order_data=_ROR_p(qty=int(t.qty)),
+                                                                        )
                                                                 except Exception as _resize_e:
                                                                     logger.warning(f"pyramid SL resize {t.ticker} failed: {_resize_e}")
                                                                 _atomic_append_note(db, t.id, f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})")
@@ -6585,6 +6724,10 @@ def manage_open_positions() -> Dict[str, Any]:
                                                     realized_partial = (px - float(t.entry_price)) * trim_qty
                                                     _atomic_acc_pl(db, t.id, round(realized_partial, 2))
                                                     t.qty = t.qty - trim_qty
+                                                    # r82: see T1 fix above — commit immediately so
+                                                    # next manage tick reads the new qty rather than
+                                                    # the pre-trim value (otherwise → re-trim cascade).
+                                                    db.commit()
                                                     _atomic_append_note(
                                                         db, t.id,
                                                         f" | PARTIAL: trimmed {trim_qty} shares at T2 "

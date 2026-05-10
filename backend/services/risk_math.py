@@ -67,7 +67,11 @@ def clamp_multiplier_stack(
         ceiling = RISK_MULT_CEILING
     raw = (confidence_mult * kelly_mult * calibration_mult
            * strategy_mult * vix_mult * ai_mult * upstream_mult)
-    clamped = min(raw, ceiling)
+    # r82: floor at 0.0. A negative multiplier from any upstream bug
+    # (e.g., cross-asset code returning -0.5) would otherwise propagate
+    # `min(-3.5, 2.0) = -3.5`, then int(budget * -3.5) = negative qty
+    # → would short-sell where a long was requested.
+    clamped = max(0.0, min(raw, ceiling))
     return raw, clamped, raw > ceiling
 
 

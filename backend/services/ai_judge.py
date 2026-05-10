@@ -251,18 +251,17 @@ _AI_PRICE_PER_M_TOK = {
 
 
 def _ai_budget_check() -> bool:
-    """True iff today's AI call count is below the cap."""
-    from datetime import datetime as _dt_aib
-    day = _dt_aib.utcnow().strftime("%Y-%m-%d")
-    n = _ai_call_counter.get(day, 0)
-    if n >= _AI_DAILY_CALL_CAP:
-        return False
-        
-    # Hard stop on daily USD cost
+    """True iff today's AI call count is below the cap.
+
+    r82 (B33): replaced per-process in-memory counter with DB-backed atomic
+    increment via ``ai_call_budget.bump_and_check``. Two Cloud Run instances
+    (and post-cold-start counters) now share state, so the cap is a real
+    cap rather than per-instance × N.
+    """
+    # Cost-based cap (separate signal — read from running token totals).
     from services.config import AI_JUDGE_MODEL
     cost_info = ai_cost_today_usd(model_hint=AI_JUDGE_MODEL)
     current_cost = cost_info.get("cost_estimate_usd", 0.0)
-    
     try:
         from database import SessionLocal, AutoTraderConfig
         db = SessionLocal()
@@ -273,12 +272,21 @@ def _ai_budget_check() -> bool:
             db.close()
     except Exception:
         usd_cap = 20.0
-        
     if current_cost >= usd_cap:
         logger.warning(f"ai_judge: daily AI USD cap ${usd_cap} reached (current ${current_cost:.4f}); abstaining")
         return False
 
-    _ai_call_counter[day] = n + 1
+    # Call-count cap via DB-backed atomic counter.
+    from services.ai_call_budget import bump_and_check as _bump_and_check
+    ok, count_after = _bump_and_check("ai_judge", _AI_DAILY_CALL_CAP)
+    if not ok:
+        logger.warning(f"ai_judge: daily call cap {_AI_DAILY_CALL_CAP} reached (count={count_after}); abstaining")
+        return False
+    # Also keep the in-memory dict in sync so the local /api/health view
+    # is non-zero even before the DB row is read elsewhere.
+    from datetime import datetime as _dt_aib
+    day = _dt_aib.utcnow().strftime("%Y-%m-%d")
+    _ai_call_counter[day] = count_after
     return True
 
 
