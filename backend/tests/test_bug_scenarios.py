@@ -2286,6 +2286,165 @@ class TestR77LiveMoneyP0Fixes(unittest.TestCase):
                 f"error-path INSERT near {tag!r} doesn't set idempotency_key"
             )
 
+    def test_kill_switch_checked_in_option_entry_paths(self):
+        """r80: cfg.killed must short-circuit consider_put_play and
+        consider_call_play. Previously only consider_signal honored it,
+        so a killed bot would still open new option positions."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        for fn in ("def consider_put_play", "def consider_call_play"):
+            anchor = src.find(fn)
+            self.assertGreater(anchor, 0, f"{fn} not found")
+            # Look at the next ~3500 chars (function head + early gates,
+            # past the lock-acquisition + initial cfg reads).
+            block = src[anchor: anchor + 3500]
+            self.assertIn(
+                'getattr(cfg, "killed"', block,
+                f"{fn} doesn't check cfg.killed early — kill switch bypass"
+            )
+
+    def test_wash_sale_gate_present(self):
+        """r80: cfg.wash_sale_cooldown_days column exists since r47 but
+        was never queried. Now consider_signal reads it and skips entries
+        on tickers with a recent realized loss inside the window."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        self.assertIn(
+            'wash_sale_cooldown_days', src,
+            "wash-sale gate missing in auto_trader.py — IRS rule risk"
+        )
+        self.assertIn(
+            'wash_sale_guard', src,
+            "wash-sale skip metric reason missing"
+        )
+
+    def test_adopted_sl_tif_matches_bracket_tif(self):
+        """r80: promote_adopted_to_managed used to hardcode TIF.GTC for
+        the SL leg even when cfg.bracket_tif='day'. That defeated the
+        weekend-gap safety on adopted positions."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        anchor = src.find("def promote_adopted_to_managed")
+        self.assertGreater(anchor, 0)
+        # The SL submit block is ~7-8kB into the function, after qty
+        # resync + level computation. Inspect the full function body.
+        block = src[anchor: anchor + 12000]
+        self.assertNotIn(
+            "time_in_force=_TIF.GTC, stop_price=", block,
+            "promote_adopted_to_managed still hardcodes GTC for SL — "
+            "defeats day-TIF weekend-gap safety"
+        )
+        self.assertIn(
+            'getattr(cfg, "bracket_tif"', block,
+            "promote_adopted_to_managed must read bracket_tif from config"
+        )
+
+    def test_idempotency_dedup_is_status_aware(self):
+        """r80: previously the idempotency dedup matched on key alone
+        (any status), so a closed_stop trade still blocked re-entry on
+        the same signal. Now only PENDING/OPEN/ADOPTED rows reserve the
+        key — closed history is inert."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        anchor = src.find("Idempotency: don't re-open the same signal")
+        self.assertGreater(anchor, 0, "idempotency block not found")
+        block = src[anchor: anchor + 1200]
+        self.assertIn(
+            'AutoTrade.status.in_(["pending", "open", "adopted"])', block,
+            "idempotency dedup is not status-aware — closed trades still "
+            "block re-entry of equivalent signals"
+        )
+
+    def test_force_close_options_verifies_position_flat(self):
+        """r80: force_close on options must verify the broker actually
+        flattened. Submit returning 'no error' means the order was
+        accepted, not necessarily filled (broker reject post-submit,
+        illiquid contract). Without verify, the trade is marked closed
+        while broker still shows the position open."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "execution_engine.py"), "r") as f:
+            src = f.read()
+        # Look in the option branch of force_close_trade.
+        anchor = src.find("submit_option_exit_with_cross_fallback")
+        self.assertGreater(anchor, 0)
+        block = src[anchor: anchor + 3000]
+        self.assertIn(
+            "force_close_unverified", block,
+            "force_close option branch missing post-submit position-poll "
+            "verify — silent unflattened positions will look closed"
+        )
+        self.assertIn(
+            "get_option_position", block,
+            "force_close option branch must poll get_option_position to "
+            "confirm residual qty is 0"
+        )
+
+    def test_alpaca_rest_reads_have_timeout_guard(self):
+        """r80: get_account / get_positions / get_orders previously had
+        no timeout — alpaca-py's underlying httpx defaults to None (wait
+        forever), so a network stall would block the entry pipeline.
+        Now wrapped in _safe_rest_read with a 5s timeout + 1 retry on
+        transient errors."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "alpaca_client.py"), "r") as f:
+            src = f.read()
+        self.assertIn(
+            "def _safe_rest_read", src,
+            "_safe_rest_read helper missing"
+        )
+        for fn_label in (
+            "def get_account",
+            "def get_positions",
+            "def get_orders",
+        ):
+            anchor = src.find(fn_label)
+            self.assertGreater(anchor, 0, f"{fn_label} not found")
+            block = src[anchor: anchor + 800]
+            self.assertIn(
+                "_safe_rest_read", block,
+                f"{fn_label} not wrapped with timeout guard"
+            )
+
+    def test_option_entry_cancel_waits_for_terminal(self):
+        """r80: submit_option_entry_with_cross_fallback used a
+        fire-and-forget cancel before market cross. That left a race
+        where the limit could fill DURING the cancel ACK while the
+        market cross also fired = 2× qty filled. Now wait_for_terminal
+        with bounded timeout + final-state poll."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "alpaca_client.py"), "r") as f:
+            src = f.read()
+        # Match the FUNCTION DEFINITION specifically, not the doc/comment refs.
+        anchor = src.find("def submit_option_entry_with_cross_fallback")
+        self.assertGreater(anchor, 0)
+        # Function is ~150 lines / ~7kB. Pull 9kB to be safe.
+        block = src[anchor: anchor + 9000]
+        self.assertIn(
+            "wait_for_terminal=True", block,
+            "submit_option_entry cancel before cross still fire-and-forget"
+        )
+
+    def test_frontend_has_kill_button(self):
+        """r80: under stress, operator must have a one-click KILL path
+        in the UI — not just a curl command. Verify the button exists
+        and posts to /api/trading/kill."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "..",
+                               "frontend", "app.js"), "r") as f:
+            src = f.read()
+        self.assertIn(
+            "/api/trading/kill", src,
+            "frontend has no caller of /api/trading/kill — operator can't "
+            "stop the bot from the UI under stress"
+        )
+        self.assertIn(
+            "KILL BOT", src,
+            "frontend has no visible KILL button label"
+        )
+
     def test_all_backend_python_files_parse(self):
         """r79-F: blanket guard against the 'stray 2-char prefix on a line'
         corruption class we kept hitting during this audit cycle (random
