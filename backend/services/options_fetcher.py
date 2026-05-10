@@ -315,10 +315,13 @@ def _fetch_polygon_chain(ticker: str) -> Optional[Dict[str, Any]]:
                 
             expirations_set.add(exp_epoch)
             
-            lq = r.get("last_quote", {})
-            lt = r.get("last_trade", {})
-            day = r.get("day", {})
-            gks = r.get("greeks", {})
+            # Guard against `key: null` in the Polygon JSON response —
+            # `dict.get(key, {})` returns None (not the default) when the
+            # key is present with a null value. `or {}` handles that.
+            lq = r.get("last_quote") or {}
+            lt = r.get("last_trade") or {}
+            day = r.get("day") or {}
+            gks = r.get("greeks") or {}
             
             bid = float(lq.get("bid") or 0.0)
             ask = float(lq.get("ask") or 0.0)
@@ -368,7 +371,29 @@ def _fetch_polygon_chain(ticker: str) -> Optional[Dict[str, Any]]:
                 c["inTheMoney"] = quote_price > c["strike"]
             for p in puts:
                 p["inTheMoney"] = quote_price < p["strike"]
-                
+
+        # Defensive guard: Polygon sometimes returns a chain skeleton with
+        # bid/ask but no greeks or IV — happens off-hours, on partial outages,
+        # or on a plan tier that doesn't include greeks. Returning a chain
+        # with IV=0.0 and delta=None silently degrades options_analyzer
+        # scoring (vega gates collapse, IV-rank gates trip). Treat
+        # "zero greeks across the entire chain" as a fetch miss so the
+        # caller falls through cleanly instead.
+        all_items = calls + puts
+        if all_items and not any(
+            it.get("delta") is not None
+            or it.get("gamma") is not None
+            or it.get("theta") is not None
+            or it.get("vega") is not None
+            or (it.get("impliedVolatility") or 0) > 0
+            for it in all_items
+        ):
+            logger.warning(
+                f"Polygon chain for {ticker} returned {len(all_items)} contracts "
+                "with zero greeks/IV — treating as miss (off-hours or plan-tier)"
+            )
+            return None
+
         return {
             "expirations": sorted(list(expirations_set)),
             "calls": calls,
@@ -400,11 +425,13 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
     """
     Return {'expirations': [ts,...], 'calls': [...], 'puts': [...], 'quote': {...}}.
 
-    Dispatch order: Alpaca (OPRA / indicative) → Yahoo → Polygon. Yahoo is
-    usually free and good enough; Polygon is the last resort because it
-    requires a paid plan tier (Options Starter+) and a key. Each tier
-    returns None on failure so a wedged source doesn't poison the next.
-    Results cached 10 minutes per (ticker, expiration).
+    Dispatch order: Polygon → Alpaca → Yahoo. Polygon Options Advanced is
+    real-time; Alpaca's `indicative` options feed and Yahoo are both
+    15-minute delayed, so Polygon belongs first when the key is set.
+    `_fetch_polygon_chain` returns None when POLYGON_API_KEY is unset, the
+    plan tier doesn't include the snapshot endpoint (HTTP 403), or the
+    chain came back without greeks/IV — so the next tier picks up cleanly
+    in any of those cases. Results cached 10 minutes per (ticker, expiration).
     """
     cache_key = f"{ticker.upper()}:{expiration or 'all'}"
     now = time.time()
@@ -414,7 +441,7 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
             _chain_cache_touch(cache_key)
             return data
 
-    # Alpaca + Polygon return the FULL chain in one call — cache the union
+    # Polygon + Alpaca return the FULL chain in one call — cache the union
     # chain under 'all' and filter on read when a specific expiration is
     # requested. Yahoo is per-expiration so it can't share this cache.
     full_key = f"{ticker.upper()}:all"
@@ -424,6 +451,14 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
         if now < f_exp:
             _chain_cache_touch(full_key)
             full = f_data
+
+    # Polygon first — real-time greeks + IV when the plan tier serves them.
+    if full is None:
+        full = _fetch_polygon_chain(ticker)
+        if full is not None:
+            _chain_cache_set(full_key, (full, now + _CHAIN_TTL))
+
+    # Alpaca next — 15-min delayed on `indicative`, real-time on OPRA.
     if full is None and _alpaca_opt_feed() != "none":
         full = _fetch_alpaca_chain(ticker)
         if full is not None:
@@ -434,23 +469,12 @@ def fetch_option_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
         _chain_cache_set(cache_key, (result, now + _CHAIN_TTL))
         return result
 
-    # Yahoo fallback
+    # Yahoo last-resort — 15-min delayed and missing greeks; only useful
+    # when both Polygon and Alpaca are unavailable.
     data = _fetch_yahoo_chain(ticker, expiration=expiration)
     if data is not None:
         _chain_cache_set(cache_key, (data, now + _CHAIN_TTL))
-        return data
-
-    # Polygon as the last fallback. Only fires when Alpaca + Yahoo both
-    # missed; fetch_polygon returns None when POLYGON_API_KEY is unset or
-    # the plan tier doesn't include the snapshot endpoint (HTTP 403), so
-    # this branch silently no-ops in those cases.
-    full = _fetch_polygon_chain(ticker)
-    if full is not None:
-        _chain_cache_set(full_key, (full, now + _CHAIN_TTL))
-        result = _filter_by_expiration(full, expiration) if expiration else full
-        _chain_cache_set(cache_key, (result, now + _CHAIN_TTL))
-        return result
-    return None
+    return data
 
 
 def fetch_expirations(ticker: str) -> List[int]:

@@ -2044,72 +2044,112 @@ class TestFmpIntegration(unittest.TestCase):
 
 
 class TestOptionChainPolygonFallback(unittest.TestCase):
-    """Polygon is wired in as the third-tier options chain fallback below
-    Alpaca + Yahoo. The dispatch must:
-      * try Alpaca first
-      * fall through to Yahoo when Alpaca returns None
-      * fall through to Polygon only when both Alpaca + Yahoo miss
-      * never call Polygon when an earlier tier succeeded
-    Without these guarantees, a working Yahoo fetch would still rack up
-    Polygon API calls (cost / rate-limit risk).
+    """Polygon is the PRIMARY options-chain source (real-time, Options
+    Advanced plan); Alpaca + Yahoo fall in below as 15-min-delayed
+    fallbacks. The dispatch must:
+      * try Polygon first
+      * fall through to Alpaca when Polygon returns None
+      * fall through to Yahoo only when both Polygon + Alpaca miss
+      * never call later tiers when an earlier tier succeeded
+    Without these guarantees, a working Polygon fetch would still rack up
+    Alpaca calls and the bot would scoring on stale data.
     """
 
     def setUp(self):
         from services import options_fetcher
-        # Clear cache between tests so dispatch always runs fresh.
         with options_fetcher._chain_cache_lock:
             options_fetcher._chain_cache.clear()
 
-    def test_polygon_not_called_when_alpaca_succeeds(self):
+    def test_alpaca_and_yahoo_not_called_when_polygon_succeeds(self):
         from services import options_fetcher
         sample_full = {
             "expirations": [1000], "calls": [], "puts": [],
-            "quote_price": 100.0, "source": "alpaca", "expiration_used": None,
+            "quote_price": 100.0, "source": "polygon", "expiration_used": None,
         }
-        with patch("services.options_fetcher._fetch_alpaca_chain", return_value=sample_full), \
+        with patch("services.options_fetcher._fetch_polygon_chain", return_value=sample_full), \
+             patch("services.options_fetcher._fetch_alpaca_chain",
+                   side_effect=AssertionError("Alpaca must not run when Polygon succeeded")), \
              patch("services.options_fetcher._fetch_yahoo_chain",
-                   side_effect=AssertionError("Yahoo must not run when Alpaca succeeded")), \
-             patch("services.options_fetcher._fetch_polygon_chain",
-                   side_effect=AssertionError("Polygon must not run when Alpaca succeeded")):
+                   side_effect=AssertionError("Yahoo must not run when Polygon succeeded")):
             out = options_fetcher.fetch_option_chain("AAPL")
         self.assertIsNotNone(out)
+        self.assertEqual(out["source"], "polygon")
+
+    def test_yahoo_not_called_when_alpaca_succeeds(self):
+        from services import options_fetcher
+        sample_alpaca = {
+            "expirations": [2000], "calls": [], "puts": [],
+            "quote_price": 100.0, "source": "alpaca", "expiration_used": None,
+        }
+        with patch("services.options_fetcher._fetch_polygon_chain", return_value=None), \
+             patch("services.options_fetcher._fetch_alpaca_chain", return_value=sample_alpaca), \
+             patch("services.options_fetcher._fetch_yahoo_chain",
+                   side_effect=AssertionError("Yahoo must not run when Alpaca succeeded")):
+            out = options_fetcher.fetch_option_chain("AAPL")
         self.assertEqual(out["source"], "alpaca")
 
-    def test_polygon_not_called_when_yahoo_succeeds(self):
+    def test_yahoo_used_when_polygon_and_alpaca_both_miss(self):
         from services import options_fetcher
         sample_yahoo = {
-            "expirations": [2000], "calls": [], "puts": [],
+            "expirations": [3000], "calls": [], "puts": [],
             "quote_price": 100.0, "source": "yahoo", "expiration_used": None,
         }
-        with patch("services.options_fetcher._fetch_alpaca_chain", return_value=None), \
-             patch("services.options_fetcher._fetch_yahoo_chain", return_value=sample_yahoo), \
-             patch("services.options_fetcher._fetch_polygon_chain",
-                   side_effect=AssertionError("Polygon must not run when Yahoo succeeded")):
+        with patch("services.options_fetcher._fetch_polygon_chain", return_value=None), \
+             patch("services.options_fetcher._fetch_alpaca_chain", return_value=None), \
+             patch("services.options_fetcher._fetch_yahoo_chain", return_value=sample_yahoo):
             out = options_fetcher.fetch_option_chain("AAPL")
         self.assertEqual(out["source"], "yahoo")
 
-    def test_polygon_used_when_alpaca_and_yahoo_both_miss(self):
+    def test_all_sources_failing_returns_none(self):
+        """When Polygon (403/key/greeks-guard), Alpaca, AND Yahoo all miss,
+        dispatch must surface None to the caller, not raise."""
         from services import options_fetcher
-        sample_polygon = {
-            "expirations": [3000], "calls": [], "puts": [],
-            "quote_price": 100.0, "source": "polygon", "expiration_used": None,
-        }
-        with patch("services.options_fetcher._fetch_alpaca_chain", return_value=None), \
-             patch("services.options_fetcher._fetch_yahoo_chain", return_value=None), \
-             patch("services.options_fetcher._fetch_polygon_chain", return_value=sample_polygon):
-            out = options_fetcher.fetch_option_chain("AAPL")
-        self.assertEqual(out["source"], "polygon")
-
-    def test_polygon_403_returns_none_does_not_crash(self):
-        """When the Polygon plan tier doesn't cover the snapshot endpoint,
-        _fetch_polygon_chain logs a warning and returns None. The dispatch
-        must surface None to the caller, not raise."""
-        from services import options_fetcher
-        with patch("services.options_fetcher._fetch_alpaca_chain", return_value=None), \
-             patch("services.options_fetcher._fetch_yahoo_chain", return_value=None), \
-             patch("services.options_fetcher._fetch_polygon_chain", return_value=None):
+        with patch("services.options_fetcher._fetch_polygon_chain", return_value=None), \
+             patch("services.options_fetcher._fetch_alpaca_chain", return_value=None), \
+             patch("services.options_fetcher._fetch_yahoo_chain", return_value=None):
             out = options_fetcher.fetch_option_chain("AAPL")
         self.assertIsNone(out)
+
+    def test_polygon_returns_none_when_chain_has_zero_greeks(self):
+        """Defensive guard: Polygon serves chain skeleton (bid/ask) but null
+        greeks/IV off-hours and on the wrong plan tier. The fetcher must
+        treat that as a miss — otherwise options_analyzer gets IV=0.0 and
+        delta=None and silently mis-scores every option entry."""
+        from services import options_fetcher
+        # Simulate a Polygon API response with bid/ask but no greeks/IV
+        # (the exact failure mode we observed Sunday on the live API).
+        sample_polygon_resp = {
+            "results": [
+                {
+                    "details": {
+                        "ticker": "O:AAPL260516C00200000",
+                        "contract_type": "call",
+                        "strike_price": 200.0,
+                        "expiration_date": "2026-05-16",
+                    },
+                    "last_quote": {"bid": 91.8, "ask": 95.15},
+                    "last_trade": {"price": 0.0},
+                    "day": {"volume": 0},
+                    "open_interest": 0,
+                    "implied_volatility": None,
+                    "greeks": None,
+                    "underlying_asset": {"price": 293.86},
+                },
+            ],
+            "next_url": None,
+        }
+        os.environ["POLYGON_API_KEY"] = "fake-key"
+        try:
+            class _FakeResp:
+                status_code = 200
+                def json(self): return sample_polygon_resp
+            class _FakeSess:
+                def get(self, *args, **kwargs): return _FakeResp()
+            with patch("services.options_fetcher._get_session", return_value=_FakeSess()):
+                out = options_fetcher._fetch_polygon_chain("AAPL")
+            self.assertIsNone(out)
+        finally:
+            os.environ.pop("POLYGON_API_KEY", None)
 
 
 if __name__ == "__main__":

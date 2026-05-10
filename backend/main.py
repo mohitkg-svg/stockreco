@@ -607,12 +607,14 @@ async def lifespan(app: FastAPI):
     # (strategy, direction) per ticker into best_strategy_per_ticker. Signal
     # generator preferentially emits signals from these winners. Runs Sunday
     # 04:00 UTC so it lands before Monday's open.
+    # 05:30 UTC so it lands after fundamental/alt-data but before ML retrain.
     try:
         from services import best_strategy as _bs
         from apscheduler.triggers.cron import CronTrigger as _Cron
         scheduler.add_job(
             _bs.recompute_all,
             trigger=_Cron(day_of_week="sun", hour=4, minute=0),
+            trigger=_Cron(day_of_week="sun", hour=5, minute=30),
             id="best_strategy_weekly",
             max_instances=1, coalesce=True, misfire_grace_time=3600,
         )
@@ -657,9 +659,11 @@ async def lifespan(app: FastAPI):
         from services import analyst_ratings as _ar
         from apscheduler.triggers.cron import CronTrigger as _Cron
         for hh, mm in [(11, 45), (14, 15), (16, 45), (19, 15)]:
+        for hh, mm in [(7, 45), (10, 15), (12, 45), (14, 45)]:
             scheduler.add_job(
                 _ar.refresh_all,
                 trigger=_Cron(hour=hh, minute=mm),
+                trigger=_Cron(hour=hh, minute=mm, timezone="America/New_York"),
                 id=f"analyst_ratings_{hh:02d}{mm:02d}",
                 max_instances=1, coalesce=True, misfire_grace_time=900,
             )
@@ -690,6 +694,9 @@ async def lifespan(app: FastAPI):
     # best_strategy job at 04:00 UTC (no, that's 04:00 — order is
     # best_strategy@04:00 → fundamentals@04:30 → ml@06:00). Most fundamental
     # fields only update quarterly with earnings, so weekly is plenty.
+    # Fundamentals refresh — weekly Sunday 04:30 UTC. Order is now correctly:
+    # fundamentals@04:30 → insider@04:45 → institutional@05:15 → 
+    # best_strategy@05:30 → ml@06:00.
     # Hash-based change detection means unchanged tickers don't churn the DB.
     try:
         from services import fundamentals as _fnd
@@ -708,9 +715,11 @@ async def lifespan(app: FastAPI):
         from services import social_sentiment as _ss
         from apscheduler.triggers.cron import CronTrigger as _Cron
         for hh, mm in [(12, 0), (15, 0), (18, 0), (21, 0)]:
+        for hh, mm in [(8, 0), (11, 0), (14, 0), (17, 0)]:
             scheduler.add_job(
                 _ss.refresh_all,
                 trigger=_Cron(hour=hh, minute=mm),
+                trigger=_Cron(hour=hh, minute=mm, timezone="America/New_York"),
                 id=f"social_sentiment_{hh:02d}{mm:02d}",
                 max_instances=1, coalesce=True, misfire_grace_time=900,
             )
