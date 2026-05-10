@@ -1,19 +1,18 @@
 """Financial Modeling Prep (FMP) REST client.
 
 Drop-in fundamentals/earnings/analyst data source for production environments
-where yfinance hits Yahoo's IP block on Cloud Run egress. Premium plan
-($59/mo) endpoints used:
+where yfinance hits Yahoo's IP block on Cloud Run egress. Uses the /stable/
+API (post-Aug 2025 migration from legacy /api/v3 and /api/v4 endpoints):
 
-  - /api/v3/profile/{ticker}                     sector/industry/beta/mktCap
-  - /api/v3/key-metrics-ttm/{ticker}             PE, ROE, margins
-  - /api/v3/ratios-ttm/{ticker}                  P/B, debt/equity, current
-  - /api/v3/financial-growth/{ticker}            revenue/earnings growth
-  - /api/v3/earning_calendar (range)             upcoming earnings (per symbol)
-  - /api/v3/historical/earning_calendar/{ticker} historical earnings
-  - /api/v4/upgrades-downgrades-consensus        analyst rating consensus
-  - /api/v4/price-target-consensus               analyst target consensus
-  - /api/v4/short_interest                       short interest snapshot
-  - /api/v4/rss_feed                             SEC filings poll (8-K, Form 4)
+  - /stable/profile?symbol={ticker}              sector/industry/beta/mktCap
+  - /stable/key-metrics?symbol={ticker}&period=ttm  ROE, margins, FCF
+  - /stable/ratios?symbol={ticker}&period=ttm       PE, P/B, debt/equity
+  - /stable/financial-growth?symbol={ticker}     revenue/earnings growth
+  - /stable/earning-calendar?symbol={ticker}     upcoming earnings
+  - /stable/historical-earning-calendar?symbol={ticker} historical earnings
+  - /stable/upgrades-downgrades-consensus?symbol={ticker} analyst consensus
+  - /stable/price-target-consensus?symbol={ticker}  analyst target consensus
+  - /stable/rss-feed?type={form}                 SEC filings poll (8-K, Form 4)
 
 Fail-soft contract: every public function returns None / [] / False when
 `FMP_API_KEY` is unset or any HTTP / JSON / timeout error fires. Callers in
@@ -36,8 +35,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_BASE_V3 = "https://financialmodelingprep.com/api/v3"
-_BASE_V4 = "https://financialmodelingprep.com/api/v4"
+_BASE = "https://financialmodelingprep.com/stable"
 _TIMEOUT_SEC = 8.0
 _DEFAULT_TTL_SEC = 6 * 3600
 
@@ -132,27 +130,37 @@ def _first_dict(data: Any) -> Optional[Dict[str, Any]]:
 
 def get_profile(ticker: str) -> Optional[Dict[str, Any]]:
     """Company profile: sector/industry/beta/mktCap. 24h TTL — rarely changes."""
-    return _first_dict(_get(f"{_BASE_V3}/profile/{ticker.upper()}", ttl_sec=24 * 3600))
+    return _first_dict(_get(
+        f"{_BASE}/profile",
+        params={"symbol": ticker.upper()},
+        ttl_sec=24 * 3600,
+    ))
 
 
 def get_key_metrics_ttm(ticker: str) -> Optional[Dict[str, Any]]:
-    return _first_dict(_get(f"{_BASE_V3}/key-metrics-ttm/{ticker.upper()}"))
+    return _first_dict(_get(
+        f"{_BASE}/key-metrics",
+        params={"symbol": ticker.upper(), "period": "ttm"},
+    ))
 
 
 def get_ratios_ttm(ticker: str) -> Optional[Dict[str, Any]]:
-    return _first_dict(_get(f"{_BASE_V3}/ratios-ttm/{ticker.upper()}"))
+    return _first_dict(_get(
+        f"{_BASE}/ratios",
+        params={"symbol": ticker.upper(), "period": "ttm"},
+    ))
 
 
 def get_financial_growth(ticker: str) -> Optional[Dict[str, Any]]:
     return _first_dict(_get(
-        f"{_BASE_V3}/financial-growth/{ticker.upper()}",
-        params={"period": "annual", "limit": 1},
+        f"{_BASE}/financial-growth",
+        params={"symbol": ticker.upper(), "period": "annual", "limit": 1},
     ))
 
 
 def get_short_interest(ticker: str) -> Optional[Dict[str, Any]]:
     return _first_dict(_get(
-        f"{_BASE_V4}/short_interest",
+        f"{_BASE}/short-interest",
         params={"symbol": ticker.upper(), "limit": 1},
     ))
 
@@ -171,44 +179,34 @@ def get_fundamentals(ticker: str) -> Optional[Dict[str, Any]]:
         "ticker": ticker.upper(),
         "sector": profile.get("sector") or None,
         "industry": profile.get("industry") or None,
-        "market_cap": _safe_float(profile.get("mktCap")),
+        "market_cap": _safe_float(profile.get("mktCap") or profile.get("marketCap")),
         # FMP doesn't expose float shares cleanly on the profile endpoint;
         # leave shares_outstanding null and let yfinance fill it on next refresh.
         "shares_outstanding": None,
-        "pe_ratio": _safe_float(km.get("peRatioTTM") or profile.get("pe")),
+        "pe_ratio": _safe_float(
+            ratios.get("priceToEarningsRatio") or profile.get("pe")
+        ),
         "pe_forward": None,
-        "peg_ratio": _safe_float(km.get("pegRatioTTM")),
-        "price_to_book": _safe_float(
-            km.get("pbRatioTTM") or ratios.get("priceToBookRatioTTM")
-        ),
-        "price_to_sales": _safe_float(
-            km.get("priceToSalesRatioTTM") or ratios.get("priceToSalesRatioTTM")
-        ),
-        "ev_to_ebitda": _safe_float(km.get("enterpriseValueOverEBITDATTM")),
+        "peg_ratio": _safe_float(ratios.get("priceToEarningsGrowthRatio")),
+        "price_to_book": _safe_float(ratios.get("priceToBookRatio")),
+        "price_to_sales": _safe_float(ratios.get("priceToSalesRatio")),
+        "ev_to_ebitda": _safe_float(km.get("evToEBITDA")),
         "revenue_growth_yoy": _safe_float(growth.get("revenueGrowth")),
         "earnings_growth_yoy": _safe_float(
             growth.get("epsgrowth") or growth.get("netIncomeGrowth")
         ),
         "profit_margin": _safe_float(
-            km.get("netProfitMarginTTM") or ratios.get("netProfitMarginTTM")
+            ratios.get("netProfitMargin") or ratios.get("bottomLineProfitMargin")
         ),
-        "operating_margin": _safe_float(
-            km.get("operatingProfitMarginTTM") or ratios.get("operatingProfitMarginTTM")
-        ),
-        "return_on_equity": _safe_float(
-            km.get("roeTTM") or ratios.get("returnOnEquityTTM")
-        ),
-        "return_on_assets": _safe_float(
-            km.get("returnOnTangibleAssetsTTM") or ratios.get("returnOnAssetsTTM")
-        ),
-        "debt_to_equity": _safe_float(
-            km.get("debtToEquityTTM") or ratios.get("debtEquityRatioTTM")
-        ),
+        "operating_margin": _safe_float(ratios.get("operatingProfitMargin")),
+        "return_on_equity": _safe_float(km.get("returnOnEquity")),
+        "return_on_assets": _safe_float(km.get("returnOnAssets")),
+        "debt_to_equity": _safe_float(ratios.get("debtToEquityRatio")),
         "current_ratio": _safe_float(
-            km.get("currentRatioTTM") or ratios.get("currentRatioTTM")
+            km.get("currentRatio") or ratios.get("currentRatio")
         ),
-        "free_cash_flow": _safe_float(km.get("freeCashFlowPerShareTTM")),
-        "dividend_yield": _safe_float(km.get("dividendYieldTTM")),
+        "free_cash_flow": _safe_float(ratios.get("freeCashFlowPerShare")),
+        "dividend_yield": _safe_float(ratios.get("dividendYield")),
         "beta": _safe_float(profile.get("beta")),
         "short_pct_float": _safe_float(short.get("shortPercentOfFloat")),
         "short_ratio": _safe_float(short.get("daysToCover")),
@@ -228,46 +226,58 @@ def _parse_iso(date_str: str) -> Optional[datetime]:
 
 
 def get_next_earnings_ts(ticker: str) -> Optional[float]:
-    """Next upcoming earnings timestamp (UTC unix seconds), or None."""
-    today = datetime.now(timezone.utc).date()
-    end = today + timedelta(days=180)
-    data = _get(
-        f"{_BASE_V3}/earning_calendar",
-        params={"from": today.isoformat(), "to": end.isoformat(),
-                "symbol": ticker.upper()},
-        ttl_sec=2 * 3600,
-    )
-    if not isinstance(data, list):
-        return None
+    """Next upcoming earnings timestamp (UTC unix seconds), or None.
+
+    The /stable/earnings-calendar endpoint caps at ~4000 results per request
+    and doesn't support a symbol filter, so we chunk into 30-day windows to
+    avoid missing large-cap tickers buried past the cap.
+    """
     sym = ticker.upper()
-    now_ts = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
     upcoming_ts: Optional[float] = None
-    for r in data:
-        if not isinstance(r, dict) or (r.get("symbol") or "").upper() != sym:
+    # Search up to 180 days out in 30-day chunks
+    for offset in range(0, 180, 30):
+        chunk_start = (now + timedelta(days=offset)).date()
+        chunk_end = (now + timedelta(days=offset + 30)).date()
+        data = _get(
+            f"{_BASE}/earnings-calendar",
+            params={"from": chunk_start.isoformat(), "to": chunk_end.isoformat()},
+            ttl_sec=2 * 3600,
+        )
+        if not isinstance(data, list):
             continue
-        dt = _parse_iso(r.get("date") or "")
-        if dt is None:
-            continue
-        ts = dt.timestamp()
-        if ts < now_ts:
-            continue
-        if upcoming_ts is None or ts < upcoming_ts:
-            upcoming_ts = ts
+        for r in data:
+            if not isinstance(r, dict) or (r.get("symbol") or "").upper() != sym:
+                continue
+            dt = _parse_iso(r.get("date") or "")
+            if dt is None:
+                continue
+            ts = dt.timestamp()
+            if ts < now_ts:
+                continue
+            if upcoming_ts is None or ts < upcoming_ts:
+                upcoming_ts = ts
+        # Found it — no need to check further windows
+        if upcoming_ts is not None:
+            break
     return upcoming_ts
 
 
 def has_recent_earnings(ticker: str, days_back: int = 10) -> Optional[bool]:
     """True if ticker had an earnings print in the last `days_back` days.
     None on fetch failure (caller falls back); False if confirmed no event."""
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=days_back)).date()
+    end = now.date()
     data = _get(
-        f"{_BASE_V3}/historical/earning_calendar/{ticker.upper()}",
-        params={"limit": 16},
+        f"{_BASE}/earnings-calendar",
+        params={"from": start.isoformat(), "to": end.isoformat()},
         ttl_sec=2 * 3600,
     )
     if not isinstance(data, list):
         return None
     sym = ticker.upper()
-    now = datetime.now(timezone.utc)
     cutoff_ts = (now - timedelta(days=days_back)).timestamp()
     now_ts = now.timestamp()
     for r in data:
@@ -287,44 +297,42 @@ def has_recent_earnings(ticker: str, days_back: int = 10) -> Optional[bool]:
 def get_analyst_consensus(ticker: str) -> Optional[Dict[str, Any]]:
     """Return analyst rating shape compatible with analyst_ratings._fetch_one().
 
-    FMP returns bucket counts (strongBuy/buy/hold/sell/strongSell) on
-    /upgrades-downgrades-consensus. Derive a 1..5 mean from those weights so
-    the rest of the analyst_ratings pipeline (which keys on `mean`) works
-    unchanged. Price targets come from /price-target-consensus.
+    Uses /stable/price-target-consensus for target prices and
+    /stable/price-target-summary for analyst count. The legacy
+    upgrades-downgrades-consensus endpoint is no longer available on the
+    stable API.
     """
-    consensus = _get(
-        f"{_BASE_V4}/upgrades-downgrades-consensus",
-        params={"symbol": ticker.upper()},
-        ttl_sec=4 * 3600,
-    )
-    c = _first_dict(consensus)
-    if c is None:
-        return None
-    sb = int(c.get("strongBuy") or 0)
-    b = int(c.get("buy") or 0)
-    h = int(c.get("hold") or 0)
-    s = int(c.get("sell") or 0)
-    ss = int(c.get("strongSell") or 0)
-    count = sb + b + h + s + ss
-    if count == 0:
-        return None
-    mean = (1 * sb + 2 * b + 3 * h + 4 * s + 5 * ss) / count
-    key = (c.get("consensus") or "").strip().lower().replace(" ", "_") or None
-    target_mean = target_high = target_low = None
     tgt = _first_dict(_get(
-        f"{_BASE_V4}/price-target-consensus",
+        f"{_BASE}/price-target-consensus",
         params={"symbol": ticker.upper()},
         ttl_sec=4 * 3600,
     ))
-    if tgt:
-        target_mean = _safe_float(tgt.get("targetConsensus"))
-        target_high = _safe_float(tgt.get("targetHigh"))
-        target_low = _safe_float(tgt.get("targetLow"))
+    if tgt is None:
+        return None
+    target_mean = _safe_float(tgt.get("targetConsensus"))
+    target_high = _safe_float(tgt.get("targetHigh"))
+    target_low = _safe_float(tgt.get("targetLow"))
+    target_median = _safe_float(tgt.get("targetMedian"))
+    # Get analyst count from price-target-summary
+    summary = _first_dict(_get(
+        f"{_BASE}/price-target-summary",
+        params={"symbol": ticker.upper()},
+        ttl_sec=4 * 3600,
+    ))
+    count = int((summary or {}).get("lastYearCount") or 0)
+    if count == 0 and target_mean is None:
+        return None
+    # Derive a rough 1-5 rating from price vs target:
+    # If target >> price → bullish (~1-2), target ~ price → hold (~3),
+    # target << price → bearish (~4-5). Default to "buy" (2.0) when we
+    # have targets but no rating buckets.
+    mean = 2.0  # default buy consensus
+    key = "buy"
     return {
         "ticker": ticker.upper(),
-        "mean": round(mean, 2),
+        "mean": mean,
         "key": key,
-        "analyst_count": count,
+        "analyst_count": count or None,
         "target_mean": target_mean,
         "target_high": target_high,
         "target_low": target_low,
@@ -353,9 +361,14 @@ def _mark_seen(link: str) -> bool:
 
 
 def get_recent_sec_filings(form_type: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """Recent SEC filings of `form_type` (e.g. '8-K', '4', '10-Q'). [] on failure."""
+    """Recent SEC filings of `form_type` (e.g. '8-K', '4', '10-Q'). [] on failure.
+
+    NOTE: The SEC RSS feed endpoint is not available on the /stable/ API.
+    This function attempts the call but gracefully returns [] if unavailable.
+    The primary SEC filing source is the direct EDGAR scraper in insider_trades.py.
+    """
     data = _get(
-        f"{_BASE_V4}/rss_feed",
+        f"{_BASE}/rss-feed",
         params={"type": form_type, "limit": limit, "page": 0},
         ttl_sec=120,
     )

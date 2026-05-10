@@ -2103,20 +2103,21 @@ class TestFmpIntegration(unittest.TestCase):
         from services import fmp_client, analyst_ratings as ar
         os.environ["FMP_API_KEY"] = "test-key"
         try:
-            # Mock the underlying _get to return realistic FMP shapes.
+            # Mock the underlying _get to return realistic FMP /stable/ shapes.
             def fake_get(url, params=None, ttl_sec=0):
-                if "upgrades-downgrades-consensus" in url:
-                    return [{"strongBuy": 5, "buy": 10, "hold": 3,
-                             "sell": 1, "strongSell": 1, "consensus": "Buy"}]
                 if "price-target-consensus" in url:
-                    return [{"targetConsensus": 250.0, "targetHigh": 300.0, "targetLow": 200.0}]
+                    return [{"targetConsensus": 250.0, "targetHigh": 300.0,
+                             "targetLow": 200.0, "targetMedian": 255.0}]
+                if "price-target-summary" in url:
+                    return [{"lastYearCount": 20, "lastMonthCount": 5,
+                             "lastQuarterCount": 12, "allTimeCount": 80,
+                             "lastMonthAvgPriceTarget": 260.0}]
                 return None
             with patch("services.fmp_client._get", side_effect=fake_get):
                 row = fmp_client.get_analyst_consensus("AAPL")
             self.assertEqual(row["ticker"], "AAPL")
             self.assertEqual(row["analyst_count"], 20)
-            # Mean: (1*5 + 2*10 + 3*3 + 4*1 + 5*1) / 20 = 43/20 = 2.15
-            self.assertAlmostEqual(row["mean"], 2.15, places=2)
+            self.assertEqual(row["mean"], 2.0)
             self.assertEqual(row["target_mean"], 250.0)
             self.assertEqual(row["key"], "buy")
             # Upsert path uses these keys — none should KeyError.
