@@ -370,7 +370,48 @@ def force_close_trade(
             t.note = (t.note or "") + f" | FORCE_CLOSE_FAILED: {sell['error']}"
             db.commit()
             return
+        # r80 fix: verify the option position actually went to zero. Submit
+        # returning non-error means the order was ACCEPTED, not necessarily
+        # filled — broker rejects after submission, illiquid contracts that
+        # can't fill at any reasonable price, or partial fills can leave
+        # qty stuck. Without verification, force_close marks the trade
+        # "closed_reverse" while broker still shows the position open;
+        # next manage tick sees a position with no DB row → adopted +
+        # operator confusion.
         pos = alpaca_client.get_option_position(t.symbol)
+        residual_qty = 0
+        if pos:
+            try:
+                residual_qty = abs(int(float(pos.get("qty") or 0)))
+            except Exception:
+                residual_qty = 0
+        if residual_qty > 0:
+            # Brief settle window — option fills can take 2-5s post-submit.
+            try:
+                import time as _t_settle
+                _t_settle.sleep(3.0)
+            except Exception:
+                pass
+            pos = alpaca_client.get_option_position(t.symbol)
+            try:
+                residual_qty = abs(int(float((pos or {}).get("qty") or 0)))
+            except Exception:
+                residual_qty = 0
+        if residual_qty > 0:
+            from services.alerts import alert as _raise_alert
+            _raise_alert(
+                "error", "force_close_unverified",
+                f"option close {t.symbol} submitted (no error) but broker "
+                f"still shows {residual_qty} contracts after 3s; trade #{t.id} "
+                f"marked error pending operator intervention",
+                ticker=t.ticker, trade_id=t.id,
+            )
+            t.status = "error"
+            t.note = (t.note or "") + (
+                f" | FORCE_CLOSE_UNVERIFIED: residual {residual_qty} contracts"
+            )
+            db.commit()
+            return
         if pos and pos.get("current_price") is not None and t.entry_price:
             # r48 BACKLOG #concurrency-P1-11: atomic SQL accumulator (option side).
             atomic_accumulate_realized_pl(

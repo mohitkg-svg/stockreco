@@ -6533,6 +6533,47 @@ function TradingPanel({ ticker, reloadToken }) {
     });
   };
 
+  // r80: KILL button — persistent kill switch + flatten in one shot.
+  // Different from Close-All: kill engages the persistent flag (stops
+  // the bot from re-entering anything) AND flattens current positions.
+  // Use this when something is *wrong* with the bot, not just to close
+  // a single bad day.
+  const killBot = () => {
+    if (busy['kill']) return;
+    const openCount = (positions || []).length;
+    const label = openCount > 0
+      ? `KILL bot + flatten ${openCount} open position${openCount === 1 ? '' : 's'} — undo within 4s`
+      : 'KILL bot (engage persistent kill switch) — undo within 4s';
+    stageAction({
+      label, delayMs: 4000, kind: 'warn',
+      onConfirm: async () => {
+        setBusyKey('kill', true); setActionError(null); setActionInfo(null);
+        try {
+          const res = await api.post('/api/trading/kill', {
+            reason: 'operator_emergency_ui',
+            flatten: true,
+            cancel_orders: true,
+          });
+          const flatN = Array.isArray(res?.flattened) ? res.flattened.length : (res?.flattened ?? 0);
+          const cancelN = res?.cancelled ?? res?.canceled ?? 0;
+          toast({
+            msg: `KILL engaged: flattened ${flatN}, canceled ${cancelN}`,
+            kind: 'success', duration: 6000,
+          });
+          pushNotification({
+            severity: 'critical', category: 'manual_kill',
+            message: `Operator killed bot via UI: flattened ${flatN}`,
+          });
+          await load();
+          setTimeout(() => { try { load(); } catch (_) {} }, 1500);
+        } catch (e) {
+          setActionError(`KILL failed: ${friendlyError(e)}`);
+          toast({ msg: `KILL failed: ${friendlyError(e)}`, kind: 'error', duration: 8000 });
+        } finally { setBusyKey('kill', false); }
+      },
+    });
+  };
+
   // r53g: Close-All button — flatten every open position via the
   // existing /api/trading/close-all backend (which routes bot-managed
   // rows through force_close_trade for correct lifecycle handling).
@@ -6614,6 +6655,16 @@ function TradingPanel({ ticker, reloadToken }) {
           )}
         </div>
         <div className="flex items-center gap-2">
+          {/* r80: KILL button — engages persistent kill flag + flattens.
+              Always visible (even with no open positions) so an operator
+              can pre-emptively stop the bot before a known event. */}
+          <button
+            disabled={!!busy['kill']}
+            onClick={killBot}
+            title="Engage persistent kill switch + flatten all open positions"
+            className="text-xs px-2.5 py-1 rounded-md bg-red-600 hover:bg-red-700 text-white border border-red-700 font-bold disabled:opacity-50 uppercase tracking-wide">
+            {busy['kill'] ? 'Killing…' : '☠ KILL BOT'}
+          </button>
           {/* r53g: flatten everything in one click — staged-undo 4s window */}
           {positions.length > 0 && (
             <button

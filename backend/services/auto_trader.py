@@ -1642,9 +1642,16 @@ def promote_adopted_to_managed(ticker: str) -> Dict[str, Any]:
             from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
             c = alpaca_client._get_client()
             sell_side = _OS.SELL if is_long else _OS.BUY
+            # r80 fix: SL TIF must match cfg.bracket_tif, not hardcode GTC.
+            # When bracket_tif="day" (default per r46 weekend-gap safety),
+            # an adopted position used to get a GTC stop that survives the
+            # weekend — defeating the day-TIF safety on the rest of the
+            # book. Match the policy.
+            _adopt_tif_str = str(getattr(cfg, "bracket_tif", "day") or "day").lower()
+            _adopt_tif = _TIF.DAY if _adopt_tif_str == "day" else _TIF.GTC
             stop_res = c.submit_order(order_data=StopOrderRequest(
                 symbol=ticker, qty=int(live_qty), side=sell_side,
-                time_in_force=_TIF.GTC, stop_price=round(new_stop, 2),
+                time_in_force=_adopt_tif, stop_price=round(new_stop, 2),
             ))
             stop_order_id = getattr(stop_res, "id", None)
         except Exception as e:
@@ -3203,9 +3210,18 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         idem = _signal_idempotency_key(signal)
         from datetime import timedelta as _td
         from services.config import IDEMPOTENCY_LOOKBACK_HOURS as _IDEM_HRS
+        # r80 fix: status-aware dedup. Previously the query matched on
+        # idempotency_key alone, so a closed_stop trade still blocked a
+        # re-entry attempt on the same signal — and AFTER the IDEM_HRS
+        # window, the INSERT would hit the UNIQUE-on-idempotency_key
+        # constraint and raise IntegrityError. Now we only block when a
+        # PENDING or OPEN trade exists with the same key (the actual
+        # double-fire risk); closed trades are treated as completed
+        # history that doesn't reserve the key.
         recent_dup = db.query(AutoTrade).filter(
             AutoTrade.idempotency_key == idem,
             AutoTrade.opened_at > datetime.utcnow() - _td(hours=_IDEM_HRS),
+            AutoTrade.status.in_(["pending", "open", "adopted"]),
         ).first()
         if recent_dup:
             logger.info(f"AutoTrader skip {ticker}: idempotent dup of trade #{recent_dup.id}")
@@ -3312,6 +3328,43 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                         return None
             except Exception:
                 pass
+
+        # ════════════════════════════════════════════════════════════════════
+        # § WASH-SALE COOLDOWN — IRS rule guard for tax-sensitive accounts
+        # ════════════════════════════════════════════════════════════════════
+        # r80 fix: cfg.wash_sale_cooldown_days column has existed since r47
+        # but no code read it. When >0, skip entries on tickers we exited at
+        # a realized loss within the last N days. IRS disallows the loss
+        # deduction otherwise. Default 0 = disabled (back-compat).
+        try:
+            _wash_days = int(getattr(cfg, "wash_sale_cooldown_days", 0) or 0)
+            if _wash_days > 0:
+                from datetime import datetime as _dt_w, timedelta as _td_w
+                _cutoff = _dt_w.utcnow() - _td_w(days=_wash_days)
+                _last_loss = (
+                    db.query(AutoTrade)
+                    .filter(
+                        AutoTrade.ticker == ticker.upper(),
+                        AutoTrade.status.like("closed%"),
+                        AutoTrade.realized_pl < 0,
+                        AutoTrade.closed_at.isnot(None),
+                        AutoTrade.closed_at >= _cutoff,
+                    )
+                    .first()
+                )
+                if _last_loss is not None:
+                    logger.info(
+                        f"AutoTrader skip {ticker}: wash-sale cooldown "
+                        f"({_wash_days}d) — last loss closed at {_last_loss.closed_at}"
+                    )
+                    metrics.inc("autotrade_skip", reason="wash_sale_guard")
+                    _gate_record(
+                        "wash_sale", "fail",
+                        formula=f"prior loss closed_at {_last_loss.closed_at} within {_wash_days}d cooldown",
+                    )
+                    return None
+        except Exception as _e:
+            logger.debug(f"wash_sale gate {ticker}: {_e}")
 
         # ════════════════════════════════════════════════════════════════════
         # § AI ENTRY VETO — Claude semantic review (off/shadow/active gated)
@@ -4041,6 +4094,14 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
     db = SessionLocal()
     try:
         cfg = get_config(db)
+        # r80 fix: kill-switch was only checked in consider_signal; option
+        # entry paths (put + call) bypassed it. A killed bot would still
+        # open new option positions on incoming signals.
+        if getattr(cfg, "killed", False):
+            _gate_record("killed", "fail",
+                         formula=f"cfg.killed = true ({getattr(cfg, 'killed_reason', '')!r})")
+            metrics.inc("autotrade_skip", reason="killed")
+            return None
         if not cfg.enabled:
             _gate_record("disabled", "fail", formula="cfg.enabled = false → bot is paused")
             metrics.inc("autotrade_skip", reason="disabled")
@@ -4525,6 +4586,12 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
     db = SessionLocal()
     try:
         cfg = get_config(db)
+        # r80 fix: kill-switch must be respected in option entry paths.
+        if getattr(cfg, "killed", False):
+            _gate_record("killed", "fail",
+                         formula=f"cfg.killed = true ({getattr(cfg, 'killed_reason', '')!r})")
+            metrics.inc("autotrade_skip", reason="killed")
+            return None
         # Requires BOTH trade_options (options trading is approved) AND
         # the call-specific flag (user has opted in to call plays).
         if not cfg.enabled:

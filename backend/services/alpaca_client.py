@@ -47,6 +47,70 @@ def is_enabled() -> bool:
     return _get_client() is not None
 
 
+# r80: timeout + retry helper for idempotent Alpaca REST reads.
+#
+# alpaca-py's underlying httpx client has no public timeout setting and
+# defaults to None (wait forever). A network stall on get_account() at the
+# top of consider_signal would block the entire entry pipeline. Wrap the
+# critical reads with a short timeout + 1 retry on transient errors so a
+# bad packet doesn't paralyze the bot.
+import concurrent.futures as _cf  # noqa: E402
+
+_REST_TIMEOUT_SEC = 5.0
+_REST_RETRIES = 1
+_REST_BACKOFF_SEC = 0.4
+
+# Persistent daemon-thread executor: a `with ThreadPoolExecutor()` block
+# calls shutdown(wait=True) on exit, which would BLOCK on the timed-out
+# thread and defeat the timeout. A long-lived shared executor avoids that
+# trap — when future.result() times out, we abandon the future and return.
+# The hung thread continues until its socket eventually errors out, but
+# the caller is unblocked.
+_REST_EXECUTOR = _cf.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="alpaca-rest"
+)
+
+
+def _safe_rest_read(fn, *args, timeout: float = _REST_TIMEOUT_SEC,
+                    retries: int = _REST_RETRIES, **kwargs):
+    """Run an idempotent Alpaca REST read with a hard timeout + retry on
+    transient errors (429 / 5xx / timeout). NOT for order submits — those
+    are non-idempotent and must never auto-retry from inside the SDK."""
+    import time as _t
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            future = _REST_EXECUTOR.submit(fn, *args, **kwargs)
+            return future.result(timeout=timeout)
+        except _cf.TimeoutError as e:
+            last_exc = e
+            # Abandon the future: don't wait for the hung call.
+            future.cancel()
+            logger.warning(
+                f"_safe_rest_read: {fn.__name__} timed out after {timeout}s "
+                f"(attempt {attempt + 1}/{retries + 1})"
+            )
+        except Exception as e:
+            last_exc = e
+            err_s = str(e).lower()
+            if any(t in err_s for t in (
+                "429", "500", "502", "503", "504",
+                "timeout", "timed out", "connection",
+            )):
+                logger.warning(
+                    f"_safe_rest_read: {fn.__name__} transient error "
+                    f"(attempt {attempt + 1}/{retries + 1}): {e}"
+                )
+            else:
+                # Non-transient (auth, malformed, etc.) — don't retry.
+                raise
+        if attempt < retries:
+            _t.sleep(_REST_BACKOFF_SEC * (2 ** attempt))
+    if last_exc is not None:
+        raise last_exc
+    return None
+
+
 _market_clock_cache: Optional[tuple] = None  # (is_open: bool, expiry_ts: float)
 import threading as _pt_threading
 _market_clock_lock = _pt_threading.Lock()
@@ -159,7 +223,8 @@ def get_account() -> Optional[Dict[str, Any]]:
     if not c:
         return None
     try:
-        a = c.get_account()
+        # r80: timeout + retry guard.
+        a = _safe_rest_read(c.get_account)
         return {
             "account_number": a.account_number,
             "status": str(a.status),
@@ -190,7 +255,8 @@ def get_positions() -> List[Dict[str, Any]]:
     if not c:
         return []
     try:
-        positions = c.get_all_positions()
+        # r80: timeout + retry guard.
+        positions = _safe_rest_read(c.get_all_positions)
     except Exception as e:
         logger.error(f"get_positions failed: {e}")
         return []
@@ -224,7 +290,8 @@ def get_orders(status: str = "all", limit: int = 50) -> List[Dict[str, Any]]:
             "all": QueryOrderStatus.ALL,
         }
         req = GetOrdersRequest(status=status_map.get(status, QueryOrderStatus.ALL), limit=limit)
-        orders = c.get_orders(filter=req)
+        # r80: timeout + retry guard.
+        orders = _safe_rest_read(c.get_orders, filter=req)
     except Exception as e:
         logger.error(f"get_orders failed: {e}")
         return []
@@ -720,9 +787,29 @@ def submit_option_entry_with_cross_fallback(
         except Exception:
             break
     try:
-        # Internal cancel before market cross — don't add 4s latency to
-        # the entry path; just fire-and-forget.
-        cancel_order(order_id, wait_for_terminal=False)
+        # r80 fix: was wait_for_terminal=False (fire-and-forget) — that
+        # left a race window where the limit could fill DURING the cancel
+        # ACK while the market cross below also fired = 2× the qty filled.
+        # Wait up to 2s for the cancel to terminalize. If the limit fills
+        # before cancel completes, cancel_order returns the now-filled
+        # order dict; we fall through and let the market cross logic also
+        # see "filled" and skip submitting another order.
+        cancel_res = cancel_order(order_id, wait_for_terminal=True, timeout_sec=2.0)
+        # If cancel races with a fill, the order is now terminal-filled.
+        # Re-poll once to confirm and bail out before crossing.
+        try:
+            c = _get_client()
+            if c:
+                o = c.get_order_by_id(order_id)
+                _final_status = str(getattr(o, "status", "")).lower()
+                if "filled" in _final_status:
+                    logger.info(
+                        f"submit_option_entry: {occ_symbol} limit filled during "
+                        f"cancel race; skipping market cross."
+                    )
+                    return first
+        except Exception:
+            pass
     except Exception:
         pass
     # r53: pre-cross slippage gate. If the current ask is more than
