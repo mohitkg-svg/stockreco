@@ -256,9 +256,14 @@ def _evaluate_stop_threat_sync(sym: str, px: float) -> None:
                         _at_t.manage_open_positions()
                         logger.info(f"manage fast-path fired for {sym} @ {px} (stop/target hit)")
                     finally:
-                        # In a pure thread, we can just release directly or sleep briefly to bounce
-                        import time
-                        time.sleep(2.0)
+                        # Release immediately — manage_open_positions() already
+                        # serializes its own DB writes via per-trade locks. The
+                        # prior 2.0s sleep here was throttling the entire
+                        # fast-path: in a SPY -2% drop hitting 10 holdings, only
+                        # one ticker could react every 2s while the others ate
+                        # correlated drawdown. The lock is non-blocking so a
+                        # concurrent tick on another symbol just no-ops if a
+                        # manage is already running.
                         _threat_path_lock.release()
         finally:
             _db_t.close()

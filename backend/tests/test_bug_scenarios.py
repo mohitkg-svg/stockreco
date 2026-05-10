@@ -2110,6 +2110,125 @@ class TestOptionChainPolygonFallback(unittest.TestCase):
             out = options_fetcher.fetch_option_chain("AAPL")
         self.assertIsNone(out)
 
+
+class TestR77LiveMoneyP0Fixes(unittest.TestCase):
+    """r77 multi-agent audit P0s — defects that would lose money on flip
+    to ALPACA_LIVE=1. Each test is a future-regression guard for a specific
+    bug class that already escaped to production once.
+    """
+
+    def test_no_scheduler_add_job_has_duplicate_trigger_kwarg(self):
+        """r77-A: scan EVERY scheduler.add_job(...) call in main.py for
+        duplicate `trigger=` kwargs. Python raises TypeError at call time;
+        the surrounding try/except logs a warning and silently kills the
+        cron. We hit this once on the FMP SEC poll (caught manually after
+        regression tests passed), then again on fundamentals_weekly and
+        social_sentiment after a reschedule pass. Now guarded broadly."""
+        import re
+        main_path = os.path.join(os.path.dirname(__file__), "..", "main.py")
+        with open(main_path, "r") as f:
+            src = f.read()
+        offenders = []
+        for m in re.finditer(r"scheduler\.add_job\(", src):
+            start = m.end()
+            depth = 1
+            i = start
+            while i < len(src) and depth > 0:
+                if src[i] == "(":
+                    depth += 1
+                elif src[i] == ")":
+                    depth -= 1
+                i += 1
+            block = src[start: i - 1]
+            n_trigger = len(re.findall(r"\btrigger=", block))
+            if n_trigger > 1:
+                line_no = src[: m.start()].count("\n") + 1
+                offenders.append((line_no, n_trigger))
+        self.assertEqual(
+            offenders, [],
+            f"scheduler.add_job() with duplicate trigger= kwargs at lines: {offenders}. "
+            "Python raises TypeError; the surrounding try/except catches it and the "
+            "cron silently never registers."
+        )
+
+    def test_no_duplicate_for_loop_or_def_lines_in_main(self):
+        """r77-A bis: same root cause — a reschedule / rename pass that
+        leaves the old line above the new line. Two consecutive `for ...:`
+        at the same indent makes the first `for` body-less (IndentationError
+        at import). Two consecutive `def name(...):` for the same name
+        means the second silently shadows the first. Sweep main.py for both."""
+        main_path = os.path.join(os.path.dirname(__file__), "..", "main.py")
+        with open(main_path, "r") as f:
+            lines = f.read().split("\n")
+        offenders = []
+        for i in range(1, len(lines)):
+            prev_full, curr_full = lines[i - 1], lines[i]
+            prev = prev_full.lstrip()
+            curr = curr_full.lstrip()
+            same_indent = (len(prev_full) - len(prev)) == (len(curr_full) - len(curr))
+            if not same_indent:
+                continue
+            if prev.startswith("for ") and curr.startswith("for ") and ":" in prev and ":" in curr:
+                offenders.append((i + 1, "for-loop"))
+            if (prev.startswith("def ") or prev.startswith("async def ")) and \
+               (curr.startswith("def ") or curr.startswith("async def ")):
+                pn = prev.split("(", 1)[0].split()[-1]
+                cn = curr.split("(", 1)[0].split()[-1]
+                if pn == cn:
+                    offenders.append((i + 1, f"def {cn}"))
+        self.assertEqual(
+            offenders, [],
+            f"Duplicated lines in main.py at: {offenders}. Likely a partial "
+            "find/replace or reschedule pass that left the old line above "
+            "the new one."
+        )
+
+    def test_bracket_tif_fallback_is_day_not_gtc(self):
+        """r77-B: bracket_tif=getattr(cfg, ..., 'gtc') would silently invert
+        the weekend-gap safety if cfg.bracket_tif comes back NULL (legacy
+        row, migration miss). The DB column default is 'day' and the status
+        endpoint also reads 'day'; the order-submit fallback must agree."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+        # Look for the offending pattern; we don't expect it to appear
+        # anywhere in the file. (A future regression that re-adds it would
+        # set off this test.)
+        self.assertNotIn(
+            'getattr(cfg, "bracket_tif", "gtc")', src,
+            "bracket_tif fallback regressed to 'gtc' — see auto_trader.py "
+            "submit_bracket_order call. DB default is 'day'; the fallback "
+            "must agree, otherwise legacy NULL rows go out as GTC and "
+            "Friday positions stay covered through weekend gaps."
+        )
+        # And confirm the corrected pattern is present.
+        self.assertIn('getattr(cfg, "bracket_tif", "day")', src)
+
+    def test_fast_path_no_artificial_2s_sleep(self):
+        """r77-C: live_quotes fast-path used to time.sleep(2.0) after
+        firing manage_open_positions. That serialized stop/target reaction
+        across tickers — in a correlated drawdown, only one position could
+        react every 2s. Manage_open_positions already serializes its own
+        DB writes via per-trade locks; the sleep was redundant + harmful."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "live_quotes.py"), "r") as f:
+            src = f.read()
+        # Locate the threat-path block by anchor.
+        anchor = src.find("manage fast-path fired")
+        self.assertGreater(anchor, 0, "fast-path log message not found")
+        block_src = src[anchor: anchor + 800]
+        # The 2.0-second sleep must not return inside this block.
+        self.assertNotIn(
+            "time.sleep(2.0)", block_src,
+            "fast-path 2.0s sleep regressed — this throttles correlated "
+            "stop/target reaction. Lock release should be immediate; "
+            "manage_open_positions handles its own serialization."
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
     def test_polygon_returns_none_when_chain_has_zero_greeks(self):
         """Defensive guard: Polygon serves chain skeleton (bid/ask) but null
         greeks/IV off-hours and on the wrong plan tier. The fetcher must

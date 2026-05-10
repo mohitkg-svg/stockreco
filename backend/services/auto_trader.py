@@ -3868,7 +3868,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             # weekends → exposed to Sunday-night gap events. Setting cfg.
             # bracket_tif="day" caps that exposure (positions intentionally
             # uncovered after RTH; manage tick re-evaluates).
-            time_in_force=str(getattr(cfg, "bracket_tif", "gtc") or "gtc"),
+            time_in_force=str(getattr(cfg, "bracket_tif", "day") or "day"),
             client_order_id=f"at-{__import__('uuid').uuid4().hex[:16]}",
         )
         if "error" in res:
