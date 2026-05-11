@@ -53,23 +53,21 @@ if _IS_SQLITE:
     # default 5s, even if SQLite's pragma would have waited longer.
     _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
 else:
-    # Postgres: connection pool with pre-ping. Cloud SQL db-f1-micro only
-    # has ~25 total slots with 3-5 reserved for superusers → ~22 usable.
-    # r73 sizing: 5+3=8 per instance, with deploy.sh capping api at
-    # max-instances=2 (was 3). Budget at peak scale-out:
-    #   api      max_instances=2 × 8 = 16
-    #   manager  max_instances=1 × 8 =  8
-    #   total                        = 24  (slight overshoot of 22 budget,
-    #                                      rare in practice — typical load is
-    #                                      1 api instance × 8 + manager × 8 = 16)
-    # Earlier 3+2 sizing (r71-fix) fit the budget perfectly but exhausted
-    # internally under normal scheduler load (manage every 20s + scan + alt
-    # data refresh) — pool exhaustion before reaching Cloud SQL's limit.
-    # Real fix is PgBouncer in front of Cloud SQL (BACKLOG); this sizing is
-    # the practical compromise until that ships.
+    # Postgres: connection pool with pre-ping. Cloud SQL db-g1-small has
+    # ~50 total slots with 3-5 reserved for superusers → ~45 usable.
+    # r85 sizing: 8+4=12 per instance after pre-live tier upgrade
+    # (f1-micro → g1-small) — was hitting QueuePool exhaustion at 5+3
+    # under normal scheduler load (manage 20s + scan + alt data refresh
+    # + news/event_detector cron). Budget at peak scale-out:
+    #   api      max_instances=2 × 12 = 24
+    #   manager  max_instances=1 × 12 = 12
+    #   total                         = 36  (fits 45 budget with headroom)
+    # Earlier sizings (3+2 in r71, 5+3 in r73) were constrained by the
+    # f1-micro 22-slot budget. PgBouncer is still BACKLOG; this gives
+    # ~50% more pool headroom per instance after the tier upgrade.
     _engine_kwargs["pool_pre_ping"] = True
-    _engine_kwargs["pool_size"] = 5
-    _engine_kwargs["max_overflow"] = 3
+    _engine_kwargs["pool_size"] = 8
+    _engine_kwargs["max_overflow"] = 4
     _engine_kwargs["pool_recycle"] = 3600
     _engine_kwargs["pool_timeout"] = 30
 
