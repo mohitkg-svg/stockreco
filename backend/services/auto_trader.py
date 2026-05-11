@@ -2458,6 +2458,19 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
     if not ticker:
         return None
 
+    # Global ticker blacklist — hoisted to run before any downstream gate or
+    # I/O. Previously sat ~800 lines below (after fat-finger / RR / setup-q),
+    # so blacklisted names that failed any of those got logged with the wrong
+    # reason and burned a full gate stack per signal. Mirrors the early
+    # placement in consider_put_play / consider_call_play.
+    if is_blacklisted(ticker):
+        logger.info(f"AutoTrader skip {ticker}: on global blacklist")
+        _gate_record("ticker_blacklisted", "fail",
+                     ticker=ticker,
+                     formula=f"{ticker} is in cfg.ticker_blacklist")
+        metrics.inc("autotrade_skip", reason="ticker_blacklisted")
+        return None
+
     # Basic filters before heavy I/O or locking.
     sig_type = signal.get("signal_type")
     if sig_type != "BUY":
@@ -3257,11 +3270,8 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         risk_per_share = _slip_rps(entry, stop, _atr_for_slip)
         far_tp = round(entry + 10 * risk_per_share, 2)
 
-        # `ticker` already bound at function top (r39 fix). Global ticker
-        # blacklist — applies regardless of watchlist/universe source.
-        if is_blacklisted(ticker, cfg):
-            logger.info(f"AutoTrader skip {ticker}: on global blacklist")
-            return None
+        # Global ticker blacklist already checked at function top
+        # (pre-flight, before any I/O). No need to re-check here.
 
         # Macro release blackout — skip new entries near high/medium impact
         # economic releases (CPI, NFP, FOMC, etc.) to avoid entering into
