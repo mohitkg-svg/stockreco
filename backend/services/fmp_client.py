@@ -322,16 +322,22 @@ def get_analyst_consensus(ticker: str) -> Optional[Dict[str, Any]]:
     count = int((summary or {}).get("lastYearCount") or 0)
     if count == 0 and target_mean is None:
         return None
-    # Derive a rough 1-5 rating from price vs target:
-    # If target >> price → bullish (~1-2), target ~ price → hold (~3),
-    # target << price → bearish (~4-5). Default to "buy" (2.0) when we
-    # have targets but no rating buckets.
-    mean = 2.0  # default buy consensus
-    key = "buy"
+    # r84: /stable/ does NOT expose rating buckets (strongBuy / buy / hold /
+    # sell / strongSell). The pre-r83 v3/v4 client computed a real
+    # consensus mean (1.0..5.0) from those bucket counts. The post-r83 code
+    # hardcoded `mean=2.0, key="buy"` for ANY ticker FMP returned data on,
+    # which made `analyst_ratings.rating_multiplier` always return 1.10×
+    # (STRONG_AGREE) on BUYs and 0.88× on SELLs — a uniform tilt regardless
+    # of actual analyst sentiment. Returning mean=None is the safe move:
+    # `rating_multiplier` short-circuits to NEUTRAL (1.00×) when mean is
+    # missing, so signals are sized as if analyst consensus is unavailable.
+    # Targets / target spread are still returned for downstream consumers
+    # (chart annotations, target_mean R:R checks). To restore an analyst
+    # gate later, derive `mean` from `target_mean / current_price` ratio.
     return {
         "ticker": ticker.upper(),
-        "mean": mean,
-        "key": key,
+        "mean": None,
+        "key": None,
         "analyst_count": count or None,
         "target_mean": target_mean,
         "target_high": target_high,

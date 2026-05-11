@@ -2117,14 +2117,22 @@ class TestFmpIntegration(unittest.TestCase):
                 row = fmp_client.get_analyst_consensus("AAPL")
             self.assertEqual(row["ticker"], "AAPL")
             self.assertEqual(row["analyst_count"], 20)
-            self.assertEqual(row["mean"], 2.0)
+            # r84: mean/key are None when /stable/ has no rating buckets
+            # (which is always — buckets aren't on /stable/). This routes
+            # rating_multiplier to NEUTRAL via its mean-is-None short-circuit
+            # at analyst_ratings.py:155, avoiding a uniform 1.10× boost on
+            # every BUY signal regardless of actual analyst sentiment.
+            self.assertIsNone(row["mean"])
+            self.assertIsNone(row["key"])
             self.assertEqual(row["target_mean"], 250.0)
-            self.assertEqual(row["key"], "buy")
             # Upsert path uses these keys — none should KeyError.
             ar._upsert(row)
             persisted = ar.get_rating("AAPL")
             self.assertEqual(persisted["analyst_count"], 20)
             self.assertAlmostEqual(persisted["target_mean"], 250.0)
+            # rating_multiplier must return NEUTRAL when mean is None
+            self.assertEqual(ar.rating_multiplier("AAPL", "BUY"), 1.0)
+            self.assertEqual(ar.rating_multiplier("AAPL", "SELL"), 1.0)
         finally:
             os.environ.pop("FMP_API_KEY", None)
 

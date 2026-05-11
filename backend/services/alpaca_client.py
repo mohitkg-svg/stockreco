@@ -913,8 +913,12 @@ def submit_option_exit_with_cross_fallback(
         try:
             c = _get_client()
             if c:
-                o = c.get_order_by_id(order_id)
-                status = str(getattr(o, "status", "")).lower()
+                # r84: timeout-wrap the poll. Inside a tight deadline loop,
+                # an unwrapped REST call could exceed `cross_after_seconds`
+                # by SDK default timeout (~30s) — defeating the purpose of
+                # the deadline and stalling the option exit pipeline.
+                o = _safe_rest_read(c.get_order_by_id, order_id, timeout=2.0)
+                status = str(getattr(o, "status", "")).lower() if o is not None else ""
                 if "filled" in status:
                     return first
         except Exception:

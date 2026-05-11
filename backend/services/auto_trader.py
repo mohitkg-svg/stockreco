@@ -1456,8 +1456,14 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
                 try:
                     if r.parent_order_id:
                         c = alpaca_client._get_client()
-                        po = c.get_order_by_id(r.parent_order_id)
-                        ps = str(getattr(po, "status", "") or "").lower()
+                        # r84: wrap REST read with timeout. Boot-time
+                        # reconciliation runs sequentially over every pending
+                        # row; one wedged REST call would hang the whole
+                        # reconcile + delay manage-loop start.
+                        po = alpaca_client._safe_rest_read(
+                            c.get_order_by_id, r.parent_order_id, timeout=3.0,
+                        ) if c else None
+                        ps = str(getattr(po, "status", "") or "").lower() if po else ""
                         if any(s in ps for s in ("rejected", "canceled", "cancelled", "expired")):
                             _terminal = True
                         if "filled" in ps and r.ticker not in alpaca_stocks:
@@ -4050,6 +4056,19 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             except Exception:
                 _limit_px = None
 
+        # r84: late KILL re-check. The early check at top of consider_signal
+        # was ~1675 lines + AI-veto + fundamentals lookups ago. kill() may
+        # have been issued in that window — kill() holds _entry_lock with a
+        # 2s timeout and proceeds anyway if it can't acquire, so a long
+        # consider_signal can race past kill's lock to this submit. Without
+        # this re-check, we'd open a NEW position immediately after kill()
+        # flattens the existing book.
+        if is_killed_in_memory():
+            try:
+                metrics.inc("autotrade_skip", reason="killed_inmem_late")
+            except Exception:
+                pass
+            return None
         res = alpaca_client.submit_bracket_order(
             symbol=ticker,
             qty=qty,
@@ -4063,7 +4082,17 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             # bracket_tif="day" caps that exposure (positions intentionally
             # uncovered after RTH; manage tick re-evaluates).
             time_in_force=str(getattr(cfg, "bracket_tif", "day") or "day"),
-            client_order_id=f"at-{__import__('uuid').uuid4().hex[:16]}",
+            # r84: deterministic broker-side dedupe. Prior code generated a
+            # fresh UUID per call. If submit_bracket_order timed out AFTER
+            # Alpaca created the order, the next scan regenerated a new UUID
+            # and Alpaca accepted both as distinct orders — 2× position size.
+            # Now derive from `idem` (= ticker + signal_type + rounded
+            # entry/stop/T1) so a retry within the IDEMPOTENCY_LOOKBACK_HOURS
+            # window (4h, well inside Alpaca's 24h client_order_id uniqueness
+            # window) collides at the broker and is rejected. Application-
+            # level dedupe at line 3346 is the first line of defense; this
+            # is belt-and-suspenders for the timeout-without-response case.
+            client_order_id=f"at-{__import__('hashlib').sha256(str(idem).encode()).hexdigest()[:16]}",
         )
         if "error" in res:
             # Stamp the idempotency_key on error rows too — without it, every
@@ -4549,6 +4578,13 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             f"score={top['score']} bear-conf={thesis['confidence']}"
         )
 
+        # r84: late KILL re-check (see consider_signal r84 comment for rationale).
+        if is_killed_in_memory():
+            try:
+                metrics.inc("autotrade_skip", reason="killed_inmem_late")
+            except Exception:
+                pass
+            return None
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
         # r53 fix: pass requested_premium so the slippage-abandon gate can
         # reject fills > 1.25× requested.
@@ -5052,6 +5088,13 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             f"score={top['score']} bull-conf={thesis['confidence']}"
         )
 
+        # r84: late KILL re-check (see consider_signal r84 comment for rationale).
+        if is_killed_in_memory():
+            try:
+                metrics.inc("autotrade_skip", reason="killed_inmem_late")
+            except Exception:
+                pass
+            return None
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
         # r53 fix: pass requested_premium so the slippage-abandon gate can
         # reject fills > 1.25× requested.
@@ -5227,7 +5270,12 @@ def _manage_option_trade(t: AutoTrade, c, db: Session, summary: Dict[str, Any]) 
           – Premium decays ≥ 50% from entry (premium stop)     → status closed_stop
       • Reconcile if the option position has gone to zero (already exited).
     """
-    parent = c.get_order_by_id(t.parent_order_id)
+    # r84: wrap REST read with timeout. Stock-side analog at the parallel
+    # call site already uses _safe_rest_read; option path was unprotected,
+    # so a wedged broker connection blocked the full option manage tick.
+    parent = alpaca_client._safe_rest_read(c.get_order_by_id, t.parent_order_id, timeout=3.0)
+    if parent is None:
+        return
     # r53d fix: see stock-side comment in manage_open_positions — strict
     # `pstatus == "filled"` never matched alpaca-py's "OrderStatus.FILLED".
     _raw = parent.status
@@ -5809,6 +5857,10 @@ def manage_open_positions() -> Dict[str, Any]:
                 "chandelier_atr_mult": float(getattr(cfg, "chandelier_atr_mult", 0) or 0),
                 "flatten_by_eod": bool(getattr(cfg, "flatten_by_eod", False)),
                 "daily_loss_limit_pct": float(getattr(cfg, "daily_loss_limit_pct", 0.03) or 0.03),
+                # r84: bracket_tif read in SL-invariant resubmit path so
+                # an emergency stop-resubmit honors the same DAY/GTC config
+                # as the original bracket (default DAY caps weekend gap risk).
+                "bracket_tif": str(getattr(cfg, "bracket_tif", "day") or "day"),
             }
             trade_ids = [
                 tid for (tid,) in _bootstrap_db.query(AutoTrade.id).filter(
@@ -6112,9 +6164,21 @@ def manage_open_positions() -> Dict[str, Any]:
                                 for _leg_id in (legs.get("stop_id"), legs.get("tp_id")):
                                     if _leg_id and _client:
                                         try:
-                                            _client.replace_order_by_id(
+                                            # r84: timeout-wrap the replace.
+                                            # A wedged broker connection here
+                                            # would stall the manage tick on a
+                                            # partial-fill reconcile. retries=0
+                                            # because replace_order_by_id is a
+                                            # mutation — auto-retry could fire
+                                            # the resize twice if the first
+                                            # attempt actually succeeded but
+                                            # the response timed out.
+                                            alpaca_client._safe_rest_read(
+                                                _client.replace_order_by_id,
                                                 _leg_id,
                                                 order_data=ReplaceOrderRequest(qty=int(broker_filled)),
+                                                timeout=3.0,
+                                                retries=0,
                                             )
                                         except Exception as _re:
                                             logger.warning(f"bracket leg resize failed for {t.ticker}: {_re}")
@@ -6344,12 +6408,23 @@ def manage_open_positions() -> Dict[str, Any]:
                                     from alpaca.trading.requests import StopOrderRequest
                                     from alpaca.trading.enums import OrderSide, TimeInForce
                                     new_stop_price = round(float(t.current_stop or t.stop_loss), 2)
+                                    # r84: honor cfg.bracket_tif. Original bracket
+                                    # respected the config (DAY caps weekend gap
+                                    # exposure) but the emergency resubmit hard-
+                                    # coded GTC, so a Friday SL-replace failure
+                                    # would leave the position naked from Sunday
+                                    # 18:00 ET through Monday open. Map the
+                                    # cfg string to the alpaca-py enum; default
+                                    # to DAY (the live recommended value) on any
+                                    # unknown / missing config.
+                                    _tif_str = (cfg_snapshot.get("bracket_tif") or "day").lower()
+                                    _resub_tif = TimeInForce.DAY if _tif_str == "day" else TimeInForce.GTC
                                     try:
                                         new_sl = c.submit_order(order_data=StopOrderRequest(
                                             symbol=t.ticker,
                                             qty=int(t.qty),
                                             side=OrderSide.SELL,
-                                            time_in_force=TimeInForce.GTC,
+                                            time_in_force=_resub_tif,
                                             stop_price=new_stop_price,
                                         ))
                                         t.stop_order_id = str(new_sl.id)
@@ -6682,10 +6757,22 @@ def manage_open_positions() -> Dict[str, Any]:
                                                                 try:
                                                                     if t.stop_order_id:
                                                                         from alpaca.trading.requests import ReplaceOrderRequest as _ROR_p
-                                                                        alpaca_client._get_client().replace_order_by_id(
+                                                                        # r84: Alpaca rotates the order id on every replace.
+                                                                        # Capture the new id and persist it; otherwise the
+                                                                        # next manage tick's SL invariant check looks up a
+                                                                        # stale (terminal) id, fails, and falsely fires the
+                                                                        # naked-position alert + resubmit storm.
+                                                                        _new_sl = alpaca_client._get_client().replace_order_by_id(
                                                                             t.stop_order_id,
                                                                             order_data=_ROR_p(qty=int(t.qty)),
                                                                         )
+                                                                        try:
+                                                                            _new_id = str(getattr(_new_sl, "id", "") or "")
+                                                                            if _new_id:
+                                                                                t.stop_order_id = _new_id
+                                                                                db.commit()
+                                                                        except Exception:
+                                                                            pass
                                                                 except Exception as _resize_e:
                                                                     logger.warning(f"pyramid SL resize {t.ticker} failed: {_resize_e}")
                                                                 _atomic_append_note(db, t.id, f" | PYRAMID: +{_add} at T1 (ADX={_adx_now:.0f})")
