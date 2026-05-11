@@ -592,6 +592,7 @@ def submit_simple_option_order(
     order_type: str = "market",
     limit_price: Optional[float] = None,
     time_in_force: str = "day",
+    client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Submit a single-leg long-option order using the OCC contract symbol.
@@ -600,6 +601,11 @@ def submit_simple_option_order(
     enabled (Lvl 1+ for long calls/puts). Bracket orders aren't allowed on
     options, so we use a SIMPLE order class and our own manage loop tracks the
     underlying for stop / target exits.
+
+    `client_order_id` (r85c) — caller-provided idempotency token. Same
+    semantics as the stock bracket path: Alpaca treats duplicate
+    client_order_ids within ~24h as the same order, so multi-instance
+    scans / app retries can't double-submit. Sanitised to [A-Za-z0-9._-]{1,48}.
     """
     c = _get_client()
     if not c:
@@ -623,6 +629,11 @@ def submit_simple_option_order(
         time_in_force=tif,
         order_class=OrderClass.SIMPLE,
     )
+    if client_order_id:
+        import re as _re
+        sanitised = _re.sub(r"[^A-Za-z0-9._-]", "", str(client_order_id))[:48]
+        if sanitised:
+            common["client_order_id"] = sanitised
     try:
         if order_type.lower() == "limit":
             if limit_price is None:
@@ -652,6 +663,7 @@ def submit_option_exit_marketable_limit(
     side: str = "sell",
     offset_cents: float = 0.05,
     fallback_to_market: bool = True,
+    client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """r42 fix #2.2: marketable-limit option exit.
 
@@ -695,11 +707,13 @@ def submit_option_exit_marketable_limit(
             occ_symbol=occ_symbol, qty=qty, side=side,
             order_type="limit", limit_price=round(px, 2),
             time_in_force="day",
+            client_order_id=client_order_id,
         )
     if fallback_to_market:
         return submit_simple_option_order(
             occ_symbol=occ_symbol, qty=qty, side=side,
             order_type="market", time_in_force="day",
+            client_order_id=client_order_id,
         )
     return {"error": "no quote available for marketable-limit"}
 
@@ -712,6 +726,7 @@ def submit_option_entry_with_cross_fallback(
     max_fill_vs_requested: float = 1.25,
     wide_spread_pct: float = 0.30,
     wide_spread_cross_seconds: float = 120.0,
+    client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """r48 #BACKLOG-options-P0-2: post a marketable-LIMIT BUY inside the
     spread first, cross to market if unfilled after N seconds.
@@ -765,8 +780,15 @@ def submit_option_entry_with_cross_fallback(
     except Exception as _e:
         logger.debug(f"submit_option_entry spread-check {occ_symbol}: {_e}")
 
+    # r85c: cross-fallback's two submits MUST use distinct client_order_ids,
+    # otherwise Alpaca dedup returns the cancelled limit when the cross
+    # fires and no market order is actually placed. Use the caller-provided
+    # id as-is for the inside-spread limit; suffix "-x" for any fallback /
+    # market-cross attempt downstream.
+    cross_id = (str(client_order_id) + "-x") if client_order_id else None
     first = submit_option_exit_marketable_limit(
         occ_symbol=occ_symbol, qty=qty, side="buy", fallback_to_market=False,
+        client_order_id=client_order_id,
     )
     if "error" in first or not first.get("id"):
         # Couldn't even submit the inside-spread limit; r53: ALSO honor
@@ -795,6 +817,7 @@ def submit_option_entry_with_cross_fallback(
         return submit_simple_option_order(
             occ_symbol=occ_symbol, qty=qty, side="buy",
             order_type="market", time_in_force="day",
+            client_order_id=cross_id,
         )
     order_id = first.get("id")
     deadline = time.time() + effective_cross_seconds
@@ -879,6 +902,7 @@ def submit_option_entry_with_cross_fallback(
     return submit_simple_option_order(
         occ_symbol=occ_symbol, qty=qty, side="buy",
         order_type="market", time_in_force="day",
+        client_order_id=cross_id,
     )
 
 

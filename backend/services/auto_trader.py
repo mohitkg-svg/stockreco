@@ -4585,12 +4585,31 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 pass
             return None
+        # r47 fix #T0c-1 / r85c: deterministic per-contract idempotency key.
+        # Built BEFORE the broker submit (was r47-built AFTER, only the DB row
+        # got it — so multi-instance scans could double-submit at the broker
+        # layer). r85c hashes it into a 16-hex client_order_id mirroring the
+        # r84 stock-bracket pattern; Alpaca dedups duplicate client_order_ids
+        # within ~24h, well past the 4h IDEMPOTENCY_LOOKBACK_HOURS app window.
+        try:
+            from datetime import date as _today_d
+            _occ_idem = (
+                f"opt|put|{ticker}|{top.get('strike')}|"
+                f"{top.get('expiration')}|{int(top.get('dte') or 0)//7}|"
+                f"{_today_d.today().isoformat()}"
+            )
+            _opt_coid = f"at-{__import__('hashlib').sha256(_occ_idem.encode()).hexdigest()[:16]}"
+        except Exception:
+            _occ_idem = None
+            _opt_coid = None
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
         # r53 fix: pass requested_premium so the slippage-abandon gate can
         # reject fills > 1.25× requested.
+        # r85c: client_order_id for broker-layer idempotency.
         res = alpaca_client.submit_option_entry_with_cross_fallback(
             occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
             requested_premium=float(top["premium"]),
+            client_order_id=_opt_coid,
         )
         if "error" in res:
             # r53: slippage_abandon is a deliberate skip, not a failure —
@@ -4605,18 +4624,10 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                     f"ask ${res.get('ask','?')} max ${res.get('max_allowed','?')}"
                 )
                 return None
-            # r79 fix: stamp idempotency_key on the error row too. Without
-            # it, the same failing signal regenerated on the next scan
-            # silently inserts another error row instead of being deduped.
-            try:
-                _err_idem = _signal_idempotency_key(
-                    ticker, "BUY",
-                    timeframe=str(thesis.get("timeframe") or "option"),
-                    entry=float(top["premium"]),
-                    occ_symbol=occ,
-                )
-            except Exception:
-                _err_idem = None
+            # r79/r85c: stamp idempotency_key on the error row too. Reuse the
+            # _occ_idem built above (was a separate broken call to
+            # _signal_idempotency_key with mismatched signature — silent
+            # except-pass meant the error row never got a key).
             db.add(AutoTrade(
                 ticker=ticker, symbol=occ, asset_type="option", side="buy",
                 qty=qty, requested_entry=top["premium"],
@@ -4624,7 +4635,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                 current_stop=top["effective_stop_premium"],
                 target1=thesis["target1"], target2=thesis["target2"],
                 target3=thesis.get("target3"), level_index=0,
-                idempotency_key=_err_idem,
+                idempotency_key=_occ_idem,
                 status="error",
                 note=f"option submit failed: {res['error']}",
             ))
@@ -4632,19 +4643,6 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             logger.warning(f"AutoTrader put submit failed for {occ}: {res['error']}")
             return None
 
-        # r47 fix #T0c-1: option entries had NO idempotency_key, so multi-
-        # instance Cloud Run could double-buy the same put on the same ticker.
-        # Build a deterministic key tying together ticker + side + strike +
-        # expiry + DTE bucket so retries / multi-instance are de-duped.
-        try:
-            from datetime import date as _today_d
-            _occ_idem = (
-                f"opt|put|{ticker}|{top.get('strike')}|"
-                f"{top.get('expiration')}|{int(top.get('dte') or 0)//7}|"
-                f"{_today_d.today().isoformat()}"
-            )
-        except Exception:
-            _occ_idem = None
         trade = AutoTrade(
             ticker=ticker,
             symbol=occ,
@@ -5095,12 +5093,28 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 pass
             return None
+        # r47 fix #T0c-1 / r85c: deterministic per-contract idempotency key
+        # built BEFORE the broker submit (mirror of PUT path). See PUT for
+        # full rationale.
+        try:
+            from datetime import date as _today_d
+            _occ_idem = (
+                f"opt|call|{ticker}|{top.get('strike')}|"
+                f"{top.get('expiration')}|{int(top.get('dte') or 0)//7}|"
+                f"{_today_d.today().isoformat()}"
+            )
+            _opt_coid = f"at-{__import__('hashlib').sha256(_occ_idem.encode()).hexdigest()[:16]}"
+        except Exception:
+            _occ_idem = None
+            _opt_coid = None
         # r48 BACKLOG fix: marketable-limit BUY with cross fallback (was market).
         # r53 fix: pass requested_premium so the slippage-abandon gate can
         # reject fills > 1.25× requested.
+        # r85c: client_order_id for broker-layer idempotency.
         res = alpaca_client.submit_option_entry_with_cross_fallback(
             occ_symbol=occ, qty=qty, cross_after_seconds=30.0,
             requested_premium=float(top["premium"]),
+            client_order_id=_opt_coid,
         )
         if "error" in res:
             if res.get("error") == "slippage_abandon":
@@ -5111,18 +5125,8 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                     f"ask ${res.get('ask','?')} max ${res.get('max_allowed','?')}"
                 )
                 return None
-            # r79 fix: idempotency_key on call-path error row too (mirrors
-            # PUT error path). Otherwise a transient submit failure silently
-            # creates a new error row on every rescan instead of dedup.
-            try:
-                _err_idem = _signal_idempotency_key(
-                    ticker, "BUY",
-                    timeframe=str(thesis.get("timeframe") or "option"),
-                    entry=float(top["premium"]),
-                    occ_symbol=occ,
-                )
-            except Exception:
-                _err_idem = None
+            # r79/r85c: idempotency_key on call-path error row (reuse _occ_idem
+            # built above; see PUT for rationale on the prior broken call).
             db.add(AutoTrade(
                 ticker=ticker, symbol=occ, asset_type="option", side="buy",
                 qty=qty, requested_entry=top["premium"],
@@ -5130,7 +5134,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                 current_stop=top["effective_stop_premium"],
                 target1=thesis["target1"], target2=thesis["target2"],
                 target3=thesis.get("target3"), level_index=0,
-                idempotency_key=_err_idem,
+                idempotency_key=_occ_idem,
                 status="error",
                 note=f"call submit failed: {res['error']}",
             ))
@@ -5138,16 +5142,6 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             logger.warning(f"AutoTrader call submit failed for {occ}: {res['error']}")
             return None
 
-        # r47 fix #T0c-1: idempotency_key for CALL plays — see PUT for rationale.
-        try:
-            from datetime import date as _today_d
-            _occ_idem = (
-                f"opt|call|{ticker}|{top.get('strike')}|"
-                f"{top.get('expiration')}|{int(top.get('dte') or 0)//7}|"
-                f"{_today_d.today().isoformat()}"
-            )
-        except Exception:
-            _occ_idem = None
         trade = AutoTrade(
             ticker=ticker,
             symbol=occ,
