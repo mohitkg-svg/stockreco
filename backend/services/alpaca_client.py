@@ -429,21 +429,42 @@ def submit_bracket_order(
 
     tp = TakeProfitRequest(limit_price=round(float(take_profit), 2)) if take_profit else None
     # r46 fix #0.4: optional stop-LIMIT (vs stop-MARKET) to cap flash-crash /
-    # halt-resume gap fills. When STOP_LIMIT_OFFSET_PCT > 0, we use a
-    # stop-LIMIT with limit_price slightly worse than the stop (0.5% by
-    # default for longs). Gap-throughs leave the order unfilled — the
-    # manage loop's SL-invariant check (auto_trader.py) detects the
-    # missing fill and re-submits / escalates as needed.
+    # halt-resume gap fills. When STOP_LIMIT_OFFSET_PCT > 0, we previously
+    # set a stop-LIMIT with limit_price slightly worse than the stop.
+    #
+    # r89 incident 2026-05-12: AAPL bracket submits rejected by Alpaca with
+    # "stop_loss.stop_price must be <= base_price - 0.01". Verified
+    # numerically: for both rejections, Alpaca's `base_price` equalled our
+    # `stop_loss.limit_price = stop_price * (1 - 0.005)` to the cent
+    # (287.17→285.73 and 279.13→277.73 — see incident notes). Alpaca's
+    # bracket validator on BUY brackets effectively requires
+    # `stop_loss.limit_price > stop_loss.stop_price`, which is the opposite
+    # direction r46 used. Flipping the sign would only fill on a bounce-
+    # back-up after the stop trigger — useless for the flash-crash
+    # protection r46 wanted. The stop-LIMIT child path is therefore
+    # disabled here pending an explicit redesign; we fall back to
+    # stop-MARKET regardless of the env var. A warning is emitted once
+    # so the operator notices the legacy env var is being ignored.
     sl = None
     if stop_loss:
         offset_pct = float(os.getenv("STOP_LIMIT_OFFSET_PCT", "0") or "0")
         stop_price_r = round(float(stop_loss), 2)
         if offset_pct > 0:
-            is_buy = (side or "buy").lower() == "buy"
-            limit_price = stop_price_r * (1 - offset_pct) if is_buy else stop_price_r * (1 + offset_pct)
-            sl = StopLossRequest(stop_price=stop_price_r, limit_price=round(limit_price, 2))
-        else:
-            sl = StopLossRequest(stop_price=stop_price_r)
+            global _STOP_LIMIT_DISABLED_WARNED
+            try:
+                _already = _STOP_LIMIT_DISABLED_WARNED  # type: ignore[name-defined]
+            except NameError:
+                _already = False
+            if not _already:
+                logger.warning(
+                    f"STOP_LIMIT_OFFSET_PCT={offset_pct} is set but the stop-LIMIT "
+                    f"child path is DISABLED as of r89 (2026-05-12 AAPL incident — "
+                    f"Alpaca rejected buy brackets when stop_loss.limit_price < "
+                    f"stop_loss.stop_price). Using stop-MARKET; unset the env "
+                    f"var in Cloud Run to silence this warning."
+                )
+                _STOP_LIMIT_DISABLED_WARNED = True
+        sl = StopLossRequest(stop_price=stop_price_r)
 
     # Bracket only valid when both exits are present
     use_bracket = tp is not None and sl is not None
@@ -499,8 +520,26 @@ def submit_bracket_order(
             "stop_loss": stop_loss,
         }
     except Exception as e:
-        logger.error(f"submit_order failed: {e}")
+        # r89: log the submit inputs alongside the error so bracket-validation
+        # rejections (Alpaca surfaces "base_price" / "stop_price" / etc. in
+        # responses that don't echo what we sent) are diagnosable from a
+        # single log line. The 2026-05-12 AAPL incident required cross-
+        # referencing 4 logs and re-deriving the math to find the cause.
+        _sl_stop = getattr(sl, "stop_price", None) if sl else None
+        _sl_lim = getattr(sl, "limit_price", None) if sl else None
+        _tp_lim = getattr(tp, "limit_price", None) if tp else None
+        logger.error(
+            f"submit_order failed: {e} | inputs symbol={symbol} side={side} "
+            f"entry_type={entry_type} qty={qty} parent_limit_price={limit_price} "
+            f"take_profit_limit={_tp_lim} stop_loss_stop={_sl_stop} "
+            f"stop_loss_limit={_sl_lim} order_class={order_class} "
+            f"client_order_id={common_kwargs.get('client_order_id')}"
+        )
         return {"error": str(e)}
+
+
+# r89: module-level sentinel for one-shot STOP_LIMIT_OFFSET_PCT warning above.
+_STOP_LIMIT_DISABLED_WARNED: bool = False
 
 
 def cancel_order(order_id: str, wait_for_terminal: bool = True, timeout_sec: float = 4.0) -> Dict[str, Any]:
@@ -1019,8 +1058,38 @@ def submit_option_exit_with_cross_fallback(
     )
 
 
+def _is_position_not_found_error(exc: BaseException) -> bool:
+    """r89: heuristic to distinguish Alpaca's 'position does not exist' (404,
+    code 40410000) from real API failures (5xx, timeouts, auth, network).
+    The SDK raises APIError for both — only the former means 'no position';
+    the latter means 'unknown state', which callers must NOT collapse to
+    residual_qty=0 (the 2026-05-12 silent close-fail root cause).
+
+    Returns True ONLY when we are CONFIDENT the position truly doesn't exist."""
+    try:
+        code = getattr(exc, "code", None)
+        if code in (40410000, "40410000"):
+            return True
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        if status in (404, "404"):
+            return True
+        msg = (str(exc) or "").lower()
+        # Alpaca's textual signal — match conservatively.
+        if "position does not exist" in msg or "position not found" in msg:
+            return True
+        if "404" in msg and "position" in msg:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def get_option_position(occ_symbol: str) -> Optional[Dict[str, Any]]:
-    """Return current position for an OCC option symbol, or None if no position."""
+    """Return current position for an OCC option symbol, or None if no position.
+
+    DEPRECATED for verify-after-close paths: this collapses BOTH 'no position'
+    AND 'API error' to None — see get_option_position_strict for the
+    fail-closed variant added in r89."""
     c = _get_client()
     if not c:
         return None
@@ -1036,6 +1105,44 @@ def get_option_position(occ_symbol: str) -> Optional[Dict[str, Any]]:
         "market_value": float(p.market_value),
         "unrealized_pl": float(p.unrealized_pl),
     }
+
+
+def get_option_position_strict(occ_symbol: str) -> Dict[str, Any]:
+    """r89: 3-state position fetch for fail-closed verify paths.
+
+    Returns {"state": "absent"|"present"|"unknown", "data": {...}|None, "error": str|None}:
+      - "absent"  → confirmed 404 / position does not exist (safe to mark closed)
+      - "present" → broker confirms the position (data populated)
+      - "unknown" → API failure, timeout, client-not-initialized, etc. Callers
+                    MUST NOT treat this as residual_qty=0 (2026-05-12 incident:
+                    market-closed call → swallowed exception → 11 contracts
+                    orphaned but trade marked closed_manual).
+
+    Use this from any path that is about to close a DB row based on broker
+    state — verify-after-close, force_close_trade, /close endpoint.
+    """
+    c = _get_client()
+    if not c:
+        return {"state": "unknown", "data": None, "error": "alpaca_client_not_initialized"}
+    try:
+        p = c.get_open_position(occ_symbol)
+    except Exception as e:
+        if _is_position_not_found_error(e):
+            return {"state": "absent", "data": None, "error": None}
+        return {"state": "unknown", "data": None, "error": f"{type(e).__name__}: {e}"}
+    try:
+        data = {
+            "symbol": p.symbol,
+            "qty": float(p.qty),
+            "avg_entry_price": float(p.avg_entry_price),
+            "current_price": float(p.current_price) if p.current_price else None,
+            "market_value": float(p.market_value),
+            "unrealized_pl": float(p.unrealized_pl),
+        }
+        return {"state": "present", "data": data, "error": None}
+    except Exception as e:
+        # SDK returned an object we couldn't parse — treat as unknown.
+        return {"state": "unknown", "data": None, "error": f"parse_failed: {type(e).__name__}: {e}"}
 
 
 def close_all_positions(cancel_orders: bool = True) -> Dict[str, Any]:

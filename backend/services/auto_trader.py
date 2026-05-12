@@ -73,6 +73,41 @@ _entry_lock = threading.Lock()
 # trail, persistence across restart) but is best-effort.
 _KILLED = threading.Event()
 
+# r89: scan-start dry_run snapshot. The operator-driven /auto/scan-now route
+# iterates many tickers serially-then-parallel; each ticker re-reads cfg via
+# get_config(). Without this override, flipping cfg.dry_run via POST
+# /auto/config mid-scan flips remaining tickers from dry to live (the
+# 2026-05-12 UNH leak: operator flipped dry_run=False at T+10min into a
+# 12min scan; UNH evaluated at T+12 fired a live BRACKET).
+#
+# Contract: routers.trading.auto_scan_now sets this to the scan-start value
+# of cfg.dry_run before invoking scheduled_scan, and clears it in finally.
+# All entry-path dry_run checks consult _effective_dry_run(cfg) which prefers
+# the override when non-None. The 5-min cron scheduled_scan does NOT set the
+# override — its scans are short (~2-5s), and cron-driven flips are the
+# expected behavior.
+_SCAN_DRY_RUN_OVERRIDE: Optional[bool] = None
+_SCAN_DRY_RUN_LOCK = threading.Lock()
+
+
+def _set_scan_dry_run_override(value: Optional[bool]) -> None:
+    """r89: scan-start sentinel for dry_run. value=None clears."""
+    global _SCAN_DRY_RUN_OVERRIDE
+    with _SCAN_DRY_RUN_LOCK:
+        _SCAN_DRY_RUN_OVERRIDE = value
+
+
+def _effective_dry_run(cfg: Any) -> bool:
+    """r89: returns the snapshotted dry_run if a scan-now override is active,
+    else cfg.dry_run. Safe to call with cfg=None (returns override or False).
+    All consider_signal / consider_put_play / consider_call_play submit-paths
+    must consult this rather than reading cfg.dry_run directly."""
+    with _SCAN_DRY_RUN_LOCK:
+        ov = _SCAN_DRY_RUN_OVERRIDE
+    if ov is not None:
+        return bool(ov)
+    return bool(getattr(cfg, "dry_run", False)) if cfg is not None else False
+
 
 def is_killed_in_memory() -> bool:
     """r82 (B9): true if the in-memory KILL flag is set. Cheap to call from
@@ -4045,7 +4080,9 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         )
 
         # Dry-run: record the intended trade but don't actually submit.
-        if getattr(cfg, "dry_run", False):
+        # r89: use _effective_dry_run so scan-now snapshot survives mid-scan
+        # cfg flips (UNH leak 2026-05-12).
+        if _effective_dry_run(cfg):
             db.add(AutoTrade(
                 ticker=ticker, symbol=ticker, asset_type="stock", side="buy",
                 qty=qty, requested_entry=entry, stop_loss=stop, current_stop=stop,
@@ -4691,6 +4728,36 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 pass
             return None
+
+        # r89: dry-run gate for PUT play (previously MISSING — only consider_signal
+        # had a dry_run check; options paths submitted live regardless. Uses
+        # _effective_dry_run so scan-now snapshot survives mid-scan cfg flips.)
+        if _effective_dry_run(cfg):
+            try:
+                db.add(AutoTrade(
+                    ticker=ticker, symbol=occ, asset_type="option", side="buy",
+                    qty=qty, requested_entry=float(top["premium"]),
+                    stop_loss=float(thesis["stop_loss"]),
+                    current_stop=float(thesis["stop_loss"]),
+                    target1=float(thesis["target1"]),
+                    target2=float(thesis["target2"]),
+                    target3=float(thesis["target3"]) if thesis.get("target3") else None,
+                    level_index=0, status="closed_manual",
+                    note=(
+                        f"DRY-RUN PUT simulated entry @ {top['premium']} "
+                        f"(strike {top.get('strike')}, exp {top.get('expiration')})"
+                    ),
+                    closed_at=datetime.utcnow(),
+                ))
+                db.commit()
+            except Exception:
+                db.rollback()
+            logger.info(
+                f"AutoTrader DRY-RUN PUT {ticker} {occ} qty={qty} "
+                f"premium≈{top['premium']} (no broker submit)"
+            )
+            return None
+
         # r47 fix #T0c-1 / r85c: deterministic per-contract idempotency key.
         # Built BEFORE the broker submit (was r47-built AFTER, only the DB row
         # got it — so multi-instance scans could double-submit at the broker
@@ -5207,6 +5274,35 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 pass
             return None
+
+        # r89: dry-run gate for CALL play (mirror of put-side r89 fix — no
+        # dry_run check existed for options paths before r89.)
+        if _effective_dry_run(cfg):
+            try:
+                db.add(AutoTrade(
+                    ticker=ticker, symbol=occ, asset_type="option", side="buy",
+                    qty=qty, requested_entry=float(top["premium"]),
+                    stop_loss=float(thesis["stop_loss"]),
+                    current_stop=float(thesis["stop_loss"]),
+                    target1=float(thesis["target1"]),
+                    target2=float(thesis["target2"]),
+                    target3=float(thesis["target3"]) if thesis.get("target3") else None,
+                    level_index=0, status="closed_manual",
+                    note=(
+                        f"DRY-RUN CALL simulated entry @ {top['premium']} "
+                        f"(strike {top.get('strike')}, exp {top.get('expiration')})"
+                    ),
+                    closed_at=datetime.utcnow(),
+                ))
+                db.commit()
+            except Exception:
+                db.rollback()
+            logger.info(
+                f"AutoTrader DRY-RUN CALL {ticker} {occ} qty={qty} "
+                f"premium≈{top['premium']} (no broker submit)"
+            )
+            return None
+
         # r47 fix #T0c-1 / r85c: deterministic per-contract idempotency key
         # built BEFORE the broker submit (mirror of PUT path). See PUT for
         # full rationale.

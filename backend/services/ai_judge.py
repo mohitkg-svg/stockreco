@@ -333,6 +333,42 @@ def _wrap_external_data(label: str, payload: Any) -> str:
     )
 
 
+# r89: auth-failure circuit breaker. The 2026-05-12 incident saw the
+# ANTHROPIC_API_KEY rejected as 401 for the entire trading session — the
+# bot continued calling the API ~12 times in a 6-second window, generating
+# 100+ 401s/minute. This both spammed logs (burying real signal) and risks
+# tripping Anthropic abuse-detection on the project. The breaker counts
+# consecutive auth-flavoured failures and, after _AUTH_FAIL_THRESHOLD,
+# short-circuits all calls for _AUTH_BACKOFF_SEC without round-tripping.
+# Any non-auth response (success OR a different error class) resets the
+# counter immediately.
+_AUTH_FAIL_THRESHOLD = 3
+_AUTH_BACKOFF_SEC = 600  # 10 minutes
+_auth_fail_count = 0
+_auth_circuit_until = 0.0
+_auth_alert_sent_for_window = False
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    """Best-effort detection of Anthropic auth / key-rejection errors.
+    Matches by SDK exception class name AND by message text so this works
+    whether we caught an `anthropic.AuthenticationError` directly or it was
+    wrapped/stringified by another layer."""
+    try:
+        name = type(exc).__name__
+        if name in ("AuthenticationError", "PermissionDeniedError"):
+            return True
+        msg = str(exc).lower()
+        if "invalid x-api-key" in msg or "authentication_error" in msg:
+            return True
+        # SDK formats status into the message as "Error code: 401" etc.
+        if "error code: 401" in msg or "error code: 403" in msg:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _call_with_tool(
     system_prompt: str,
     user_prompt: str,
@@ -346,7 +382,16 @@ def _call_with_tool(
       * per-day budget check (`_ai_budget_check`) before any API call
       * one retry on malformed/no-tool-use response (free quality lift)
       * prompt-injection-resistant system prompt prefix
+    r89: auth-failure circuit breaker — see _is_auth_error / _AUTH_*.
     """
+    global _auth_fail_count, _auth_circuit_until, _auth_alert_sent_for_window
+
+    # r89: short-circuit if the auth breaker is open. No round-trip, no log
+    # noise. Fail-open semantics are preserved (None → caller abstains).
+    _now = time.time()
+    if _auth_circuit_until > _now:
+        return None
+
     if not _ai_budget_check():
         logger.warning(f"ai_judge: daily AI call cap {_AI_DAILY_CALL_CAP} reached; abstaining")
         return None
@@ -367,6 +412,7 @@ def _call_with_tool(
     full_system = safety_prefix + system_prompt
 
     def _try_once(extra_user: str = "") -> Optional[Dict[str, Any]]:
+        global _auth_fail_count, _auth_circuit_until, _auth_alert_sent_for_window
         try:
             resp = client.messages.create(
                 model=AI_JUDGE_MODEL,
@@ -379,8 +425,48 @@ def _call_with_tool(
                 timeout=timeout_sec,
             )
         except Exception as e:
-            logger.warning(f"ai_judge: API call failed ({type(e).__name__}: {e})")
+            # r89: auth-error breaker.
+            if _is_auth_error(e):
+                _auth_fail_count += 1
+                if _auth_fail_count >= _AUTH_FAIL_THRESHOLD:
+                    _auth_circuit_until = time.time() + _AUTH_BACKOFF_SEC
+                    if not _auth_alert_sent_for_window:
+                        _auth_alert_sent_for_window = True
+                        # One loud alert per open-circuit window — surfaces the
+                        # underlying config issue (key revoked / wrong) without
+                        # spamming the alerts channel.
+                        try:
+                            from services.alerts import alert as _ra
+                            _ra(
+                                "critical", "ai_judge_auth_failed",
+                                f"ai_judge: {_auth_fail_count} consecutive auth "
+                                f"failures from Anthropic (last: {type(e).__name__}: "
+                                f"{e}). Backing off {_AUTH_BACKOFF_SEC}s. AI veto "
+                                f"will abstain (fail-open) for the duration. "
+                                f"ROTATE ANTHROPIC_API_KEY in Cloud Run secrets.",
+                            )
+                        except Exception:
+                            pass
+                    logger.warning(
+                        f"ai_judge: auth failure ({_auth_fail_count}× consecutive); "
+                        f"circuit open for {_AUTH_BACKOFF_SEC}s: {e}"
+                    )
+                else:
+                    logger.warning(
+                        f"ai_judge: auth failure ({_auth_fail_count}/"
+                        f"{_AUTH_FAIL_THRESHOLD} before backoff): {e}"
+                    )
+            else:
+                # Non-auth error — reset the auth counter so a transient
+                # 401 followed by a non-auth blip doesn't accumulate.
+                _auth_fail_count = 0
+                logger.warning(f"ai_judge: API call failed ({type(e).__name__}: {e})")
             return None
+        # Successful round-trip → reset auth state.
+        if _auth_fail_count > 0 or _auth_alert_sent_for_window:
+            _auth_fail_count = 0
+            _auth_alert_sent_for_window = False
+            _auth_circuit_until = 0.0
         # r48 BACKLOG #observability-P1-15: record token usage for $ tracking.
         try:
             usage = getattr(resp, "usage", None)
@@ -405,7 +491,9 @@ def _call_with_tool(
     out = _try_once()
     if out is None:
         # r44 fix Wave 5: one retry with stricter prompt before abstaining.
-        out = _try_once("\n\nIMPORTANT: You MUST respond by calling the provided tool. Do not respond in plain text.")
+        # r89: skip the retry if the breaker just opened (no point).
+        if _auth_circuit_until <= time.time():
+            out = _try_once("\n\nIMPORTANT: You MUST respond by calling the provided tool. Do not respond in plain text.")
     return out
 
 

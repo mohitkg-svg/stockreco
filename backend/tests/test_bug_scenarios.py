@@ -2505,14 +2505,19 @@ class TestR77LiveMoneyP0Fixes(unittest.TestCase):
         flattened. Submit returning 'no error' means the order was
         accepted, not necessarily filled (broker reject post-submit,
         illiquid contract). Without verify, the trade is marked closed
-        while broker still shows the position open."""
+        while broker still shows the position open.
+        r89: widened block window after the verify path grew a 3-state
+        unknown/absent/present arm (Bug 2 fix for 2026-05-12 silent
+        close-fail). Also asserts the strict variant is used in the
+        verify branch since the legacy get_option_position collapses
+        API errors into None."""
         with open(os.path.join(os.path.dirname(__file__), "..",
                                "services", "execution_engine.py"), "r") as f:
             src = f.read()
         # Look in the option branch of force_close_trade.
         anchor = src.find("submit_option_exit_with_cross_fallback")
         self.assertGreater(anchor, 0)
-        block = src[anchor: anchor + 3000]
+        block = src[anchor: anchor + 6000]
         self.assertIn(
             "force_close_unverified", block,
             "force_close option branch missing post-submit position-poll "
@@ -2522,6 +2527,18 @@ class TestR77LiveMoneyP0Fixes(unittest.TestCase):
             "get_option_position", block,
             "force_close option branch must poll get_option_position to "
             "confirm residual qty is 0"
+        )
+        # r89: verify path must use the strict variant so 'API error'
+        # is no longer silently collapsed into residual_qty=0.
+        self.assertIn(
+            "get_option_position_strict", block,
+            "force_close option branch must use get_option_position_strict "
+            "so API errors are not collapsed into 'position absent'"
+        )
+        self.assertIn(
+            "force_close_verify_unknown", block,
+            "force_close option branch must fail-closed on 'unknown' position "
+            "state (the 2026-05-12 silent close-fail root cause)"
         )
 
     def test_alpaca_rest_reads_have_timeout_guard(self):
@@ -2708,6 +2725,217 @@ class TestR77LiveMoneyP0Fixes(unittest.TestCase):
             "stop/target reaction. Lock release should be immediate; "
             "manage_open_positions handles its own serialization."
         )
+
+    # ════════════════════════════════════════════════════════════════════
+    # r89 — Bug 1: dry_run snapshot at scan-start
+    # Bug 2: get_option_position fail-closed on API errors
+    # ════════════════════════════════════════════════════════════════════
+    def test_r89_effective_dry_run_helper_exists(self):
+        """r89 Bug 1: auto_trader must expose _effective_dry_run + the
+        _set_scan_dry_run_override sentinel so /auto/scan-now can pin
+        dry_run for the duration of a scan."""
+        from services import auto_trader as _at
+        self.assertTrue(
+            hasattr(_at, "_effective_dry_run"),
+            "_effective_dry_run helper missing — option/stock entry paths "
+            "cannot honor scan-start dry_run snapshot"
+        )
+        self.assertTrue(
+            hasattr(_at, "_set_scan_dry_run_override"),
+            "_set_scan_dry_run_override missing — /auto/scan-now cannot "
+            "pin dry_run"
+        )
+
+        # Override takes precedence over cfg.dry_run.
+        class _CfgLive: dry_run = False
+        cfg_live = _CfgLive()
+        self.assertFalse(_at._effective_dry_run(cfg_live))
+        _at._set_scan_dry_run_override(True)
+        try:
+            self.assertTrue(
+                _at._effective_dry_run(cfg_live),
+                "override=True must mask cfg.dry_run=False (the 2026-05-12 "
+                "UNH leak scenario: cfg flipped to live mid-scan)"
+            )
+            # cfg=None must still honor the override.
+            self.assertTrue(_at._effective_dry_run(None))
+        finally:
+            _at._set_scan_dry_run_override(None)
+
+        # After clear, override no longer applies — cfg wins again.
+        self.assertFalse(_at._effective_dry_run(cfg_live))
+
+        # override=False also pins; cfg.dry_run=True must be masked OFF.
+        class _CfgDry: dry_run = True
+        cfg_dry = _CfgDry()
+        self.assertTrue(_at._effective_dry_run(cfg_dry))
+        _at._set_scan_dry_run_override(False)
+        try:
+            self.assertFalse(
+                _at._effective_dry_run(cfg_dry),
+                "override=False must mask cfg.dry_run=True (operator "
+                "snapshotted live-scan must not silently dry-run if "
+                "cfg flipped to dry mid-scan)"
+            )
+        finally:
+            _at._set_scan_dry_run_override(None)
+
+    def test_r89_options_entry_paths_have_dry_run_gate(self):
+        """r89 Bug 1b: consider_put_play and consider_call_play previously
+        had NO dry_run check — only consider_signal (stock path) gated
+        on dry_run. With Bug 1, both option paths must consult
+        _effective_dry_run before invoking submit_option_entry_*."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "services", "auto_trader.py"), "r") as f:
+            src = f.read()
+
+        for fn_name in ("def consider_put_play", "def consider_call_play"):
+            anchor = src.find(fn_name)
+            self.assertGreater(anchor, 0, f"{fn_name} not found")
+            # Find the submit call that follows this function definition.
+            submit_idx = src.find("submit_option_entry_with_cross_fallback",
+                                  anchor)
+            self.assertGreater(submit_idx, 0,
+                               f"{fn_name} missing submit_option_entry call")
+            # Body between def-line and the submit must contain a
+            # _effective_dry_run check — i.e. the dry-run gate fires
+            # before any broker submission.
+            body = src[anchor:submit_idx]
+            self.assertIn(
+                "_effective_dry_run(cfg)", body,
+                f"{fn_name} missing dry-run gate before option submit — "
+                "operator flipping dry_run mid-scan would still fire live "
+                "option orders (the 2026-05-12 leak shape)"
+            )
+            # And the gate must actually return early (no broker submit).
+            self.assertIn(
+                "DRY-RUN", body,
+                f"{fn_name} dry-run gate present but appears not to short-"
+                "circuit — must record a DRY-RUN AutoTrade row and return"
+            )
+
+    def test_r89_scan_now_route_pins_dry_run(self):
+        """r89 Bug 1: routers/trading.py /auto/scan-now must snapshot
+        cfg.dry_run at scan-start and pin it via _set_scan_dry_run_override,
+        clearing in finally so cron scans aren't affected."""
+        with open(os.path.join(os.path.dirname(__file__), "..",
+                               "routers", "trading.py"), "r") as f:
+            src = f.read()
+        anchor = src.find("def auto_scan_now")
+        self.assertGreater(anchor, 0)
+        # Search a generous window past the route definition.
+        block = src[anchor: anchor + 3500]
+        self.assertIn(
+            "_set_scan_dry_run_override", block,
+            "/auto/scan-now must pin cfg.dry_run via _set_scan_dry_run_override"
+        )
+        # Must also clear (override=None) in finally — otherwise a single
+        # scan would permanently pin dry_run for subsequent cron scans.
+        self.assertIn(
+            "_set_scan_dry_run_override(None)", block,
+            "/auto/scan-now must clear the override (in finally) so cron "
+            "scans revert to reading cfg.dry_run live"
+        )
+        # The clear must be inside a finally block.
+        self.assertIn(
+            "finally:", block,
+            "/auto/scan-now override-clear must be inside finally so an "
+            "exception during scheduled_scan doesn't leak the override"
+        )
+
+    def test_r89_get_option_position_strict_three_states(self):
+        """r89 Bug 2: alpaca_client.get_option_position_strict must return
+        a 3-state response (absent/present/unknown) so verify-after-close
+        callers can fail-closed on API errors instead of silently treating
+        'API failure' as 'position is gone'. The 2026-05-12 silent close
+        of C260522C00135000 happened because get_option_position swallowed
+        the SDK exception and returned None — caller computed residual_qty=0
+        and marked the trade closed_manual while broker still held 11
+        contracts."""
+        from services import alpaca_client as _ac
+        self.assertTrue(
+            hasattr(_ac, "get_option_position_strict"),
+            "get_option_position_strict missing — verify-after-close paths "
+            "cannot distinguish 'no position' from 'API error'"
+        )
+        self.assertTrue(
+            hasattr(_ac, "_is_position_not_found_error"),
+            "_is_position_not_found_error helper missing — strict variant "
+            "needs a way to identify the 404 / 40410000 sentinel"
+        )
+
+        # Helper recognises the 404 / code 40410000 / textual signals.
+        class _ApiErr404(Exception):
+            status_code = 404
+        class _ApiErrCode(Exception):
+            code = 40410000
+        class _ApiErrText(Exception):
+            def __str__(self): return "position does not exist"
+        class _ApiErr5xx(Exception):
+            status_code = 503
+        class _NetworkErr(Exception):
+            def __str__(self): return "Connection reset by peer"
+
+        self.assertTrue(_ac._is_position_not_found_error(_ApiErr404()))
+        self.assertTrue(_ac._is_position_not_found_error(_ApiErrCode()))
+        self.assertTrue(_ac._is_position_not_found_error(_ApiErrText()))
+        self.assertFalse(
+            _ac._is_position_not_found_error(_ApiErr5xx()),
+            "5xx must NOT be classified as 'position absent' — that's the "
+            "fail-open shape that caused the 2026-05-12 orphan"
+        )
+        self.assertFalse(
+            _ac._is_position_not_found_error(_NetworkErr()),
+            "network errors must NOT be classified as 'position absent'"
+        )
+
+        # Strict variant on absent (404) returns state="absent".
+        with patch.object(_ac, "_get_client") as _gc:
+            class _C:
+                def get_open_position(self, sym):
+                    raise _ApiErr404()
+            _gc.return_value = _C()
+            r = _ac.get_option_position_strict("AAPL260516C00200000")
+            self.assertEqual(r["state"], "absent")
+            self.assertIsNone(r["data"])
+
+        # Strict variant on 5xx returns state="unknown" (NOT absent).
+        with patch.object(_ac, "_get_client") as _gc:
+            class _C:
+                def get_open_position(self, sym):
+                    raise _ApiErr5xx()
+            _gc.return_value = _C()
+            r = _ac.get_option_position_strict("AAPL260516C00200000")
+            self.assertEqual(
+                r["state"], "unknown",
+                "API 5xx must yield state='unknown' so force_close fails closed"
+            )
+
+        # Strict variant on present returns state="present" + data dict.
+        class _Pos:
+            symbol = "AAPL260516C00200000"
+            qty = "11"
+            avg_entry_price = "1.50"
+            current_price = "1.75"
+            market_value = "1925.00"
+            unrealized_pl = "275.00"
+        with patch.object(_ac, "_get_client") as _gc:
+            class _C:
+                def get_open_position(self, sym):
+                    return _Pos()
+            _gc.return_value = _C()
+            r = _ac.get_option_position_strict("AAPL260516C00200000")
+            self.assertEqual(r["state"], "present")
+            self.assertEqual(int(r["data"]["qty"]), 11)
+
+        # No client → state="unknown" (NOT absent) — fail-closed.
+        with patch.object(_ac, "_get_client", return_value=None):
+            r = _ac.get_option_position_strict("AAPL260516C00200000")
+            self.assertEqual(
+                r["state"], "unknown",
+                "client-not-initialized must yield unknown, not absent — "
+                "otherwise a startup race would mark every option closed"
+            )
 
 
 if __name__ == "__main__":

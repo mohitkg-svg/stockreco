@@ -378,13 +378,56 @@ def force_close_trade(
         # "closed_reverse" while broker still shows the position open;
         # next manage tick sees a position with no DB row → adopted +
         # operator confusion.
-        pos = alpaca_client.get_option_position(t.symbol)
+        # r89 fix: switched to get_option_position_strict — the previous
+        # call collapsed "API error" into None which silently became
+        # residual_qty=0 (2026-05-12 incident: /close at 03:30 ET with
+        # options market closed → SDK exception swallowed → trade marked
+        # closed_manual while broker still held 11 contracts).
+        pos_resp = alpaca_client.get_option_position_strict(t.symbol)
+        pos_state = pos_resp.get("state")
+        pos_data = pos_resp.get("data")
         residual_qty = 0
-        if pos:
+        if pos_state == "present":
             try:
-                residual_qty = abs(int(float(pos.get("qty") or 0)))
+                residual_qty = abs(int(float((pos_data or {}).get("qty") or 0)))
             except Exception:
                 residual_qty = 0
+        elif pos_state == "unknown":
+            # Brief retry window — option fills can take 2-5s post-submit and
+            # transient API errors often clear within a few seconds.
+            try:
+                import time as _t_settle
+                _t_settle.sleep(3.0)
+            except Exception:
+                pass
+            pos_resp = alpaca_client.get_option_position_strict(t.symbol)
+            pos_state = pos_resp.get("state")
+            pos_data = pos_resp.get("data")
+            if pos_state == "present":
+                try:
+                    residual_qty = abs(int(float((pos_data or {}).get("qty") or 0)))
+                except Exception:
+                    residual_qty = 0
+            elif pos_state == "unknown":
+                # Still unknown after retry — fail CLOSED. We don't know if the
+                # SELL filled or not; safest is to mark trade error and let
+                # the operator reconcile rather than mark closed_manual on a
+                # broker that may still hold the contracts.
+                from services.alerts import alert as _raise_alert
+                _raise_alert(
+                    "error", "force_close_verify_unknown",
+                    f"option close {t.symbol} submitted (no error) but broker "
+                    f"position state UNKNOWN after retry "
+                    f"(err={pos_resp.get('error')!r}); trade #{t.id} marked "
+                    f"error pending operator intervention",
+                    ticker=t.ticker, trade_id=t.id,
+                )
+                t.status = "error"
+                t.note = (t.note or "") + (
+                    f" | FORCE_CLOSE_VERIFY_UNKNOWN: {pos_resp.get('error')}"
+                )
+                db.commit()
+                return
         if residual_qty > 0:
             # Brief settle window — option fills can take 2-5s post-submit.
             try:
@@ -392,11 +435,18 @@ def force_close_trade(
                 _t_settle.sleep(3.0)
             except Exception:
                 pass
-            pos = alpaca_client.get_option_position(t.symbol)
-            try:
-                residual_qty = abs(int(float((pos or {}).get("qty") or 0)))
-            except Exception:
+            pos_resp = alpaca_client.get_option_position_strict(t.symbol)
+            pos_state = pos_resp.get("state")
+            pos_data = pos_resp.get("data")
+            if pos_state == "present":
+                try:
+                    residual_qty = abs(int(float((pos_data or {}).get("qty") or 0)))
+                except Exception:
+                    residual_qty = 0
+            elif pos_state == "absent":
                 residual_qty = 0
+            # If unknown after retry, keep prior residual_qty (>0) so we fail
+            # closed via the residual_qty>0 branch below.
         if residual_qty > 0:
             from services.alerts import alert as _raise_alert
             _raise_alert(
@@ -412,10 +462,10 @@ def force_close_trade(
             )
             db.commit()
             return
-        if pos and pos.get("current_price") is not None and t.entry_price:
+        if pos_data and pos_data.get("current_price") is not None and t.entry_price:
             # r48 BACKLOG #concurrency-P1-11: atomic SQL accumulator (option side).
             atomic_accumulate_realized_pl(
-                db, t.id, (pos["current_price"] - t.entry_price) * t.qty * 100
+                db, t.id, (pos_data["current_price"] - t.entry_price) * t.qty * 100
             )
             db.refresh(t)
 

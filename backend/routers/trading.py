@@ -1099,20 +1099,57 @@ def auto_scan_now():
 
     Returns the scheduled_scan summary (tickers scanned, entries opened,
     skip-counter deltas).
+
+    r89: snapshots cfg.dry_run at scan-start and pins it for the duration
+    of the scan via `_set_scan_dry_run_override`. Prevents the 2026-05-12
+    UNH leak: operator flipped dry_run=False mid-scan and a ticker that
+    evaluated after the flip fired a live BRACKET. With the override,
+    every ticker in the scan-now invocation sees the same dry_run value
+    regardless of mid-scan cfg writes.
     """
     logger.warning("ADMIN /auto/scan-now invoked")
     import time as _t_sn
     from main import scheduled_scan as _ss, _app_health as _ah
+
+    # r89: snapshot cfg.dry_run at scan-start.
+    from database import SessionLocal as _SL_dr, AutoTraderConfig as _ATC_dr
+    _scan_dry_run_snapshot: Optional[bool] = None
+    _db_snap = _SL_dr()
+    try:
+        _cfg_snap = _db_snap.query(_ATC_dr).filter(_ATC_dr.id == 1).first()
+        if _cfg_snap is not None:
+            _scan_dry_run_snapshot = bool(getattr(_cfg_snap, "dry_run", False))
+    except Exception as _se:
+        logger.warning(f"/auto/scan-now: could not snapshot dry_run ({_se!r}); proceeding without override")
+    finally:
+        try:
+            _db_snap.close()
+        except Exception:
+            pass
+
+    if _scan_dry_run_snapshot is not None:
+        auto_trader._set_scan_dry_run_override(_scan_dry_run_snapshot)
+        logger.info(f"/auto/scan-now: pinned dry_run={_scan_dry_run_snapshot} for scan duration (r89)")
+
     started = _t_sn.time()
     try:
         _ss()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"scan failed: {e}")
+    finally:
+        # r89: always clear, even on exception, so subsequent cron scans
+        # and entry-paths revert to live cfg.dry_run reads.
+        if _scan_dry_run_snapshot is not None:
+            try:
+                auto_trader._set_scan_dry_run_override(None)
+            except Exception:
+                pass
     elapsed = round(_t_sn.time() - started, 2)
     return {
         "ok": True,
         "elapsed_sec": elapsed,
         "last_scan_at": _ah.get("last_scan_at"),
+        "dry_run_pinned": _scan_dry_run_snapshot,
     }
 
 
