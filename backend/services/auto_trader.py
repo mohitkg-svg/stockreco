@@ -1026,11 +1026,25 @@ def _session_start_utc() -> datetime:
     return anchor_utc
 
 
+class RealizedPnlUnavailable(Exception):
+    """Raised by realized_pnl_today() when the DB read fails so the
+    daily-loss gate at the call site can FAIL-SAFE (refuse new entries)
+    instead of silently treating an unknown PnL as 0.0 and waving the
+    gate open. r87 — discovered during 2026-05-11 rehearsal where DB
+    pool exhaustion produced 7 × `realized_pnl_today failed: QueuePool
+    limit reached` and the gate downstream would have happily kept
+    entering trades on a starved DB during a real session."""
+
+
 def realized_pnl_today() -> float:
     """Sum of realized_pl on auto-trades closed since 00:00 ET today
     (r53 — was 9:30 ET session-start, which let after-hours and
     pre-market losses momentarily evade the daily-loss gate). Used by
-    the daily-loss gate and surfaced on /api/health for observability."""
+    the daily-loss gate and surfaced on /api/health for observability.
+
+    Raises RealizedPnlUnavailable on DB error so the gate caller can
+    decide whether to fail-safe (refuse entries) — never returns a
+    silent 0.0 (r87)."""
     db = SessionLocal()
     try:
         rows = db.query(AutoTrade).filter(
@@ -1040,7 +1054,7 @@ def realized_pnl_today() -> float:
         return float(sum((r.realized_pl or 0.0) for r in rows))
     except Exception as e:
         logger.warning(f"realized_pnl_today failed: {e}")
-        return 0.0
+        raise RealizedPnlUnavailable(str(e)) from e
     finally:
         db.close()
 
@@ -2759,7 +2773,24 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             dll = _dll_dyn(static_pct=dll_static)
             _acct_probe = alpaca_client.get_account()
             _equity_probe = float(_acct_probe["equity"]) if _acct_probe else 0.0
-            _rpnl = realized_pnl_today()
+            # r87 fail-safe: if realized PnL is unknown (DB pool starved),
+            # refuse new entries. The 2026-05-11 rehearsal showed the prior
+            # silent-0.0 fallback would have let the bot keep buying through
+            # a starved DB while accumulated losses were invisible to the
+            # gate. Better to skip one signal than to disable the kill.
+            try:
+                _rpnl = realized_pnl_today()
+            except RealizedPnlUnavailable as _rpe:
+                _gate_record("daily_loss_halt", "fail",
+                             reason="realized_pnl_unavailable",
+                             formula=f"realized_pnl_today() raised ({_rpe}) → refuse entry (fail-safe)")
+                logger.warning(
+                    f"AutoTrader skip {signal.get('ticker')}: realized_pnl_today unavailable "
+                    f"({_rpe}) — failing safe on daily-loss gate"
+                )
+                metrics.inc("autotrade_event", event="daily_loss_unknown")
+                metrics.inc("autotrade_skip", reason="realized_pnl_unavailable")
+                return None
             _unr = 0.0
             try:
                 _open_pos = alpaca_client.get_positions() or []

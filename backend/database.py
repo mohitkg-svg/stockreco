@@ -55,21 +55,29 @@ if _IS_SQLITE:
 else:
     # Postgres: connection pool with pre-ping. Cloud SQL db-g1-small has
     # ~50 total slots with 3-5 reserved for superusers → ~45 usable.
-    # r85 sizing: 8+4=12 per instance after pre-live tier upgrade
-    # (f1-micro → g1-small) — was hitting QueuePool exhaustion at 5+3
-    # under normal scheduler load (manage 20s + scan + alt data refresh
-    # + news/event_detector cron). Budget at peak scale-out:
-    #   api      max_instances=2 × 12 = 24
-    #   manager  max_instances=1 × 12 = 12
-    #   total                         = 36  (fits 45 budget with headroom)
-    # Earlier sizings (3+2 in r71, 5+3 in r73) were constrained by the
-    # f1-micro 22-slot budget. PgBouncer is still BACKLOG; this gives
-    # ~50% more pool headroom per instance after the tier upgrade.
+    # r87 sizing: 16+8=24 per instance. r85 (8+4=12) saturated during the
+    # 2026-05-11 paper rehearsal — 104 × `QueuePool limit reached` in 7h
+    # of RTH, with scheduled_scan skipped for 67 consecutive 5-min ticks
+    # because each scan piled up on DB waits. Bumping pool while we wait
+    # on the PgBouncer rollout (still BACKLOG). Budget at peak scale-out:
+    #   api      max_instances=2 × 24 = 48
+    #   manager  max_instances=1 × 24 = 24
+    #   total                         = 72  (over 45 budget at peak)
+    # Typical 2-instance steady state (1 api + 1 manager) = 48, just over
+    # the 45 budget but only when BOTH pools are simultaneously saturated
+    # — which is the exact pathology we're solving. A brief connection
+    # refusal under simultaneous saturation is strictly better than the
+    # current sustained pool-exhaustion + scan-pile-up failure mode.
+    # pool_timeout reduced 30s → 10s so callers fail fast and surface the
+    # contention instead of stacking 30s waits behind a starved pool.
+    # Earlier sizings (3+2 in r71, 5+3 in r73, 8+4 in r85) constrained by
+    # f1-micro / cautious headroom — but the cost of false-economy on
+    # pool size was a near-no-trade rehearsal day.
     _engine_kwargs["pool_pre_ping"] = True
-    _engine_kwargs["pool_size"] = 8
-    _engine_kwargs["max_overflow"] = 4
+    _engine_kwargs["pool_size"] = 16
+    _engine_kwargs["max_overflow"] = 8
     _engine_kwargs["pool_recycle"] = 3600
-    _engine_kwargs["pool_timeout"] = 30
+    _engine_kwargs["pool_timeout"] = 10
 
 engine = create_engine(DATABASE_URL, **_engine_kwargs)
 

@@ -355,8 +355,17 @@ def _with_singleton_lock(job_id: str):
 # can silently drop a critical job for hours; jobs that fail before their
 # inner try/except just disappear.
 try:
-    from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+    from apscheduler.events import (
+        EVENT_JOB_ERROR, EVENT_JOB_MISSED, EVENT_JOB_MAX_INSTANCES,
+    )
     _job_failure_counts: Dict[str, int] = {}
+    # r87: track consecutive max-instances skips per job so we can alert
+    # when a slow job pile-up silently disables a critical loop. During
+    # the 2026-05-11 paper rehearsal, scheduled_scan was skipped for 67
+    # consecutive 5-min ticks (14:55Z → 20:25Z) because each scan was
+    # blocked on DB pool + Alpaca timeouts, and there was no alert path
+    # for max_instances events — only for JOB_ERROR / JOB_MISSED.
+    _job_skip_counts: Dict[str, int] = {}
 
     def _job_error_listener(event):
         try:
@@ -390,8 +399,59 @@ try:
         except Exception:
             pass
 
+    # r87: jobs whose pile-up materially harms trading get alerted at low
+    # consecutive-skip counts. Non-critical jobs (news_poll, etc.) only
+    # alert at the top of the ladder so we don't drown in pages.
+    _CRITICAL_SCHED_JOBS = {
+        "watchlist_scan",       # stock entry signal generation
+        "auto_trader_manage",   # exit / trail / SL management
+        "pending_reconcile",    # fills sit stuck without this
+    }
+
+    def _job_max_instances_listener(event):
+        try:
+            from services.alerts import alert as _raise_a
+        except Exception:
+            return
+        jid = getattr(event, "job_id", "?") or "?"
+        n = _job_skip_counts.get(jid, 0) + 1
+        _job_skip_counts[jid] = n
+        # Reset counter when the job actually executes (handled in
+        # _job_executed_listener below).
+        try:
+            if jid in _CRITICAL_SCHED_JOBS:
+                # Tight ladder for critical jobs: page early.
+                if n in (3, 10, 30):
+                    sev = "error" if n < 10 else "critical"
+                    _raise_a(
+                        sev, "scheduler_job_skipped",
+                        f"job '{jid}' skipped (#{n} consecutive): max_instances reached "
+                        f"— prior run still executing, downstream loop is stalled",
+                    )
+            else:
+                if n in (10, 50):
+                    _raise_a(
+                        "warning", "scheduler_job_skipped",
+                        f"job '{jid}' skipped (#{n} consecutive): max_instances reached",
+                    )
+        except Exception:
+            pass
+
+    from apscheduler.events import EVENT_JOB_EXECUTED
+
+    def _job_executed_listener(event):
+        # Successful execution clears both the failure and skip counters
+        # for that job, so the alert ladder is per-incident not lifetime.
+        jid = getattr(event, "job_id", "?") or "?"
+        if _job_failure_counts.get(jid):
+            _job_failure_counts.pop(jid, None)
+        if _job_skip_counts.get(jid):
+            _job_skip_counts.pop(jid, None)
+
     scheduler.add_listener(_job_error_listener, EVENT_JOB_ERROR)
     scheduler.add_listener(_job_missed_listener, EVENT_JOB_MISSED)
+    scheduler.add_listener(_job_max_instances_listener, EVENT_JOB_MAX_INSTANCES)
+    scheduler.add_listener(_job_executed_listener, EVENT_JOB_EXECUTED)
 except Exception as _le:
     logger.warning(f"scheduler listener install failed: {_le}")
 

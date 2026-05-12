@@ -56,8 +56,12 @@ def is_enabled() -> bool:
 # bad packet doesn't paralyze the bot.
 import concurrent.futures as _cf  # noqa: E402
 
-_REST_TIMEOUT_SEC = 5.0
-_REST_RETRIES = 1
+_REST_TIMEOUT_SEC = 8.0   # r87: 5.0 → 8.0 after 2026-05-11 rehearsal showed
+                          # 220 × `get_account timed out after 5.0s` in one
+                          # session — Alpaca REST p99 routinely exceeds 5s.
+_REST_RETRIES = 2         # r87: 1 → 2 retries (3 attempts total) so a single
+                          # transient stall doesn't immediately propagate as
+                          # a None and disable downstream gates.
 _REST_BACKOFF_SEC = 0.4
 
 # Persistent daemon-thread executor: a `with ThreadPoolExecutor()` block
@@ -163,7 +167,7 @@ def is_market_open() -> bool:
         # r80 round-2: wrap with timeout. A network stall on /v2/clock
         # would otherwise hold _market_clock_inflight clear() forever
         # and block every subsequent caller's wait(timeout=5).
-        clk = _safe_rest_read(c.get_clock, timeout=3.0)
+        clk = _safe_rest_read(c.get_clock, timeout=6.0)  # r87: 3.0 → 6.0
         is_open = bool(clk.is_open) if clk is not None else False
     except Exception as e:
         logger.warning(f"get_clock failed: {e}")
@@ -189,7 +193,7 @@ def minutes_to_close() -> Optional[float]:
     try:
         # r80c: timeout-wrap. A network stall on /v2/clock used to
         # block promote_adopted + EOD-flatten paths indefinitely.
-        clk = _safe_rest_read(c.get_clock, timeout=3.0)
+        clk = _safe_rest_read(c.get_clock, timeout=6.0)  # r87: 3.0 → 6.0
         if clk is None or not clk.is_open:
             return None
         import datetime as _dt
@@ -213,7 +217,7 @@ def minutes_since_open() -> Optional[float]:
         return None
     try:
         # r80c: timeout-wrap.
-        clk = _safe_rest_read(c.get_clock, timeout=3.0)
+        clk = _safe_rest_read(c.get_clock, timeout=6.0)  # r87: 3.0 → 6.0
         if clk is None or not clk.is_open:
             return None
         import datetime as _dt
@@ -233,14 +237,52 @@ def minutes_since_open() -> Optional[float]:
         return None
 
 
-def get_account() -> Optional[Dict[str, Any]]:
+# r87: account snapshot cache. The 2026-05-11 rehearsal hit `get_account
+# timed out after 5.0s` 156 times + `get_account failed` 64 times — because
+# every consider_signal preflight, every risk_manager gate, and the EquitySnapshot
+# job all call get_account() independently. With 5-10 signals per scan tick and
+# 5 gates per signal, that's dozens of get_account() calls per minute, each
+# costing up to 8s × 3 retries on a wedged broker connection. Cache for 10s
+# so per-tick gates share one round-trip. TTL kept short so values stay fresh
+# for daily-loss / equity gates that care about realized PnL movement.
+_account_cache: Optional[tuple] = None  # (snapshot: dict, expiry_ts: float)
+_account_cache_lock = _pt_threading.Lock()
+_ACCOUNT_CACHE_TTL_SEC = 10.0
+
+
+def _account_cache_clear() -> None:
+    """Force-clear the account cache. Call after order submits / fills when
+    the caller needs an up-to-the-moment buying_power read."""
+    global _account_cache
+    with _account_cache_lock:
+        _account_cache = None
+
+
+def get_account(force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+    global _account_cache
+    import time as _t
+    if not force_refresh:
+        with _account_cache_lock:
+            if _account_cache and _t.time() < _account_cache[1]:
+                return dict(_account_cache[0])
     c = _get_client()
     if not c:
         return None
     try:
         # r80: timeout + retry guard.
         a = _safe_rest_read(c.get_account)
-        return {
+        if a is None:
+            # Timed out across retries — keep returning the stale snapshot
+            # if we have one, so the gates don't all fail open on a transient
+            # broker stall. Caller can call force_refresh=True if they need
+            # certainty.
+            with _account_cache_lock:
+                if _account_cache:
+                    logger.warning("get_account: REST returned None, serving stale cache")
+                    return dict(_account_cache[0])
+            logger.error("get_account: REST returned None and no cache available")
+            return None
+        snap = {
             "account_number": a.account_number,
             "status": str(a.status),
             "cash": float(a.cash),
@@ -260,8 +302,18 @@ def get_account() -> Optional[Dict[str, Any]]:
             "day_trade_count": int(getattr(a, "daytrade_count", 0) or 0),
             "paper": os.getenv("ALPACA_LIVE", "0") != "1",
         }
+        with _account_cache_lock:
+            _account_cache = (snap, _t.time() + _ACCOUNT_CACHE_TTL_SEC)
+        return dict(snap)
     except Exception as e:
         logger.error(f"get_account failed: {e}")
+        # r87: if we have a stale cache, prefer it over None so downstream
+        # gates evaluate (with a stale equity reading) rather than fail
+        # open by hitting `_acct_probe is None → _equity_probe = 0`.
+        with _account_cache_lock:
+            if _account_cache:
+                logger.warning("get_account: exception, serving stale cache")
+                return dict(_account_cache[0])
         return None
 
 
@@ -428,6 +480,11 @@ def submit_bracket_order(
         else:
             req = MarketOrderRequest(**common_kwargs)
         o = c.submit_order(order_data=req)
+        # r87: invalidate account snapshot cache so the next gate read picks
+        # up the post-submit buying_power immediately. Without this, the
+        # 10s TTL could let the next signal's pos-sizer believe we still
+        # have full BP and over-leverage.
+        _account_cache_clear()
         return {
             "id": str(o.id),
             "symbol": o.symbol,
@@ -642,6 +699,8 @@ def submit_simple_option_order(
         else:
             req = MarketOrderRequest(**common)
         o = c.submit_order(order_data=req)
+        # r87: invalidate account cache post-submit (see submit_bracket_order).
+        _account_cache_clear()
         return {
             "id": str(o.id),
             "symbol": o.symbol,
