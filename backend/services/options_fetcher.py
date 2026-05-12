@@ -231,7 +231,7 @@ def _fetch_yahoo_chain(ticker: str, expiration: Optional[int] = None) -> Optiona
         params = {"crumb": crumb}
         if expiration:
             params["date"] = expiration
-        resp = sess.get(url, params=params, timeout=15)
+        resp = sess.get(url, params=params, timeout=5)
         if resp.status_code != 200:
             logger.warning(f"Yahoo options API {resp.status_code} for {ticker}")
             return None
@@ -269,8 +269,11 @@ def _fetch_polygon_chain(ticker: str) -> Optional[Dict[str, Any]]:
     try:
         # Polygon paginates snapshots. 15 pages × 250 = ~3750 contracts,
         # ample for most liquid names without unbounded loops.
+        # r89 timeout cut 15s→5s: at 28 tickers × 15 pages a single hung
+        # request used to be able to blow past the 5-min cron tick and
+        # trigger scheduler_job_skipped alerts on watchlist_scan.
         for _ in range(15):
-            resp = sess.get(next_url, timeout=15)
+            resp = sess.get(next_url, timeout=5)
             if resp.status_code != 200:
                 logger.warning(f"Polygon options API returned {resp.status_code} for {ticker}")
                 break

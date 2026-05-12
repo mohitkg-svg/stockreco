@@ -530,8 +530,25 @@ async def _news_worker():
                 sub_reply = json.loads(await ws.recv())
                 
                 if not sub_reply or sub_reply[0].get("T") != "subscription":
-                    logger.warning(f"news-stream subscribe failed: {sub_reply}")
-                    await asyncio.sleep(backoff)
+                    # r89: detect Alpaca's "connection limit exceeded" (code 406)
+                    # and back off hard. Otherwise two Cloud Run instances briefly
+                    # overlapping during a deploy/scale-up trigger a 5s reconnect
+                    # storm that fills logs with WARN-level noise. 5min wait
+                    # gives the sibling instance time to fully drain.
+                    _err = sub_reply[0] if sub_reply else {}
+                    _is_conn_limit = (
+                        _err.get("T") == "error"
+                        and (_err.get("code") == 406 or "connection limit" in str(_err.get("msg", "")).lower())
+                    )
+                    if _is_conn_limit:
+                        logger.warning(
+                            "news-stream: connection limit exceeded — backing off 300s "
+                            "(another instance likely holds the slot)"
+                        )
+                        await asyncio.sleep(300)
+                    else:
+                        logger.warning(f"news-stream subscribe failed: {sub_reply}")
+                        await asyncio.sleep(backoff)
                     continue
 
                 logger.info("news-stream: connected, subscribed to '*' via raw WebSocket")

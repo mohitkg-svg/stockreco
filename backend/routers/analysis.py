@@ -298,7 +298,13 @@ def _run_analysis_for_ticker(ticker: str, db: Session) -> List[dict]:
             except Exception as e:
                 logger.warning(f"auto_trader hook error on {ticker} {tf}: {e}")
         except Exception as e:
-            logger.error(f"Error analyzing {ticker} {tf}: {e}")
+            # r89: include traceback so root-cause is grep-able. Previously we
+            # only logged the message ("index 14 out of bounds…") with no clue
+            # to which call raised — GEV 1mo took days to trace.
+            import traceback as _tb
+            logger.error(
+                f"Error analyzing {ticker} {tf}: {e}\n{_tb.format_exc()}"
+            )
             db.rollback()  # drop any half-built state so the next iteration starts clean
     # After all timeframes are scored: if NONE are a strong BUY, hunt put-plays.
     try:
