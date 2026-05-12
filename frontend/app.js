@@ -4410,19 +4410,20 @@ function AutoTraderPanel({ reloadToken }) {
                 </div>
               </div>
             </label>
-            {/* r60: Universe source selector */}
+            {/* r60: Universe source selector. r88: "Watchlist" option added & defaulted. */}
             <div className="ml-6 flex items-center gap-2 text-xs">
               <label className="app-text-muted">Universe source:</label>
               <select
-                value={cfg.universe_source ?? 'russell1000'}
+                value={cfg.universe_source ?? 'watchlist'}
                 onChange={e => updateCfg({ universe_source: e.target.value })}
                 className="bg-gray-900 border border-gray-700 rounded px-2 py-1 text-xs"
               >
+                <option value="watchlist">Watchlist only (operator-curated)</option>
                 <option value="russell1000">Russell 1000 (~611 names)</option>
                 <option value="sp500">S&amp;P 500 (~500 names)</option>
               </select>
               <span className="text-[10px] app-text-muted">
-                R1000 includes mid-caps; SP500 is the institutional default (cleaner / narrower).
+                Watchlist = scope-restrict to your curated tickers (r88 default). R1000 / SP500 widen scope to the bundled index file.
               </span>
             </div>
             {/* r60: Ticker blacklist */}
