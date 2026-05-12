@@ -59,8 +59,16 @@ def _bundled_universe_path(name: str = "russell1000") -> str:
 def _read_universe_file() -> Optional[List[str]]:
     """Read the active universe file. Resolution order:
       1. STOCK_UNIVERSE_FILE env var (operator override)
-      2. cfg.universe_source ("russell1000" or "sp500") → bundled file
-      3. Default: russell1000.txt
+      2. cfg.universe_source:
+           - "watchlist" → query `watchlist` table (r88; new default)
+           - "russell1000" / "sp500" → bundled file
+      3. Default: watchlist (r88; was russell1000.txt pre-r88)
+
+    Note: when source is "watchlist", the candidate-pool universe is just
+    the operator-curated watchlist. Combined with the watchlist tickers
+    that scheduled_scan already iterates, the union is a no-op — but the
+    consumer code path is preserved so `pull_universe()` and downstream
+    scoring still work without branching.
     """
     path = os.getenv("STOCK_UNIVERSE_FILE")
     if not path:
@@ -70,11 +78,26 @@ def _read_universe_file() -> Optional[List[str]]:
             _db = SessionLocal()
             try:
                 cfg = _db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
-                source = (getattr(cfg, "universe_source", None) or "russell1000") if cfg else "russell1000"
+                source = (getattr(cfg, "universe_source", None) or "watchlist") if cfg else "watchlist"
             finally:
                 _db.close()
         except Exception:
-            source = "russell1000"
+            source = "watchlist"
+        # r88: "watchlist" source pulls directly from the watchlist table
+        # rather than a bundled file.
+        if source == "watchlist":
+            try:
+                from database import SessionLocal as _SL_wl, WatchlistStock as _WS_wl
+                _wdb = _SL_wl()
+                try:
+                    rows = _wdb.query(_WS_wl).all()
+                    tickers = [r.ticker.upper() for r in rows if r.ticker and _TICKER_RE.match(r.ticker.upper())]
+                    return tickers or None
+                finally:
+                    _wdb.close()
+            except Exception as e:
+                logger.warning(f"scanner: watchlist universe read failed: {e}")
+                return None
         path = _bundled_universe_path(source)
     try:
         tickers: List[str] = []

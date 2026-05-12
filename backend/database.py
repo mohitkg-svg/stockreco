@@ -203,6 +203,13 @@ class AutoTraderConfig(Base):
     # When true, auto-trader scans the union of watchlist + candidate_pool
     # (top-N tickers from universe scanner). When false, watchlist only.
     use_universe_scanner = Column(Boolean, default=False)
+    # r88: hard scope-restrict to watchlist tickers. When true, blocks ANY
+    # entry whose ticker is not currently a row in `watchlist` — overrides
+    # use_universe_scanner, event-driven candidates, and direct API calls.
+    # Gated in consider_signal / consider_put_play / consider_call_play so
+    # every entry path funnels through it. Default false (preserves prior
+    # behavior — universe scanner + events still allowed when enabled).
+    watchlist_only = Column(Boolean, default=False)
     # How many candidates the scanner keeps in the pool.
     universe_top_n = Column(Integer, default=30)
     # CSV of ticker symbols to never auto-trade (stock or options). Applied
@@ -346,7 +353,10 @@ class AutoTraderConfig(Base):
     # r60: scanner universe source. "russell1000" (~611 names, default) or
     # "sp500" (~500 names, S&P 500 only — narrower / higher quality).
     # Read by services.scanner._read_universe_file.
-    universe_source = Column(String, default="russell1000")
+    # r88: "watchlist" is the new default — restricts trading universe to
+    # operator-curated watchlist tickers only. "russell1000" / "sp500"
+    # widen scope to the bundled index file (paired with use_universe_scanner).
+    universe_source = Column(String, default="watchlist")
     # r68-A: equity-snapshot freshness watchdog. Auto-trader rejects entries
     # when the most recent EquitySnapshot row is older than this many minutes
     # (during RTH only). Prevents trading at full size when reconciliation
@@ -1235,6 +1245,7 @@ def create_tables():
     _ensure_column("fundamentals", "short_ratio", "FLOAT")
     _ensure_column("auto_trader_config", "entry_order_type", "VARCHAR DEFAULT 'market'")
     _ensure_column("auto_trader_config", "use_universe_scanner", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "watchlist_only", "BOOLEAN DEFAULT FALSE")
     _ensure_column("auto_trader_config", "universe_top_n", "INTEGER DEFAULT 30")
     _ensure_column("auto_trader_config", "ticker_blacklist", "VARCHAR DEFAULT ''")
     _ensure_column("auto_trades", "original_qty", "DOUBLE PRECISION")
@@ -1298,7 +1309,9 @@ def create_tables():
     _ensure_column("auto_trader_config", "option_contract_min_score", "DOUBLE PRECISION DEFAULT 65.0")
     _ensure_column("auto_trader_config", "option_contract_min_score_aggressive", "DOUBLE PRECISION DEFAULT 55.0")
     # r60: universe-source toggle (russell1000 | sp500)
-    _ensure_column("auto_trader_config", "universe_source", "VARCHAR DEFAULT 'russell1000'")
+    # r88: new rows default to "watchlist" (operator-curated only). Existing
+    # rows keep whatever they have — DDL DEFAULT applies only to NEW inserts.
+    _ensure_column("auto_trader_config", "universe_source", "VARCHAR DEFAULT 'watchlist'")
     # r68: equity-snapshot freshness watchdog and setup_quality composite gate
     _ensure_column("auto_trader_config", "equity_snapshot_max_age_min", "DOUBLE PRECISION DEFAULT 15.0")
     _ensure_column("auto_trader_config", "setup_quality_min", "DOUBLE PRECISION DEFAULT 55.0")

@@ -913,6 +913,50 @@ def is_blacklisted(ticker: str, cfg: Optional[Any] = None) -> bool:
     return any(ticker == s.strip() for s in bl.split(",") if s.strip())
 
 
+def blocked_by_watchlist_only(ticker: str, cfg: Optional[Any] = None) -> bool:
+    """r88: True if the active config scope-restricts to watchlist tickers
+    AND `ticker` is not a row in the watchlist. The scope-restrict condition
+    fires when EITHER `cfg.watchlist_only` is true OR `cfg.universe_source`
+    is "watchlist" (the r88 default). Mirrors `is_blacklisted` signature —
+    safe to call with cfg=None (opens its own session). Returns False
+    (allow) when neither knob restricts scope, when no config row exists,
+    or when the ticker is in the watchlist. Per-ticker `auto_trade_enabled`
+    is intentionally NOT checked here; existing downstream gates cover that.
+    Fail-open on DB error so a pool hiccup doesn't silently freeze all
+    entries."""
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return False
+    db = None
+    try:
+        if cfg is None:
+            db = SessionLocal()
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+        if not cfg:
+            return False
+        _wl_only = bool(getattr(cfg, "watchlist_only", False))
+        _src = (getattr(cfg, "universe_source", None) or "").lower()
+        if not _wl_only and _src != "watchlist":
+            return False
+        local = db or SessionLocal()
+        try:
+            from database import WatchlistStock as _WS
+            row = local.query(_WS).filter(_WS.ticker == ticker).first()
+            return row is None
+        finally:
+            if local is not db:
+                local.close()
+    except Exception as e:
+        logger.warning(f"blocked_by_watchlist_only({ticker}) fail-open: {e}")
+        return False
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 def get_config(db: Session) -> AutoTraderConfig:
     cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
     if not cfg:
@@ -939,6 +983,7 @@ def get_config_dict() -> Dict[str, Any]:
             "aggressive_options_mode": bool(getattr(cfg, "aggressive_options_mode", False)),
             "entry_order_type": getattr(cfg, "entry_order_type", "market") or "market",
             "use_universe_scanner": bool(getattr(cfg, "use_universe_scanner", False)),
+            "watchlist_only": bool(getattr(cfg, "watchlist_only", False)),
             "universe_top_n": int(getattr(cfg, "universe_top_n", 30) or 30),
             "ticker_blacklist": (getattr(cfg, "ticker_blacklist", "") or ""),
             "signal_timeframes": cfg.signal_timeframes or "1h,4h,1d",
@@ -2483,6 +2528,18 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                      ticker=ticker,
                      formula=f"{ticker} is in cfg.ticker_blacklist")
         metrics.inc("autotrade_skip", reason="ticker_blacklisted")
+        return None
+
+    # r88: watchlist-only scope gate. When cfg.watchlist_only is true,
+    # reject any ticker that isn't in the watchlist table. Placed right
+    # after blacklist so events / scanner pool / direct API calls all
+    # funnel through it.
+    if blocked_by_watchlist_only(ticker):
+        logger.info(f"AutoTrader skip {ticker}: watchlist_only=true and ticker not in watchlist")
+        _gate_record("watchlist_only", "fail",
+                     ticker=ticker,
+                     formula=f"cfg.watchlist_only=true AND {ticker} ∉ watchlist → reject")
+        metrics.inc("autotrade_skip", reason="watchlist_only")
         return None
 
     # Basic filters before heavy I/O or locking.
@@ -4336,6 +4393,14 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             metrics.inc("autotrade_skip", reason="ticker_blacklisted")
             return None
 
+        # r88: watchlist-only scope gate (put-play path).
+        if blocked_by_watchlist_only(ticker, cfg):
+            _gate_record("watchlist_only", "fail",
+                         ticker=ticker,
+                         formula=f"cfg.watchlist_only=true AND {ticker} ∉ watchlist → reject")
+            metrics.inc("autotrade_skip", reason="watchlist_only")
+            return None
+
         # Macro release blackout — options-strict (1.5× window) to account for
         # IV crush and gamma whipsaw around CPI/NFP/FOMC releases.
         try:
@@ -4843,6 +4908,14 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                          ticker=ticker, blacklist=getattr(cfg, "ticker_blacklist", ""),
                          formula=f"{ticker} is in cfg.ticker_blacklist")
             metrics.inc("autotrade_skip", reason="ticker_blacklisted")
+            return None
+
+        # r88: watchlist-only scope gate (call-play path).
+        if blocked_by_watchlist_only(ticker, cfg):
+            _gate_record("watchlist_only", "fail",
+                         ticker=ticker,
+                         formula=f"cfg.watchlist_only=true AND {ticker} ∉ watchlist → reject")
+            metrics.inc("autotrade_skip", reason="watchlist_only")
             return None
 
         # Macro release blackout — options-strict mirror of put-side guard.

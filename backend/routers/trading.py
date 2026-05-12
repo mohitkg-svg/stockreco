@@ -55,6 +55,8 @@ class AutoTraderConfigRequest(BaseModel):
     entry_order_type: Optional[str] = Field(None, pattern="^(market|limit_at_mid)$")
     use_universe_scanner: Optional[bool] = None
     universe_top_n: Optional[int] = Field(None, ge=5, le=200)
+    # r88: hard scope-restrict to watchlist-only entries.
+    watchlist_only: Optional[bool] = None
     ticker_blacklist: Optional[str] = Field(None, max_length=500)
     daily_loss_limit_pct: Optional[float] = Field(None, ge=0, le=0.5)
     max_concurrent_positions: Optional[int] = Field(None, ge=0, le=100)
@@ -87,7 +89,7 @@ class AutoTraderConfigRequest(BaseModel):
     option_contract_min_score: Optional[float] = Field(None, ge=0, le=200)
     option_contract_min_score_aggressive: Optional[float] = Field(None, ge=0, le=200)
     # r60: scanner universe source toggle
-    universe_source: Optional[str] = Field(None, pattern="^(russell1000|sp500)$")
+    universe_source: Optional[str] = Field(None, pattern="^(watchlist|russell1000|sp500)$")
     # r68-A: equity-snapshot freshness watchdog
     equity_snapshot_max_age_min: Optional[float] = Field(None, ge=1, le=120)
     # r69: setup-quality composite gate
