@@ -479,11 +479,26 @@ def _call_with_tool(
         except Exception:
             pass
         try:
+            text_snippets: list = []
+            stop_reason = getattr(resp, "stop_reason", None)
             for block in resp.content or []:
-                if getattr(block, "type", None) == "tool_use":
+                btype = getattr(block, "type", None)
+                if btype == "tool_use":
                     inp = getattr(block, "input", None)
                     if isinstance(inp, dict):
                         return inp
+                elif btype == "text":
+                    txt = getattr(block, "text", "") or ""
+                    if txt:
+                        text_snippets.append(txt[:300])
+            # r90+: no tool_use block — surface what Claude actually said so
+            # we can diagnose why the forced-tool call is being ignored. Tiny
+            # log; rate-limited by the per-call frequency itself.
+            logger.warning(
+                f"ai_judge: no tool_use in response (stop_reason={stop_reason}, "
+                f"blocks={[getattr(b,'type',None) for b in (resp.content or [])]}, "
+                f"text={' | '.join(text_snippets)[:500]!r})"
+            )
         except Exception as e:
             logger.warning(f"ai_judge: malformed response ({e})")
         return None

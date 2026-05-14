@@ -697,10 +697,20 @@ def summary_analysis(days: int = 7) -> Dict[str, Any]:
             t1 = t.closed_at
             if not t0 or not t1:
                 continue
+            # r90+: previously filtered on `NewsEvent.ticker == t.ticker`,
+            # which missed every multi-symbol article (primary ticker stored
+            # was a co-mentioned name, not the trade's ticker). Per-trade
+            # context endpoint already uses the symbols-LIKE join; align the
+            # bucketing aggregator with it so "no_news" stops swallowing 95%
+            # of trades.
+            from sqlalchemy import or_ as _or
             news_rows = (
                 db.query(NewsEvent)
-                .filter(NewsEvent.ticker == t.ticker,
-                        NewsEvent.published_at >= t0,
+                .filter(_or(
+                    NewsEvent.ticker == t.ticker,
+                    NewsEvent.symbols.like(f"%{t.ticker}%"),
+                ))
+                .filter(NewsEvent.published_at >= t0,
                         NewsEvent.published_at <= t1)
                 .all()
             )

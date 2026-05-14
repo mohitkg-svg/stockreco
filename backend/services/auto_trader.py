@@ -2192,6 +2192,42 @@ def _build_ai_context(ticker: str, db: Session) -> Dict[str, Any]:
     return ctx
 
 
+def _news_context_suffix(ticker: str, db: Session, hours: int = 24) -> str:
+    """Return a compact ` | news[n=N sent=±X.XX max_sev=S]` suffix to append
+    to trade entry notes, so retrospective audits can answer "what did news
+    look like at the moment we entered?" without a separate join.
+
+    Empty string if no news / on any error — never blocks an entry.
+    r90+: persists news context on AutoTrade.note (item D in the pre-news
+    audit plan). Uses the same symbols-LIKE filter as _build_ai_context so
+    multi-symbol articles count.
+    """
+    try:
+        from database import NewsEvent
+        from sqlalchemy import or_ as _or
+        from datetime import datetime as _dt, timedelta as _td
+        cutoff = _dt.utcnow() - _td(hours=hours)
+        rows = (
+            db.query(NewsEvent)
+            .filter(_or(
+                NewsEvent.ticker == ticker,
+                NewsEvent.symbols.like(f"%{ticker}%"),
+            ))
+            .filter(NewsEvent.published_at >= cutoff)
+            .all()
+        )
+        if not rows:
+            return " | news[n=0]"
+        scores = [float(r.sentiment_score) for r in rows if r.sentiment_score is not None]
+        sevs = [float(r.severity) for r in rows if r.severity is not None]
+        avg_s = (sum(scores) / len(scores)) if scores else 0.0
+        max_sev = max(sevs) if sevs else 0.0
+        return f" | news[n={len(rows)} sent={avg_s:+.2f} max_sev={max_sev:.0f}]"
+    except Exception as _ne:
+        logger.warning(f"_news_context_suffix failed for {ticker}: {_ne}")
+        return ""
+
+
 # ---------- Budget bookkeeping --------------------------------------------
 
 def _open_allocations(db: Session) -> Dict[str, float]:
@@ -4291,7 +4327,10 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             sector=sector or None,
             idempotency_key=idem,
             high_water_mark=entry,
-            note=f"opened from signal conf {confidence:.0f} ({signal.get('timeframe')})",
+            note=(
+                f"opened from signal conf {confidence:.0f} ({signal.get('timeframe')})"
+                + _news_context_suffix(ticker, db)
+            ),
         )
         db.add(trade)
         try:
@@ -4844,6 +4883,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                 f"PUT play: bear-conf {thesis['confidence']} | strike {top['strike']} "
                 f"exp {top['expiration']} ({top['dte']}d) | underlying stop "
                 f"${thesis['stop_loss']:.2f}, T1 ${thesis['target1']:.2f}, T2 ${thesis['target2']:.2f}"
+                + _news_context_suffix(ticker, db)
             ),
         )
         db.add(trade)
@@ -5380,6 +5420,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                 f"CALL play: bull-conf {thesis['confidence']} | strike {top['strike']} "
                 f"exp {top['expiration']} ({top['dte']}d) | underlying stop "
                 f"${thesis['stop_loss']:.2f}, T1 ${thesis['target1']:.2f}, T2 ${thesis['target2']:.2f}"
+                + _news_context_suffix(ticker, db)
             ),
         )
         db.add(trade)
