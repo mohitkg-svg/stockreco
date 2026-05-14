@@ -322,22 +322,41 @@ def get_analyst_consensus(ticker: str) -> Optional[Dict[str, Any]]:
     count = int((summary or {}).get("lastYearCount") or 0)
     if count == 0 and target_mean is None:
         return None
-    # r84: /stable/ does NOT expose rating buckets (strongBuy / buy / hold /
-    # sell / strongSell). The pre-r83 v3/v4 client computed a real
-    # consensus mean (1.0..5.0) from those bucket counts. The post-r83 code
-    # hardcoded `mean=2.0, key="buy"` for ANY ticker FMP returned data on,
-    # which made `analyst_ratings.rating_multiplier` always return 1.10×
-    # (STRONG_AGREE) on BUYs and 0.88× on SELLs — a uniform tilt regardless
-    # of actual analyst sentiment. Returning mean=None is the safe move:
-    # `rating_multiplier` short-circuits to NEUTRAL (1.00×) when mean is
-    # missing, so signals are sized as if analyst consensus is unavailable.
-    # Targets / target spread are still returned for downstream consumers
-    # (chart annotations, target_mean R:R checks). To restore an analyst
-    # gate later, derive `mean` from `target_mean / current_price` ratio.
+    # r92: /stable/ does NOT expose rating buckets. Derive a 1..5 consensus
+    # mean from the analyst-target upside (target_mean / current_price - 1).
+    # Higher upside → lower mean (1=StrongBuy). Bands chosen to match the
+    # rating_multiplier zones in analyst_ratings.py:
+    #   upside ≥ +30%        → 1.0  (StrongBuy)   → BUY ×1.10
+    #   +15% ≤ upside < +30% → 2.0  (Buy)         → BUY ×1.10 / ×1.04 boundary
+    #   -10% ≤ upside < +15% → 3.0  (Hold)        → NEUTRAL
+    #   -25% ≤ upside < -10% → 4.0  (Sell)        → BUY ×0.88 (disagree)
+    #   upside < -25%        → 5.0  (StrongSell)  → BUY ×0.88 (strong disagree)
+    mean: Optional[float] = None
+    key: Optional[str] = None
+    try:
+        if target_mean is not None and target_mean > 0:
+            from services.data_fetcher import get_current_price  # local: avoid cycle
+            cp = get_current_price(ticker.upper())
+            price = float(cp[0]) if cp and cp[0] else None
+            if price and price > 0:
+                upside = (target_mean / price) - 1.0
+                if upside >= 0.30:
+                    mean, key = 1.0, "strong_buy"
+                elif upside >= 0.15:
+                    mean, key = 2.0, "buy"
+                elif upside >= -0.10:
+                    mean, key = 3.0, "hold"
+                elif upside >= -0.25:
+                    mean, key = 4.0, "sell"
+                else:
+                    mean, key = 5.0, "strong_sell"
+    except Exception as e:
+        logger.warning(f"fmp.get_analyst_consensus: mean-from-upside failed for {ticker}: {e}")
+        mean, key = None, None
     return {
         "ticker": ticker.upper(),
-        "mean": None,
-        "key": None,
+        "mean": mean,
+        "key": key,
         "analyst_count": count or None,
         "target_mean": target_mean,
         "target_high": target_high,

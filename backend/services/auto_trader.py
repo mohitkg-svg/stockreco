@@ -3698,6 +3698,55 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             logger.debug(f"ai_judge entry_veto wrapper failed: {_e}")
 
         # ════════════════════════════════════════════════════════════════════
+        # § DETERMINISTIC NEWS GATE — r92 (E). Rule-based, no AI dependency.
+        # ════════════════════════════════════════════════════════════════════
+        # Block / downsize / alert based on fresh contra-sentiment news.
+        # Independent of ai_judge — works even when Claude abstains.
+        _news_qty_mult = 1.0
+        try:
+            from services import news_gate as _ng
+            _ngate = _ng.news_entry_gate(ticker, "bull", db)
+            if _ngate.get("action") == "block":
+                logger.info(
+                    f"AutoTrader skip {ticker}: {_ngate.get('reason','')} "
+                    f"top={_ngate.get('top_news', {}).get('headline','')[:80]}"
+                )
+                metrics.inc("autotrade_skip", reason="news_block")
+                if _ngate.get("alert"):
+                    try:
+                        from services.alerts import alert as _ra
+                        _ra("warning", f"news_block_{ticker}",
+                            f"{ticker} entry blocked: {_ngate.get('reason')} | "
+                            f"{(_ngate.get('top_news') or {}).get('headline','')[:140]}")
+                    except Exception:
+                        pass
+                return None
+            if _ngate.get("action") == "downsize":
+                _news_qty_mult = float(_ngate.get("qty_mult") or 1.0)
+                logger.info(
+                    f"AutoTrader {ticker}: {_ngate.get('reason','')} "
+                    f"qty_mult={_news_qty_mult}"
+                )
+                if _ngate.get("alert"):
+                    try:
+                        from services.alerts import alert as _ra
+                        _ra("info", f"news_downsize_{ticker}",
+                            f"{ticker} entry downsized ×{_news_qty_mult}: "
+                            f"{_ngate.get('reason')}")
+                    except Exception:
+                        pass
+            elif _ngate.get("alert"):
+                try:
+                    from services.alerts import alert as _ra
+                    _ra("info", f"news_alert_{ticker}",
+                        f"{ticker} entry proceeding with news context: "
+                        f"{_ngate.get('reason')}")
+                except Exception:
+                    pass
+        except Exception as _ne:
+            logger.debug(f"news_entry_gate wrapper failed for {ticker}: {_ne}")
+
+        # ════════════════════════════════════════════════════════════════════
         # § BUDGET + SIZING — multiplier stack, heat-aware throttle, qty calc
         # ════════════════════════════════════════════════════════════════════
         # Check budget
@@ -4100,6 +4149,11 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp,
             _max_qty_by_gap,
         )
+
+        # r92 (E): deterministic news downsize multiplier (applied after all
+        # other caps so it can only REDUCE qty, never inflate).
+        if _news_qty_mult < 1.0:
+            qty = int(qty * _news_qty_mult)
 
         if qty < 1:
             return None
@@ -4713,6 +4767,35 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                 return None
         except Exception:
             pass
+        # r92 (E): deterministic news gate for PUT plays. Puts profit from
+        # the underlying falling, so positive news at high severity is contra.
+        _news_qty_mult_p = 1.0
+        try:
+            from services import news_gate as _ng
+            _ngate = _ng.news_entry_gate(ticker, "bear", db)
+            if _ngate.get("action") == "block":
+                logger.info(
+                    f"AutoTrader skip PUT {ticker}: {_ngate.get('reason','')} "
+                    f"top={(_ngate.get('top_news') or {}).get('headline','')[:80]}"
+                )
+                metrics.inc("autotrade_skip", reason="news_block")
+                if _ngate.get("alert"):
+                    try:
+                        from services.alerts import alert as _ra
+                        _ra("warning", f"news_block_put_{ticker}",
+                            f"PUT {ticker} blocked: {_ngate.get('reason')} | "
+                            f"{(_ngate.get('top_news') or {}).get('headline','')[:140]}")
+                    except Exception:
+                        pass
+                return None
+            if _ngate.get("action") == "downsize":
+                _news_qty_mult_p = float(_ngate.get("qty_mult") or 1.0)
+                logger.info(
+                    f"AutoTrader PUT {ticker}: {_ngate.get('reason','')} "
+                    f"qty_mult={_news_qty_mult_p}"
+                )
+        except Exception as _ne:
+            logger.debug(f"news_entry_gate (put) failed for {ticker}: {_ne}")
         risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity) * _iv_factor_p
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
@@ -4725,6 +4808,9 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp,
             max_qty_by_dollar_cap,
         )
+        # r92 (E): apply deterministic news downsize (puts).
+        if _news_qty_mult_p < 1.0:
+            qty = int(qty * _news_qty_mult_p)
         if qty < 1:
             return None
 
@@ -5265,6 +5351,34 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                 return None
         except Exception:
             pass
+        # r92 (E): deterministic news gate for CALL plays. Bull bias.
+        _news_qty_mult_c = 1.0
+        try:
+            from services import news_gate as _ng
+            _ngate = _ng.news_entry_gate(ticker, "bull", db)
+            if _ngate.get("action") == "block":
+                logger.info(
+                    f"AutoTrader skip CALL {ticker}: {_ngate.get('reason','')} "
+                    f"top={(_ngate.get('top_news') or {}).get('headline','')[:80]}"
+                )
+                metrics.inc("autotrade_skip", reason="news_block")
+                if _ngate.get("alert"):
+                    try:
+                        from services.alerts import alert as _ra
+                        _ra("warning", f"news_block_call_{ticker}",
+                            f"CALL {ticker} blocked: {_ngate.get('reason')} | "
+                            f"{(_ngate.get('top_news') or {}).get('headline','')[:140]}")
+                    except Exception:
+                        pass
+                return None
+            if _ngate.get("action") == "downsize":
+                _news_qty_mult_c = float(_ngate.get("qty_mult") or 1.0)
+                logger.info(
+                    f"AutoTrader CALL {ticker}: {_ngate.get('reason','')} "
+                    f"qty_mult={_news_qty_mult_c}"
+                )
+        except Exception as _ne:
+            logger.debug(f"news_entry_gate (call) failed for {ticker}: {_ne}")
         risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity) * _iv_factor_c
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
@@ -5277,6 +5391,9 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             max_qty_by_per_ticker, max_qty_by_cash, max_qty_by_bp,
             max_qty_by_dollar_cap,
         )
+        # r92 (E): apply deterministic news downsize (calls).
+        if _news_qty_mult_c < 1.0:
+            qty = int(qty * _news_qty_mult_c)
         if qty < 1:
             return None
 
@@ -6164,6 +6281,98 @@ def manage_open_positions() -> Dict[str, Any]:
                 try:
                     if not t.parent_order_id:
                         continue
+
+                    # ════════════════════════════════════════════════════════
+                    # r92 (E): DETERMINISTIC NEWS-DRIVEN POSITION ACTION
+                    # ════════════════════════════════════════════════════════
+                    # Rule-based per-tick check on FRESH (last 30m) contra
+                    # news. Independent of ai_judge. Acts in order: close
+                    # (sev≥80), trim (sev≥60), alert-only (sev≥40). Per
+                    # (trade_id, news_id, action) dedup so repeated ticks
+                    # don't double-fire on the same article.
+                    if t.status == "open":
+                        try:
+                            # Determine directional bias.
+                            if t.asset_type == "stock":
+                                _ng_bias = "bull" if (t.side or "buy") == "buy" else "bear"
+                            elif t.asset_type == "option":
+                                _ng_bias = "bull" if _is_call_option(t) else "bear"
+                            else:
+                                _ng_bias = None
+                            if _ng_bias:
+                                from services import news_gate as _ng_mod
+                                _ng_act = _ng_mod.news_position_action(t.id, t.ticker, _ng_bias, db)
+                                _ng_action = _ng_act.get("action", "hold")
+                                _ng_top = _ng_act.get("top_news") or {}
+                                if _ng_action == "close":
+                                    if _ng_act.get("alert"):
+                                        try:
+                                            _raise_alert(
+                                                "warning", f"news_close_{t.ticker}_{t.id}",
+                                                f"CLOSING {t.ticker} trade {t.id} on contra news: "
+                                                f"{_ng_act.get('reason')} | {_ng_top.get('headline','')[:140]}"
+                                            )
+                                        except Exception:
+                                            pass
+                                    _force_close_trade(
+                                        t, db,
+                                        f"news_close: {_ng_act.get('reason','')[:80]}",
+                                        summary,
+                                        status_override="closed_news",
+                                    )
+                                    metrics.inc("autotrade_event", event="news_close")
+                                    continue
+                                if _ng_action == "trim":
+                                    try:
+                                        _half = max(1, int((t.qty or 0) * float(_ng_act.get("trim_fraction") or 0.5)))
+                                        if _half >= 1 and (t.qty or 0) > _half:
+                                            from alpaca.trading.enums import OrderSide as _OS_n, TimeInForce as _TIF_n
+                                            if t.asset_type == "stock" and not alpaca_client.is_market_open():
+                                                _epx_n = _current_price(t.ticker) or float(t.entry_price or 0)
+                                                from alpaca.trading.requests import LimitOrderRequest as _LOR_n
+                                                _req_n = _LOR_n(
+                                                    symbol=t.ticker, qty=_half,
+                                                    side=_OS_n.SELL, time_in_force=_TIF_n.DAY,
+                                                    limit_price=round(_epx_n, 2), extended_hours=True,
+                                                )
+                                            else:
+                                                from alpaca.trading.requests import MarketOrderRequest as _MOR_n
+                                                _trim_sym = t.symbol if t.asset_type == "option" else t.ticker
+                                                _req_n = _MOR_n(
+                                                    symbol=_trim_sym, qty=_half,
+                                                    side=_OS_n.SELL, time_in_force=_TIF_n.DAY,
+                                                )
+                                            _trim_n = alpaca_client._get_client().submit_order(order_data=_req_n)
+                                            if _trim_n is not None:
+                                                t.qty = (t.qty or 0) - _half
+                                                _atomic_append_note(
+                                                    db, t.id,
+                                                    f" | NEWS-TRIM: -{_half} ({_ng_act.get('reason','')[:60]})"
+                                                )
+                                                db.commit()
+                                                metrics.inc("autotrade_event", event="news_trim")
+                                                if _ng_act.get("alert"):
+                                                    try:
+                                                        _raise_alert(
+                                                            "info", f"news_trim_{t.ticker}_{t.id}",
+                                                            f"TRIMMED {t.ticker} -{_half} on contra news: "
+                                                            f"{_ng_act.get('reason')} | {_ng_top.get('headline','')[:140]}"
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                    except Exception as _trim_e:
+                                        logger.warning(f"news_trim failed for {t.ticker} trade={t.id}: {_trim_e}")
+                                elif _ng_action == "hold" and _ng_act.get("alert"):
+                                    try:
+                                        _raise_alert(
+                                            "info", f"news_alert_{t.ticker}_{t.id}",
+                                            f"{t.ticker} trade {t.id} news context: "
+                                            f"{_ng_act.get('reason')} | {_ng_top.get('headline','')[:140]}"
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception as _ng_wrap:
+                            logger.debug(f"news_position_action wrapper failed t={t.id}: {_ng_wrap}")
 
                     # r44 fix Wave 4: stocks earnings-flatten. If earnings
                     # ≤ 1h away on an open stock position, trim 50% (mirror
