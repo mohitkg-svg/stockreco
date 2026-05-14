@@ -361,13 +361,16 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
             # not string. Prior code did `(severity or "").lower()` which raised
             # AttributeError on the first iter — caught by an outer try/except,
             # silently dropping ALL news exits since this code shipped (r41).
-            # Now: gate on numeric severity ≥ 35 (matches the |compound| ≥ 0.35
-            # threshold used by sentiment.py for "neutral" vs "positive/negative").
+            # r93 (G): lowered gate 35 → 25. The r92 deterministic news_gate
+            # already handles sev ≥ 60 (trim) / ≥ 80 (close) without AI; lower
+            # the AI-judge gate so Claude sees mid-severity (25-60) news for
+            # nuanced thesis-broken vs noise filtering. Per-call cost is
+            # bounded by AI_NEWS_EXIT_MAX_AGE_MIN freshness + per-mode dedup.
             try:
                 sev = int(item.get("severity") or 0)
             except Exception:
                 sev = 0
-            if sev < 35:
+            if sev < 25:
                 continue
             ticker = item["ticker"]
             open_trades = db.query(AutoTrade).filter(
