@@ -2113,15 +2113,21 @@ class TestFmpIntegration(unittest.TestCase):
                              "lastQuarterCount": 12, "allTimeCount": 80,
                              "lastMonthAvgPriceTarget": 260.0}]
                 return None
-            with patch("services.fmp_client._get", side_effect=fake_get):
+            # r94 follow-up: r92 derives `mean` from (target / current_price)
+            # upside, so we must also stub get_current_price. Returning None
+            # here exercises the documented fail-safe (no price → mean stays
+            # None → rating_multiplier short-circuits to NEUTRAL), which is
+            # what this test was originally asserting.
+            with patch("services.fmp_client._get", side_effect=fake_get), \
+                 patch("services.data_fetcher.get_current_price", return_value=None):
                 row = fmp_client.get_analyst_consensus("AAPL")
             self.assertEqual(row["ticker"], "AAPL")
             self.assertEqual(row["analyst_count"], 20)
-            # r84: mean/key are None when /stable/ has no rating buckets
-            # (which is always — buckets aren't on /stable/). This routes
-            # rating_multiplier to NEUTRAL via its mean-is-None short-circuit
-            # at analyst_ratings.py:155, avoiding a uniform 1.10× boost on
-            # every BUY signal regardless of actual analyst sentiment.
+            # r92: mean is derived from target/current upside. When current
+            # price is unavailable (mocked None above), the derivation is
+            # skipped and mean/key stay None — routing rating_multiplier to
+            # NEUTRAL via its mean-is-None short-circuit at
+            # analyst_ratings.py:155.
             self.assertIsNone(row["mean"])
             self.assertIsNone(row["key"])
             self.assertEqual(row["target_mean"], 250.0)
@@ -2303,7 +2309,11 @@ class TestR77LiveMoneyP0Fixes(unittest.TestCase):
                                "services", "news.py"), "r") as f:
             src = f.read()
         # Anchor on the trim branch and pull the next ~5kB of source.
-        anchor = src.find('action == "trim"')
+        # r95 follow-up: anchor must skip the `if action == "trim" and qty<=1`
+        # fallback (which just promotes to "close") and land on the real
+        # trim block — `elif action == "trim":` — otherwise the extracted
+        # block is the close path and the ldb.commit() assertion fails.
+        anchor = src.find('elif action == "trim"')
         self.assertGreater(anchor, 0, "trim branch not found")
         block = src[anchor: anchor + 5000]
         # Stop at the next sibling-level `elif action ==` or the outer
