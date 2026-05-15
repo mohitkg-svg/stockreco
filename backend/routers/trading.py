@@ -83,6 +83,14 @@ class AutoTraderConfigRequest(BaseModel):
     book_var_99_cap_pct: Optional[float] = Field(None, ge=0, le=1)
     bracket_tif: Optional[str] = Field(None, pattern="^(day|gtc|DAY|GTC)$")
     max_correlated_open: Optional[int] = Field(None, ge=0, le=50)
+    # r94 schema-drift fix #3: portfolio Greeks caps. DB columns existed
+    # since r48 (portfolio_max_vega_pct/gamma_pct/net_delta_pct) but were
+    # never added to the request schema, so POST /auto/config silently
+    # dropped them and the defaults (0.05% / 0.02% / 50%) couldn't be
+    # tuned without raw SQL. Operator can now actually toggle.
+    portfolio_max_vega_pct: Optional[float] = Field(None, ge=0, le=1)
+    portfolio_max_gamma_pct: Optional[float] = Field(None, ge=0, le=1)
+    portfolio_max_net_delta_pct: Optional[float] = Field(None, ge=0, le=5)
     # r58: option floor configs (previously hardcoded)
     option_thesis_min_conf_aggressive: Optional[float] = Field(None, ge=0, le=100)
     option_thesis_min_conf_mult: Optional[float] = Field(None, ge=0, le=2)

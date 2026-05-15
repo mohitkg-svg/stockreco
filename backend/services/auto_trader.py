@@ -1045,6 +1045,10 @@ def get_config_dict() -> Dict[str, Any]:
             "book_var_99_cap_pct": float(getattr(cfg, "book_var_99_cap_pct", 0.05) or 0.05),
             "bracket_tif": getattr(cfg, "bracket_tif", "day") or "day",
             "max_correlated_open": int(getattr(cfg, "max_correlated_open", 1) or 1),
+            # r94: portfolio Greeks caps (DB-backed since r48, now observable)
+            "portfolio_max_vega_pct": float(getattr(cfg, "portfolio_max_vega_pct", 0.0005) or 0.0005),
+            "portfolio_max_gamma_pct": float(getattr(cfg, "portfolio_max_gamma_pct", 0.0002) or 0.0002),
+            "portfolio_max_net_delta_pct": float(getattr(cfg, "portfolio_max_net_delta_pct", 0.50) or 0.50),
             # r58: option-floor configs (previously hardcoded)
             "option_thesis_min_conf_aggressive": float(getattr(cfg, "option_thesis_min_conf_aggressive", 60.0) or 60.0),
             "option_thesis_min_conf_mult": float(getattr(cfg, "option_thesis_min_conf_mult", 0.85) or 0.85),
