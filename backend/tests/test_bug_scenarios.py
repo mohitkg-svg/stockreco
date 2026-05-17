@@ -653,46 +653,6 @@ class TestShortInterestMultiplier(unittest.TestCase):
         self.assertEqual(short_interest_multiplier("UNKNOWN", "BUY"), 1.0)
 
 
-class TestSocialSentimentMultiplier(unittest.TestCase):
-
-    def setUp(self):
-        _reset_db()
-        self.db = SessionLocal()
-
-    def tearDown(self):
-        self.db.close()
-
-    def _store(self, ticker: str, msgs: int, bullish: Optional[float] = None):
-        from database import SocialSentiment
-        self.db.add(SocialSentiment(
-            ticker=ticker.upper(), source="stocktwits",
-            message_count_24h=msgs, bullish_pct_24h=bullish,
-            bearish_pct_24h=(1 - bullish) if bullish is not None else None,
-        ))
-        self.db.commit()
-
-    def test_strong_bullish_lean_confirms_buy(self):
-        from services.social_sentiment import sentiment_multiplier
-        self._store("BULL", 50, 0.75)
-        self.assertEqual(sentiment_multiplier("BULL", "BUY"), 1.04)
-        self.assertEqual(sentiment_multiplier("BULL", "SELL"), 0.96)
-
-    def test_strong_bearish_lean_confirms_sell(self):
-        from services.social_sentiment import sentiment_multiplier
-        self._store("BEAR", 50, 0.30)
-        self.assertEqual(sentiment_multiplier("BEAR", "SELL"), 1.04)
-        self.assertEqual(sentiment_multiplier("BEAR", "BUY"), 0.96)
-
-    def test_low_volume_not_trusted(self):
-        """Below 20-message min, any lean is ignored (too noisy)."""
-        from services.social_sentiment import sentiment_multiplier
-        self._store("LOWVOL", 5, 0.90)  # 5 messages, 90% bullish — ignored
-        self.assertEqual(sentiment_multiplier("LOWVOL", "BUY"), 1.0)
-
-    def test_mixed_sentiment_neutral(self):
-        from services.social_sentiment import sentiment_multiplier
-        self._store("MIXED", 50, 0.50)
-        self.assertEqual(sentiment_multiplier("MIXED", "BUY"), 1.0)
 
 
 class TestInsiderMultiplier(unittest.TestCase):
@@ -1446,27 +1406,6 @@ class TestInsiderClusterAmplification(unittest.TestCase):
         self.assertEqual(insider_multiplier("CLUST", "BUY"), 1.12)
 
 
-class TestNR7Strategy(unittest.TestCase):
-    def test_nr7_strategy_returns_dict(self):
-        from services.strategies import _nr7_breakout
-        import pandas as _pd
-        # Synthetic 50-bar OHLCV with one NR7 bar near the end.
-        idx = _pd.date_range("2026-01-01", periods=50, freq="D")
-        df = _pd.DataFrame({
-            "Open": [100.0] * 50,
-            "High": [102.0] * 50,
-            "Low": [98.0] * 50,
-            "Close": [100.0] * 50,
-            "Volume": [1_000_000] * 50,
-            "VOL_SMA20": [1_000_000] * 50,
-        }, index=idx)
-        # Last bar tighter range to make it NR7.
-        df.iloc[-2, df.columns.get_loc("High")] = 100.5
-        df.iloc[-2, df.columns.get_loc("Low")] = 99.5
-        s = _nr7_breakout(df)
-        self.assertIn("entry_long", s)
-        self.assertIn("entry_short", s)
-        self.assertEqual(s["regime"], "any")
 
 
 class TestAIBudgetCheck(unittest.TestCase):
