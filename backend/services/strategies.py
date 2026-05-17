@@ -544,8 +544,12 @@ def _lev_etf_decay_short(d: pd.DataFrame) -> Dict:
             "entry_long": empty, "entry_short": empty,
         }
     rv20 = d["Close"].pct_change().rolling(20).std() * (252 ** 0.5)
-    rv60 = rv20.rolling(60, min_periods=30)
-    rv_pct = rv20.rank(pct=True)
+    # r97: rolling 252-bar percentile rank (was rank(pct=True) — global rank
+    # used the full series, leaking future bars into the historical signal).
+    rv_pct = rv20.rolling(252, min_periods=60).apply(
+        lambda x: (x[-1] >= x).sum() / len(x),
+        raw=True,
+    )
     chop = (d["ADX_14"] < 20) & (rv_pct >= 0.75)
     short_e = chop & (d["Close"] < d["Close"].shift(1))
     return {
@@ -614,31 +618,20 @@ def _vix_spike_reversion(d: pd.DataFrame) -> Dict:
     }
 
 
+# QUANT REVISION: Orthogonal (uncorrelated) features. 
+# Discarding multicollinear technical indicators. Keeping ONE mean-reversion factor, 
+# and leaning into alternative data and structurally sound setups.
 STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
-    _trend_following,
-    _golden_cross,
     _rsi_mean_reversion,
-    _macd_crossover,
-    _bollinger_breakout,
-    _donchian_breakout,
-    _ema_pullback,
-    _gap_fill,
     _gap_and_go,
-    _fvg_pullback,
     _vwap_reclaim,
-    _opening_range_breakout,
-    # r44 Wave 7 additions:
-    _nr7_breakout,
-    _inside_bar_breakout,
+    _vix_spike_reversion,
     _high52_proximity,
-    # r46 Tier P additions:
+    _trend_following,
+    _nr7_breakout,
+    _lev_etf_decay_short,
     _opening_reversal,
     _last_30min_momentum,
-    _news_spike_fade,
-    # r47 Tier P additions:
-    _vix_spike_reversion,
-    # r48 BACKLOG additions:
-    _lev_etf_decay_short,
 ]
 
 

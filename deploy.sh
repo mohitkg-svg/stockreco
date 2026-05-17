@@ -61,13 +61,36 @@ fi
 # production losses. Skip with SKIP_TESTS=1 if you really need to.
 if [ "${SKIP_TESTS:-0}" != "1" ]; then
   echo "── Running pre-deploy regression tests ──"
-  if (cd backend && DATABASE_URL="sqlite:///$(mktemp)" APP_API_KEY=test \
-       python3 -m unittest tests.test_bug_scenarios tests.test_smoke 2>&1 | tail -8); then
+
+  TEST_DB_URL="sqlite:///$(mktemp)"
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "   (Starting ephemeral Postgres container for tests)"
+    # Ensure no leftover container is hanging around
+    docker rm -f stockrecs-test-db >/dev/null 2>&1 || true
+    if docker run --rm -d --name stockrecs-test-db -p 5432:5432 -e POSTGRES_PASSWORD=test postgres:16-alpine >/dev/null 2>&1; then
+      echo "   (Waiting for Postgres to be ready...)"
+      for i in {1..20}; do
+        if docker exec stockrecs-test-db pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+          TEST_DB_URL="postgresql://postgres:test@localhost:5432/postgres"
+          sleep 1
+          break
+        fi
+        sleep 1
+      done
+    else
+      echo "   (Failed to start Postgres container, falling back to SQLite)"
+    fi
+  fi
+
+  if (cd backend && DATABASE_URL="$TEST_DB_URL" APP_API_KEY=test \
+       python3 -m unittest -v tests.test_bug_scenarios tests.test_smoke); then
     echo "✅ tests passed; proceeding with deploy"
   else
     echo "❌ pre-deploy tests FAILED — aborting. Set SKIP_TESTS=1 to override."
+    if command -v docker >/dev/null 2>&1; then docker stop stockrecs-test-db >/dev/null 2>&1 || true; fi
     exit 1
   fi
+  if command -v docker >/dev/null 2>&1; then docker stop stockrecs-test-db >/dev/null 2>&1 || true; fi
 fi
 
 # Pick up env vars from backend/.env if present (without overwriting shell vars).
@@ -90,37 +113,38 @@ fi
 
 echo "→ Deploying $SERVICE to Cloud Run in $REGION (project: $PROJECT)"
 
-# Build env-var string. Comma-separate, escape commas in values (none expected
-# for our keys) — anything hairy should move to Secret Manager.
-# We use `--update-env-vars` below (not --set-env-vars) so existing Cloud
-# Run env vars set via `gcloud run services update` (e.g. ALPACA_DATA_FEED)
-# are preserved across deploys. --set-env-vars previously wiped them.
-ENV_VARS="APCA_API_KEY_ID=${APCA_API_KEY_ID},APCA_API_SECRET_KEY=${APCA_API_SECRET_KEY},DATABASE_URL=${DATABASE_URL}"
+# ---- Secrets Management (B27) -----------------------------------------------
+# Secrets are mapped via GCP Secret Manager instead of being passed as plaintext
+# env vars. Ensure these exist: gcloud secrets create apca-api-key-id ...
+SECRETS="APCA_API_KEY_ID=apca-api-key-id:latest,APCA_API_SECRET_KEY=apca-api-secret-key:latest,DATABASE_URL=database-url:latest"
+REMOVE_ENV_VARS="APCA_API_KEY_ID,APCA_API_SECRET_KEY,DATABASE_URL"
+
 if [ -n "${APP_API_KEY:-}" ]; then
-  ENV_VARS="${ENV_VARS},APP_API_KEY=${APP_API_KEY}"
+  SECRETS="${SECRETS},APP_API_KEY=app-api-key:latest"
+  REMOVE_ENV_VARS="${REMOVE_ENV_VARS},APP_API_KEY"
 fi
-# Anthropic key (chat widget + AI judge layer). Only forwarded when set
-# in the local shell — so an unset local var doesn't blank the value
-# already on the live service.
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  ENV_VARS="${ENV_VARS},ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+  SECRETS="${SECRETS},ANTHROPIC_API_KEY=anthropic-api-key:latest"
+  REMOVE_ENV_VARS="${REMOVE_ENV_VARS},ANTHROPIC_API_KEY"
 fi
-# Financial Modeling Prep key (fundamentals + earnings + analyst ratings +
-# SEC filings poll). Same conditional pattern: unset local → preserve Cloud
-# Run value across deploys; when fmp_client.is_enabled() returns False the
-# yfinance fallback paths take over.
 if [ -n "${FMP_API_KEY:-}" ]; then
-  ENV_VARS="${ENV_VARS},FMP_API_KEY=${FMP_API_KEY}"
+  SECRETS="${SECRETS},FMP_API_KEY=fmp-api-key:latest"
+  REMOVE_ENV_VARS="${REMOVE_ENV_VARS},FMP_API_KEY"
 fi
-# Polygon options tier.
 if [ -n "${POLYGON_API_KEY:-}" ]; then
-  ENV_VARS="${ENV_VARS},POLYGON_API_KEY=${POLYGON_API_KEY}"
+  SECRETS="${SECRETS},POLYGON_API_KEY=polygon-api-key:latest"
+  REMOVE_ENV_VARS="${REMOVE_ENV_VARS},POLYGON_API_KEY"
 fi
+
+# Build env-var string for non-sensitive configuration.
+# We use `--update-env-vars` below so existing Cloud Run env vars are preserved.
+ENV_VARS=""
+
 # AI judge call-site modes. Only forwarded when explicitly set, so the
 # default off-everywhere stays put unless you flip the env var.
 for _m in AI_ENTRY_VETO_MODE AI_NEWS_EXIT_MODE AI_CONFIDENCE_MULT_MODE; do
   if [ -n "${!_m:-}" ]; then
-    ENV_VARS="${ENV_VARS},${_m}=${!_m}"
+    ENV_VARS="${ENV_VARS}${ENV_VARS:+,}${_m}=${!_m}"
   fi
 done
 # CORS: r82 — was unconditionally setting CORS_ALLOW_ORIGINS=* on every
@@ -137,7 +161,7 @@ if [ "${ALPACA_LIVE:-0}" = "1" ] && [ "${CORS_ALLOW_ORIGINS}" = "*" ]; then
   echo "❌ Refusing to deploy LIVE with CORS_ALLOW_ORIGINS='*'." >&2
   exit 1
 fi
-ENV_VARS="${ENV_VARS},CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS}"
+ENV_VARS="${ENV_VARS}${ENV_VARS:+,}CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS}"
 # Algo Trader Plus feature flags — sticky so deploys don't wipe them:
 #   ALPACA_DATA_FEED=sip         SIP consolidated tape (bars + live stream)
 #   ALPACA_OPTIONS_FEED=indicative  Options snapshots (AT+ tier supports this)
@@ -164,6 +188,14 @@ if gcloud sql instances describe stockrecs-db --format="value(settings.tier)" > 
   fi
 fi
 
+DEPLOY_FLAGS=()
+if [ -n "$ENV_VARS" ]; then
+  DEPLOY_FLAGS+=(--update-env-vars "$ENV_VARS")
+fi
+if [ -n "$REMOVE_ENV_VARS" ]; then
+  DEPLOY_FLAGS+=(--remove-env-vars "$REMOVE_ENV_VARS")
+fi
+
 gcloud run deploy "$SERVICE" \
   --source . \
   --region "$REGION" \
@@ -177,7 +209,8 @@ gcloud run deploy "$SERVICE" \
   --timeout 300s \
   --cpu-boost \
   --add-cloudsql-instances "$CSQL_INSTANCE" \
-  --update-env-vars "$ENV_VARS"
+  "${DEPLOY_FLAGS[@]}" \
+  --update-secrets "$SECRETS"
 
 # Cloud Run liveness probe — auto-restart instance if /api/healthz returns
 # non-200 for 3 consecutive checks. r82 (B49): switched from /api/health to

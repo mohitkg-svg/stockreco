@@ -1646,7 +1646,6 @@ class TestNewStrategiesPresent(unittest.TestCase):
         names = {fn.__name__ for fn in STRATEGY_FUNCS}
         self.assertIn("_opening_reversal", names)
         self.assertIn("_last_30min_momentum", names)
-        self.assertIn("_news_spike_fade", names)
 
 
 class TestIdempotencyUnique(unittest.TestCase):

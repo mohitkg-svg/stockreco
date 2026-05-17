@@ -20,13 +20,36 @@ SERVICE="stockrecs-manager"
 # Pre-deploy regression tests — same suite as the api deploy.
 if [ "${SKIP_TESTS:-0}" != "1" ]; then
   echo "── Running pre-deploy regression tests ──"
-  if (cd backend && DATABASE_URL="sqlite:///$(mktemp)" APP_API_KEY=test \
-       python3 -m unittest tests.test_bug_scenarios tests.test_smoke 2>&1 | tail -8); then
+
+  TEST_DB_URL="sqlite:///$(mktemp)"
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "   (Starting ephemeral Postgres container for tests)"
+    # Ensure no leftover container is hanging around
+    docker rm -f stockrecs-test-db >/dev/null 2>&1 || true
+    if docker run --rm -d --name stockrecs-test-db -p 5432:5432 -e POSTGRES_PASSWORD=test postgres:16-alpine >/dev/null 2>&1; then
+      echo "   (Waiting for Postgres to be ready...)"
+      for i in {1..20}; do
+        if docker exec stockrecs-test-db pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+          TEST_DB_URL="postgresql://postgres:test@localhost:5432/postgres"
+          sleep 1
+          break
+        fi
+        sleep 1
+      done
+    else
+      echo "   (Failed to start Postgres container, falling back to SQLite)"
+    fi
+  fi
+
+  if (cd backend && DATABASE_URL="$TEST_DB_URL" APP_API_KEY=test \
+       python3 -m unittest -v tests.test_bug_scenarios tests.test_smoke); then
     echo "✅ tests passed; proceeding with manager deploy"
   else
     echo "❌ pre-deploy tests FAILED — aborting. Set SKIP_TESTS=1 to override."
+    if command -v docker >/dev/null 2>&1; then docker stop stockrecs-test-db >/dev/null 2>&1 || true; fi
     exit 1
   fi
+  if command -v docker >/dev/null 2>&1; then docker stop stockrecs-test-db >/dev/null 2>&1 || true; fi
 fi
 
 # Pick up env vars from backend/.env if present.
@@ -49,22 +72,34 @@ fi
 
 echo "→ Deploying $SERVICE (RUN_MODE=manager) to Cloud Run in $REGION"
 
-# Manager-mode env. RUN_MODE=manager flips the lifespan to register only the
-# manage loop + reconciliation. APP_API_KEY is still set so internal /api/health
-# works for the liveness probe.
-ENV_VARS="RUN_MODE=manager,APCA_API_KEY_ID=${APCA_API_KEY_ID},APCA_API_SECRET_KEY=${APCA_API_SECRET_KEY},DATABASE_URL=${DATABASE_URL}"
+SECRETS="APCA_API_KEY_ID=apca-api-key-id:latest,APCA_API_SECRET_KEY=apca-api-secret-key:latest,DATABASE_URL=database-url:latest"
+REMOVE_ENV_VARS="APCA_API_KEY_ID,APCA_API_SECRET_KEY,DATABASE_URL"
 if [ -n "${APP_API_KEY:-}" ]; then
-  ENV_VARS="${ENV_VARS},APP_API_KEY=${APP_API_KEY}"
+  SECRETS="${SECRETS},APP_API_KEY=app-api-key:latest"
+  REMOVE_ENV_VARS="${REMOVE_ENV_VARS},APP_API_KEY"
 fi
+
+# Manager-mode env. RUN_MODE=manager flips the lifespan to register only the
+# manage loop + reconciliation.
+ENV_VARS="RUN_MODE=manager"
 ENV_VARS="${ENV_VARS},CORS_ALLOW_ORIGINS=*"
 ENV_VARS="${ENV_VARS},ALPACA_DATA_FEED=${ALPACA_DATA_FEED:-sip}"
 ENV_VARS="${ENV_VARS},LOG_JSON=${LOG_JSON:-1}"
+
 # ALPACA_LIVE pass-through so manager can match api when you flip to live.
 if [ -n "${ALPACA_LIVE:-}" ]; then
   ENV_VARS="${ENV_VARS},ALPACA_LIVE=${ALPACA_LIVE}"
 fi
 if [ -n "${I_UNDERSTAND_LIVE_RISK:-}" ]; then
   ENV_VARS="${ENV_VARS},I_UNDERSTAND_LIVE_RISK=${I_UNDERSTAND_LIVE_RISK}"
+fi
+
+DEPLOY_FLAGS=()
+if [ -n "$ENV_VARS" ]; then
+  DEPLOY_FLAGS+=(--update-env-vars "$ENV_VARS")
+fi
+if [ -n "$REMOVE_ENV_VARS" ]; then
+  DEPLOY_FLAGS+=(--remove-env-vars "$REMOVE_ENV_VARS")
 fi
 
 # Same Cloud SQL instance as the api service.
@@ -83,7 +118,8 @@ gcloud run deploy "$SERVICE" \
   --max-instances 1 \
   --timeout 300s \
   --add-cloudsql-instances "$CSQL_INSTANCE" \
-  --update-env-vars "$ENV_VARS"
+  "${DEPLOY_FLAGS[@]}" \
+  --update-secrets "$SECRETS"
 
 # Manager liveness probe — health endpoint flags `degraded=True` if the
 # manage loop hasn't ticked in 120s, so the probe will trip and Cloud Run
