@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("/train")
-def train(max_tickers: int = Query(40, ge=5, le=200)):
+def train(max_tickers: int = Query(40, ge=5, le=200), force: bool = Query(False)):
     """Kick training in a background thread and return immediately.
     Cloud Run's 300s request timeout is shorter than the training run, so
     the work runs detached. Poll /api/ml/status or /api/ml/scorecard."""
-    return ml_trainer.train_async(max_tickers=max_tickers)
+    return ml_trainer.train_async(max_tickers=max_tickers, force=force)
 
 
 @router.post("/calibrate-weights")

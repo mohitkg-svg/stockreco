@@ -579,12 +579,12 @@ def get_status() -> Dict[str, Any]:
     return {"state": "no_status"}
 
 
-def train_async(max_tickers: int = 40) -> Dict[str, Any]:
+def train_async(max_tickers: int = 40, force: bool = False) -> Dict[str, Any]:
     """Kick training in a background thread and return immediately. Status
     polled via /api/ml/status or /api/ml/scorecard."""
     import threading
     cur = get_status()
-    if cur.get("state") in ("collecting", "training"):
+    if not force and cur.get("state") in ("collecting", "training"):
         return {"accepted": False, "reason": f"already running (state={cur.get('state')})", "status": cur}
 
     def _job():
