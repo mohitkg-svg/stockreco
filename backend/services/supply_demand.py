@@ -18,7 +18,7 @@ Detection rules (pragmatic, no ML):
   5. Classify relative to current price: demand zones must sit at/below price,
      supply zones at/above.
 """
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import pandas as pd
 
 
