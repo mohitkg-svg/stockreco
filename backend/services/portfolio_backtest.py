@@ -218,7 +218,7 @@ def run_portfolio_backtest(
     min_hold_bars: int = 3,
     max_hold_bars: int = 30,
     stress_window: Optional[str] = None,
-    harmonized_cost_model: bool = False,
+    harmonized_cost_model: bool = True,
 ) -> Dict[str, Any]:
     """Run the composite backtest. Returns {stats, trades, rejections}.
 

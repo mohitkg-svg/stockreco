@@ -205,13 +205,12 @@ def recalculate_targets(ticker: str, direction: str,
                          current_price_value: float) -> Optional[List[float]]:
     """After T3 is breached and the trend is clearly continuing, compute the
     next three targets from `current_price_value`. Uses daily swing levels
-    above (long) / below (bear) price plus gap-fill magnets; falls back to
+    above (long) / below (bear) price; falls back to
     ATR-based steps when the chart hasn't formed enough structure beyond."""
     try:
         from services.data_fetcher import fetch_ohlcv
         from services.support_resistance import swing_levels
         from services.indicators import compute_indicators
-        from services.gap_detector import gap_targets_above, gap_targets_below
         df = fetch_ohlcv(ticker, "1d")
         if df is None or df.empty:
             return None
@@ -238,13 +237,11 @@ def recalculate_targets(ticker: str, direction: str,
 
         if direction == "long":
             swing_above = {l["price"] for l in levels if l["price"] > current_price_value * 1.005}
-            gap_above = set(gap_targets_above(df, current_price_value))
-            above = sorted(swing_above | gap_above)
+            above = sorted(swing_above)
             picks = above[:3]
         else:
             swing_below = {l["price"] for l in levels if l["price"] < current_price_value * 0.995}
-            gap_below = set(gap_targets_below(df, current_price_value))
-            below = sorted(swing_below | gap_below, reverse=True)
+            below = sorted(swing_below, reverse=True)
             picks = below[:3]
 
         while len(picks) < 3:
@@ -311,6 +308,31 @@ def check_reversal(t: AutoTrade, db: Session) -> Optional[str]:
 
     The opposing signal must be on a TF ≥ the trade's source TF — a 5m
     fakeout shouldn't be allowed to close a 1d-conviction position."""
+    
+    # --- 1. Dynamic Order Flow & L3 Spoofing Exit (Time-Series Decay Model) ---
+    # Replaces static geometry targets by predicting flow exhaustion in real-time
+    try:
+        from services.l3_orderbook import get_spoofing_score, get_orderbook_skew
+        from services.order_flow import aggressor_flow_imbalance
+
+        spoof = get_spoofing_score(t.ticker)
+        flow = aggressor_flow_imbalance(t.ticker, window_minutes=5)
+        skew = get_orderbook_skew(t.ticker)
+        side = t.side.upper() if t.side else "BUY"
+
+        if side == "BUY":
+            if spoof < -0.70:
+                return f"dynamic_exit: L3 spoofing detected (fake bid support pulled, score={spoof:.2f})"
+            if flow is not None and flow < -0.60 and skew < -0.30:
+                return f"dynamic_exit: Order flow decayed (aggressive selling, flow={flow:.2f}, skew={skew:.2f})"
+        else:
+            if spoof > 0.70:
+                return f"dynamic_exit: L3 spoofing detected (fake ask resistance pulled, score={spoof:.2f})"
+            if flow is not None and flow > 0.60 and skew > 0.30:
+                return f"dynamic_exit: Order flow decayed (aggressive buying, flow={flow:.2f}, skew={skew:.2f})"
+    except Exception as e:
+        logger.debug(f"dynamic flow exit check failed: {e}")
+
     from datetime import timedelta as _td_grace
     opened_at = t.filled_at or t.opened_at
     if not opened_at:
