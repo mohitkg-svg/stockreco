@@ -5568,11 +5568,25 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
         except Exception as _ne:
             logger.debug(f"news_entry_gate (call) failed for {ticker}: {_ne}")
 
-        # QUANT REVISION: Apply Markowitz Covariance Multiplier
+        # QUANT REVISION: Apply Markowitz Mean-Variance Optimization (MVO)
         try:
-            from services.correlation import markowitz_covariance_multiplier
-            _mvo_mult = markowitz_covariance_multiplier(ticker, db)
-        except Exception:
+            from database import AutoTrade as _AT_mvo
+            _open_mvo = db.query(_AT_mvo).filter(
+                _AT_mvo.status.in_(["pending", "open", "adopted"])
+            ).all()
+            _mvo_tickers = list({t.ticker.upper() for t in _open_mvo if t.ticker} | {ticker.upper()})
+            _mvo_returns = []
+            for tk in _mvo_tickers:
+                _pw = float(thesis.get("confidence") or 50) / 100.0 if tk == ticker.upper() else 0.55
+                _er = (_pw * 1.5) - (1.0 - _pw) * 1.0
+                _mvo_returns.append(max(0.01, _er))
+            from services.correlation import optimize_portfolio_mvo
+            _mvo_weights = optimize_portfolio_mvo(_mvo_tickers, _mvo_returns, lookback=60)
+            _equal_weight = 1.0 / max(1, len(_mvo_tickers))
+            _mvo_target_weight = _mvo_weights.get(ticker.upper(), _equal_weight)
+            _mvo_mult = float(max(0.5, min(2.0, _mvo_target_weight / _equal_weight)))
+        except Exception as _e:
+            logger.debug(f"MVO optimization failed: {_e}")
             _mvo_mult = 1.0
             
         # QUANT REVISION: Kelly Criterion Sizing for Options
@@ -7557,7 +7571,7 @@ def manage_open_positions() -> Dict[str, Any]:
                                                 # just let chandelier trail.
                                                 _atomic_append_note(
                                                     db, t.id,
-                                                    f" | level_index ≥ 3, chandelier-only trail "
+                                                    f" | level_index ≥ 3, trail only "
                                                     f"(no more target recompute)",
                                                 )
                                             _touch_clear(t, db)
@@ -7570,74 +7584,6 @@ def manage_open_positions() -> Dict[str, Any]:
                                 # Price fell back below the target before we
                                 # got N confirmations — reset the streak.
                                 _touch_clear(t, db)
-
-                            # 2c) Chandelier + structural overlay.
-                            # Critical-audit fix #5: chandelier now activates
-                            # from bar 1, not after T1. Previously ~8% of
-                            # entries reversed before reaching T1 and hit the
-                            # hard stop at full 1R; a pre-T1 chandelier
-                            # trail would have exited many at 0.5-0.7R.
-                            # BUT we require price has moved into favor by
-                            # at least 0.5R before letting chandelier tighten —
-                            # otherwise chandelier would tighten the broker-held
-                            # SL right after a fill, which is the naked-long
-                            # race we spent audit-fix #2 avoiding.
-                            base_mult = cfg_snapshot["chandelier_atr_mult"]
-                            ch_mult = _adaptive_chandelier_mult(base_mult, t.ticker) if base_mult > 0 else 0
-                            chandelier_stop = None
-                            if ch_mult > 0 and t.high_water_mark and t.entry_price:
-                                _initial_risk_ch = max(0.01, float(t.entry_price) - float(t.stop_loss))
-                                _favor_move = t.high_water_mark - float(t.entry_price)
-                                if _favor_move >= 0.5 * _initial_risk_ch:
-                                    _atr = _chandelier_atr(t.ticker)
-                                    if _atr is not None:
-                                        chandelier_stop = round(t.high_water_mark - ch_mult * _atr, 2)
-
-                            # Ground-up Tier 3: structural trail — most recent
-                            # weekly swing low on daily+ source trades. The
-                            # "just below structure" stop is what discretionary
-                            # traders use; harder to shake out than an ATR-distance
-                            # stop because it respects market memory.
-                            structural_stop = None
-                            try:
-                                src_tf_trail = _trade_source_timeframe(t, db)
-                                if src_tf_trail in ("1d", "1mo") and (t.level_index or 0) >= 1:
-                                    from services.data_fetcher import fetch_ohlcv as _fo_wk
-                                    wk_df = _fo_wk(t.ticker, "1d")
-                                    if wk_df is not None and len(wk_df) >= 10:
-                                        # Most recent swing low = min low over last 10 bars
-                                        # (~2 weeks) with 0.3% buffer for wick tolerance.
-                                        recent_low = float(wk_df["Low"].iloc[-10:].min())
-                                        structural_stop = round(recent_low * 0.997, 2)
-                            except Exception:
-                                pass
-
-                            # Choose the higher (tighter for long) of the two.
-                            candidates = [x for x in (chandelier_stop, structural_stop) if x is not None]
-                            if candidates:
-                                new_trail_stop = max(candidates)
-                                source = (
-                                    "structural" if new_trail_stop == structural_stop and
-                                    (chandelier_stop is None or structural_stop >= chandelier_stop)
-                                    else "chandelier"
-                                )
-                                # r42 fix #0.2: capture rotated id from broker replace.
-                                _new_tid = _replace_stop(t.stop_order_id, new_trail_stop) if new_trail_stop > t.current_stop else None
-                                if _new_tid:
-                                    t.stop_order_id = _new_tid
-                                    old_stop = t.current_stop
-                                    t.current_stop = new_trail_stop
-                                    _atomic_append_note(
-                                        db, t.id,
-                                        f" | {source} trail → stop {new_trail_stop} "
-                                        f"(from {old_stop})",
-                                    )
-                                    db.commit()
-                                    summary["trailed"] += 1
-                                    logger.info(
-                                        f"AutoTrader {t.ticker} {source} trail → {new_trail_stop} "
-                                        f"(chandelier={chandelier_stop}, structural={structural_stop})"
-                                    )
 
                     # 3) Reconcile: if parent or both legs closed, close the trade
                     if t.status == "open":

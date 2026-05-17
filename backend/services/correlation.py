@@ -199,3 +199,56 @@ def markowitz_covariance_multiplier(new_ticker: str, db: Any) -> float:
 
     # Linear map: corr 0.8 -> 0.6x size, corr 0 -> 1.0x size, corr -0.8 -> 1.4x size
     return float(max(0.5, min(1.5, 1.0 - (weighted_correlation * 0.5))))
+
+
+def optimize_portfolio_mvo(tickers: List[str], expected_returns: List[float], lookback: int = 252) -> Dict[str, float]:
+    """
+    Markowitz Mean-Variance Optimization (MVO).
+    Computes the Tangency Portfolio weights given empirical covariance
+    and ML-predicted expected returns.
+    
+    W = (Σ⁻¹) μ / (1ᵀ Σ⁻¹ μ)
+    """
+    import numpy as np
+    import pandas as pd
+    from sklearn.covariance import LedoitWolf
+
+    if not tickers or len(tickers) != len(expected_returns) or len(tickers) < 2:
+        return {tk: 1.0 / max(1, len(tickers)) for tk in tickers}
+
+    returns_dict = {}
+    for tk in tickers:
+        rets = _fetch_daily_returns(tk, lookback)
+        if rets and len(rets) >= lookback * 0.8:
+            returns_dict[tk] = {d: r for d, r in rets}
+
+    if not returns_dict:
+        return {tk: 1.0 / len(tickers) for tk in tickers}
+
+    df = pd.DataFrame(returns_dict).dropna(axis=1)
+    valid_tickers = df.columns.tolist()
+
+    if len(valid_tickers) < 2:
+        return {tk: 1.0 / len(valid_tickers) for tk in valid_tickers}
+
+    # QUANT REVISION: Ledoit-Wolf Shrinkage for Covariance Matrix Stabilization
+    cov_matrix = LedoitWolf().fit(df).covariance_
+    mu = np.array([expected_returns[tickers.index(tk)] for tk in valid_tickers])
+
+    try:
+        cov_inv = np.linalg.pinv(cov_matrix)
+        w_unnorm = cov_inv @ mu
+        w_long = np.maximum(w_unnorm, 0.0) # Long only
+        sum_w = np.sum(w_long)
+        if sum_w > 0:
+            weights = w_long / sum_w
+        else:
+            weights = np.ones(len(valid_tickers)) / len(valid_tickers)
+    except Exception:
+        weights = np.ones(len(valid_tickers)) / len(valid_tickers)
+
+    out = {tk: float(w) for tk, w in zip(valid_tickers, weights)}
+    for tk in tickers:
+        if tk not in out:
+            out[tk] = 0.0
+    return out
