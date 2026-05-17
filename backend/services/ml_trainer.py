@@ -77,13 +77,13 @@ _FOLDS = 4
 _MIN_TOTAL_SAMPLES = 200
 
 
-def _label_forward_return(future: pd.DataFrame, entry_close: float) -> Optional[int]:
-    """Label 1 if the N-bar forward return is positive, 0 otherwise."""
+def _label_forward_return(future: pd.DataFrame, entry_close: float) -> Optional[float]:
+    """Target variable: continuous N-bar forward return (regression)."""
     if future.empty:
         return None
     # Calculate pure forward return percentage
     ret = (float(future["Close"].iloc[-1]) - entry_close) / entry_close
-    return 1 if ret > 0 else 0
+    return float(ret)
 
 
 def _read_drop_target_geometry_flag() -> bool:
@@ -155,7 +155,7 @@ def _collect_samples_for_ticker(ticker: str, daily_cache: Dict[str, pd.DataFrame
         except Exception as e:
             logger.debug(f"ml_trainer: features {ticker}@{i}: {e}")
             continue
-        feat["__label"] = int(label)
+        feat["__label"] = float(label)
         feat["__ticker"] = ticker
         feat["__ts"] = pd.Timestamp(as_of_ts).isoformat()
         rows.append(feat)
@@ -207,7 +207,7 @@ def _collect_live_outcome_samples() -> List[Dict[str, Any]]:
             # Keep only known feature columns, drop anything unexpected so the
             # row shape matches feature_columns().
             sample = {k: feat.get(k) for k in cols}
-            sample["__label"] = int(r.outcome)
+            sample["__label"] = 0.05 if int(r.outcome) == 1 else -0.05
             sample["__ticker"] = r.ticker
             sample["__ts"] = (r.created_at.isoformat() if r.created_at else "")
             sample["__source"] = "live"
@@ -292,7 +292,7 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     from services.ml_features import feature_columns
     cols = feature_columns()
     X = samples[cols].astype(float).values
-    y = samples["__label"].astype(int).values
+    y = samples["__label"].astype(float).values
 
     # r44 fix #0.16: walk-forward by TIME boundaries, not row index. Same
     # `__ts` boundary across all tickers prevents cross-ticker leakage:
@@ -373,41 +373,41 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         y_te = y[te_idx]
         if len(X_te) < 30 or len(set(y_tr)) < 2 or len(set(y_te)) < 2:
             continue
-        # r44 fix #1.5: handle class imbalance via scale_pos_weight.
-        n_neg = int((y_tr == 0).sum())
-        n_pos = int((y_tr == 1).sum())
-        spw = (n_neg / max(1, n_pos))
         booster = lgb.train(
             params={
-                "objective": "binary",
-                "metric": "binary_logloss",
+                "objective": "regression",
+                "metric": "rmse",
                 "learning_rate": 0.05,
                 "num_leaves": 31,
                 "min_data_in_leaf": 20,
                 "feature_fraction": 0.85,
                 "bagging_fraction": 0.85,
                 "bagging_freq": 4,
-                "scale_pos_weight": spw,
                 "verbose": -1,
             },
             train_set=lgb.Dataset(X_tr, label=y_tr, feature_name=cols),
             num_boost_round=200,
         )
         pred = booster.predict(X_te)
+        
+        # Convert continuous labels to binary for classification metrics and Isotonic Mapping
+        y_te_bin = (y_te > 0).astype(int)
+        y_tr_bin = (y_tr > 0).astype(int)
+        
         try:
-            auc = roc_auc_score(y_te, pred)
+            auc = roc_auc_score(y_te_bin, pred)
         except Exception:
             auc = None
-        acc = accuracy_score(y_te, (pred >= 0.5).astype(int))
+        acc = accuracy_score(y_te_bin, (pred > 0.0).astype(int))
         fold_metrics.append({
             "fold": k, "n_train": len(X_tr), "n_test": len(X_te),
             "auc": round(auc, 4) if auc is not None else None,
             "accuracy": round(acc, 4),
-            "pos_rate_train": round(float(np.mean(y_tr)), 3),
-            "pos_rate_test": round(float(np.mean(y_te)), 3),
+            "pos_rate_train": round(float(np.mean(y_tr_bin)), 3),
+            "pos_rate_test": round(float(np.mean(y_te_bin)), 3),
         })
         oof_preds.extend(pred.tolist())
-        oof_labels.extend(y_te.tolist())
+        oof_labels.extend(y_te_bin.tolist())
     if not fold_metrics:
         return {"trained": False, "reason": "no usable folds"}
     aucs = [m["auc"] for m in fold_metrics if m.get("auc") is not None]
@@ -416,8 +416,8 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     # Final model on ALL samples (after fold validation passes the bar)
     final_booster = lgb.train(
         params={
-            "objective": "binary",
-            "metric": "binary_logloss",
+            "objective": "regression",
+            "metric": "rmse",
             "learning_rate": 0.05,
             "num_leaves": 31,
             "min_data_in_leaf": 20,

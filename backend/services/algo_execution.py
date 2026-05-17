@@ -1,6 +1,6 @@
 """
-TWAP / VWAP Execution Engine
-Slices large Kelly-sized orders into smaller child orders to minimize impact slippage.
+VWAP Execution Engine (U-Shaped Liquidity Profile)
+Slices large orders using a parabolic volume curve to match intraday liquidity.
 """
 import logging
 import time
@@ -34,7 +34,16 @@ def tick_twaps():
         return
     for twap_id, state in _active_twaps.items():
         elapsed = now - state["start_time"]
-        target_qty = state["total_qty"] if elapsed >= state["duration_sec"] else int(state["total_qty"] * (elapsed / state["duration_sec"]))
+        
+        # QUANT REVISION: U-Shaped VWAP Profile
+        # Cumulative distribution function for a parabola v(x) = 6(x-0.5)^2 + 0.5
+        if elapsed >= state["duration_sec"]:
+            target_qty = state["total_qty"]
+        else:
+            x = elapsed / state["duration_sec"]
+            cdf = (2 * (x ** 3)) - (3 * (x ** 2)) + (2 * x)
+            target_qty = int(state["total_qty"] * cdf)
+            
         slice_qty = target_qty - state["filled_qty"]
         if slice_qty > 0:
             try:

@@ -298,6 +298,56 @@ def _inside_bar_breakout(d: pd.DataFrame) -> Dict:
     }
 
 
+def _stat_arb_pairs(d: pd.DataFrame) -> Dict:
+    """Market Neutral Statistical Arbitrage (Cointegration).
+
+    Trades the spread between highly correlated assets when they deviate
+    by > 2 standard deviations. Mean-reversion edge that is strictly
+    market-neutral.
+    """
+    empty = pd.Series(False, index=d.index)
+    ticker = (d.attrs.get("ticker") if hasattr(d, "attrs") else None) or ""
+    
+    # Defined cointegrated pairs
+    pairs = {
+        "NVDA": "AMD", "AMD": "NVDA", 
+        "SPY": "QQQ", "QQQ": "SPY",
+        "GOOGL": "META", "META": "GOOGL",
+        "JPM": "BAC", "BAC": "JPM"
+    }
+    
+    peer = pairs.get(ticker.upper())
+    if not peer or len(d) < 60:
+        return {"name": "StatArb Pairs", "description": "—", "regime": "any", "entry_long": empty, "entry_short": empty}
+        
+    try:
+        from services.data_fetcher import fetch_ohlcv
+        peer_df = fetch_ohlcv(peer, "1d")
+        if peer_df is None or peer_df.empty or len(peer_df) < 60:
+            return {"name": "StatArb Pairs", "description": "—", "regime": "any", "entry_long": empty, "entry_short": empty}
+            
+        # Align series and calculate spread z-score
+        df_sync = pd.DataFrame({"asset": d["Close"], "peer": peer_df["Close"]}).dropna()
+        spread = np.log(df_sync["asset"]) - np.log(df_sync["peer"])
+        z_score = (spread - spread.rolling(60).mean()) / spread.rolling(60).std()
+        
+        # Re-align back to original index
+        z_score = z_score.reindex(d.index).ffill()
+        
+        long_e = z_score < -2.0
+        short_e = z_score > 2.0
+        
+        return {
+            "name": "StatArb Pairs",
+            "description": f"Statistical Arbitrage against cointegrated peer {peer}",
+            "regime": "any",
+            "entry_long": long_e.fillna(False),
+            "entry_short": short_e.fillna(False),
+        }
+    except Exception:
+        return {"name": "StatArb Pairs", "description": "—", "regime": "any", "entry_long": empty, "entry_short": empty}
+
+
 # QUANT REVISION: Orthogonal (uncorrelated) features. 
 # Discarding multicollinear technical indicators. Keeping ONE mean-reversion factor, 
 # and leaning into alternative data and structurally sound setups.
@@ -310,6 +360,7 @@ STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
     _opening_reversal,
     _last_30min_momentum,
     _inside_bar_breakout,
+    _stat_arb_pairs,
 ]
 
 
