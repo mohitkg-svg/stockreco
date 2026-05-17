@@ -234,7 +234,6 @@ def _simulate(
     `entry_idx`/`hist` lookups use `df.iloc[:i+1]` to enforce no look-ahead
     on the gap-target computation (the only place future bars could leak in).
     """
-    from services.gap_detector import gap_targets_above as _gta, gap_targets_below as _gtb
 
     stop_mult = STOP_ATR_MULT_BY_TF.get(timeframe, DEFAULT_STOP_ATR_MULT) if timeframe else DEFAULT_STOP_ATR_MULT
     target_mult = stop_mult * DEFAULT_RR  # preserve 1.67 R:R
@@ -307,17 +306,7 @@ def _simulate(
             entry_price = _apply_costs(float(row["Open"]), "entry", direction, dyn_bps=entry_dyn)
             entry_date = d.index[i]
             # r39 audit cleanup: removed unused `entry_idx = i`.
-            # Compute gap-fill levels from history visible at entry (no look-ahead)
-            hist = d.iloc[:i + 1]
-            try:
-                if direction == "BUY":
-                    fills_above = _gta(hist, entry_price)
-                    gap_target = fills_above[0] if fills_above else None
-                else:
-                    fills_below = _gtb(hist, entry_price)
-                    gap_target = fills_below[0] if fills_below else None
-            except Exception:
-                gap_target = None
+            gap_target = None
             r = stop_mult * a   # risk distance in $
             if direction == "BUY":
                 stop = entry_price - r
