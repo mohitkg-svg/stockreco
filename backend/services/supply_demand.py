@@ -20,6 +20,7 @@ Detection rules (pragmatic, no ML):
 """
 from typing import List, Dict, Any, Optional
 import pandas as pd
+import numpy as np
 
 
 MOVE_ATR_MULT = 1.5       # departure candle body ≥ 1.5× ATR
