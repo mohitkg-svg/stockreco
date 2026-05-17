@@ -23,6 +23,24 @@ def train(max_tickers: int = Query(40, ge=5, le=200)):
     return ml_trainer.train_async(max_tickers=max_tickers)
 
 
+@router.post("/calibrate-weights")
+def calibrate_weights(lookback_days: int = Query(180, ge=30, le=730)):
+    """r96 R1: recompute per-(strategy, timeframe) calibrated weights from
+    closed AutoTrade realized expectancy over the trailing window. Persists
+    to disk + MLArtifact. Operator flips cfg.calibrated_weights_enabled
+    after reviewing the returned bucket summary."""
+    from services import calibrated_weights as _cw
+    return _cw.calibrate(lookback_days=lookback_days)
+
+
+@router.get("/calibrated-weights")
+def calibrated_weights_status():
+    """r96 R1: observability accessor — returns the currently loaded
+    (strategy, timeframe) → weight map. Empty when never calibrated."""
+    from services import calibrated_weights as _cw
+    return _cw.status()
+
+
 @router.get("/status")
 def status():
     """Current training state (queued|collecting|training|done|error).

@@ -1152,7 +1152,15 @@ def current_portfolio_heat() -> float:
     """Beta-weighted dollar-at-risk across all open + pending auto trades.
     Returns 0.0 on any DB / fundamentals lookup failure (errs on the
     "no throttling, just use default sizing" side rather than over-shrinking
-    entries on a transient hiccup). Reads only — no writes."""
+    entries on a transient hiccup). Reads only — no writes.
+
+    r96 R3: when cfg.correlation_aware_sizing_enabled is True, the
+    beta-weighted sum is additionally multiplied by a correlation
+    inflation factor ∈ [1.0, 3.0] (services.correlation) that captures
+    how clustered the open positions are. Five tech longs into FOMC look
+    like five independent positions to the beta-only calc; the inflation
+    factor surfaces them as ~1.8-2.5× one bet.
+    """
     try:
         from database import SessionLocal, AutoTrade
         try:
@@ -1165,6 +1173,9 @@ def current_portfolio_heat() -> float:
                 AutoTrade.status.in_(["pending", "open"])
             ).all()
             total = 0.0
+            # r96 R3: collect per-position risk so the correlation module
+            # can compute its inflation factor in one pass without re-querying.
+            positions_for_corr: List[Dict[str, Any]] = []
             for ot in open_trades:
                 oe = ot.entry_price or ot.requested_entry or 0.0
                 os_ = ot.current_stop or ot.stop_loss or 0.0
@@ -1177,6 +1188,10 @@ def current_portfolio_heat() -> float:
                 elif ot.asset_type == "option" and oe > 0:
                     raw = float(oe) * 100 * (ot.qty or 0)
                 total += raw * beta_weight(ot.ticker)
+                if raw > 0 and ot.ticker:
+                    positions_for_corr.append({
+                        "ticker": ot.ticker, "dollar_risk": float(raw),
+                    })
             # r44 fix #0.10: include in-flight BP reservations as a
             # conservative heat add. Without this, two parallel scanners
             # could both compute heat=8% (cap=10%) and each reserve a
@@ -1187,6 +1202,17 @@ def current_portfolio_heat() -> float:
                 total += max(0.0, in_flight / 20.0)
             except Exception:
                 pass
+            # r96 R3: correlation-aware inflation (flag-gated default OFF).
+            try:
+                from database import AutoTraderConfig as _ATC_corr
+                _cfg_corr = db.query(_ATC_corr).filter(_ATC_corr.id == 1).first()
+                if _cfg_corr and bool(getattr(_cfg_corr, "correlation_aware_sizing_enabled", False)):
+                    from services.correlation import correlation_inflation_factor
+                    infl = correlation_inflation_factor(positions_for_corr)
+                    if infl > 1.0:
+                        total *= float(infl)
+            except Exception as _ce:
+                logger.debug(f"correlation inflation skipped: {_ce}")
             return total
         finally:
             db.close()

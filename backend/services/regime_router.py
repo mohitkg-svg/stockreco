@@ -83,6 +83,18 @@ def _classify_raw() -> Optional[str]:
             return "HIGH_VOL"
     except Exception:
         v = None
+    # r96 R6: when cfg.multidim_regime_enabled is True, ALSO check VIX term
+    # structure, realized vol, and breadth proxy. Any one of those flipping
+    # promotes the regime to HIGH_VOL regardless of VIX level — captures
+    # stress that's already in the tape but not yet in the VIX print.
+    try:
+        from services.multidim_regime import multidim_enabled, stress_regime_active
+        if multidim_enabled():
+            is_stress, _detail = stress_regime_active()
+            if is_stress:
+                return "HIGH_VOL"
+    except Exception:
+        pass
     try:
         from services.data_fetcher import fetch_ohlcv
         from services.indicators import compute_indicators as _ci

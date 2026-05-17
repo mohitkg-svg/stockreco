@@ -17,13 +17,7 @@ direction='BUY'.
 """
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
-import json
 import logging
-
-from services.data_fetcher import fetch_ohlcv
-from services.indicators import compute_indicators
-from services.support_resistance import swing_levels, pivot_points
-from services.fibonacci import compute_fib_levels
 
 logger = logging.getLogger(__name__)
 

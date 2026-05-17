@@ -55,11 +55,17 @@ def _ai_rate_inc(ticker: str) -> int:
     with _AI_RATE_LOCK:
         n = _AI_RATE.get(bucket, 0) + 1
         _AI_RATE[bucket] = n
-        # Prune entries older than 2h (keep current + previous hour for grace).
+        
+        # Prune entries older than 2h. To avoid O(N) overhead on every increment,
+        # we only prune when the hour bucket ticks over.
         cur_h = bucket[1]
-        for k in list(_AI_RATE.keys()):
-            if k[1] < cur_h - 1:
-                _AI_RATE.pop(k, None)
+        last_prune = getattr(_ai_rate_inc, "_last_prune_h", 0)
+        if last_prune < cur_h:
+            for k in list(_AI_RATE.keys()):
+                if k[1] < cur_h - 1:
+                    _AI_RATE.pop(k, None)
+            _ai_rate_inc._last_prune_h = cur_h
+            
         return n
 
 
@@ -398,6 +404,11 @@ def _dispatch_ai_news_exit(news_for_open: List[Dict[str, Any]]) -> None:
                 if not res.get("honored"):
                     continue
                 action = res.get("action", "hold")
+                
+                # Fix: if a trim would reduce the position to 0, treat it as a full close
+                # so the DB row status updates to closed_news_ai instead of staying open with qty=0.
+                if action == "trim" and (t.qty or 0) <= 1:
+                    action = "close"
                 if action == "close":
                     # r47 fix #T0e-3: serialize against the manage tick so the
                     # AI thread doesn't lost-update mid-T1-trim or mid-stop-replace.

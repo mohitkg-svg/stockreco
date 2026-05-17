@@ -121,6 +121,13 @@ class WatchlistStock(Base):
     # Per-ticker auto-trade gate. Global enable lives on AutoTraderConfig — both
     # must be true for a signal/put-play to open a position.
     auto_trade_enabled = Column(Boolean, default=True)
+    # r96 R4: survivorship tracking. When the data source repeatedly fails
+    # to fetch OHLCV for this ticker, `delisted` flips True with
+    # `delisted_at` set to detection time. Backtester reads these to
+    # INCLUDE the ticker in the historical universe (clamped at delisted_at)
+    # rather than silently filtering it out — fixes survivorship bias.
+    delisted = Column(Boolean, default=False)
+    delisted_at = Column(DateTime, nullable=True)
 
 
 class Signal(Base):
@@ -173,7 +180,7 @@ class AutoTraderConfig(Base):
     __tablename__ = "auto_trader_config"
     id = Column(Integer, primary_key=True)
     enabled = Column(Boolean, default=False)
-    confidence_threshold = Column(Float, default=75.0)
+    confidence_threshold = Column(Float, default=55.0)
     max_pct_of_equity = Column(Float, default=0.50)   # total cap
     stock_pct_of_equity = Column(Float, default=0.40) # of equity, not of cap
     # r39 audit fix #11: defaulted to 0.10 (10% of equity) but recent paper
@@ -369,6 +376,88 @@ class AutoTraderConfig(Base):
     # setup_quality_gate_enabled is True; default off to allow shadow eval.
     setup_quality_min = Column(Float, default=55.0)
     setup_quality_gate_enabled = Column(Boolean, default=False)
+    # r96 F1: ML label-leak fix. When True, ml_features.extract_features emits
+    # None for sig_stop_pct + sig_t1_pct (features derived from the same
+    # entry/stop/target1 levels the labeler uses to decide win/loss). Default
+    # False keeps the prior leaky behavior until operator flips post-retrain.
+    ml_features_drop_target_geometry = Column(Boolean, default=False)
+    # r96 F2: ML drift auto-disable. When True, the nightly ml_eval job flips
+    # ml_scoring_enabled=False if Brier > ml_drift_brier_alert_threshold on
+    # the last `ml_drift_consecutive_days_required` consecutive eval rows.
+    # Default False — operator must opt-in to closing this loop.
+    ml_drift_auto_disable_enabled = Column(Boolean, default=False)
+    ml_drift_consecutive_days_required = Column(Integer, default=3)
+    # r96 F3: strategy auto-disable. When True, consider_signal rejects new
+    # entries whose `signal.strategy` has realized win rate strictly below
+    # `strategy_auto_disable_wr_floor` on n >= `strategy_auto_disable_min_n`
+    # closed trades over the lookback window. Default False preserves the
+    # prior soft-shrink behavior (mult floor 0.5×, never zero).
+    strategy_auto_disable_enabled = Column(Boolean, default=False)
+    strategy_auto_disable_wr_floor = Column(Float, default=0.40)
+    strategy_auto_disable_min_n = Column(Integer, default=30)
+    strategy_auto_disable_lookback_days = Column(Integer, default=60)
+    # r96 F4: hard daily-loss halt. The existing daily_loss_limit_pct gate is a
+    # SOFT halt — blocks new entries but does not kill the session. When
+    # daily_loss_hard_halt_enabled is True, breaching daily_loss_hard_halt_pct
+    # also engages kill(flatten=True). Default False — operator opts in.
+    daily_loss_hard_halt_enabled = Column(Boolean, default=False)
+    daily_loss_hard_halt_pct = Column(Float, default=0.03)
+    # r96 F5: strict time-based ML folds. When True, the trainer REFUSES to
+    # fall back to row-based folds on thin data (which reintroduces
+    # interleaved-by-row leakage). Default False keeps the existing fallback
+    # path for back-compat; flip once sample count is stable.
+    ml_strict_time_folds = Column(Boolean, default=False)
+    # r96 F6: when True, portfolio_backtest derives cost baseline from the
+    # SAME constants the per-ticker backtester uses (resolves the audit-
+    # flagged ~3bps disagreement between the two engines). Default False
+    # preserves the legacy 12bps hardcoded baseline.
+    harmonized_cost_model_enabled = Column(Boolean, default=False)
+    # r96 F7: when True, the periodic reconcile job calls
+    # auto_resubmit_orphan_stops — for every open AutoTrade row whose
+    # ticker has no live stop order at the broker, a fresh SL is submitted
+    # at the row's current_stop price. Default False keeps prior behavior
+    # (operator-driven re-arming after a crash).
+    auto_resubmit_sl_enabled = Column(Boolean, default=False)
+    # r96 F8: when True, ml_scorer.log_prediction captures the feature vector
+    # at scoring time into MLPrediction.features_json, AND ml_trainer
+    # appends those closed-outcome rows to the training set on next train().
+    # Default False — operator opts in once enough live predictions have
+    # accumulated for the feedback loop to be useful (typically weeks).
+    ml_trainer_use_live_outcomes = Column(Boolean, default=False)
+    # r96 R1: when True, signal_generator multiplies confidence by the
+    # per-(strategy, timeframe) calibrated weight loaded from
+    # services.calibrated_weights (learned from realized expectancy on
+    # closed trades over a trailing 180d window). Default False keeps the
+    # prior hand-tuned-only behavior. Operator runs POST
+    # /api/ml/calibrate-weights to compute the table, then flips this.
+    calibrated_weights_enabled = Column(Boolean, default=False)
+    # r96 R2: when True, signal_generator applies a bucket-diversity
+    # dampener (services.signal_buckets) that rewards multi-bucket
+    # confirmation (trend + momentum + flow + …) and punishes single-source
+    # signals. Default False preserves the prior raw-additive scoring.
+    signal_buckets_enabled = Column(Boolean, default=False)
+    # r96 R3: when True, current_portfolio_heat() multiplies its beta-
+    # weighted sum by a correlation inflation factor ∈ [1.0, 3.0]
+    # (services.correlation). Clustered concentration (5 tech longs)
+    # surfaces as inflated heat instead of being treated as 5 independent
+    # bets. Default False preserves the legacy beta-only behavior.
+    correlation_aware_sizing_enabled = Column(Boolean, default=False)
+    # r96 R4: when True, backtester + portfolio_backtest INCLUDE delisted
+    # tickers in their historical universe (clamped at delisted_at) rather
+    # than running on the current-survivor set. Default False preserves the
+    # legacy "currently-active-only" universe — i.e. survivorship-biased.
+    survivorship_filter_enabled = Column(Boolean, default=False)
+    # r96 R5: when True, the scheduled job calls option_greeks.backfill_
+    # missing_greeks periodically to populate entry_delta/gamma/theta/vega
+    # on option positions whose Greeks weren't captured at fill time.
+    # Manual backfill via /api/admin/backfill-option-greeks is always
+    # available; this flag only gates the periodic schedule.
+    live_greeks_backfill_enabled = Column(Boolean, default=False)
+    # r96 R6: when True, regime_router._classify_raw also consults VIX
+    # term structure, realized SPY vol, and breadth-proxy in addition to
+    # VIX level. Any one tripping promotes regime to HIGH_VOL. Default
+    # False keeps the prior ADX+VIX-level-only classifier.
+    multidim_regime_enabled = Column(Boolean, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -453,6 +542,8 @@ class AutoTrade(Base):
     # promoted-from-adopted positions get a proper TF for reverse-thesis
     # checks (was always defaulting to "1d").
     source_timeframe = Column(String, nullable=True)
+    # A/B Testing origin
+    origin = Column(String, nullable=True)
 
 
 class CandidatePool(Base):
@@ -836,6 +927,12 @@ class MLPrediction(Base):
     realized_pl = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     closed_at = Column(DateTime, nullable=True)
+    # r96 F8: feature vector at scoring time, JSON-encoded. Enables the
+    # trainer to ingest LIVE realized outcomes (closed predictions where
+    # outcome IS NOT NULL) as additional labeled training rows — closes
+    # the feedback loop from prod trades back into model retraining.
+    # Null on rows logged before r96 or when feature capture is gated off.
+    features_json = Column(Text, nullable=True)
 
 
 class MLEvalResult(Base):
@@ -1273,6 +1370,7 @@ def create_tables():
     _ensure_column("auto_trades", "entry_vega", "DOUBLE PRECISION")
     _ensure_column("auto_trades", "entry_iv", "DOUBLE PRECISION")
     _ensure_column("auto_trades", "source_timeframe", "VARCHAR")
+    _ensure_column("auto_trades", "origin", "VARCHAR")
     # r48 BACKLOG: AutoTraderConfig — portfolio Greeks caps + new strategy flags
     _ensure_column("auto_trader_config", "portfolio_max_vega_pct", "DOUBLE PRECISION DEFAULT 0.0005")
     _ensure_column("auto_trader_config", "portfolio_max_gamma_pct", "DOUBLE PRECISION DEFAULT 0.0002")
@@ -1331,6 +1429,43 @@ def create_tables():
     # Per-signal factor capture for downstream IC analysis.
     _ensure_column("signals", "factor_score_composite", "DOUBLE PRECISION")
     _ensure_column("signals", "factor_scores_json", "TEXT")
+    # r96 F1: ML label-leak fix flag (default off — preserves prior behavior).
+    _ensure_column("auto_trader_config", "ml_features_drop_target_geometry", "BOOLEAN DEFAULT FALSE")
+    # r96 F2: ML drift auto-disable wiring for ml_drift_brier_alert_threshold.
+    _ensure_column("auto_trader_config", "ml_drift_auto_disable_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "ml_drift_consecutive_days_required", "INTEGER DEFAULT 3")
+    # r96 F3: strategy auto-disable on WR floor breach.
+    _ensure_column("auto_trader_config", "strategy_auto_disable_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "strategy_auto_disable_wr_floor", "DOUBLE PRECISION DEFAULT 0.40")
+    _ensure_column("auto_trader_config", "strategy_auto_disable_min_n", "INTEGER DEFAULT 30")
+    _ensure_column("auto_trader_config", "strategy_auto_disable_lookback_days", "INTEGER DEFAULT 60")
+    # r96 F4: hard daily-loss halt that engages kill() instead of just soft-reject.
+    _ensure_column("auto_trader_config", "daily_loss_hard_halt_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "daily_loss_hard_halt_pct", "DOUBLE PRECISION DEFAULT 0.03")
+    # r96 F5: strict time-based ML folds (refuses row-fallback that leaks).
+    _ensure_column("auto_trader_config", "ml_strict_time_folds", "BOOLEAN DEFAULT FALSE")
+    # r96 F6: cost-model harmonization toggle for portfolio_backtest.
+    _ensure_column("auto_trader_config", "harmonized_cost_model_enabled", "BOOLEAN DEFAULT FALSE")
+    # r96 F7: orphan-SL auto-resubmit toggle for reconcile.
+    _ensure_column("auto_trader_config", "auto_resubmit_sl_enabled", "BOOLEAN DEFAULT FALSE")
+    # r96 F8: MLPrediction features_json column for live-outcome retraining.
+    _ensure_column("ml_predictions", "features_json", "TEXT")
+    _ensure_column("auto_trader_config", "ml_trainer_use_live_outcomes", "BOOLEAN DEFAULT FALSE")
+    # r96 R1: calibrated weights toggle for signal_generator.
+    _ensure_column("auto_trader_config", "calibrated_weights_enabled", "BOOLEAN DEFAULT FALSE")
+    # r96 R2: bucket-diversity dampener toggle for signal_generator.
+    _ensure_column("auto_trader_config", "signal_buckets_enabled", "BOOLEAN DEFAULT FALSE")
+    # r96 R3: correlation-aware portfolio heat toggle.
+    _ensure_column("auto_trader_config", "correlation_aware_sizing_enabled", "BOOLEAN DEFAULT FALSE")
+    # r96 R4: survivorship tracking on watchlist + cfg toggle.
+    _ensure_column("watchlist", "delisted", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("watchlist", "delisted_at", "TIMESTAMP")
+    _ensure_column("auto_trader_config", "survivorship_filter_enabled", "BOOLEAN DEFAULT FALSE")
+    # r96 R5: scheduled option-Greeks backfill toggle.
+    _ensure_column("auto_trader_config", "live_greeks_backfill_enabled", "BOOLEAN DEFAULT FALSE")
+    # r96 R6: multi-dim regime classifier toggle.
+    _ensure_column("auto_trader_config", "multidim_regime_enabled", "BOOLEAN DEFAULT FALSE")
+    _ensure_column("auto_trader_config", "twap_enabled", "BOOLEAN DEFAULT TRUE")
     # Seed singleton config row if missing
     db = SessionLocal()
     try:

@@ -186,14 +186,15 @@ def _macro_features(as_of: datetime) -> Dict[str, Optional[float]]:
 
 
 def _regime_features(as_of: datetime, daily_cache: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, Optional[float]]:
-    """VIX level + 5d change. Uses ^VIX via yfinance."""
-    from services.data_fetcher import fetch_ohlcv
+    """VIX level + 5d change. Uses ^VIX via internal data_fetcher."""
     out: Dict[str, Optional[float]] = {"regime_vix": None, "regime_vix_chg_5d": None}
     try:
         if daily_cache is not None and "^VIX" in daily_cache:
             df = daily_cache["^VIX"]
         else:
-            df = fetch_ohlcv("^VIX", "1d")
+            from services.data_fetcher import _fetch_chart
+            # Use robust internal fetcher (avoids yfinance JSONDecodeErrors + Alpaca warnings)
+            df = _fetch_chart("^VIX", "1d", "2y")
             if daily_cache is not None:
                 daily_cache["^VIX"] = df
         row = _last_row_at_or_before(df, as_of) if df is not None else None
@@ -235,18 +236,6 @@ def _live_only_features(ticker: str) -> Dict[str, Optional[float]]:
     return out
 
 
-def _signal_features(signal: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """Encode the candidate signal itself."""
-    side = (signal.get("signal_type") or "").upper()
-    return {
-        "sig_dir": 1.0 if side == "BUY" else (-1.0 if side == "SELL" else 0.0),
-        "sig_conf": _safe(signal.get("confidence")),
-        # entry-stop and entry-T1 distances normalized by entry, capture R/R shape
-        "sig_stop_pct": _pct_change(_safe(signal.get("entry")), _safe(signal.get("stop_loss"))),
-        "sig_t1_pct": _pct_change(_safe(signal.get("target1")), _safe(signal.get("entry"))),
-    }
-
-
 def _microstructure_features(ticker: str, as_of: datetime,
                               tape_day_df: Optional[pd.DataFrame] = None) -> Dict[str, Optional[float]]:
     """Wrapper around services.alpaca_tape.microstructure_features that
@@ -270,6 +259,7 @@ def extract_features(
     daily_cache: Optional[Dict[str, pd.DataFrame]] = None,
     include_live_only: bool = True,
     tape_day_df: Optional[pd.DataFrame] = None,
+    drop_target_geometry: bool = False,
 ) -> Dict[str, Optional[float]]:
     """Materialize the full feature row for a (ticker, ts, signal) triple.
 
@@ -280,6 +270,11 @@ def extract_features(
     `include_live_only=False` for historical/backtest rows where analyst
     ratings and live news aren't available. The model still scores those
     columns but treats them as missing.
+
+    `drop_target_geometry=True` zeroes out the entry/stop/target1-derived
+    features (sig_stop_pct, sig_t1_pct) to close the F1 label-leak path:
+    the labeler decides win/loss from the same levels, so a model trained on
+    those features learns the labeler, not signal quality.
     """
     if daily_df is None:
         from services.data_fetcher import fetch_ohlcv
@@ -290,7 +285,6 @@ def extract_features(
     feat.update(_correlated_assets_features(as_of_ts, daily_cache))
     feat.update(_macro_features(as_of_ts))
     feat.update(_regime_features(as_of_ts, daily_cache))
-    feat.update(_signal_features(signal))
     feat.update(_microstructure_features(ticker, as_of_ts, tape_day_df=tape_day_df))
     if include_live_only:
         feat.update(_live_only_features(ticker))
@@ -315,11 +309,10 @@ def feature_columns() -> List[str]:
         "macro_hrs_to_next_high", "macro_hrs_since_last_high", "macro_in_blackout",
         # regime
         "regime_vix", "regime_vix_chg_5d",
-        # signal
-        "sig_dir", "sig_conf", "sig_stop_pct", "sig_t1_pct",
         # microstructure (Alpaca consolidated tape, last 30 min)
         "ms_trade_count", "ms_avg_size", "ms_dollar_volume",
         "ms_block_trade_pct", "ms_buysell_imbalance", "ms_tape_accel",
+        "ms_ob_imbalance", "ms_l3_skew",
         # live-only
         "analyst_mean", "analyst_count", "analyst_target_prem",
     ]

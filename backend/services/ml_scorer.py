@@ -31,6 +31,22 @@ _calibrator_loaded_at: Optional[float] = None
 _load_lock = threading.Lock()
 
 
+def _read_drop_target_geometry_flag() -> bool:
+    """r96 F1: read the ml_features_drop_target_geometry flag from cfg. Must
+    match the trainer's read of the same flag — training and inference feature
+    vectors have to use the same construction or scores are nonsense."""
+    try:
+        from database import SessionLocal, AutoTraderConfig
+        db = SessionLocal()
+        try:
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            return bool(getattr(cfg, "ml_features_drop_target_geometry", False)) if cfg else False
+        finally:
+            db.close()
+    except Exception:
+        return False
+
+
 def _hydrate_from_db_if_missing() -> bool:
     """If model.txt isn't on this container's /tmp, try pulling from DB.
     Returns True if a model is available locally after the call."""
@@ -151,6 +167,7 @@ def predict_winrate(ticker: str, signal: Dict[str, Any], as_of: Optional[datetim
         feat = extract_features(
             ticker, as_of or datetime.utcnow(), signal,
             include_live_only=True,
+            drop_target_geometry=_read_drop_target_geometry_flag(),
         )
         cols = feature_columns()
         x = [[feat.get(c) for c in cols]]
@@ -185,6 +202,7 @@ def predict_winrate_raw_and_calibrated(ticker: str, signal: Dict[str, Any],
         feat = extract_features(
             ticker, as_of or datetime.utcnow(), signal,
             include_live_only=True,
+            drop_target_geometry=_read_drop_target_geometry_flag(),
         )
         cols = feature_columns()
         x = [[feat.get(c) for c in cols]]
@@ -239,13 +257,39 @@ def winrate_to_multiplier(p: Optional[float]) -> float:
 
 def log_prediction(ticker: str, signal: Dict[str, Any], p: Optional[float],
                    trade_id: Optional[int] = None) -> None:
-    """Persist a prediction to MLPrediction. Used for post-hoc calibration."""
+    """Persist a prediction to MLPrediction. Used for post-hoc calibration.
+
+    r96 F8: also captures the feature vector at scoring time into
+    `features_json`, so the trainer can re-use closed predictions as
+    additional labeled rows. Feature capture is gated by
+    cfg.ml_trainer_use_live_outcomes (default False) — only worth the
+    write cost when the trainer will actually consume the rows.
+    """
     if p is None:
         return
     try:
-        from database import SessionLocal, MLPrediction
+        from database import SessionLocal, MLPrediction, AutoTraderConfig
+        import json as _json_lp
         db = SessionLocal()
         try:
+            features_json_str = None
+            try:
+                _cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+                if _cfg and bool(getattr(_cfg, "ml_trainer_use_live_outcomes", False)):
+                    from services.ml_features import extract_features
+                    feat = extract_features(
+                        ticker, datetime.utcnow(), signal,
+                        include_live_only=True,
+                        drop_target_geometry=_read_drop_target_geometry_flag(),
+                    )
+                    # JSON can't hold NaN; convert all values to plain floats or None.
+                    safe_feat = {
+                        k: (float(v) if isinstance(v, (int, float)) and v == v else None)
+                        for k, v in feat.items()
+                    }
+                    features_json_str = _json_lp.dumps(safe_feat)
+            except Exception as _fe:
+                logger.debug(f"ml_scorer.log_prediction feature capture failed: {_fe}")
             row = MLPrediction(
                 ticker=ticker.upper(),
                 signal_type=(signal.get("signal_type") or "").upper(),
@@ -254,6 +298,7 @@ def log_prediction(ticker: str, signal: Dict[str, Any], p: Optional[float],
                 signal_confidence=float(signal.get("confidence") or 0),
                 trade_id=trade_id,
                 created_at=datetime.utcnow(),
+                features_json=features_json_str,
             )
             db.add(row)
             db.commit()

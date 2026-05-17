@@ -1,0 +1,806 @@
+Run bash deploy-all.sh us-central1
+🚀 Deploying API Service (stockrecs)...
+── Rebuilding frontend (esbuild) ──
+  app.compiled.js      256.2kb
+  app.compiled.js.map  586.9kb
+
+⚡ Done in 35ms
+[build] wrote app.compiled.js (256.2 KB) in 43 ms
+✅ frontend rebuilt
+── Running pre-deploy ruff lint ──
+All checks passed!
+✅ ruff passed
+── Running pre-deploy regression tests ──
+   (Starting ephemeral Postgres container for tests)
+   (Waiting for Postgres to be ready...)
+test_budget_check_blocks_after_cap (tests.test_bug_scenarios.TestAIBudgetCheck.test_budget_check_blocks_after_cap) ... /home/runner/work/stockreco/stockreco/backend/services/ai_judge.py:305: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  day = _dt_co.utcnow().strftime("%Y-%m-%d")
+/home/runner/work/stockreco/stockreco/backend/services/ai_judge.py:288: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  day = _dt_aib.utcnow().strftime("%Y-%m-%d")
+ai_judge: daily call cap 3 reached (count=4); abstaining
+ok
+test_neutral_when_no_data (tests.test_bug_scenarios.TestAdaptiveRisk.test_neutral_when_no_data)
+No VIX, no closed trades → neutral 1.0. ... /home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:830: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  since = datetime.utcnow() - timedelta(days=30)
+APCA creds missing — paper trading disabled
+ok
+test_adaptive_zero_when_compounded_low (tests.test_bug_scenarios.TestAdaptiveZero.test_adaptive_zero_when_compounded_low)
+r43 fix #1.26: when the unfloored multiplier product would be ... /home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:830: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  since = datetime.utcnow() - timedelta(days=30)
+ok
+test_invalid_ticker_rejected (tests.test_bug_scenarios.TestAdminTickerValidation.test_invalid_ticker_rejected) ... ok
+test_clamps_extreme_values (tests.test_bug_scenarios.TestBetaWeight.test_clamps_extreme_values)
+Meme stocks can report beta 3-5; noisy data, clamped to [0.5, 2.0]. ... /opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/site-packages/sqlalchemy/sql/schema.py:3596: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return util.wrap_callable(lambda ctx: fn(), fn)  # type: ignore
+ok
+test_neutral_when_missing (tests.test_bug_scenarios.TestBetaWeight.test_neutral_when_missing)
+No row or null beta → default 1.0 (market-weighted). ... ok
+test_passthrough_for_typical_range (tests.test_bug_scenarios.TestBetaWeight.test_passthrough_for_typical_range) ... ok
+test_case_insensitive (tests.test_bug_scenarios.TestBlacklist.test_case_insensitive) ... ok
+test_comma_separated_multi (tests.test_bug_scenarios.TestBlacklist.test_comma_separated_multi) ... ok
+test_empty_blacklist_blocks_nothing (tests.test_bug_scenarios.TestBlacklist.test_empty_blacklist_blocks_nothing) ... ok
+test_exact_match_blocked (tests.test_bug_scenarios.TestBlacklist.test_exact_match_blocked) ... ok
+test_cache_bounded (tests.test_bug_scenarios.TestBoundedTradeCache.test_cache_bounded) ... ok
+test_calendar_multiplier_in_bounds (tests.test_bug_scenarios.TestCalendarMultiplier.test_calendar_multiplier_in_bounds) ... /home/runner/work/stockreco/stockreco/backend/services/macro_calendar.py:190: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  now = datetime.utcnow()
+/home/runner/work/stockreco/stockreco/backend/services/seasonality.py:19: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return datetime.utcnow().replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/New_York"))
+ok
+test_expensive_premium_aggressive (tests.test_bug_scenarios.TestCheapOptionsSizing.test_expensive_premium_aggressive) ... ok
+test_mid_premium_normal (tests.test_bug_scenarios.TestCheapOptionsSizing.test_mid_premium_normal) ... ok
+test_sub_50c_premium_capped_tight (tests.test_bug_scenarios.TestCheapOptionsSizing.test_sub_50c_premium_capped_tight) ... ok
+test_freeze_on_5_consecutive_losses (tests.test_bug_scenarios.TestConsecutiveLossFreeze.test_freeze_on_5_consecutive_losses)
+r43 fix #1.20: 5 stops in a row freeze trading regardless of ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1353: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  base = datetime.utcnow() - timedelta(days=10)
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:54: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "opened_at": datetime.utcnow() - timedelta(minutes=10),
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:55: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "filled_at": datetime.utcnow() - timedelta(minutes=10),
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1366: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  closed_at=datetime.utcnow() - timedelta(minutes=i+1),
+/home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:944: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  since = datetime.utcnow() - timedelta(days=30)
+ok
+test_correlation_gate_returns_empty_on_no_data (tests.test_bug_scenarios.TestCorrelationGate.test_correlation_gate_returns_empty_on_no_data)
+When data isn't available, gate fails open (returns no correlations) ... Yahoo Finance returned 404 for NOSUCH
+ok
+test_crisis_chandelier_mult_default (tests.test_bug_scenarios.TestCrisisHelpers.test_crisis_chandelier_mult_default) ... /home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:495: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  since = _dt_cm.utcnow() - _td_cm(days=30)
+/home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:944: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  since = datetime.utcnow() - timedelta(days=30)
+ok
+test_crisis_t1_trim_default (tests.test_bug_scenarios.TestCrisisHelpers.test_crisis_t1_trim_default) ... ok
+test_equity_snapshot_columns (tests.test_bug_scenarios.TestEquitySnapshotTable.test_equity_snapshot_columns) ... ok
+test_freeze_on_count_wr_low (tests.test_bug_scenarios.TestExpectancyFreezeGate.test_freeze_on_count_wr_low)
+Standard count-WR < 35% trigger still fires. ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1213: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  closed_at=datetime.utcnow() - timedelta(hours=i+1)))
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:54: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "opened_at": datetime.utcnow() - timedelta(minutes=10),
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:55: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "filled_at": datetime.utcnow() - timedelta(minutes=10),
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1215: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  closed_at=datetime.utcnow() - timedelta(hours=1)))
+ok
+test_freeze_on_negative_expectancy_when_diversified_losses (tests.test_bug_scenarios.TestExpectancyFreezeGate.test_freeze_on_negative_expectancy_when_diversified_losses)
+≥10 trades, expectancy ≤ 0, sum_pl ≤ -2× worst → freeze even ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1234: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  closed_at=datetime.utcnow() - timedelta(hours=i+1)))
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1237: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  closed_at=datetime.utcnow() - timedelta(hours=i+10)))
+ok
+test_analyst_consensus_shape_compatible_with_pipeline (tests.test_bug_scenarios.TestFmpIntegration.test_analyst_consensus_shape_compatible_with_pipeline)
+The dict returned by fmp_client.get_analyst_consensus must satisfy ... /home/runner/work/stockreco/stockreco/backend/services/analyst_ratings.py:79: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  r.updated_at = datetime.utcnow()
+ok
+test_disabled_when_key_unset (tests.test_bug_scenarios.TestFmpIntegration.test_disabled_when_key_unset) ... ok
+test_earnings_uses_fmp_first (tests.test_bug_scenarios.TestFmpIntegration.test_earnings_uses_fmp_first) ... ok
+test_enabled_when_key_set (tests.test_bug_scenarios.TestFmpIntegration.test_enabled_when_key_set) ... ok
+test_form_to_event_kind_routing (tests.test_bug_scenarios.TestFmpIntegration.test_form_to_event_kind_routing) ... ok
+test_fundamentals_falls_back_to_yfinance_when_fmp_returns_none (tests.test_bug_scenarios.TestFmpIntegration.test_fundamentals_falls_back_to_yfinance_when_fmp_returns_none)
+When FMP_API_KEY is set but the FMP composite fetch returns None ... ok
+test_fundamentals_uses_fmp_when_returned (tests.test_bug_scenarios.TestFmpIntegration.test_fundamentals_uses_fmp_when_returned) ... ok
+test_sec_filings_poll_dedupes_same_filing_across_ticks (tests.test_bug_scenarios.TestFmpIntegration.test_sec_filings_poll_dedupes_same_filing_across_ticks)
+Two consecutive poll runs returning the same filing must result ... /home/runner/work/stockreco/stockreco/backend/services/fmp_client.py:460: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  now = datetime.utcnow()
+/opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/site-packages/sqlalchemy/sql/schema.py:3596: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return util.wrap_callable(lambda ctx: fn(), fn)  # type: ignore
+ok
+test_sec_filings_poll_skips_when_disabled (tests.test_bug_scenarios.TestFmpIntegration.test_sec_filings_poll_skips_when_disabled) ... ok
+test_change_in_any_field_changes_hash (tests.test_bug_scenarios.TestFundamentalsHashing.test_change_in_any_field_changes_hash) ... ok
+test_same_inputs_produce_same_hash (tests.test_bug_scenarios.TestFundamentalsHashing.test_same_inputs_produce_same_hash) ... ok
+test_envelope_bounds (tests.test_bug_scenarios.TestFundamentalsMultiplier.test_envelope_bounds) ... ok
+test_mirror_on_sell (tests.test_bug_scenarios.TestFundamentalsMultiplier.test_mirror_on_sell) ... ok
+test_neutral_when_no_data (tests.test_bug_scenarios.TestFundamentalsMultiplier.test_neutral_when_no_data) ... ok
+test_penalty_for_junk_on_buy (tests.test_bug_scenarios.TestFundamentalsMultiplier.test_penalty_for_junk_on_buy) ... ok
+test_strong_buy_for_excellent_fundamentals (tests.test_bug_scenarios.TestFundamentalsMultiplier.test_strong_buy_for_excellent_fundamentals) ... ok
+test_distressed_company_scores_low (tests.test_bug_scenarios.TestFundamentalsScore.test_distressed_company_scores_low) ... ok
+test_excellent_balance_sheet_growth_scores_high (tests.test_bug_scenarios.TestFundamentalsScore.test_excellent_balance_sheet_growth_scores_high) ... ok
+test_partial_data_doesnt_blow_up (tests.test_bug_scenarios.TestFundamentalsScore.test_partial_data_doesnt_blow_up)
+Small/foreign-listed tickers may only have a couple of fields populated. ... ok
+test_score_clamped (tests.test_bug_scenarios.TestFundamentalsScore.test_score_clamped) ... ok
+test_idempotency_unique_index (tests.test_bug_scenarios.TestIdempotencyUnique.test_idempotency_unique_index) ... ok
+test_cluster_buy_returns_amplified (tests.test_bug_scenarios.TestInsiderClusterAmplification.test_cluster_buy_returns_amplified)
+r44 Wave 7: 12+ buys + ratio≥0.7 → 1.12× cluster bonus. ... ok
+test_balanced_neutral (tests.test_bug_scenarios.TestInsiderMultiplier.test_balanced_neutral) ... ok
+test_heavy_selling_confirms_sell (tests.test_bug_scenarios.TestInsiderMultiplier.test_heavy_selling_confirms_sell) ... ok
+test_heavy_selling_penalizes_buy (tests.test_bug_scenarios.TestInsiderMultiplier.test_heavy_selling_penalizes_buy) ... ok
+test_strong_insider_buy_boosts_buy (tests.test_bug_scenarios.TestInsiderMultiplier.test_strong_insider_buy_boosts_buy) ... ok
+test_thin_sample_neutral (tests.test_bug_scenarios.TestInsiderMultiplier.test_thin_sample_neutral)
+Below min-count floor, ratio is too noisy; stay neutral. ... ok
+test_kelly_is_fractional_not_full (tests.test_bug_scenarios.TestKellyFractional.test_kelly_is_fractional_not_full)
+Quarter-Kelly default keeps the result well below the full-Kelly ... ok
+test_isotonic_round_trip (tests.test_bug_scenarios.TestMLCalibration.test_isotonic_round_trip)
+Direct test of the IsotonicRegression layer — fit, persist, load, ... ok
+test_scorer_calibrator_loaded_accessor (tests.test_bug_scenarios.TestMLCalibration.test_scorer_calibrator_loaded_accessor)
+The status endpoint exposes whether a calibrator is currently ... ok
+test_envelope_bounds (tests.test_bug_scenarios.TestMLMultiplier.test_envelope_bounds) ... ok
+test_monotonic_non_decreasing (tests.test_bug_scenarios.TestMLMultiplier.test_monotonic_non_decreasing)
+Higher P(win) must never produce a lower multiplier. ... ok
+test_none_returns_neutral (tests.test_bug_scenarios.TestMLMultiplier.test_none_returns_neutral) ... ok
+test_inside_post_blackout (tests.test_bug_scenarios.TestMacroBlackout.test_inside_post_blackout)
+30 min after CPI = inside the 60-min post-window. ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:222: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  self.now = datetime.utcnow()
+/opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/site-packages/sqlalchemy/sql/schema.py:3596: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return util.wrap_callable(lambda ctx: fn(), fn)  # type: ignore
+ok
+test_inside_pre_blackout_high (tests.test_bug_scenarios.TestMacroBlackout.test_inside_pre_blackout_high)
+20 min before CPI = inside the 30-min pre-window for high impact. ... ok
+test_options_strict_widens_window (tests.test_bug_scenarios.TestMacroBlackout.test_options_strict_widens_window)
+options_strict=True widens windows by 50%. 40 min pre-CPI = inside ... ok
+test_outside_pre_blackout_window (tests.test_bug_scenarios.TestMacroBlackout.test_outside_pre_blackout_window)
+45 min before CPI = OUTSIDE the 30-min pre-window. ... ok
+test_sell_limit_is_inside_spread (tests.test_bug_scenarios.TestMarketableLimitInsideSpread.test_sell_limit_is_inside_spread)
+r43 fix #0.6: SELL must post INSIDE the spread (mid - offset), ... ok
+test_nr7_strategy_returns_dict (tests.test_bug_scenarios.TestNR7Strategy.test_nr7_strategy_returns_dict) ... /home/runner/work/stockreco/stockreco/backend/services/strategies.py:459: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  is_nr7_prev = is_nr7.shift(1).fillna(False)
+ok
+test_tier_p_strategies_in_funcs (tests.test_bug_scenarios.TestNewStrategiesPresent.test_tier_p_strategies_in_funcs) ... ok
+test_news_event_real_columns (tests.test_bug_scenarios.TestNewsContextColumnNames.test_news_event_real_columns) ... ok
+test_int_severity_blocks_low (tests.test_bug_scenarios.TestNewsSeverityGate.test_int_severity_blocks_low) ... ok
+test_int_severity_passes_high (tests.test_bug_scenarios.TestNewsSeverityGate.test_int_severity_passes_high) ... ok
+test_call_detected (tests.test_bug_scenarios.TestOCCParser.test_call_detected) ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:54: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "opened_at": datetime.utcnow() - timedelta(minutes=10),
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:55: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "filled_at": datetime.utcnow() - timedelta(minutes=10),
+ok
+test_put_detected_as_not_call (tests.test_bug_scenarios.TestOCCParser.test_put_detected_as_not_call) ... ok
+test_short_or_missing_symbol_safe (tests.test_bug_scenarios.TestOCCParser.test_short_or_missing_symbol_safe) ... ok
+test_occ_fallback_when_contractSymbol_missing (tests.test_bug_scenarios.TestOCCSymbolFallback.test_occ_fallback_when_contractSymbol_missing)
+r43 fix #0.1: Alpaca-feed contracts have only `_occ`. Reader must fall back. ... ok
+test_all_sources_failing_returns_none (tests.test_bug_scenarios.TestOptionChainPolygonFallback.test_all_sources_failing_returns_none)
+When Polygon (403/key/greeks-guard), Alpaca, AND Yahoo all miss, ... ok
+test_alpaca_and_yahoo_not_called_when_polygon_succeeds (tests.test_bug_scenarios.TestOptionChainPolygonFallback.test_alpaca_and_yahoo_not_called_when_polygon_succeeds) ... ok
+test_yahoo_not_called_when_alpaca_succeeds (tests.test_bug_scenarios.TestOptionChainPolygonFallback.test_yahoo_not_called_when_alpaca_succeeds) ... ok
+test_yahoo_used_when_polygon_and_alpaca_both_miss (tests.test_bug_scenarios.TestOptionChainPolygonFallback.test_yahoo_used_when_polygon_and_alpaca_both_miss) ... ok
+test_premium_stop_uses_min_not_max (tests.test_bug_scenarios.TestPremiumStopSemantics.test_premium_stop_uses_min_not_max)
+r43 fix #1.9: effective_stop_premium must use MIN of premium-50% ... ok
+test_get_account_keys_when_no_client (tests.test_bug_scenarios.TestR47AccountBlockedFields.test_get_account_keys_when_no_client) ... ok
+test_boost_fires_on_direction_match_alone (tests.test_bug_scenarios.TestR47ConfidenceBoostFiresOnDirectionMatch.test_boost_fires_on_direction_match_alone) ... ok
+test_calibration_multiplier_uses_n_column (tests.test_bug_scenarios.TestR47DeadMultipliers.test_calibration_multiplier_uses_n_column)
+r47 #T0a-1: prior code read getattr(row, 'n_trades', 0) but the ... /opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/site-packages/sqlalchemy/sql/schema.py:3596: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return util.wrap_callable(lambda ctx: fn(), fn)  # type: ignore
+ok
+test_inside_bar_breakout_uses_parent_bar_range (tests.test_bug_scenarios.TestR47DeadMultipliers.test_inside_bar_breakout_uses_parent_bar_range)
+r47 #T0c-4: prior code's `inside` mask was indexed wrong AND the ... ok
+test_strategy_multiplier_uses_n_key (tests.test_bug_scenarios.TestR47DeadMultipliers.test_strategy_multiplier_uses_n_key)
+r47 #T0a-2: prior code read entry.get('trades') but scorecard ... ok
+test_vix_spike_in_registry (tests.test_bug_scenarios.TestR47NewStrategiesPresent.test_vix_spike_in_registry) ... ok
+test_ai_rate_inc_persists_across_calls (tests.test_bug_scenarios.TestR47NewsAIRateModuleLevel.test_ai_rate_inc_persists_across_calls) ... /home/runner/work/stockreco/stockreco/backend/services/news.py:54: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  bucket = (ticker.upper(), int(_dt_air.utcnow().timestamp() // 3600))
+/home/runner/work/stockreco/stockreco/backend/services/news.py:68: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  bucket = (ticker.upper(), int(_dt_air.utcnow().timestamp() // 3600))
+ok
+test_iv_rank_size_factor_curve (tests.test_bug_scenarios.TestR47Overlays.test_iv_rank_size_factor_curve) ... ok
+test_overlay_combined_clamp (tests.test_bug_scenarios.TestR47Overlays.test_overlay_combined_clamp) ... ok
+test_short_position_contributes_to_heat (tests.test_bug_scenarios.TestR47PortfolioHeatShorts.test_short_position_contributes_to_heat) ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1759: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  opened_at=datetime.utcnow(),
+ok
+test_new_config_columns_present (tests.test_bug_scenarios.TestR47SchemaDrift.test_new_config_columns_present) ... ok
+test_ai_cost_tracker (tests.test_bug_scenarios.TestR48Backlog.test_ai_cost_tracker)
+r48 BACKLOG #observability-P1-15: $ cost tracker with token math. ... /home/runner/work/stockreco/stockreco/backend/services/ai_judge.py:296: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  day = _dt_au.utcnow().strftime("%Y-%m-%d")
+/home/runner/work/stockreco/stockreco/backend/services/ai_judge.py:305: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  day = _dt_co.utcnow().strftime("%Y-%m-%d")
+ok
+test_ai_envelope_tightened (tests.test_bug_scenarios.TestR48Backlog.test_ai_envelope_tightened)
+r48 BACKLOG #edge-F12: AI mult envelope shrunk to [0.85, 1.15]. ... ok
+test_atomic_realized_pl_helper_exists (tests.test_bug_scenarios.TestR48Backlog.test_atomic_realized_pl_helper_exists) ... ok
+test_book_var_99_uses_2_33 (tests.test_bug_scenarios.TestR48Backlog.test_book_var_99_uses_2_33)
+r48 BACKLOG #numerical-P2-20: 99% VaR multiplier corrected from 1.5 → 2.33. ... ok
+test_db_down_breaker (tests.test_bug_scenarios.TestR48Backlog.test_db_down_breaker) ... /home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:174: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  _db_down_until = datetime.utcnow() + timedelta(seconds=seconds)
+/home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:184: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return _db_down_until is not None and datetime.utcnow() < _db_down_until
+ok
+test_default_stop_atr_mult (tests.test_bug_scenarios.TestR48Backlog.test_default_stop_atr_mult)
+r48 BACKLOG #numerical-P2-22: default aligned to daily TF (was 1.5, now 2.0). ... ok
+test_factor_composite (tests.test_bug_scenarios.TestR48Backlog.test_factor_composite) ... /home/runner/work/stockreco/stockreco/backend/services/factors.py:297: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  cutoff = _dt_ms.utcnow() - _td_ms(hours=72)
+/home/runner/work/stockreco/stockreco/backend/services/factors.py:300: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  MacroEvent.release_time_utc <= _dt_ms.utcnow(),
+ok
+test_greeks_persistence_columns (tests.test_bug_scenarios.TestR48Backlog.test_greeks_persistence_columns)
+r48 BACKLOG #options-P0-4: AutoTrade has entry_delta/gamma/theta/vega/iv. ... ok
+test_index_event_requires_ticker (tests.test_bug_scenarios.TestR48Backlog.test_index_event_requires_ticker)
+r48 BACKLOG #edge-F10: boost only fires for whitelisted inclusion tickers. ... ok
+test_kelly_nan_guard (tests.test_bug_scenarios.TestR48Backlog.test_kelly_nan_guard)
+r48 BACKLOG #numerical-P1-11: NaN inputs return 1.0 instead of NaN. ... ok
+test_lev_etf_strategy_in_registry (tests.test_bug_scenarios.TestR48Backlog.test_lev_etf_strategy_in_registry) ... ok
+test_marketable_limit_option_entries (tests.test_bug_scenarios.TestR48Backlog.test_marketable_limit_option_entries)
+r48 BACKLOG #options-P0-2: option entries route through the new ... ok
+test_opex_eligible_universe (tests.test_bug_scenarios.TestR48Backlog.test_opex_eligible_universe)
+r48 BACKLOG #edge-F11: OPEX 0.92× only for liquid mega-caps. ... ok
+test_order_flow_module_exposes_gates (tests.test_bug_scenarios.TestR48Backlog.test_order_flow_module_exposes_gates) ... ok
+test_pdt_breaker (tests.test_bug_scenarios.TestR48Backlog.test_pdt_breaker) ... /home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:165: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  _pdt_lockout_until = datetime.utcnow() + timedelta(hours=hours)
+/home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:179: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return _pdt_lockout_until is not None and datetime.utcnow() < _pdt_lockout_until
+ok
+test_portfolio_greeks_caps_function_exists (tests.test_bug_scenarios.TestR48Backlog.test_portfolio_greeks_caps_function_exists) ... ok
+test_winrate_smoothness (tests.test_bug_scenarios.TestR48Backlog.test_winrate_smoothness)
+r48 BACKLOG #F19: smooth tanh ramp, monotonic, in-envelope. ... ok
+test_adopted_sl_tif_matches_bracket_tif (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_adopted_sl_tif_matches_bracket_tif)
+r80: promote_adopted_to_managed used to hardcode TIF.GTC for ... ok
+test_all_backend_python_files_parse (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_all_backend_python_files_parse)
+r79-F: blanket guard against the 'stray 2-char prefix on a line' ... ok
+test_alpaca_rest_reads_have_timeout_guard (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_alpaca_rest_reads_have_timeout_guard)
+r80: get_account / get_positions / get_orders previously had ... ok
+test_bracket_tif_fallback_is_day_not_gtc (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_bracket_tif_fallback_is_day_not_gtc)
+r77-B: bracket_tif=getattr(cfg, ..., 'gtc') would silently invert ... ok
+test_fast_path_no_artificial_2s_sleep (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_fast_path_no_artificial_2s_sleep)
+r77-C: live_quotes fast-path used to time.sleep(2.0) after ... ok
+test_fmp_sec_webhook_is_sync_def (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_fmp_sec_webhook_is_sync_def)
+r77-E: fmp_sec_webhook used to be `async def` but did sync ... ok
+test_force_close_options_verifies_position_flat (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_force_close_options_verifies_position_flat)
+r80: force_close on options must verify the broker actually ... ok
+test_frontend_has_kill_button (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_frontend_has_kill_button)
+r80: under stress, operator must have a one-click KILL path ... ok
+test_idempotency_dedup_is_status_aware (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_idempotency_dedup_is_status_aware)
+r80: previously the idempotency dedup matched on key alone ... ok
+test_kill_switch_checked_in_option_entry_paths (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_kill_switch_checked_in_option_entry_paths)
+r80: cfg.killed must short-circuit consider_put_play and ... ok
+test_logger_defined_before_first_use_in_auto_trader (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_logger_defined_before_first_use_in_auto_trader)
+r79-E: `logger = logging.getLogger(__name__)` must be at the ... ok
+test_news_ai_trim_uses_lock_and_fresh_session (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_news_ai_trim_uses_lock_and_fresh_session)
+r77-D: AI news_exit `trim` branch was modifying t.qty + db.commit() ... ok
+test_no_duplicate_for_loop_or_def_lines_in_main (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_no_duplicate_for_loop_or_def_lines_in_main)
+r77-A bis: same root cause — a reschedule / rename pass that ... ok
+test_no_note_concat_read_modify_write_in_auto_trader (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_no_note_concat_read_modify_write_in_auto_trader)
+r79-B: same race-condition class as realized_pl. `t.note = ... ok
+test_no_realized_pl_read_modify_write_in_auto_trader (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_no_realized_pl_read_modify_write_in_auto_trader)
+r79-A: every `t.realized_pl = (t.realized_pl or 0) + delta` ... ok
+test_no_scheduler_add_job_has_duplicate_trigger_kwarg (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_no_scheduler_add_job_has_duplicate_trigger_kwarg)
+r77-A: scan EVERY scheduler.add_job(...) call in main.py for ... ok
+test_option_entry_cancel_waits_for_terminal (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_option_entry_cancel_waits_for_terminal)
+r80: submit_option_entry_with_cross_fallback used a ... ok
+test_option_error_paths_set_idempotency_key (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_option_error_paths_set_idempotency_key)
+r79-D: option PUT/CALL error-path AutoTrade INSERTs used to ... ok
+test_r89_effective_dry_run_helper_exists (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_r89_effective_dry_run_helper_exists)
+r89 Bug 1: auto_trader must expose _effective_dry_run + the ... ok
+test_r89_get_option_position_strict_three_states (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_r89_get_option_position_strict_three_states)
+r89 Bug 2: alpaca_client.get_option_position_strict must return ... ok
+test_r89_options_entry_paths_have_dry_run_gate (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_r89_options_entry_paths_have_dry_run_gate)
+r89 Bug 1b: consider_put_play and consider_call_play previously ... ok
+test_r89_scan_now_route_pins_dry_run (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_r89_scan_now_route_pins_dry_run)
+r89 Bug 1: routers/trading.py /auto/scan-now must snapshot ... ok
+test_sector_heat_uses_original_qty (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_sector_heat_uses_original_qty)
+r79-C: sector-heat aggregation must read original_qty, not ... ok
+test_wash_sale_gate_present (tests.test_bug_scenarios.TestR77LiveMoneyP0Fixes.test_wash_sale_gate_present)
+r80: cfg.wash_sale_cooldown_days column exists since r47 but ... ok
+test_rr_min_blocks_negative_ev_trade (tests.test_bug_scenarios.TestRRMinFloor.test_rr_min_blocks_negative_ev_trade)
+r43 fix #0.2: a 0.4% T1 against 5% stop must be rejected. ... ok
+test_force_close_stock_adds_runner_pl (tests.test_bug_scenarios.TestRealizedPlAccumulation.test_force_close_stock_adds_runner_pl)
+force_close_trade for a stock with prior partial trim must ADD the ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:1130: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  opened_at=datetime.utcnow() - timedelta(minutes=20),
+reverse-close cancel_all_orders TEST: Alpaca client not initialized
+/home/runner/work/stockreco/stockreco/backend/services/execution_engine.py:473: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  t.closed_at = datetime.utcnow()
+AutoTrader CLOSED_REVERSE TEST (stock) — test reason PL≈$464.00
+ok
+test_regime_multiplier_in_bounds (tests.test_bug_scenarios.TestRegimeMultiplier.test_regime_multiplier_in_bounds) ... ok
+test_strategies_have_regime_field (tests.test_bug_scenarios.TestRegimeStrategyGate.test_strategies_have_regime_field)
+Every strategy must declare a `regime` so the auto-trader and ... /home/runner/work/stockreco/stockreco/backend/services/strategies.py:459: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  is_nr7_prev = is_nr7.shift(1).fillna(False)
+ok
+test_long_call_NOT_closed_by_buy (tests.test_bug_scenarios.TestReverseThesisDirection.test_long_call_NOT_closed_by_buy)
+Long CALL + BUY signal → BUY confirms the bull thesis, NO reversal. ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:54: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "opened_at": datetime.utcnow() - timedelta(minutes=10),
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:55: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "filled_at": datetime.utcnow() - timedelta(minutes=10),
+/home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:71: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "generated_at": datetime.utcnow(),
+ok
+test_long_call_closed_by_sell (tests.test_bug_scenarios.TestReverseThesisDirection.test_long_call_closed_by_sell)
+Long CALL (bullish bet) + SELL signal at gate → reversal triggers. ... ok
+test_long_put_NOT_closed_by_sell (tests.test_bug_scenarios.TestReverseThesisDirection.test_long_put_NOT_closed_by_sell)
+Long PUT + SELL signal → SELL confirms the bear thesis, no reversal. ... ok
+test_long_put_closed_by_buy (tests.test_bug_scenarios.TestReverseThesisDirection.test_long_put_closed_by_buy)
+Long PUT (bearish bet) + BUY signal at gate → reversal triggers. ... ok
+test_stock_long_NOT_closed_below_conf_gate (tests.test_bug_scenarios.TestReverseThesisDirection.test_stock_long_NOT_closed_below_conf_gate)
+Conf below REVERSE_CONFIDENCE_GATE (80) shouldn't fire. ... ok
+test_stock_long_NOT_closed_by_buy (tests.test_bug_scenarios.TestReverseThesisDirection.test_stock_long_NOT_closed_by_buy)
+Stock long + BUY → never reversal (BUY confirms a long). ... ok
+test_stock_long_NOT_closed_by_lower_tf (tests.test_bug_scenarios.TestReverseThesisDirection.test_stock_long_NOT_closed_by_lower_tf)
+A 1h SELL should NOT close a 1d-source long. Tighter rule than M5. ... ok
+test_stock_long_closed_by_high_conf_sell (tests.test_bug_scenarios.TestReverseThesisDirection.test_stock_long_closed_by_high_conf_sell)
+Stock long + SELL @ same TF + ≥80 conf → reversal triggers. ... ok
+test_calibration_multiplier_clamped_high (tests.test_bug_scenarios.TestRiskManagerDefensiveClamps.test_calibration_multiplier_clamped_high) ... ok
+test_calibration_multiplier_passthrough (tests.test_bug_scenarios.TestRiskManagerDefensiveClamps.test_calibration_multiplier_passthrough)
+A value within [0.5, 1.3] must pass through unchanged. ... ok
+test_strategy_multiplier_clamped_high (tests.test_bug_scenarios.TestRiskManagerDefensiveClamps.test_strategy_multiplier_clamped_high)
+A strategy multiplier > 1.3 from DB must be clamped to 1.3. ... ok
+test_strategy_multiplier_clamped_low (tests.test_bug_scenarios.TestRiskManagerDefensiveClamps.test_strategy_multiplier_clamped_low)
+A strategy multiplier < 0.5 from DB must be clamped to 0.5. ... ok
+test_bp_breaker_lifecycle (tests.test_bug_scenarios.TestRiskManagerState.test_bp_breaker_lifecycle) ... /home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:147: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  _bp_exhausted_until = datetime.utcnow() + timedelta(minutes=minutes)
+/home/runner/work/stockreco/stockreco/backend/services/risk_manager.py:208: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return bool(_bp_exhausted_until and datetime.utcnow() < _bp_exhausted_until)
+ok
+test_bp_reservation_round_trip (tests.test_bug_scenarios.TestRiskManagerState.test_bp_reservation_round_trip) ... ok
+test_sl_failure_count_rolling (tests.test_bug_scenarios.TestRiskManagerState.test_sl_failure_count_rolling) ... ok
+test_clamp_multiplier_stack (tests.test_bug_scenarios.TestRiskMath.test_clamp_multiplier_stack) ... ok
+test_clamp_passthrough_when_under_ceiling (tests.test_bug_scenarios.TestRiskMath.test_clamp_passthrough_when_under_ceiling) ... ok
+test_confidence_risk_mult_ramps (tests.test_bug_scenarios.TestRiskMath.test_confidence_risk_mult_ramps) ... ok
+test_idempotency_key_bucket_aware (tests.test_bug_scenarios.TestRiskMath.test_idempotency_key_bucket_aware)
+Conf 75 and 85 should hash differently (different 10-buckets). ... /home/runner/work/stockreco/stockreco/backend/services/risk_math.py:28: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  day_stamp = datetime.utcnow().strftime("%Y%m%d")
+ok
+test_idempotency_key_deterministic (tests.test_bug_scenarios.TestRiskMath.test_idempotency_key_deterministic) ... ok
+test_kelly_thin_data_neutral (tests.test_bug_scenarios.TestRiskMath.test_kelly_thin_data_neutral) ... ok
+test_position_size_by_risk_floors_to_zero (tests.test_bug_scenarios.TestRiskMath.test_position_size_by_risk_floors_to_zero) ... ok
+test_position_size_by_risk_normal (tests.test_bug_scenarios.TestRiskMath.test_position_size_by_risk_normal) ... ok
+test_below_ceiling_unchanged (tests.test_bug_scenarios.TestRiskMultCeiling.test_below_ceiling_unchanged) ... ok
+test_compound_clamped_to_ceiling (tests.test_bug_scenarios.TestRiskMultCeiling.test_compound_clamped_to_ceiling) ... ok
+test_ai_mult_included_in_ceiling (tests.test_bug_scenarios.TestRiskMultCeilingUpstream.test_ai_mult_included_in_ceiling)
+ai_mult is now inside the ceiling clamp, not outside. ... ok
+test_low_beta_upstream_clamped (tests.test_bug_scenarios.TestRiskMultCeilingUpstream.test_low_beta_upstream_clamped)
+β=0.5 → upstream = 2.0. Even with neutral factors, ceiling must bind. ... ok
+test_pyramid_blocked_when_at_ceiling (tests.test_bug_scenarios.TestRiskMultCeilingUpstream.test_pyramid_blocked_when_at_ceiling)
+Pyramid must return 0 when current qty already at ceiling × original. ... ok
+test_pyramid_capped_by_ceiling (tests.test_bug_scenarios.TestRiskMultCeilingUpstream.test_pyramid_capped_by_ceiling)
+Pyramid add must not push total qty above original_qty × ceiling. ... ok
+test_upstream_below_ceiling_passes_through (tests.test_bug_scenarios.TestRiskMultCeilingUpstream.test_upstream_below_ceiling_passes_through)
+When total product is under ceiling, no clamping occurs. ... ok
+test_upstream_mult_included_in_ceiling (tests.test_bug_scenarios.TestRiskMultCeilingUpstream.test_upstream_mult_included_in_ceiling)
+clamp_multiplier_stack with upstream_mult > 1 must still bind at ceiling. ... ok
+test_default_is_api (tests.test_bug_scenarios.TestRunMode.test_default_is_api) ... ok
+test_manager_mode (tests.test_bug_scenarios.TestRunMode.test_manager_mode) ... ok
+test_unknown_falls_back_to_api (tests.test_bug_scenarios.TestRunMode.test_unknown_falls_back_to_api) ... ok
+test_pre_fomc_drift_qualification (tests.test_bug_scenarios.TestSeasonalityHelpers.test_pre_fomc_drift_qualification) ... /home/runner/work/stockreco/stockreco/backend/services/macro_calendar.py:190: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  now = datetime.utcnow()
+ok
+test_moderate_short_gives_buy_squeeze_tilt (tests.test_bug_scenarios.TestShortInterestMultiplier.test_moderate_short_gives_buy_squeeze_tilt) ... /opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/site-packages/sqlalchemy/sql/schema.py:3596: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  return util.wrap_callable(lambda ctx: fn(), fn)  # type: ignore
+ok
+test_neutral_below_threshold (tests.test_bug_scenarios.TestShortInterestMultiplier.test_neutral_below_threshold) ... ok
+test_no_data_neutral (tests.test_bug_scenarios.TestShortInterestMultiplier.test_no_data_neutral) ... ok
+test_very_crowded_short_penalizes_buy (tests.test_bug_scenarios.TestShortInterestMultiplier.test_very_crowded_short_penalizes_buy) ... ok
+test_slippage_awareness_increases_risk (tests.test_bug_scenarios.TestSlippageAwareRPS.test_slippage_awareness_increases_risk) ... ok
+test_low_volume_not_trusted (tests.test_bug_scenarios.TestSocialSentimentMultiplier.test_low_volume_not_trusted)
+Below 20-message min, any lean is ignored (too noisy). ... ok
+test_mixed_sentiment_neutral (tests.test_bug_scenarios.TestSocialSentimentMultiplier.test_mixed_sentiment_neutral) ... ok
+test_strong_bearish_lean_confirms_sell (tests.test_bug_scenarios.TestSocialSentimentMultiplier.test_strong_bearish_lean_confirms_sell) ... ok
+test_strong_bullish_lean_confirms_buy (tests.test_bug_scenarios.TestSocialSentimentMultiplier.test_strong_bullish_lean_confirms_buy) ... ok
+test_dte_thresholds_scale_with_dte (tests.test_bug_scenarios.TestThetaStopDTEScaling.test_dte_thresholds_scale_with_dte)
+r43 fix #1.10: theta-stop hold floor is shorter for shorter DTE. ... ok
+test_returns_default_when_no_row (tests.test_bug_scenarios.TestTickerProfileFallback.test_returns_default_when_no_row) ... ok
+test_columns_present (tests.test_bug_scenarios.TestTickerProfileTable.test_columns_present) ... ok
+test_404_on_unknown_trade (tests.test_bug_scenarios.TestTradeRationale.test_404_on_unknown_trade) ... /opt/hostedtoolcache/Python/3.12.13/x64/lib/python3.12/site-packages/pydantic/_internal/_config.py:295: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.10/migration/
+  warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+ok
+test_backtest_section_when_best_strategy_present (tests.test_bug_scenarios.TestTradeRationale.test_backtest_section_when_best_strategy_present) ... ok
+test_fundamentals_and_analyst_present_when_available (tests.test_bug_scenarios.TestTradeRationale.test_fundamentals_and_analyst_present_when_available) ... ok
+test_macro_context_within_48h_only (tests.test_bug_scenarios.TestTradeRationale.test_macro_context_within_48h_only) ... /home/runner/work/stockreco/stockreco/backend/tests/test_bug_scenarios.py:912: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  opened = datetime.utcnow()
+ok
+test_origin_both (tests.test_bug_scenarios.TestTradeRationale.test_origin_both) ... ok
+test_origin_scanner_only (tests.test_bug_scenarios.TestTradeRationale.test_origin_scanner_only) ... ok
+test_origin_watchlist_only (tests.test_bug_scenarios.TestTradeRationale.test_origin_watchlist_only) ... ok
+test_signal_reasoning_split_into_lines (tests.test_bug_scenarios.TestTradeRationale.test_signal_reasoning_split_into_lines) ... ok
+test_session_start_uses_zoneinfo (tests.test_bug_scenarios.TestZoneInfoSessionStart.test_session_start_uses_zoneinfo)
+r53: `_session_start_utc` is now anchored to 00:00 ET (was ... /home/runner/work/stockreco/stockreco/backend/services/auto_trader.py:1094: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  now_utc = datetime.utcnow()
+ok
+test_active_mode_with_no_key_still_abstains_safely (tests.test_smoke.TestAIJudgeAbstainPaths.test_active_mode_with_no_key_still_abstains_safely) ... /home/runner/work/stockreco/stockreco/backend/services/ai_judge.py:305: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  day = _dt_co.utcnow().strftime("%Y-%m-%d")
+/home/runner/work/stockreco/stockreco/backend/services/ai_judge.py:288: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  day = _dt_aib.utcnow().strftime("%Y-%m-%d")
+ok
+test_confidence_multiplier_clamps_to_envelope (tests.test_smoke.TestAIJudgeAbstainPaths.test_confidence_multiplier_clamps_to_envelope) ... ok
+test_no_api_key_shadow_mode_abstains (tests.test_smoke.TestAIJudgeAbstainPaths.test_no_api_key_shadow_mode_abstains) ... ok
+test_off_mode_confidence_mult_returns_1 (tests.test_smoke.TestAIJudgeAbstainPaths.test_off_mode_confidence_mult_returns_1) ... ok
+test_off_mode_entry_veto_proceeds (tests.test_smoke.TestAIJudgeAbstainPaths.test_off_mode_entry_veto_proceeds) ... ok
+test_off_mode_news_exit_holds (tests.test_smoke.TestAIJudgeAbstainPaths.test_off_mode_news_exit_holds) ... ok
+test_chandelier_math (tests.test_smoke.TestChandelierTrailMath.test_chandelier_math) ... ok
+test_chandelier_only_tightens (tests.test_smoke.TestChandelierTrailMath.test_chandelier_only_tightens) ... ok
+test_inflation_factor_capped (tests.test_smoke.TestCorrelationMath.test_inflation_factor_capped) ... ERROR
+test_inflation_factor_empty_is_unity (tests.test_smoke.TestCorrelationMath.test_inflation_factor_empty_is_unity) ... ERROR
+test_inflation_factor_single_position_is_unity (tests.test_smoke.TestCorrelationMath.test_inflation_factor_single_position_is_unity) ... ERROR
+test_pearson_perfect_negative (tests.test_smoke.TestCorrelationMath.test_pearson_perfect_negative) ... ERROR
+test_pearson_perfect_positive (tests.test_smoke.TestCorrelationMath.test_pearson_perfect_positive) ... ERROR
+test_pearson_too_short_returns_zero (tests.test_smoke.TestCorrelationMath.test_pearson_too_short_returns_zero) ... ERROR
+test_pearson_zero_variance_returns_zero (tests.test_smoke.TestCorrelationMath.test_pearson_zero_variance_returns_zero) ... ERROR
+test_breached_exactly_at_threshold (tests.test_smoke.TestDailyLossHardHalt.test_breached_exactly_at_threshold) ... ERROR
+test_breached_when_combined_below_threshold (tests.test_smoke.TestDailyLossHardHalt.test_breached_when_combined_below_threshold) ... ERROR
+test_not_breached_at_exact_threshold_minus_one_cent (tests.test_smoke.TestDailyLossHardHalt.test_not_breached_at_exact_threshold_minus_one_cent) ... ERROR
+test_safe_default_on_unknown_realized (tests.test_smoke.TestDailyLossHardHalt.test_safe_default_on_unknown_realized) ... ERROR
+test_safe_default_on_zero_equity (tests.test_smoke.TestDailyLossHardHalt.test_safe_default_on_zero_equity) ... ERROR
+test_safe_default_on_zero_halt_pct (tests.test_smoke.TestDailyLossHardHalt.test_safe_default_on_zero_halt_pct) ... ERROR
+test_unrealized_gain_offsets_realized_loss (tests.test_smoke.TestDailyLossHardHalt.test_unrealized_gain_offsets_realized_loss) ... ERROR
+test_50_to_70_pct (tests.test_smoke.TestHeatAwareRiskMultiplier.test_50_to_70_pct) ... ok
+test_70_to_85_pct (tests.test_smoke.TestHeatAwareRiskMultiplier.test_70_to_85_pct) ... ok
+test_85_to_100_pct (tests.test_smoke.TestHeatAwareRiskMultiplier.test_85_to_100_pct) ... ok
+test_below_50pct_no_throttle (tests.test_smoke.TestHeatAwareRiskMultiplier.test_below_50pct_no_throttle) ... ok
+test_negative_equity_no_op (tests.test_smoke.TestHeatAwareRiskMultiplier.test_negative_equity_no_op) ... ok
+test_no_heat_no_throttle (tests.test_smoke.TestHeatAwareRiskMultiplier.test_no_heat_no_throttle) ... ok
+test_zero_equity_no_op (tests.test_smoke.TestHeatAwareRiskMultiplier.test_zero_equity_no_op) ... ok
+test_deterministic (tests.test_smoke.TestIdempotencyKey.test_deterministic) ... ok
+test_different_direction_differs (tests.test_smoke.TestIdempotencyKey.test_different_direction_differs) ... ok
+test_different_ticker_differs (tests.test_smoke.TestIdempotencyKey.test_different_ticker_differs) ... ok
+test_different_timeframe_differs (tests.test_smoke.TestIdempotencyKey.test_different_timeframe_differs) ... ok
+test_rounding_collapses_jitter (tests.test_smoke.TestIdempotencyKey.test_rounding_collapses_jitter) ... ok
+test_disables_when_all_breach (tests.test_smoke.TestMLDriftAutoDisable.test_disables_when_all_breach) ... ERROR
+test_no_action_when_already_off (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_already_off) ... ERROR
+test_no_action_when_below_threshold (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_below_threshold) ... ERROR
+test_no_action_when_disabled (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_disabled) ... ERROR
+test_no_action_when_one_row_passes (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_one_row_passes) ... ERROR
+test_skipped_when_history_too_short (tests.test_smoke.TestMLDriftAutoDisable.test_skipped_when_history_too_short) ... ERROR
+test_column_schema_stable_across_flag (tests.test_smoke.TestMLLabelLeakFix.test_column_schema_stable_across_flag)
+Column list must NOT change when the flag flips — that would force ... ERROR
+test_drop_target_geometry_omits_levels (tests.test_smoke.TestMLLabelLeakFix.test_drop_target_geometry_omits_levels) ... ERROR
+test_inc_safe (tests.test_smoke.TestMetricsNoOpFallback.test_inc_safe) ... ok
+test_timer_safe (tests.test_smoke.TestMetricsNoOpFallback.test_timer_safe) ... ok
+test_multidim_enabled_default_false (tests.test_smoke.TestMultidimRegimeThresholds.test_multidim_enabled_default_false) ... ERROR
+test_threshold_constants_sane (tests.test_smoke.TestMultidimRegimeThresholds.test_threshold_constants_sane) ... ERROR
+test_daily_noop (tests.test_smoke.TestORBStrategy.test_daily_noop) ... ok
+test_short_input_noop (tests.test_smoke.TestORBStrategy.test_short_input_noop) ... ok
+test_backfills_missing_fields_when_quote_available (tests.test_smoke.TestOptionGreeksBackfill.test_backfills_missing_fields_when_quote_available) ... ERROR
+test_idempotent_when_all_populated (tests.test_smoke.TestOptionGreeksBackfill.test_idempotent_when_all_populated) ... ERROR
+test_no_quote_available_skips (tests.test_smoke.TestOptionGreeksBackfill.test_no_quote_available_skips) ... ERROR
+test_skips_non_option_rows (tests.test_smoke.TestOptionGreeksBackfill.test_skips_non_option_rows) ... ERROR
+test_case_normalizes_symbol (tests.test_smoke.TestOrphanStopOrderBucketing.test_case_normalizes_symbol) ... ERROR
+test_handles_empty_and_malformed (tests.test_smoke.TestOrphanStopOrderBucketing.test_handles_empty_and_malformed) ... ERROR
+test_keeps_only_stop_orders (tests.test_smoke.TestOrphanStopOrderBucketing.test_keeps_only_stop_orders) ... ERROR
+test_partial_exits_emit_one_trade_with_aggregate_pnl (tests.test_smoke.TestPartialExitBacktest.test_partial_exits_emit_one_trade_with_aggregate_pnl) ... ok
+test_partial_vs_legacy_diverge_on_strong_trend (tests.test_smoke.TestPartialExitBacktest.test_partial_vs_legacy_diverge_on_strong_trend) ... ok
+test_corr_calc_pair_correlation (tests.test_smoke.TestPortfolioBacktest.test_corr_calc_pair_correlation) ... ok
+test_stress_window_registry_consistent (tests.test_smoke.TestPortfolioBacktest.test_stress_window_registry_consistent) ... ok
+test_unknown_stress_window_returns_note (tests.test_smoke.TestPortfolioBacktest.test_unknown_stress_window_returns_note) ... ok
+test_burst_allows_then_blocks (tests.test_smoke.TestRateLimiter.test_burst_allows_then_blocks) ... ok
+test_disabled_via_env (tests.test_smoke.TestRateLimiter.test_disabled_via_env) ... ok
+test_separate_keys_have_separate_buckets (tests.test_smoke.TestRateLimiter.test_separate_keys_have_separate_buckets) ... ok
+test_buy_without_levels_not_actionable (tests.test_smoke.TestSignalPayloadValidation.test_buy_without_levels_not_actionable) ... ok
+test_confidence_out_of_range_rejected (tests.test_smoke.TestSignalPayloadValidation.test_confidence_out_of_range_rejected) ... ok
+test_extras_allowed_for_enrichment (tests.test_smoke.TestSignalPayloadValidation.test_extras_allowed_for_enrichment) ... ok
+test_invalid_signal_type_rejected (tests.test_smoke.TestSignalPayloadValidation.test_invalid_signal_type_rejected) ... ok
+test_invalid_timeframe_rejected (tests.test_smoke.TestSignalPayloadValidation.test_invalid_timeframe_rejected) ... ok
+test_missing_ticker_rejected (tests.test_smoke.TestSignalPayloadValidation.test_missing_ticker_rejected) ... ok
+test_neutral_signal_not_actionable (tests.test_smoke.TestSignalPayloadValidation.test_neutral_signal_not_actionable) ... ok
+test_ticker_uppercased (tests.test_smoke.TestSignalPayloadValidation.test_ticker_uppercased) ... ok
+test_well_formed_validates (tests.test_smoke.TestSignalPayloadValidation.test_well_formed_validates) ... ok
+test_disabled_returns_false_when_flag_off (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_returns_false_when_flag_off) ... ERROR
+test_disabled_returns_false_when_n_below_min (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_returns_false_when_n_below_min) ... ERROR
+test_disabled_returns_false_when_wr_at_floor (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_returns_false_when_wr_at_floor) ... ERROR
+test_disabled_when_wr_below_floor_and_n_sufficient (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_when_wr_below_floor_and_n_sufficient) ... ERROR
+test_missing_strategy_or_card_returns_false (tests.test_smoke.TestStrategyAutoDisableGate.test_missing_strategy_or_card_returns_false) ... ERROR
+test_empty_df_passthrough (tests.test_smoke.TestSurvivorshipClamp.test_empty_df_passthrough) ... ERROR
+test_no_delisted_record_returns_input (tests.test_smoke.TestSurvivorshipClamp.test_no_delisted_record_returns_input) ... ERROR
+test_chop_returns_default (tests.test_smoke.TestTrimFractionForADX.test_chop_returns_default) ... ok
+test_default_when_adx_missing (tests.test_smoke.TestTrimFractionForADX.test_default_when_adx_missing) ... ok
+test_extreme_does_NOT_skip_T2 (tests.test_smoke.TestTrimFractionForADX.test_extreme_does_NOT_skip_T2) ... ok
+test_extreme_returns_zero_at_T1 (tests.test_smoke.TestTrimFractionForADX.test_extreme_returns_zero_at_T1) ... ok
+test_strong_returns_15pct (tests.test_smoke.TestTrimFractionForADX.test_strong_returns_15pct) ... ok
+test_no_vwap_column_noop (tests.test_smoke.TestVwapStrategy.test_no_vwap_column_noop) ... ok
+
+======================================================================
+ERROR: test_inflation_factor_capped (tests.test_smoke.TestCorrelationMath.test_inflation_factor_capped)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 769, in test_inflation_factor_capped
+    from services.correlation import correlation_inflation_factor, MAX_INFLATION
+ModuleNotFoundError: No module named 'services.correlation'
+
+======================================================================
+ERROR: test_inflation_factor_empty_is_unity (tests.test_smoke.TestCorrelationMath.test_inflation_factor_empty_is_unity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 765, in test_inflation_factor_empty_is_unity
+    from services.correlation import correlation_inflation_factor
+ModuleNotFoundError: No module named 'services.correlation'
+
+======================================================================
+ERROR: test_inflation_factor_single_position_is_unity (tests.test_smoke.TestCorrelationMath.test_inflation_factor_single_position_is_unity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 758, in test_inflation_factor_single_position_is_unity
+    from services.correlation import correlation_inflation_factor
+ModuleNotFoundError: No module named 'services.correlation'
+
+======================================================================
+ERROR: test_pearson_perfect_negative (tests.test_smoke.TestCorrelationMath.test_pearson_perfect_negative)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 742, in test_pearson_perfect_negative
+    from services.correlation import _pearson
+ModuleNotFoundError: No module named 'services.correlation'
+
+======================================================================
+ERROR: test_pearson_perfect_positive (tests.test_smoke.TestCorrelationMath.test_pearson_perfect_positive)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 736, in test_pearson_perfect_positive
+    from services.correlation import _pearson
+ModuleNotFoundError: No module named 'services.correlation'
+
+======================================================================
+ERROR: test_pearson_too_short_returns_zero (tests.test_smoke.TestCorrelationMath.test_pearson_too_short_returns_zero)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 754, in test_pearson_too_short_returns_zero
+    from services.correlation import _pearson
+ModuleNotFoundError: No module named 'services.correlation'
+
+======================================================================
+ERROR: test_pearson_zero_variance_returns_zero (tests.test_smoke.TestCorrelationMath.test_pearson_zero_variance_returns_zero)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 748, in test_pearson_zero_variance_returns_zero
+    from services.correlation import _pearson
+ModuleNotFoundError: No module named 'services.correlation'
+
+======================================================================
+ERROR: test_breached_exactly_at_threshold (tests.test_smoke.TestDailyLossHardHalt.test_breached_exactly_at_threshold)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 846, in test_breached_exactly_at_threshold
+    from services.auto_trader import _daily_loss_hard_halt_breached
+ImportError: cannot import name '_daily_loss_hard_halt_breached' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_breached_when_combined_below_threshold (tests.test_smoke.TestDailyLossHardHalt.test_breached_when_combined_below_threshold)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 826, in test_breached_when_combined_below_threshold
+    from services.auto_trader import _daily_loss_hard_halt_breached
+ImportError: cannot import name '_daily_loss_hard_halt_breached' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_not_breached_at_exact_threshold_minus_one_cent (tests.test_smoke.TestDailyLossHardHalt.test_not_breached_at_exact_threshold_minus_one_cent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 837, in test_not_breached_at_exact_threshold_minus_one_cent
+    from services.auto_trader import _daily_loss_hard_halt_breached
+ImportError: cannot import name '_daily_loss_hard_halt_breached' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_safe_default_on_unknown_realized (tests.test_smoke.TestDailyLossHardHalt.test_safe_default_on_unknown_realized)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 855, in test_safe_default_on_unknown_realized
+    from services.auto_trader import _daily_loss_hard_halt_breached
+ImportError: cannot import name '_daily_loss_hard_halt_breached' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_safe_default_on_zero_equity (tests.test_smoke.TestDailyLossHardHalt.test_safe_default_on_zero_equity)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 863, in test_safe_default_on_zero_equity
+    from services.auto_trader import _daily_loss_hard_halt_breached
+ImportError: cannot import name '_daily_loss_hard_halt_breached' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_safe_default_on_zero_halt_pct (tests.test_smoke.TestDailyLossHardHalt.test_safe_default_on_zero_halt_pct)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 871, in test_safe_default_on_zero_halt_pct
+    from services.auto_trader import _daily_loss_hard_halt_breached
+ImportError: cannot import name '_daily_loss_hard_halt_breached' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_unrealized_gain_offsets_realized_loss (tests.test_smoke.TestDailyLossHardHalt.test_unrealized_gain_offsets_realized_loss)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 879, in test_unrealized_gain_offsets_realized_loss
+    from services.auto_trader import _daily_loss_hard_halt_breached
+ImportError: cannot import name '_daily_loss_hard_halt_breached' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_disables_when_all_breach (tests.test_smoke.TestMLDriftAutoDisable.test_disables_when_all_breach)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1051, in test_disables_when_all_breach
+    from services.ml_eval import _maybe_auto_disable_on_drift
+ImportError: cannot import name '_maybe_auto_disable_on_drift' from 'services.ml_eval' (/home/runner/work/stockreco/stockreco/backend/services/ml_eval.py)
+
+======================================================================
+ERROR: test_no_action_when_already_off (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_already_off)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1018, in test_no_action_when_already_off
+    from services.ml_eval import _maybe_auto_disable_on_drift
+ImportError: cannot import name '_maybe_auto_disable_on_drift' from 'services.ml_eval' (/home/runner/work/stockreco/stockreco/backend/services/ml_eval.py)
+
+======================================================================
+ERROR: test_no_action_when_below_threshold (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_below_threshold)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1029, in test_no_action_when_below_threshold
+    from services.ml_eval import _maybe_auto_disable_on_drift
+ImportError: cannot import name '_maybe_auto_disable_on_drift' from 'services.ml_eval' (/home/runner/work/stockreco/stockreco/backend/services/ml_eval.py)
+
+======================================================================
+ERROR: test_no_action_when_disabled (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_disabled)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1007, in test_no_action_when_disabled
+    from services.ml_eval import _maybe_auto_disable_on_drift
+ImportError: cannot import name '_maybe_auto_disable_on_drift' from 'services.ml_eval' (/home/runner/work/stockreco/stockreco/backend/services/ml_eval.py)
+
+======================================================================
+ERROR: test_no_action_when_one_row_passes (tests.test_smoke.TestMLDriftAutoDisable.test_no_action_when_one_row_passes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1040, in test_no_action_when_one_row_passes
+    from services.ml_eval import _maybe_auto_disable_on_drift
+ImportError: cannot import name '_maybe_auto_disable_on_drift' from 'services.ml_eval' (/home/runner/work/stockreco/stockreco/backend/services/ml_eval.py)
+
+======================================================================
+ERROR: test_skipped_when_history_too_short (tests.test_smoke.TestMLDriftAutoDisable.test_skipped_when_history_too_short)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1062, in test_skipped_when_history_too_short
+    from services.ml_eval import _maybe_auto_disable_on_drift
+ImportError: cannot import name '_maybe_auto_disable_on_drift' from 'services.ml_eval' (/home/runner/work/stockreco/stockreco/backend/services/ml_eval.py)
+
+======================================================================
+ERROR: test_column_schema_stable_across_flag (tests.test_smoke.TestMLLabelLeakFix.test_column_schema_stable_across_flag)
+Column list must NOT change when the flag flips — that would force
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1113, in test_column_schema_stable_across_flag
+    off_keys = set(_signal_features(sig, drop_target_geometry=False).keys())
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: _signal_features() got an unexpected keyword argument 'drop_target_geometry'
+
+======================================================================
+ERROR: test_drop_target_geometry_omits_levels (tests.test_smoke.TestMLLabelLeakFix.test_drop_target_geometry_omits_levels)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 1091, in test_drop_target_geometry_omits_levels
+    a_off = _signal_features(sig_a, drop_target_geometry=False)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: _signal_features() got an unexpected keyword argument 'drop_target_geometry'
+
+======================================================================
+ERROR: test_multidim_enabled_default_false (tests.test_smoke.TestMultidimRegimeThresholds.test_multidim_enabled_default_false)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 610, in test_multidim_enabled_default_false
+    from services.multidim_regime import multidim_enabled
+ModuleNotFoundError: No module named 'services.multidim_regime'
+
+======================================================================
+ERROR: test_threshold_constants_sane (tests.test_smoke.TestMultidimRegimeThresholds.test_threshold_constants_sane)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 591, in test_threshold_constants_sane
+    from services.multidim_regime import (
+ModuleNotFoundError: No module named 'services.multidim_regime'
+
+======================================================================
+ERROR: test_backfills_missing_fields_when_quote_available (tests.test_smoke.TestOptionGreeksBackfill.test_backfills_missing_fields_when_quote_available)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 655, in test_backfills_missing_fields_when_quote_available
+    from services import option_greeks as og
+ImportError: cannot import name 'option_greeks' from 'services' (unknown location)
+
+======================================================================
+ERROR: test_idempotent_when_all_populated (tests.test_smoke.TestOptionGreeksBackfill.test_idempotent_when_all_populated)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 633, in test_idempotent_when_all_populated
+    from services import option_greeks as og
+ImportError: cannot import name 'option_greeks' from 'services' (unknown location)
+
+======================================================================
+ERROR: test_no_quote_available_skips (tests.test_smoke.TestOptionGreeksBackfill.test_no_quote_available_skips)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 693, in test_no_quote_available_skips
+    from services import option_greeks as og
+ImportError: cannot import name 'option_greeks' from 'services' (unknown location)
+
+======================================================================
+ERROR: test_skips_non_option_rows (tests.test_smoke.TestOptionGreeksBackfill.test_skips_non_option_rows)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 619, in test_skips_non_option_rows
+    from services import option_greeks as og
+ImportError: cannot import name 'option_greeks' from 'services' (unknown location)
+
+======================================================================
+ERROR: test_case_normalizes_symbol (tests.test_smoke.TestOrphanStopOrderBucketing.test_case_normalizes_symbol)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 817, in test_case_normalizes_symbol
+    from services.auto_trader import _stop_orders_by_symbol
+ImportError: cannot import name '_stop_orders_by_symbol' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_handles_empty_and_malformed (tests.test_smoke.TestOrphanStopOrderBucketing.test_handles_empty_and_malformed)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 807, in test_handles_empty_and_malformed
+    from services.auto_trader import _stop_orders_by_symbol
+ImportError: cannot import name '_stop_orders_by_symbol' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_keeps_only_stop_orders (tests.test_smoke.TestOrphanStopOrderBucketing.test_keeps_only_stop_orders)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 790, in test_keeps_only_stop_orders
+    from services.auto_trader import _stop_orders_by_symbol
+ImportError: cannot import name '_stop_orders_by_symbol' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_disabled_returns_false_when_flag_off (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_returns_false_when_flag_off)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 895, in test_disabled_returns_false_when_flag_off
+    from services.auto_trader import _strategy_auto_disable_check
+ImportError: cannot import name '_strategy_auto_disable_check' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_disabled_returns_false_when_n_below_min (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_returns_false_when_n_below_min)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 905, in test_disabled_returns_false_when_n_below_min
+    from services.auto_trader import _strategy_auto_disable_check
+ImportError: cannot import name '_strategy_auto_disable_check' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_disabled_returns_false_when_wr_at_floor (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_returns_false_when_wr_at_floor)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 915, in test_disabled_returns_false_when_wr_at_floor
+    from services.auto_trader import _strategy_auto_disable_check
+ImportError: cannot import name '_strategy_auto_disable_check' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_disabled_when_wr_below_floor_and_n_sufficient (tests.test_smoke.TestStrategyAutoDisableGate.test_disabled_when_wr_below_floor_and_n_sufficient)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 924, in test_disabled_when_wr_below_floor_and_n_sufficient
+    from services.auto_trader import _strategy_auto_disable_check
+ImportError: cannot import name '_strategy_auto_disable_check' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_missing_strategy_or_card_returns_false (tests.test_smoke.TestStrategyAutoDisableGate.test_missing_strategy_or_card_returns_false)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 935, in test_missing_strategy_or_card_returns_false
+    from services.auto_trader import _strategy_auto_disable_check
+ImportError: cannot import name '_strategy_auto_disable_check' from 'services.auto_trader' (/home/runner/work/stockreco/stockreco/backend/services/auto_trader.py)
+
+======================================================================
+ERROR: test_empty_df_passthrough (tests.test_smoke.TestSurvivorshipClamp.test_empty_df_passthrough)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 726, in test_empty_df_passthrough
+    from services.survivorship import clamp_df_to_delisted_at
+ModuleNotFoundError: No module named 'services.survivorship'
+
+======================================================================
+ERROR: test_no_delisted_record_returns_input (tests.test_smoke.TestSurvivorshipClamp.test_no_delisted_record_returns_input)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/stockreco/stockreco/backend/tests/test_smoke.py", line 716, in test_no_delisted_record_returns_input
+    from services.survivorship import clamp_df_to_delisted_at
+ModuleNotFoundError: No module named 'services.survivorship'
+
+----------------------------------------------------------------------
+Ran 272 tests in 24.171s
+
+FAILED (errors=38)
+❌ pre-deploy tests FAILED — aborting. Set SKIP_TESTS=1 to override.
+Error: Process completed with exit code 1.

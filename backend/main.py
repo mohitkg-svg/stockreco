@@ -78,7 +78,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from database import create_tables, SessionLocal, WatchlistStock, AutoTraderConfig
-from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router, ml as ml_router, fundamentals as fundamentals_router, social as social_router, ai_judge as ai_judge_router, admin as admin_router
+from routers import watchlist, analysis, backtest, options, stream, trading, news, alerts as alerts_router, chat as chat_router, analyst_ratings as analyst_ratings_router, macro as macro_router, ml as ml_router, fundamentals as fundamentals_router, social as social_router, admin as admin_router
 from routers.analysis import _run_analysis_for_ticker
 from routers._auth import require_api_key, auth_configured
 from services import live_quotes, auto_trader, metrics
@@ -681,6 +681,12 @@ def _ml_outcome_backfill():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_tables()
+    
+    try:
+        from services import l3_orderbook
+        asyncio.create_task(l3_orderbook.polygon_quote_worker(), name="polygon_l3_shim_stream")
+    except Exception as e:
+        logger.warning(f"L3 stream failed to start: {e}")
 
     # r82 (B9): re-arm the in-memory KILL flag from the persisted cfg.killed
     # row IMMEDIATELY after schema creation so a Cloud Run cold-start cannot
@@ -752,6 +758,14 @@ async def lifespan(app: FastAPI):
             )
         except Exception as _e:
             logger.warning(f"health_watchdog not scheduled: {_e}")
+            try:
+                from services import algo_execution
+                scheduler.add_job(
+                    algo_execution.tick_twaps, "interval", seconds=15, id="tick_twaps",
+                    max_instances=1, coalesce=True, misfire_grace_time=10,
+                )
+            except Exception as e:
+                pass
         scheduler.start()
         _app_health["scheduler_started"] = True
         logger.info("Manager service started — manage every 20s, reconcile every 60min")
@@ -1166,7 +1180,7 @@ except Exception as _gz_e:
 # r48 BACKLOG #observability-P0-6: frontend error reporter endpoint.
 # Without this any runtime exception in the UI is silent — operator
 # sees a blank dashboard and assumes the bot is dead.
-@app.post("/api/log/frontend-error")
+@app.post("/api/log/frontend-error", dependencies=[Depends(require_api_key)])
 def _log_frontend_error(payload: dict):
     """Accept a minimal error payload from the dashboard and emit it as
     a `frontend_error` alert. Throttled by the alerts.py 5min dedup."""
@@ -1363,7 +1377,6 @@ app.include_router(macro_router.router)
 app.include_router(ml_router.router)
 app.include_router(fundamentals_router.router)
 app.include_router(social_router.router)
-app.include_router(ai_judge_router.router)
 app.include_router(admin_router.router)
 
 
@@ -1518,8 +1531,6 @@ def health():
         "crisis_mode": _crisis_mode_flag(),
         "session_dd_pct": _session_dd_pct(),
         "account_dd_mult": _acct_dd_mult(),
-        # r48 BACKLOG #observability-P1-15: AI cost tracker
-        "ai_cost_today": _ai_cost_today(),
         # r48 BACKLOG #observability-P1-17: MLPrediction backlog
         "mlpred_backlog": _mlpred_backlog(),
         # r48 BACKLOG #observability-P1-18: cache freshness
@@ -1594,19 +1605,6 @@ def _memory_stats() -> dict:
     except Exception:
         pass
     return out
-
-
-def _ai_cost_today() -> dict:
-    try:
-        # r53 fix (Tier-1 #7): pass actual model from config instead of
-        # defaulting to Opus pricing. AI_JUDGE_MODEL is Haiku ($1/$5 per M
-        # tokens); using Opus pricing ($15/$75) made reported cost ~15× too
-        # high in the UI.
-        from services.ai_judge import ai_cost_today_usd
-        from services.config import AI_JUDGE_MODEL
-        return ai_cost_today_usd(model_hint=AI_JUDGE_MODEL)
-    except Exception:
-        return {}
 
 
 def _mlpred_backlog() -> int:

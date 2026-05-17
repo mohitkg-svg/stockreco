@@ -77,30 +77,33 @@ _FOLDS = 4
 _MIN_TOTAL_SAMPLES = 200
 
 
-def _label_trade(future: pd.DataFrame, side: str, entry: float, stop: float, t1: float) -> Optional[int]:
-    """Return 1 (win), 0 (loss), or None (neither hit within horizon)."""
+def _label_forward_return(future: pd.DataFrame, entry_close: float) -> Optional[int]:
+    """Label 1 if the N-bar forward return is positive, 0 otherwise."""
     if future.empty:
         return None
-    if side == "BUY":
-        for _, row in future.iterrows():
-            high = float(row.get("High", row.get("Close")))
-            low = float(row.get("Low", row.get("Close")))
-            if low <= stop:
-                return 0
-            if high >= t1:
-                return 1
-    elif side == "SELL":
-        for _, row in future.iterrows():
-            high = float(row.get("High", row.get("Close")))
-            low = float(row.get("Low", row.get("Close")))
-            if high >= stop:
-                return 0
-            if low <= t1:
-                return 1
-    return None
+    # Calculate pure forward return percentage
+    ret = (float(future["Close"].iloc[-1]) - entry_close) / entry_close
+    return 1 if ret > 0 else 0
 
 
-def _collect_samples_for_ticker(ticker: str, daily_cache: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
+def _read_drop_target_geometry_flag() -> bool:
+    """r96 F1: read the ml_features_drop_target_geometry flag from cfg.
+    Default False so absence/error preserves prior leaky behavior — operator
+    must explicitly flip the bit to engage the leak fix."""
+    try:
+        from database import SessionLocal, AutoTraderConfig
+        db = SessionLocal()
+        try:
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            return bool(getattr(cfg, "ml_features_drop_target_geometry", False)) if cfg else False
+        finally:
+            db.close()
+    except Exception:
+        return False
+
+
+def _collect_samples_for_ticker(ticker: str, daily_cache: Dict[str, pd.DataFrame],
+                                 drop_target_geometry: bool = False) -> List[Dict[str, Any]]:
     """Walk historical daily bars, generate signals, label outcomes, return rows."""
     from services.data_fetcher import fetch_ohlcv
     from services.indicators import compute_indicators
@@ -125,20 +128,11 @@ def _collect_samples_for_ticker(ticker: str, daily_cache: Dict[str, pd.DataFrame
     last_safe = n - _LABEL_HORIZON_BARS - 1
     for i in range(_WARMUP_BARS, last_safe + 1, _SAMPLE_STRIDE):
         sliced = df.iloc[:i + 1]
-        try:
-            sig = generate_signal(ticker, "1d", sliced)
-        except Exception:
-            continue
-        if not sig or sig.get("signal_type") not in ("BUY", "SELL"):
-            continue
-        side = sig["signal_type"]
-        entry = sig.get("entry")
-        stop = sig.get("stop_loss")
-        t1 = sig.get("target1")
-        if not all(isinstance(x, (int, float)) for x in (entry, stop, t1)):
-            continue
+        
+        entry = float(sliced["Close"].iloc[-1])
         future = df.iloc[i + 1: i + 1 + _LABEL_HORIZON_BARS]
-        label = _label_trade(future, side, float(entry), float(stop), float(t1))
+        label = _label_forward_return(future, entry)
+        
         if label is None:
             continue
         as_of_ts = df.index[i].to_pydatetime() if hasattr(df.index[i], "to_pydatetime") else df.index[i]
@@ -151,11 +145,12 @@ def _collect_samples_for_ticker(ticker: str, daily_cache: Dict[str, pd.DataFrame
             tape_day_df = None
         try:
             feat = extract_features(
-                ticker, as_of_ts, sig,
+                ticker, as_of_ts, {},
                 daily_df=sliced,
                 daily_cache=daily_cache,
                 include_live_only=False,
                 tape_day_df=tape_day_df,
+                drop_target_geometry=drop_target_geometry,
             )
         except Exception as e:
             logger.debug(f"ml_trainer: features {ticker}@{i}: {e}")
@@ -167,28 +162,117 @@ def _collect_samples_for_ticker(ticker: str, daily_cache: Dict[str, pd.DataFrame
     return rows
 
 
-def collect_samples(tickers: Optional[List[str]] = None, max_tickers: int = 80) -> pd.DataFrame:
-    """Build labeled DataFrame across watchlist + candidate pool tickers."""
-    from database import SessionLocal, WatchlistStock, CandidatePool
-    if tickers is None:
+def _read_use_live_outcomes_flag() -> bool:
+    """r96 F8: gate for ingesting realized MLPrediction outcomes as labeled
+    training rows. Default False — operator opts in once feature capture
+    has been collecting for a while (otherwise n_live is too small to help)."""
+    try:
+        from database import SessionLocal, AutoTraderConfig
         db = SessionLocal()
         try:
-            t = set(s.ticker for s in db.query(WatchlistStock).all())
-            t |= set(r.ticker for r in db.query(CandidatePool).all())
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            return bool(getattr(cfg, "ml_trainer_use_live_outcomes", False)) if cfg else False
         finally:
             db.close()
-        tickers = sorted(t)[:max_tickers]
+    except Exception:
+        return False
+
+
+def _collect_live_outcome_samples() -> List[Dict[str, Any]]:
+    """r96 F8: pull closed MLPrediction rows with features_json + outcome and
+    convert them to training samples. Empty list when flag is off or no rows
+    qualify."""
+    import json as _json_lo
+    from database import SessionLocal, MLPrediction
+    from services.ml_features import feature_columns
+    rows: List[Dict[str, Any]] = []
+    db = SessionLocal()
+    try:
+        preds = (
+            db.query(MLPrediction)
+            .filter(
+                MLPrediction.outcome.isnot(None),
+                MLPrediction.features_json.isnot(None),
+            )
+            .all()
+        )
+        cols = set(feature_columns())
+        for r in preds:
+            try:
+                feat = _json_lo.loads(r.features_json or "{}")
+            except Exception:
+                continue
+            if not isinstance(feat, dict):
+                continue
+            # Keep only known feature columns, drop anything unexpected so the
+            # row shape matches feature_columns().
+            sample = {k: feat.get(k) for k in cols}
+            sample["__label"] = int(r.outcome)
+            sample["__ticker"] = r.ticker
+            sample["__ts"] = (r.created_at.isoformat() if r.created_at else "")
+            sample["__source"] = "live"
+            rows.append(sample)
+    finally:
+        db.close()
+    return rows
+
+
+def collect_samples(tickers: Optional[List[str]] = None, max_tickers: int = 80) -> pd.DataFrame:
+    """Build labeled DataFrame across watchlist + candidate pool tickers.
+
+    r96 F8: when cfg.ml_trainer_use_live_outcomes is True, closed MLPrediction
+    rows (live realized win/loss outcomes captured at scoring time) are
+    appended to the synthetic backtest rows — closes the feedback loop from
+    live trades back into the next training round.
+    """
+    from database import SessionLocal, WatchlistStock, CandidatePool
+    if tickers is None:
+        # r96 R4: when survivorship_filter_enabled is True, include delisted
+        # tickers so ML training labels aren't biased toward survivor names.
+        try:
+            from services.survivorship import list_universe, survivorship_enabled
+            include_delisted = survivorship_enabled()
+            tickers = list_universe(include_delisted=include_delisted)[:max_tickers]
+        except Exception:
+            db = SessionLocal()
+            try:
+                t = set(s.ticker for s in db.query(WatchlistStock).all())
+                t |= set(r.ticker for r in db.query(CandidatePool).all())
+            finally:
+                db.close()
+            tickers = sorted(t)[:max_tickers]
+    drop_target_geometry = _read_drop_target_geometry_flag()
+    if drop_target_geometry:
+        logger.info("ml_trainer: F1 label-leak fix engaged — sig_stop_pct/sig_t1_pct features dropped")
     daily_cache: Dict[str, pd.DataFrame] = {}
     all_rows: List[Dict[str, Any]] = []
     for tk in tickers:
         try:
-            rows = _collect_samples_for_ticker(tk, daily_cache)
+            rows = _collect_samples_for_ticker(tk, daily_cache, drop_target_geometry=drop_target_geometry)
             all_rows.extend(rows)
         except Exception as e:
             logger.debug(f"ml_trainer: ticker {tk} skipped: {e}")
+    # r96 F8: append live realized outcomes if enabled.
+    if _read_use_live_outcomes_flag():
+        try:
+            live_rows = _collect_live_outcome_samples()
+            if live_rows:
+                logger.info(
+                    f"ml_trainer: F8 ingested {len(live_rows)} live MLPrediction "
+                    f"outcomes alongside {len(all_rows)} synthetic backtest rows"
+                )
+                all_rows.extend(live_rows)
+        except Exception as e:
+            logger.warning(f"ml_trainer: F8 live-outcome ingest failed: {e}")
     if not all_rows:
         return pd.DataFrame()
     df = pd.DataFrame(all_rows).sort_values("__ts").reset_index(drop=True)
+
+    # Cross-sectional z-score normalization
+    from services.ml_features import feature_columns
+    cols = [c for c in feature_columns() if c not in ("macro_in_blackout", "analyst_count")]
+    df[cols] = df.groupby("__ts")[cols].transform(lambda x: (x - x.mean()) / (x.std() + 1e-9))
+
     logger.info(f"ml_trainer: collected {len(df)} samples across {df['__ticker'].nunique()} tickers")
     return df
 
@@ -219,8 +303,41 @@ def train(samples: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     # label horizon means same-day samples can predict each other).
     EMBARGO_DAYS = 5
     timestamps = pd.to_datetime(samples["__ts"]).reset_index(drop=True)
+    # r96 F5: read cfg.ml_strict_time_folds. When True, refuse to train on
+    # too-thin data instead of falling back to row-based folds — the row
+    # fallback reintroduces interleaved-by-row leakage exactly when the
+    # sample is small, which is the worst time for it. Default False keeps
+    # prior behavior (fallback) until operator opts in.
+    _strict_time_folds = False
+    try:
+        from database import SessionLocal as _SL_strict, AutoTraderConfig as _ATC_strict
+        _dbs = _SL_strict()
+        try:
+            _cfg_strict = _dbs.query(_ATC_strict).filter(_ATC_strict.id == 1).first()
+            _strict_time_folds = bool(getattr(_cfg_strict, "ml_strict_time_folds", False)) if _cfg_strict else False
+        finally:
+            _dbs.close()
+    except Exception:
+        _strict_time_folds = False
     if len(timestamps) < (_FOLDS + 1) * 30:
+        if _strict_time_folds:
+            # r96 F5 strict mode: refuse to train rather than mask leakage.
+            return {
+                "trained": False,
+                "reason": (
+                    f"ml_strict_time_folds=True and sample size {len(timestamps)} "
+                    f"< {(_FOLDS + 1) * 30} required for time-based folds. "
+                    f"Row-based fallback would leak; refusing to train."
+                ),
+            }
         # Fall back to row-based folds when sample is too thin for time splits.
+        # WARNING: this path reintroduces interleaved-by-row leakage; flip
+        # cfg.ml_strict_time_folds=True to forbid it once enough samples exist.
+        logger.warning(
+            f"ml_trainer: sample size {len(timestamps)} < "
+            f"{(_FOLDS + 1) * 30} — using ROW-BASED folds (leakage risk). "
+            f"Flip cfg.ml_strict_time_folds=True to refuse instead."
+        )
         n = len(samples)
         fold_size = n // (_FOLDS + 1)
         fold_iter = []

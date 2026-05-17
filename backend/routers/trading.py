@@ -103,6 +103,39 @@ class AutoTraderConfigRequest(BaseModel):
     # r69: setup-quality composite gate
     setup_quality_min: Optional[float] = Field(None, ge=0, le=100)
     setup_quality_gate_enabled: Optional[bool] = None
+    # r96 F1: ML label-leak fix flag.
+    ml_features_drop_target_geometry: Optional[bool] = None
+    # r96 F2: ML drift auto-disable wiring.
+    ml_drift_auto_disable_enabled: Optional[bool] = None
+    ml_drift_consecutive_days_required: Optional[int] = Field(None, ge=1, le=30)
+    # r96 F3: strategy auto-disable on WR floor breach.
+    strategy_auto_disable_enabled: Optional[bool] = None
+    strategy_auto_disable_wr_floor: Optional[float] = Field(None, ge=0.0, le=1.0)
+    strategy_auto_disable_min_n: Optional[int] = Field(None, ge=1, le=10000)
+    strategy_auto_disable_lookback_days: Optional[int] = Field(None, ge=1, le=365)
+    # r96 F4: hard daily-loss halt that engages kill().
+    daily_loss_hard_halt_enabled: Optional[bool] = None
+    daily_loss_hard_halt_pct: Optional[float] = Field(None, ge=0.0, le=0.5)
+    # r96 F5: strict ML time folds.
+    ml_strict_time_folds: Optional[bool] = None
+    # r96 F6: cost-model harmonization toggle.
+    harmonized_cost_model_enabled: Optional[bool] = None
+    # r96 F7: orphan-SL resubmit toggle.
+    auto_resubmit_sl_enabled: Optional[bool] = None
+    # r96 F8: live-outcome retraining toggle.
+    ml_trainer_use_live_outcomes: Optional[bool] = None
+    # r96 R1: per-(strategy, timeframe) calibrated weight toggle.
+    calibrated_weights_enabled: Optional[bool] = None
+    # r96 R2: bucket-diversity dampener toggle.
+    signal_buckets_enabled: Optional[bool] = None
+    # r96 R3: correlation-aware portfolio heat toggle.
+    correlation_aware_sizing_enabled: Optional[bool] = None
+    # r96 R4: survivorship-adjusted backtest universe toggle.
+    survivorship_filter_enabled: Optional[bool] = None
+    # r96 R5: scheduled option-Greeks backfill toggle.
+    live_greeks_backfill_enabled: Optional[bool] = None
+    # r96 R6: multi-dim regime classifier toggle.
+    multidim_regime_enabled: Optional[bool] = None
 
 
 class KillSwitchRequest(BaseModel):

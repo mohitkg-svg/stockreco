@@ -370,6 +370,66 @@ def regime_status_endpoint():
     return regime_status()
 
 
+@router.post("/mark-delisted/{ticker}")
+def mark_delisted_endpoint(ticker: str):
+    """r96 R4: flag a watchlist ticker as delisted (idempotent). Backtest
+    universe loaders consult this when cfg.survivorship_filter_enabled is
+    True to include the historical data in their sample (clamped at
+    delisted_at). Auto-detection from repeated data_fetcher empties is a
+    follow-on; for now operator marks manually."""
+    from services.survivorship import mark_delisted
+    ok = mark_delisted(ticker)
+    return {"ticker": ticker.upper(), "marked": bool(ok)}
+
+
+@router.get("/delisted-tickers")
+def delisted_tickers_endpoint():
+    """r96 R4: list every WatchlistStock row with delisted=True."""
+    from database import SessionLocal, WatchlistStock
+    db = SessionLocal()
+    try:
+        rows = db.query(WatchlistStock).filter(WatchlistStock.delisted.is_(True)).all()
+        return {
+            "n": len(rows),
+            "rows": [
+                {
+                    "ticker": r.ticker,
+                    "delisted_at": r.delisted_at.isoformat() if r.delisted_at else None,
+                    "name": r.name,
+                }
+                for r in rows
+            ],
+        }
+    finally:
+        db.close()
+
+
+@router.post("/backfill-option-greeks")
+def backfill_option_greeks_endpoint(force_refresh: bool = False):
+    """r96 R5: backfill entry_delta/gamma/theta/vega on currently-open option
+    positions by re-fetching the OCC chain. `force_refresh=True` overwrites
+    existing values (mark-to-market); default backfills NULLs only. The
+    scheduled job runs only when cfg.live_greeks_backfill_enabled — this
+    endpoint always runs regardless of the flag (manual operator action)."""
+    from services.option_greeks import backfill_missing_greeks
+    return backfill_missing_greeks(force_refresh=bool(force_refresh))
+
+
+@router.get("/multidim-regime")
+def multidim_regime_endpoint():
+    """r96 R6: surface the four regime dimensions (VIX level, VIX term,
+    realized vol, breadth) + whether stress mode is currently active. When
+    cfg.multidim_regime_enabled is True, an active stress signal promotes
+    regime_router's classification to HIGH_VOL regardless of VIX level."""
+    from services.multidim_regime import stress_regime_active, multidim_enabled
+    is_stress, detail = stress_regime_active()
+    return {
+        "enabled": multidim_enabled(),
+        "stress_active": is_stress,
+        **detail,
+    }
+
+
 @router.post("/backfill-realized-pl")
 def backfill_realized_pl():
     """Patch `realized_pl` on `closed_reconciled` / `closed_external` rows

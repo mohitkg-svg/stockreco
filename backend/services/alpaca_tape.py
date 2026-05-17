@@ -119,6 +119,15 @@ def fetch_live_window(ticker: str, lookback_minutes: int = 30) -> Optional[pd.Da
     × 100KB DataFrame each = 50MB RSS just for tape cache; stale entries
     past TTL still occupy memory until overwritten.
     """
+    # Try memory tape first (0ms latency, zero network I/O!)
+    try:
+        from services.live_quotes import get_recent_trades_df
+        mem_df = get_recent_trades_df(ticker, lookback_minutes * 60)
+        if mem_df is not None and len(mem_df) >= 20:
+            return mem_df
+    except Exception:
+        pass
+
     now_ts = time.time()
     key = ticker.upper()
     cached = _LIVE_CACHE.get(key)

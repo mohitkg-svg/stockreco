@@ -100,7 +100,24 @@ def backtest_portfolio(
     `stress_window` (optional): one of the canned historical drawdown
     windows from `/api/backtest/portfolio/stress-windows`. When set, the
     backtest runs over that fixed date range instead of the trailing
-    `lookback_days` window."""
+    `lookback_days` window.
+
+    r96 F6: cost model harmonization. When cfg.harmonized_cost_model_enabled
+    is True, the portfolio backtest derives its cost baseline from the SAME
+    constants the per-ticker backtester uses (COMMISSION_BPS/SLIPPAGE_BPS/
+    ADVERSE_BPS) instead of its hardcoded 12bps. Default False preserves
+    the legacy 12bps baseline."""
+    harmonized = False
+    try:
+        from database import SessionLocal as _SL_h, AutoTraderConfig as _ATC_h
+        _db_h = _SL_h()
+        try:
+            _cfg_h = _db_h.query(_ATC_h).filter(_ATC_h.id == 1).first()
+            harmonized = bool(getattr(_cfg_h, "harmonized_cost_model_enabled", False)) if _cfg_h else False
+        finally:
+            _db_h.close()
+    except Exception:
+        harmonized = False
     return run_portfolio_backtest(
         starting_equity=starting_equity,
         risk_per_trade_pct=risk_per_trade_pct,
@@ -111,6 +128,7 @@ def backtest_portfolio(
         max_tickers=max_tickers,
         lookback_days=lookback_days,
         stress_window=stress_window or None,
+        harmonized_cost_model=harmonized,
     )
 
 

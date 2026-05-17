@@ -284,9 +284,8 @@ def is_call_option(t: AutoTrade) -> bool:
 
 # --------------------- Reverse-thesis detection ----------------------------
 
-# Raised from 65 (Critical-audit fix #7) — only high-conviction opposite
-# signals can force-close a position; noise below this is ignored.
-REVERSE_CONFIDENCE_GATE = 80.0
+# QUANT REVISION: Lowered to 60.0 to align with ML probability outputs (P(win)=0.60).
+REVERSE_CONFIDENCE_GATE = 60.0
 
 # Timeframe rank — higher TF carries more weight. Reverse-thesis only fires
 # when the opposing signal is on a TF ≥ the original trade-source TF.

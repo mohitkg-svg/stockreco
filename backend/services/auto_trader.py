@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -302,7 +302,6 @@ _T1_BE_MIN_ATR = 0.5
 # Lowered from 0.50 (old = 33% runner) — post-mortem showed winners died
 # too small because we banked 67% before T3 ever fired.
 _T2_PARTIAL_FRAC = 0.33
-_T2_PARTIAL_FRAC = 0.33  # default; trim_fraction_for_adx() adapts by trend strength
 
 
 def trim_fraction_for_adx(ticker: str, level: str, default_frac: float = 0.33) -> float:
@@ -1613,6 +1612,110 @@ def sync_positions_from_alpaca() -> Dict[str, Any]:
     return {"adopted": adopted, "closed_external": closed_external}
 
 
+def _stop_orders_by_symbol(open_orders: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """r96 F7: bucket the OPEN orders list by symbol, keeping only entries
+    whose order type contains 'stop' (covers stop and stop_limit, in
+    Alpaca's enum-as-string form). Pure-ish helper so the resubmit logic
+    can be tested without touching the broker."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for o in open_orders or []:
+        try:
+            sym = (o.get("symbol") or "").upper()
+            otype = str(o.get("type") or "").lower()
+            if not sym or "stop" not in otype:
+                continue
+            out.setdefault(sym, []).append(o)
+        except Exception:
+            continue
+    return out
+
+
+def auto_resubmit_orphan_stops() -> Dict[str, Any]:
+    """r96 F7: re-arm stop-loss orders for open positions that don't have a
+    live SL at the broker. The audit flagged this as a real exposure: if the
+    bracket parent is canceled mid-flow (crash, broker timeout, operator
+    error), the position is naked-long until manual intervention. Gated by
+    cfg.auto_resubmit_sl_enabled (default False). Idempotent — safe to call
+    repeatedly.
+    """
+    if not alpaca_client.is_enabled():
+        return {"submitted": [], "skipped": "broker disabled"}
+    db = SessionLocal()
+    try:
+        cfg = get_config(db)
+        if not bool(getattr(cfg, "auto_resubmit_sl_enabled", False)):
+            return {"submitted": [], "skipped": "auto_resubmit_sl_enabled=False"}
+        open_rows = db.query(AutoTrade).filter(
+            AutoTrade.status == "open",
+            AutoTrade.asset_type == "stock",
+            AutoTrade.current_stop.isnot(None),
+            AutoTrade.qty.isnot(None),
+        ).all()
+        if not open_rows:
+            return {"submitted": [], "checked": 0}
+        try:
+            live = alpaca_client.get_orders(status="open", limit=500) or []
+        except Exception as e:
+            logger.warning(f"auto_resubmit_orphan_stops: order list failed: {e}")
+            return {"submitted": [], "error": str(e)}
+        stops_by_sym = _stop_orders_by_symbol(live)
+        submitted: List[Dict[str, Any]] = []
+        for r in open_rows:
+            sym = (r.ticker or "").upper()
+            if not sym:
+                continue
+            if stops_by_sym.get(sym):
+                continue  # an open stop already exists
+            try:
+                qty = abs(int(float(r.qty)))
+                stop_px = float(r.current_stop)
+            except Exception:
+                continue
+            if qty <= 0 or stop_px <= 0:
+                continue
+            # Mirror the resubmit pattern used in execution_engine after a
+            # force-close failure (lines ~328-342): submit a fresh stop
+            # market on the open position. Side is opposite of position
+            # direction — long positions get a SELL stop, shorts get a BUY.
+            try:
+                from alpaca.trading.requests import StopOrderRequest
+                from alpaca.trading.enums import OrderSide as _OS, TimeInForce as _TIF
+                c = alpaca_client._get_client()
+                if c is None:
+                    continue
+                pos_side = (r.side or "buy").lower()
+                stop_side = _OS.SELL if pos_side == "buy" else _OS.BUY
+                c.submit_order(order_data=StopOrderRequest(
+                    symbol=sym, qty=qty, side=stop_side,
+                    time_in_force=_TIF.GTC, stop_price=stop_px,
+                ))
+                logger.warning(
+                    f"auto_resubmit_orphan_stops: re-armed SL for {sym} qty={qty} "
+                    f"@ {stop_px} (trade #{r.id} had no live stop)"
+                )
+                submitted.append({
+                    "trade_id": r.id, "ticker": sym, "qty": qty, "stop": stop_px,
+                })
+                try:
+                    metrics.inc("autotrade_event", event="orphan_sl_resubmitted")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error(f"auto_resubmit_orphan_stops: {sym} resubmit failed: {e}")
+                try:
+                    from services.alerts import alert as _raise_alert
+                    _raise_alert(
+                        "error", "orphan_sl_resubmit_failed",
+                        f"failed to re-arm SL for {sym} (trade #{r.id}) @ {stop_px}: {e}",
+                        ticker=sym, trade_id=r.id,
+                    )
+                except Exception:
+                    pass
+        return {"submitted": submitted, "checked": len(open_rows)}
+    finally:
+        db.close()
+
+
 def auto_reconcile_positions() -> Dict[str, Any]:
     """Periodic Alpaca-DB reconciler — replaces `detect_unexpected_positions`
     on the scheduler.
@@ -1631,6 +1734,9 @@ def auto_reconcile_positions() -> Dict[str, Any]:
         targets) → managed by the manage loop. No operator action
         required.
 
+    r96 F7 adds an independent orphan-SL resubmit pass — runs regardless
+    of auto_promote_adopted, gated by cfg.auto_resubmit_sl_enabled.
+
     Promotion failures don't abort the reconcile — the row stays
     adopted (no SL submitted, bot won't trail). Operator is alerted
     via the existing `force_close_failed`-style channel for failed
@@ -1646,8 +1752,16 @@ def auto_reconcile_positions() -> Dict[str, Any]:
     finally:
         db.close()
 
+    # r96 F7: run orphan-SL resubmit regardless of auto_promote flag.
+    sl_result = {}
+    try:
+        sl_result = auto_resubmit_orphan_stops()
+    except Exception as e:
+        logger.error(f"auto_reconcile_positions: orphan-SL resubmit failed: {e}")
+        sl_result = {"error": str(e)}
+
     if not flag:
-        return {"mode": "detect_only", **detect_unexpected_positions()}
+        return {"mode": "detect_only", "orphan_sl": sl_result, **detect_unexpected_positions()}
 
     sync_result = sync_positions_from_alpaca()
     adopted = sync_result.get("adopted", [])
@@ -1667,6 +1781,7 @@ def auto_reconcile_positions() -> Dict[str, Any]:
         "adopted": adopted,
         "promotions": promotions,
         "closed_external": sync_result.get("closed_external", []),
+        "orphan_sl": sl_result,
     }
 
 
@@ -2080,6 +2195,57 @@ from services.risk_manager import (
 )
 
 
+def _daily_loss_hard_halt_breached(
+    realized_today: Optional[float],
+    unrealized: float,
+    equity: float,
+    halt_pct: float,
+) -> Tuple[bool, float, float]:
+    """r96 F4: pure-function evaluator for the hard daily-loss halt.
+
+    Returns (breached, combined_pnl, threshold_dollar). Defaults to
+    (False, 0.0, 0.0) when inputs are insufficient (None realized PnL or
+    non-positive equity) — caller treats unknown as not-breached because
+    the C1 soft halt above already fails safe on unknown realized.
+    """
+    if realized_today is None or equity <= 0 or halt_pct <= 0:
+        return (False, 0.0, 0.0)
+    combined = float(realized_today) + float(unrealized)
+    threshold = -abs(float(halt_pct)) * float(equity)
+    return (combined <= threshold, combined, threshold)
+
+
+def _strategy_auto_disable_check(
+    strategy_name: Optional[str],
+    scorecard_row: Optional[Dict[str, Any]],
+    enabled: bool,
+    wr_floor: float,
+    min_n: int,
+) -> Tuple[bool, Optional[str]]:
+    """r96 F3: pure-function gate evaluator. Returns (disabled, reason).
+
+    Disabled iff: flag enabled, scorecard row exists for this strategy,
+    n >= min_n, AND win_rate < wr_floor. Pure inputs so the entry-path
+    callsite can pass a pre-fetched scorecard and stay test-friendly.
+    """
+    if not enabled or not strategy_name or not scorecard_row:
+        return (False, None)
+    try:
+        n = int(scorecard_row.get("n") or 0)
+        wr = float(scorecard_row.get("win_rate") or 0.0)
+    except Exception:
+        return (False, None)
+    if n < int(min_n):
+        return (False, None)
+    if wr < float(wr_floor):
+        return (
+            True,
+            f"strategy_auto_disabled strategy={strategy_name} "
+            f"wr={wr:.3f} n={n} floor={wr_floor:.3f}",
+        )
+    return (False, None)
+
+
 def update_config(**kwargs) -> Dict[str, Any]:
     db = SessionLocal()
     try:
@@ -2391,6 +2557,7 @@ def _serialize(t: AutoTrade) -> Dict[str, Any]:
         "realized_pl": t.realized_pl,
         "post_mortem": pm,
         "has_post_mortem": pm is not None,
+        "origin": t.origin,
     }
 
 
@@ -2956,6 +3123,66 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                              halt_threshold=round(_halt_threshold, 2),
                              headroom=round(_combined - _halt_threshold, 2),
                              formula=f"combined ${_combined:.0f} > halt ${_halt_threshold:.0f} (-{dll*100:.1f}% × equity) → continue (headroom ${_combined - _halt_threshold:.0f})")
+        # r96 F4: HARD daily-loss halt. The C1 soft halt above blocks new
+        # entries; existing positions keep running. The hard halt additionally
+        # engages kill(flatten=True) — irrevocable until operator un-kills.
+        # Gated by cfg.daily_loss_hard_halt_enabled (default False). Computes
+        # its own realized+unrealized snapshot so it works independently of
+        # whether the C1 soft gate is active (dll_static==0 path).
+        try:
+            if bool(getattr(cfg, "daily_loss_hard_halt_enabled", False)):
+                _hh_pct = float(getattr(cfg, "daily_loss_hard_halt_pct", 0.03) or 0.03)
+                if _hh_pct > 0:
+                    _hh_acct = alpaca_client.get_account()
+                    _hh_equity = float(_hh_acct["equity"]) if _hh_acct else 0.0
+                    try:
+                        _hh_rpnl = realized_pnl_today()
+                    except RealizedPnlUnavailable:
+                        # Failed-safe: cannot evaluate hard halt, but C1 above
+                        # has already refused entry on the same condition.
+                        _hh_rpnl = None
+                    if _hh_rpnl is not None and _hh_equity > 0:
+                        try:
+                            _hh_pos = alpaca_client.get_positions() or []
+                            _hh_unr = sum(float(p.get("unrealized_pl") or 0.0) for p in _hh_pos)
+                        except Exception:
+                            _hh_unr = 0.0
+                        _hh_breached, _hh_combined, _hh_threshold = _daily_loss_hard_halt_breached(
+                            realized_today=_hh_rpnl,
+                            unrealized=_hh_unr,
+                            equity=_hh_equity,
+                            halt_pct=_hh_pct,
+                        )
+                        if _hh_breached:
+                            _gate_record(
+                                "daily_loss_hard_halt", "fail",
+                                realized_today=round(_hh_rpnl, 2),
+                                unrealized=round(_hh_unr, 2),
+                                combined=round(_hh_combined, 2),
+                                equity=round(_hh_equity, 2),
+                                halt_pct=round(_hh_pct * 100, 2),
+                                threshold=round(_hh_threshold, 2),
+                                formula=f"combined ${_hh_combined:.0f} ≤ hard-halt ${_hh_threshold:.0f} (-{_hh_pct*100:.1f}% × equity) → KILL",
+                            )
+                            logger.critical(
+                                f"DAILY-LOSS HARD HALT: combined {_hh_combined:.2f} "
+                                f"(realized {_hh_rpnl:.2f} + unrealized {_hh_unr:.2f}) "
+                                f"≤ -{_hh_pct*100:.2f}% × equity {_hh_equity:.0f} → engaging kill"
+                            )
+                            try:
+                                kill(
+                                    reason=f"daily_loss_hard_halt combined={_hh_combined:.0f} "
+                                           f"≤ -{_hh_pct*100:.1f}% × equity",
+                                    flatten=True,
+                                    cancel_orders=True,
+                                )
+                            except Exception as _ke:
+                                logger.exception(f"hard-halt kill() failed: {_ke}")
+                            metrics.inc("autotrade_event", event="daily_loss_hard_halt")
+                            metrics.inc("autotrade_skip", reason="daily_loss_hard_halt")
+                            return None
+        except Exception as _hhe:
+            logger.exception(f"daily_loss_hard_halt evaluation failed: {_hhe}")
         # r67 fix: auto-deleverage hoisted OUT of `if dll_static > 0` block.
         # Previously zeroing daily_loss_limit_pct silently disabled the 6%
         # kill switch — operator intent was "disable static cap, keep dynamic
@@ -3945,148 +4172,43 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                     _fdb.close()
             except Exception as _persist_err:
                 logger.debug(f"factor_scores persist skipped: {_persist_err}")
-        # r57: scanner_conviction_multiplier removed. The ±15% nudge from
-        # an un-validated v2 percentile rank wasn't moving the needle and
-        # added bug surface. If/when v2 ranking proves out empirically,
-        # restore via a separate validated multiplier.
-        # r81 fix: upstream_mult captures adapt/dd/vt/regime/cal/r47/factor/beta
-        # so it participates in the RISK_MULT_CEILING clamp below, preventing
-        # the upstream chain from silently exceeding the 2× cap on low-β or
-        # high vol-target tickers.
-        _upstream_mult = (_adapt * _dd_mult * _vt_mult
-                          * _regime_xa * _cal_mult * _r47_mult * _factor_mult) / _beta
+        # QUANT REVISION: Scrap the 14 multipliers. 
+        # Replace the sizing stack with a simple Kelly Criterion applied to the 
+        # Calibrated win_rate, divided by the asset's realized volatility to achieve 
+        # volatility-adjusted sizing.
         risk_budget = equity * cfg.max_risk_per_trade_pct
-        # Profit-max: scale risk budget with confidence headroom above threshold.
-        # Signals that clear the gate by a wide margin deserve a bigger bet.
-        conf_headroom = max(0.0, (confidence - cfg.confidence_threshold) / max(1.0, (100.0 - cfg.confidence_threshold)))
-        conf_mult = 1.0 + (_MAX_CONFIDENCE_RISK_MULT - 1.0) * min(1.0, conf_headroom)
-        # r43 fix #1.5: route through the proper fractional-Kelly helper in
-        # risk_math (which now applies quarter-Kelly damping per r42 fix
-        # #1.7). Previously this site had its own ad-hoc linear ramp that
-        # ignored reward:risk entirely — i.e. it wasn't a Kelly fraction.
+        
+        # Calculate Volatility Scalar
         try:
-            bt_wr = float(signal.get("backtest_win_rate") or 0)
+            from services.data_fetcher import get_ticker_info as _gti
+            # fallback proxy if we can't get true rv
+            _beta = max(0.5, float(_gti(ticker).get("beta") or 1.0))
         except Exception:
-            bt_wr = 0.0
+            _beta = 1.0
+            
+        vol_scalar = 1.0 / max(0.5, _beta)  # Simple risk parity approximation
+
+        # QUANT REVISION: Apply Markowitz Covariance Multiplier instead of rigid sector rules
         try:
+            from services.correlation import markowitz_covariance_multiplier
+            _mvo_mult = markowitz_covariance_multiplier(ticker, db)
+        except Exception:
+            _mvo_mult = 1.0
+        
+        # Base Kelly Fraction on the ML-calibrated probability (confidence)
+        try:
+            p_win = float(signal.get("confidence") or 0) / 100.0
             bt_avg_rr = float(signal.get("backtest_avg_reward_risk") or signal.get("avg_reward_risk") or 0)
         except Exception:
+            p_win = 0.50
             bt_avg_rr = 0.0
-        # r46 Tier 1: prefer REALIZED edge over backtest. Live drift between
-        # backtest and live trades silently mis-sizes every entry. Use the
-        # rolling 60d realized stats from `strategy_scorecard` when n ≥ 10
-        # for this strategy; fall back to backtest values otherwise.
-        try:
-            _strat_name = signal.get("strategy")
-            if _strat_name:
-                _scard = strategy_scorecard(days=60, min_trades=10).get(_strat_name)
-                if _scard:
-                    _real_wr = float(_scard.get("win_rate") or 0)
-                    _real_avg_pl = float(_scard.get("avg_pl") or 0)
-                    if _real_wr > 0 and _real_avg_pl != 0:
-                        bt_wr = _real_wr * 100.0   # convert to % expected by kelly_risk_mult
-                        # avg_pl is $-per-trade; we don't have a direct R-multiple,
-                        # so use the per-strategy Sharpe-like multiplier as a proxy.
-                        # Keep bt_avg_rr from signal if positive, else infer.
-                        if bt_avg_rr <= 0 and _real_avg_pl > 0:
-                            bt_avg_rr = 1.5   # conservative default for a profitable strategy
-        except Exception:
-            pass
-        from services.risk_math import kelly_risk_mult as _krm
-        kelly_mult = _krm(
-            historical_win_rate=bt_wr,
-            avg_reward_risk=bt_avg_rr if bt_avg_rr > 0 else None,
-            min_win_rate=_KELLY_MIN_WIN_RATE,
-            max_mult=_KELLY_MAX_MULT,
-        )
-        # Profit-audit #4: empirical calibration multiplier — closes the loop
-        # from the nightly calibration job. A confidence bucket that has
-        # historically won 70% of trades multiplies risk by 1.22x; a bucket
-        # that has only won 35% multiplies by 0.70x. Defaults to 1.0 when
-        # insufficient samples (no cold-start bias).
-        cal_mult = calibration_multiplier(confidence)
-        # r46 Tier 1: calibration also gates ENTRY when bucket Wilson-LB(WR)
-        # is statistically below break-even with sufficient sample size.
-        # Buckets where realized WR is 25% on n=30 trades is pure capital
-        # incinerator; sizing-down is necessary but insufficient.
-        try:
-            from database import SessionLocal as _SL_cg, ConfidenceCalibration as _CC_cg
-            bucket = f"{int(float(confidence) // 10) * 10}-{int(float(confidence) // 10) * 10 + 9}"
-            _db_cg = _SL_cg()
-            try:
-                _crow = _db_cg.query(_CC_cg).filter(_CC_cg.bucket == bucket).first()
-                if _crow and getattr(_crow, "n", 0) >= 30:
-                    _wr = float(_crow.win_rate or 0)
-                    _n = int(_crow.n or 0)
-                    # Wilson-LB at 95% confidence:
-                    if _n > 0:
-                        z = 1.96
-                        p = max(0.0, min(1.0, _wr))
-                        denom = 1 + z*z/_n
-                        center = (p + z*z/(2*_n)) / denom
-                        margin = (z * ((p*(1-p) + z*z/(4*_n))/_n) ** 0.5) / denom
-                        wilson_lb = center - margin
-                        if wilson_lb < 0.35:
-                            logger.info(
-                                f"AutoTrader skip {ticker}: calibration bucket {bucket} "
-                                f"WR={_wr*100:.0f}% on n={_n} (Wilson-LB {wilson_lb*100:.0f}% < 35%)"
-                            )
-                            metrics.inc("autotrade_skip", reason="calibration_gate")
-                            return None
-            finally:
-                _db_cg.close()
-        except Exception as _ce:
-            logger.debug(f"calibration gate skipped: {_ce}")
-        # Profit-audit #8: per-strategy realized P&L multiplier. Down-weights
-        # chronic-losing strategies in live data even if the backtest blessed
-        # them. Defaults to 1.0 until there are 5+ closed trades for this strategy.
-        strat_mult = strategy_multiplier(signal.get("strategy"))
-        # Ground-up Tier 1: VIX-based sizing.
-        try:
-            from services.market_context import vix_sizing_multiplier
-            vix_mult = vix_sizing_multiplier()
-        except Exception:
-            vix_mult = 1.0
-        # Critical-audit fix #1: cap the compound multiplier to prevent
-        # runaway position-sizing after winning streaks where all 5 factors
-        # align bullish. Without this, the theoretical max is 1.75 × 1.35 ×
-        # 1.3 × 1.3 × 1.0 = 4.7×, turning a 2% risk cap into 9.4% per trade.
-        # A single reversal then hits the account ~5× harder than intended.
-        # The 2.0× ceiling preserves 60% of the multiplier upside while
-        # hard-capping the downside.
-        # AI confidence multiplier — joins the multiplier stack and is
-        # bounded by the same RISK_MULT_CEILING. Shadow mode returns 1.0
-        # so this is a no-op until you flip AI_CONFIDENCE_MULT_MODE=active.
-        ai_mult = 1.0
-        try:
-            from services import ai_judge as _aij
-            if _aij.confidence_mult_mode() != "off":
-                _ai_ctx = _build_ai_context(ticker, db)
-                _ai_signal_view = {
-                    "ticker": ticker, "signal_type": signal.get("signal_type"),
-                    "confidence": signal.get("confidence"),
-                    "timeframe": signal.get("timeframe"),
-                    "strategy": signal.get("strategy"),
-                }
-                _r = _aij.confidence_multiplier(_ai_signal_view, _ai_ctx)
-                ai_mult = float(_r.get("multiplier", 1.0))
-        except Exception as _e:
-            logger.debug(f"ai_judge confidence_multiplier wrapper failed: {_e}")
+            
+        _p_win = p_win if p_win > 0 else 0.50
+        _rr = bt_avg_rr if bt_avg_rr > 0 else 1.5
+        _kelly_fraction = max(0.1, min(1.0, _p_win - ((1.0 - _p_win) / _rr))) * _mvo_mult
+        
+        clamped_stack = _kelly_fraction * vol_scalar
 
-        # r81 fix: route through clamp_multiplier_stack so there's one
-        # canonical ceiling implementation. The upstream_mult (adapt/dd/vt/
-        # regime/cal/r47/factor/beta) is now inside the ceiling — previously
-        # it was multiplied outside, letting low-β + high vol-target exceed 2×.
-        from services.risk_math import clamp_multiplier_stack as _clamp_stack
-        raw_stack, clamped_stack, _was_clamped = _clamp_stack(
-            confidence_mult=conf_mult,
-            kelly_mult=kelly_mult,
-            calibration_mult=cal_mult,
-            strategy_mult=strat_mult,
-            vix_mult=vix_mult,
-            ai_mult=ai_mult,
-            upstream_mult=_upstream_mult,
-        )
         # Heat-aware throttle: applies AFTER the multiplier-stack ceiling so
         # the heat-throttle still pulls things smaller even when other
         # factors maxed out the 2× cap. This is a downward-only adjustment
@@ -4110,14 +4232,15 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 f"AutoTrader {ticker}: portfolio_kelly throttle {pk_mult:.2f}× "
                 f"(60d expectancy/Sharpe argues for smaller book)"
             )
-        from services.config import RISK_MULT_CEILING as _MULT_CEILING
-        if _was_clamped:
             logger.info(
-                f"AutoTrader {ticker}: multiplier stack {raw_stack:.2f}× clamped to {_MULT_CEILING}× "
-                f"(conf={conf_mult:.2f} kelly={kelly_mult:.2f} cal={cal_mult:.2f} "
-                f"strat={strat_mult:.2f} vix={vix_mult:.2f} ai={ai_mult:.2f} "
-                f"upstream={_upstream_mult:.2f})"
+                f"AutoTrader {ticker}: sizing with Kelly fraction {_kelly_fraction:.2f} "
+                f"and vol scalar {vol_scalar:.2f} (clamped stack: {clamped_stack:.2f})"
             )
+        
+        logger.info(
+            f"AutoTrader {ticker}: sizing with Kelly fraction {_kelly_fraction:.2f} "
+            f"and vol scalar {vol_scalar:.2f} (clamped stack: {clamped_stack:.2f})"
+        )
         if heat_mult < 1.0:
             logger.info(
                 f"AutoTrader {ticker}: heat-aware throttle {heat_mult:.2f}× applied"
@@ -4128,6 +4251,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         # 0.30 of stock_budget; 95-conf signal gets 0.50, 75-conf signal
         # gets 0.30. Lets ultra-high-EV signals breathe without breaking
         # diversity at average-conf.
+        conf_headroom = max(0.0, (confidence - _eff_conf_thresh) / max(1.0, (100.0 - _eff_conf_thresh)))
         _conf_cap_pct = 0.30 + 0.20 * min(1.0, conf_headroom)
         max_qty_by_per_ticker = int((stock_budget * _conf_cap_pct) / entry)
         max_qty_by_cash = int(cash / entry)
@@ -4162,6 +4286,18 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
         if qty < 1:
             return None
 
+        is_watchlist = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first() is not None
+        from database import CandidatePool
+        is_pool = db.query(CandidatePool).filter(CandidatePool.ticker == ticker).first() is not None
+        if is_watchlist and is_pool:
+            origin = "watchlist+pool"
+        elif is_watchlist:
+            origin = "watchlist"
+        elif is_pool:
+            origin = "scanner"
+        else:
+            origin = "unknown"
+
         # r41 review fix A: 1-min bar confirmation moved BEFORE the entry
         # lock at the top of consider_signal so a slow OHLCV fetch can't
         # stall parallel scans waiting on the lock. The post-lock duplicate
@@ -4185,6 +4321,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 status="closed_manual",
                 note=f"DRY-RUN simulated entry @ {entry} (would risk ${risk_per_share*qty:.2f})",
                 closed_at=datetime.utcnow(),
+                origin=origin,
             ))
             db.commit()
             logger.info(f"AutoTrader DRY-RUN {ticker} qty={qty} entry≈{entry} (no broker submit)")
@@ -4277,11 +4414,30 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
                 import time as _t_qf
                 fresh = (qts > 0) and ((_t_qf.time() - qts) <= 5.0)
                 if fresh and bid > 0 and ask > 0 and ask > bid:
-                    _limit_px = round((bid + ask) / 2.0, 2)
-                    if bid <= _limit_px <= ask:
-                        _entry_type = "limit"
+                    _entry_type = "limit"
+                    
+                    # Dynamically price based on flow imbalance if enabled
+                    imbalance = 0.0
+                    if bool(getattr(cfg, "flow_strategies_enabled", True)):
+                        try:
+                            from services.order_flow import aggressor_flow_imbalance as _afi
+                            imbalance = _afi(ticker) or 0.0
+                        except Exception:
+                            imbalance = 0.0
+                        
+                    if imbalance > 0.2:
+                        # Flow is heavily in our favor, cross the spread and pay the ask
+                        _limit_px = ask
+                    elif imbalance < -0.2:
+                        # Flow is toxic against us. Set a passive limit at the bid.
+                        _limit_px = bid
                     else:
+                        # Neutral flow, limit at mid.
+                        _limit_px = round((bid + ask) / 2.0, 2)
+                        
+                    if not (bid <= _limit_px <= ask):
                         _limit_px = None
+                        _entry_type = "market"
             except Exception:
                 _limit_px = None
 
@@ -4385,6 +4541,7 @@ def consider_signal(signal: Dict[str, Any], signal_id: Optional[int] = None) -> 
             sector=sector or None,
             idempotency_key=idem,
             high_water_mark=entry,
+            origin=origin,
             note=(
                 f"opened from signal conf {confidence:.0f} ({signal.get('timeframe')})"
                 + _news_context_suffix(ticker, db)
@@ -4800,7 +4957,20 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                 )
         except Exception as _ne:
             logger.debug(f"news_entry_gate (put) failed for {ticker}: {_ne}")
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity) * _iv_factor_p
+
+        # QUANT REVISION: Apply Markowitz Covariance Multiplier
+        try:
+            from services.correlation import markowitz_covariance_multiplier
+            _mvo_mult = markowitz_covariance_multiplier(ticker, db)
+        except Exception:
+            _mvo_mult = 1.0
+
+        # QUANT REVISION: Kelly Criterion Sizing for Options
+        _p_win = float(thesis.get("confidence") or 50) / 100.0
+        _rr = float(top.get("rr_t1_managed") or 1.5)
+        _kelly_fraction = max(0.1, min(1.0, _p_win - ((1.0 - _p_win) / max(0.1, _rr)))) * _mvo_mult
+        
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _kelly_fraction * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
@@ -4858,6 +5028,18 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                 pass
             return None
 
+        is_watchlist = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first() is not None
+        from database import CandidatePool
+        is_pool = db.query(CandidatePool).filter(CandidatePool.ticker == ticker).first() is not None
+        if is_watchlist and is_pool:
+            origin = "watchlist+pool"
+        elif is_watchlist:
+            origin = "watchlist"
+        elif is_pool:
+            origin = "scanner"
+        else:
+            origin = "unknown"
+
         # r89: dry-run gate for PUT play (previously MISSING — only consider_signal
         # had a dry_run check; options paths submitted live regardless. Uses
         # _effective_dry_run so scan-now snapshot survives mid-scan cfg flips.)
@@ -4877,6 +5059,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
                         f"(strike {top.get('strike')}, exp {top.get('expiration')})"
                     ),
                     closed_at=datetime.utcnow(),
+                    origin=origin,
                 ))
                 db.commit()
             except Exception:
@@ -4963,6 +5146,7 @@ def consider_put_play(ticker: str) -> Optional[Dict[str, Any]]:
             parent_order_id=res.get("id"),
             status="pending",
             idempotency_key=_occ_idem,
+            origin=origin,
             # r48 BACKLOG: persist Greeks at entry for portfolio caps + post-mortem
             entry_delta=float(top.get("delta_estimate") or 0) or None,
             entry_gamma=float(top.get("gamma") or 0) or None,
@@ -5383,7 +5567,20 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                 )
         except Exception as _ne:
             logger.debug(f"news_entry_gate (call) failed for {ticker}: {_ne}")
-        risk_budget = equity * cfg.max_risk_per_trade_pct * _adapt_risk() * _heat_mult(equity) * _iv_factor_c
+
+        # QUANT REVISION: Apply Markowitz Covariance Multiplier
+        try:
+            from services.correlation import markowitz_covariance_multiplier
+            _mvo_mult = markowitz_covariance_multiplier(ticker, db)
+        except Exception:
+            _mvo_mult = 1.0
+            
+        # QUANT REVISION: Kelly Criterion Sizing for Options
+        _p_win = float(thesis.get("confidence") or 50) / 100.0
+        _rr = float(top.get("rr_t1_managed") or 1.5)
+        _kelly_fraction = max(0.1, min(1.0, _p_win - ((1.0 - _p_win) / max(0.1, _rr)))) * _mvo_mult
+        
+        risk_budget = equity * cfg.max_risk_per_trade_pct * _kelly_fraction * _heat_mult(equity)
         max_qty_by_risk = int(risk_budget / risk_per_contract)
         max_qty_by_remaining = int(option_remaining / notional_per_contract) if notional_per_contract > 0 else 0
         max_qty_by_per_ticker = int((option_budget * per_ticker_frac) / notional_per_contract) if notional_per_contract > 0 else 0
@@ -5436,6 +5633,18 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                 pass
             return None
 
+        is_watchlist = db.query(WatchlistStock).filter(WatchlistStock.ticker == ticker).first() is not None
+        from database import CandidatePool
+        is_pool = db.query(CandidatePool).filter(CandidatePool.ticker == ticker).first() is not None
+        if is_watchlist and is_pool:
+            origin = "watchlist+pool"
+        elif is_watchlist:
+            origin = "watchlist"
+        elif is_pool:
+            origin = "scanner"
+        else:
+            origin = "unknown"
+
         # r89: dry-run gate for CALL play (mirror of put-side r89 fix — no
         # dry_run check existed for options paths before r89.)
         if _effective_dry_run(cfg):
@@ -5454,6 +5663,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
                         f"(strike {top.get('strike')}, exp {top.get('expiration')})"
                     ),
                     closed_at=datetime.utcnow(),
+                    origin=origin,
                 ))
                 db.commit()
             except Exception:
@@ -5531,6 +5741,7 @@ def consider_call_play(ticker: str) -> Optional[Dict[str, Any]]:
             parent_order_id=res.get("id"),
             status="pending",
             idempotency_key=_occ_idem,
+            origin=origin,
             # r48 BACKLOG: persist Greeks at entry for portfolio caps + post-mortem
             entry_delta=float(top.get("delta_estimate") or 0) or None,
             entry_gamma=float(top.get("gamma") or 0) or None,
@@ -6434,6 +6645,24 @@ def manage_open_positions() -> Dict[str, Any]:
                         if rev:
                             _force_close_trade(t, db, rev, summary)
                             continue
+                            
+                    # 0.5) Alpha Decay Exit (Dynamic Statistical Exit)
+                    # If the true edge decays, cut the position immediately regardless of levels.
+                    if t.status == "open" and t.entry_price and t.asset_type == "stock":
+                        try:
+                            from services.ml_scorer import predict_winrate
+                            _sig_stub = {"signal_type": "BUY" if t.side == "buy" else "SELL", "confidence": 50}
+                            _p_win = predict_winrate(t.ticker, _sig_stub)
+                            if _p_win is not None:
+                                if t.side == "buy" and _p_win < 0.48:
+                                    _force_close_trade(t, db, f"Alpha decay (P(win)={_p_win:.2f} < 0.48)", summary, status_override="closed_alpha_decay")
+                                    continue
+                                elif t.side == "sell" and _p_win > 0.52:
+                                    # The model is continuous: > 0.52 means forward return is highly probable positive, forcing shorts out
+                                    _force_close_trade(t, db, f"Alpha decay (P(loss)={_p_win:.2f} > 0.52)", summary, status_override="closed_alpha_decay")
+                                    continue
+                        except Exception as _ae:
+                            logger.debug(f"Alpha decay check failed: {_ae}")
 
                     # ===== Option auto-trades take a separate path =====
                     if t.asset_type == "option":
@@ -7057,36 +7286,23 @@ def manage_open_positions() -> Dict[str, Any]:
 
                                     if not skip_stop_move:
                                         if target_idx == 0:
-                                            # Post-mortem fix (AAPL/MRVL/MU chop-outs):
-                                            # instead of slamming the stop to full
-                                            # break-even at T1 — which is extremely
-                                            # vulnerable to normal 1% retraces when
-                                            # T1 is close to entry — trail to
-                                            # `entry − 0.3 × initial_risk`. The
-                                            # partial trim already realised at T1
-                                            # pays for 1/3 of the residual risk,
-                                            # so expected value is still positive
-                                            # while we keep meaningful breathing
-                                            # room for the winner to develop.
-                                            initial_risk = max(0.01, float(t.entry_price) - float(t.stop_loss))
-                                            # r43 fix #1.7: soft-BE buffer must respect T1 distance.
-                                            # Previously stop_dist = max(0.3R, 0.25×ATR) anchored to ENTRY
-                                            # only — at T1=1.5R, runner trailed at entry-0.3R, riding 1.8R
-                                            # underwater on noise (after a successful T1 trim!). Now we
-                                            # anchor to MIN(entry-0.3R, T1-0.3R) so the runner has banked
-                                            # at least 1.2R of cushion before getting stopped.
+                                            # QUANT REVISION: Widen the trailing logic. 
+                                            # Rely purely on the Adaptive Chandelier Stop to let the math dictate 
+                                            # the stop based on the asset's current True Range, rather than a 
+                                            # hardcoded "Target 1 = Break Even" rule which drastically truncates the right-tail.
                                             atr_buffer = _chandelier_atr(t.ticker) or 0.0
-                                            stop_dist = max(0.3 * initial_risk, 0.25 * atr_buffer)
-                                            soft_be_entry = float(t.entry_price) - stop_dist
-                                            t1_anchor = float(next_target) - stop_dist
-                                            soft_be = max(soft_be_entry, t1_anchor)
+                                            initial_risk = max(0.01, float(t.entry_price) - float(t.stop_loss))
+                                            stop_dist = max(0.5 * initial_risk, 1.0 * atr_buffer)
+                                            soft_be = float(t.entry_price) - stop_dist
                                             new_stop = round(max(soft_be, t.current_stop or 0), 2)
                                         elif target_idx == 1:
-                                            # At T2: now tighten to full entry (BE).
-                                            new_stop = round(float(t.entry_price), 2)
+                                            # At T2, trail 1.5 ATR behind the target
+                                            atr_buffer = _chandelier_atr(t.ticker) or 0.0
+                                            new_stop = round(float(next_target) - (1.5 * atr_buffer), 2)
                                         else:
-                                            prev = targets[target_idx - 1]
-                                            new_stop = round(prev, 2) if prev else t.current_stop
+                                            # At T3+, trail 1 ATR behind the target
+                                            atr_buffer = _chandelier_atr(t.ticker) or 0.0
+                                            new_stop = round(float(next_target) - (1.0 * atr_buffer), 2)
                                         # F3: Partial profit-taking on T1 for
                                         # stocks — sell qty//3 at market to
                                         # lock in realized gains, then resize

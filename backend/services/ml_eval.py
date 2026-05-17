@@ -172,9 +172,67 @@ def evaluate(days: int = 60) -> Dict:
             f"ml_eval: n={n} brier={result['brier']} ece={result['ece']} "
             f"auc={result['auc']} ready={ready}"
         )
+        # r96 F2: close the drift loop. If cfg.ml_drift_auto_disable_enabled is
+        # True AND the latest N eval rows all breach the Brier threshold, flip
+        # ml_scoring_enabled=False and alert. Previously the threshold lived in
+        # the schema (database.py:301) but was never read at runtime —
+        # operator had to spot drift manually on the dashboard.
+        try:
+            _maybe_auto_disable_on_drift(db, brier_now=result["brier"])
+        except Exception as _de:
+            logger.warning(f"ml_eval drift auto-disable check failed: {_de}")
         return result
     finally:
         db.close()
+
+
+def _maybe_auto_disable_on_drift(db, brier_now: Optional[float]) -> None:
+    """r96 F2: if drift auto-disable is enabled and the last N consecutive
+    eval rows (including this one) breach the Brier threshold, flip
+    ml_scoring_enabled=False. No-op if scoring is already off."""
+    from database import AutoTraderConfig, MLEvalResult
+    cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+    if cfg is None:
+        return
+    if not bool(getattr(cfg, "ml_drift_auto_disable_enabled", False)):
+        return
+    if not bool(getattr(cfg, "ml_scoring_enabled", False)):
+        # Already off — nothing to do, but don't alert repeatedly.
+        return
+    threshold = float(getattr(cfg, "ml_drift_brier_alert_threshold", 0.05) or 0.05)
+    n_required = int(getattr(cfg, "ml_drift_consecutive_days_required", 3) or 3)
+    n_required = max(1, n_required)
+    # Pull the most recent N eval rows, newest first.
+    recent = (
+        db.query(MLEvalResult)
+        .order_by(MLEvalResult.computed_at.desc())
+        .limit(n_required)
+        .all()
+    )
+    if len(recent) < n_required:
+        return  # not enough history yet
+    # Every row's Brier must be (a) present and (b) above threshold.
+    if not all(
+        (r.brier is not None) and (float(r.brier) > threshold) for r in recent
+    ):
+        return
+    # All breach — flip the scorer off and alert.
+    cfg.ml_scoring_enabled = False
+    db.commit()
+    breach_summary = ", ".join(
+        f"{r.brier:.4f}" for r in recent
+    )
+    msg = (
+        f"ML scorer auto-disabled: Brier > {threshold:.3f} on last "
+        f"{n_required} evals [{breach_summary}], current={brier_now}. "
+        f"ml_scoring_enabled flipped to False."
+    )
+    logger.warning(f"ml_eval: {msg}")
+    try:
+        from services.alerts import alert as _alert
+        _alert(severity="critical", category="ml_drift", message=msg)
+    except Exception as _ae:
+        logger.warning(f"ml_eval drift alert send failed: {_ae}")
 
 
 def latest_result() -> Optional[Dict]:

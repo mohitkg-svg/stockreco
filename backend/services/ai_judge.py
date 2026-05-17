@@ -44,6 +44,26 @@ from typing import Dict, Any, Optional, Literal
 
 logger = logging.getLogger(__name__)
 
+_cached_usd_cap: float = 20.0
+_cached_usd_cap_ts: float = 0.0
+
+def _get_usd_cap() -> float:
+    global _cached_usd_cap, _cached_usd_cap_ts
+    now = time.time()
+    if now - _cached_usd_cap_ts < 300:
+        return _cached_usd_cap
+    try:
+        from database import SessionLocal, AutoTraderConfig
+        db = SessionLocal()
+        try:
+            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
+            _cached_usd_cap = float(cfg.ai_daily_usd_cap) if cfg and cfg.ai_daily_usd_cap is not None else 20.0
+            _cached_usd_cap_ts = now
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return _cached_usd_cap
 
 # ---------- Mode resolution -------------------------------------------------
 # Each call site has its own env flag so they can be enabled independently.
@@ -262,16 +282,7 @@ def _ai_budget_check() -> bool:
     from services.config import AI_JUDGE_MODEL
     cost_info = ai_cost_today_usd(model_hint=AI_JUDGE_MODEL)
     current_cost = cost_info.get("cost_estimate_usd", 0.0)
-    try:
-        from database import SessionLocal, AutoTraderConfig
-        db = SessionLocal()
-        try:
-            cfg = db.query(AutoTraderConfig).filter(AutoTraderConfig.id == 1).first()
-            usd_cap = float(cfg.ai_daily_usd_cap) if cfg and cfg.ai_daily_usd_cap is not None else 20.0
-        finally:
-            db.close()
-    except Exception:
-        usd_cap = 20.0
+    usd_cap = _get_usd_cap()
     if current_cost >= usd_cap:
         logger.warning(f"ai_judge: daily AI USD cap ${usd_cap} reached (current ${current_cost:.4f}); abstaining")
         return False

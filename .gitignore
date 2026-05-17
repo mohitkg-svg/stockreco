@@ -25,3 +25,4 @@ backend/logs/
 # Frontend toolchain (r42 — esbuild-driven pre-bundle)
 frontend/node_modules/
 frontend/app.compiled.js.map
+*.db

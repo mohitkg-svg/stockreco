@@ -218,6 +218,7 @@ def run_portfolio_backtest(
     min_hold_bars: int = 3,
     max_hold_bars: int = 30,
     stress_window: Optional[str] = None,
+    harmonized_cost_model: bool = False,
 ) -> Dict[str, Any]:
     """Run the composite backtest. Returns {stats, trades, rejections}.
 
@@ -232,13 +233,22 @@ def run_portfolio_backtest(
     from services.signal_generator import generate_signal
 
     if tickers is None:
-        db = SessionLocal()
+        # r96 R4: when survivorship_filter_enabled is True, INCLUDE delisted
+        # tickers in the historical universe so the backtest sees the true
+        # point-in-time set, not just current survivors. Their data frames
+        # are clamped to delisted_at during signal generation below.
         try:
-            t = set(s.ticker for s in db.query(WatchlistStock).all())
-            t |= set(r.ticker for r in db.query(CandidatePool).all())
-        finally:
-            db.close()
-        tickers = sorted(t)[:max_tickers]
+            from services.survivorship import list_universe, survivorship_enabled
+            include_delisted = survivorship_enabled()
+            tickers = list_universe(include_delisted=include_delisted)[:max_tickers]
+        except Exception:
+            db = SessionLocal()
+            try:
+                t = set(s.ticker for s in db.query(WatchlistStock).all())
+                t |= set(r.ticker for r in db.query(CandidatePool).all())
+            finally:
+                db.close()
+            tickers = sorted(t)[:max_tickers]
 
     # Validate stress_window BEFORE any data fetch — unknown key returns
     # cleanly without a 60-second yfinance round-trip.
@@ -348,8 +358,23 @@ def run_portfolio_backtest(
                 # (round-trip 12bps baseline + Corwin-Schultz adder for the
                 # exit bar). Prior code charged ZERO costs in portfolio
                 # backtests — overstated total return by ~2-5% annually.
+                # r96 F6: when harmonized_cost_model=True, derive baseline +
+                # adverse selection from the SAME constants the per-ticker
+                # backtester uses (services.backtester.COMMISSION_BPS,
+                # SLIPPAGE_BPS, ADVERSE_BPS). The audit flagged this module's
+                # 12bps hardcoded baseline as disagreeing with backtester's
+                # 12+3=15bps (incl. adverse). Both estimators converge here.
                 gross = (exit_px - tr.entry_price) * tr.shares * (1 if tr.direction == "BUY" else -1)
-                cost_bps = 12.0  # baseline round-trip
+                if harmonized_cost_model:
+                    from services.backtester import (
+                        COMMISSION_BPS as _BT_COMMISSION_BPS,
+                        SLIPPAGE_BPS as _BT_SLIPPAGE_BPS,
+                        ADVERSE_BPS as _BT_ADVERSE_BPS,
+                    )
+                    # Round-trip baseline + entry-side adverse selection.
+                    cost_bps = 2.0 * (_BT_COMMISSION_BPS + _BT_SLIPPAGE_BPS) + _BT_ADVERSE_BPS
+                else:
+                    cost_bps = 12.0  # baseline round-trip (legacy)
                 try:
                     # High-low estimator for current bar
                     h = float(df["High"].at[d]) if "High" in df.columns else None

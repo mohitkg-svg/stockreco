@@ -826,35 +826,11 @@ def submit_option_entry_with_cross_fallback(
     wide_spread_cross_seconds: float = 120.0,
     client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """r48 #BACKLOG-options-P0-2: post a marketable-LIMIT BUY inside the
-    spread first, cross to market if unfilled after N seconds.
+    """Post a marketable-LIMIT BUY inside the spread first, and cancel if unfilled
+    after N seconds (Strict Limit-Only policy).
 
-    Prior to this primitive, option ENTRIES used `submit_simple_option_order`
-    with `order_type="market"` — eating the full ask on every wide OPRA
-    book.
-
-    r53 fix (Tier-0 #1): three new safeties surfaced by VTWO ($1.55 →
-    $4.90, +216%) / AMKR ($6.48 → $9.50, +47%) / RMBS (~$1.55 → $15.00)
-    market-cross blow-ups documented in DESIGN.md changelog:
-
-      1. **Slippage abandon** — if the market-cross would result in a
-         fill > `max_fill_vs_requested` × `requested_premium`, we
-         CANCEL the limit and ABANDON the trade rather than crossing
-         past 1.25× requested. Caller can retry on the next manage tick
-         when the spread tightens.
-      2. **Wide-spread cross deferral** — when current ask/bid spread
-         exceeds `wide_spread_pct` of mid (defaults: 30%), extend the
-         marketable-limit window to `wide_spread_cross_seconds` (120s)
-         instead of the default 30s. Wide books are wide because nobody
-         wants to take that side; crossing immediately just hands the
-         market-maker the spread.
-      3. **Caller passes `requested_premium`** so the abandon math has
-         a reference. When None (caller hasn't migrated), we fall through
-         to the legacy "cross at 30s" behavior.
-
-    Returns the FINAL submitted order dict (market cross if it fired,
-    otherwise the inside-the-spread BUY limit, or `{"error": "..."}`
-    on slippage-abandon).
+    Returns the FINAL submitted order dict (the inside-the-spread BUY limit, 
+    or `{"error": "..."}` if unfilled).
     """
     # r53: spread-aware cross deadline. Look up current quote; if spread
     # is unusually wide, give the limit longer to fill at mid.
@@ -889,34 +865,10 @@ def submit_option_entry_with_cross_fallback(
         client_order_id=client_order_id,
     )
     if "error" in first or not first.get("id"):
-        # Couldn't even submit the inside-spread limit; r53: ALSO honor
-        # slippage cap on the market fallback path so a stale-quote
-        # bug can't sneak past the abandon gate.
-        if requested_premium and requested_premium > 0:
-            try:
-                from services.live_quotes import get_option_quote as _gq2
-                q2 = _gq2(occ_symbol)
-                if q2:
-                    ask2 = float(q2.get("ask") or 0)
-                    if ask2 > 0 and ask2 > requested_premium * max_fill_vs_requested:
-                        logger.warning(
-                            f"submit_option_entry ABANDON {occ_symbol}: ask "
-                            f"${ask2:.2f} > {max_fill_vs_requested}×requested "
-                            f"${requested_premium:.2f} — skip rather than cross"
-                        )
-                        return {
-                            "error": "slippage_abandon",
-                            "requested_premium": requested_premium,
-                            "ask": ask2,
-                            "max_allowed": requested_premium * max_fill_vs_requested,
-                        }
-            except Exception:
-                pass
-        return submit_simple_option_order(
-            occ_symbol=occ_symbol, qty=qty, side="buy",
-            order_type="market", time_in_force="day",
-            client_order_id=cross_id,
-        )
+        return {
+            "error": "limit_unfilled",
+            "note": f"Could not submit inside-spread limit order, and market orders are disabled to prevent slippage. Original error: {first.get('error', 'no_quote')}",
+        }
     order_id = first.get("id")
     deadline = time.time() + effective_cross_seconds
     while time.time() < deadline:
@@ -963,45 +915,11 @@ def submit_option_entry_with_cross_fallback(
             pass
     except Exception:
         pass
-    # r53: pre-cross slippage gate. If the current ask is more than
-    # max_fill_vs_requested × requested_premium, abandon rather than
-    # cross. This is the load-bearing fix for VTWO/AMKR/RMBS.
-    if requested_premium and requested_premium > 0:
-        try:
-            from services.live_quotes import get_option_quote as _gq3
-            q3 = _gq3(occ_symbol)
-            if q3:
-                ask3 = float(q3.get("ask") or 0)
-                if ask3 > 0 and ask3 > requested_premium * max_fill_vs_requested:
-                    logger.warning(
-                        f"submit_option_entry ABANDON {occ_symbol}: ask "
-                        f"${ask3:.2f} > {max_fill_vs_requested}×requested "
-                        f"${requested_premium:.2f} after {effective_cross_seconds}s "
-                        f"window — skip rather than cross to market"
-                    )
-                    try:
-                        from services.alerts import alert as _raise_alert
-                        _raise_alert(
-                            "warning", "option_entry_slippage_abandon",
-                            f"{occ_symbol} abandoned: ask ${ask3:.2f} > "
-                            f"{max_fill_vs_requested}×requested ${requested_premium:.2f}",
-                            ticker=occ_symbol[:6].rstrip("0123456789"),
-                        )
-                    except Exception:
-                        pass
-                    return {
-                        "error": "slippage_abandon",
-                        "requested_premium": requested_premium,
-                        "ask": ask3,
-                        "max_allowed": requested_premium * max_fill_vs_requested,
-                    }
-        except Exception as _e:
-            logger.debug(f"submit_option_entry post-cross check {occ_symbol}: {_e}")
-    return submit_simple_option_order(
-        occ_symbol=occ_symbol, qty=qty, side="buy",
-        order_type="market", time_in_force="day",
-        client_order_id=cross_id,
-    )
+    
+    return {
+        "error": "limit_unfilled",
+        "note": f"Limit order {order_id} did not fill within {effective_cross_seconds}s and was canceled rather than crossing the spread.",
+    }
 
 
 def submit_option_exit_with_cross_fallback(

@@ -204,6 +204,24 @@ def aggressor_flow_gate(ticker: str, direction: str, threshold: float = 0.30) ->
     return False
 
 
+def order_book_imbalance(ticker: str) -> Optional[float]:
+    """Top-of-Book Imbalance (OBI proxy) from NBBO sizes.
+    OBI = (Bid_Size - Ask_Size) / (Bid_Size + Ask_Size)
+    Range is [-1, 1]. Positive = buy-side pressure (more resting bids)."""
+    try:
+        from services import live_quotes as _lq
+        q = _lq.get_stock_quote(ticker)
+        if not q:
+            return None
+        bid_size = float(q.get("bid_size") or 0)
+        ask_size = float(q.get("ask_size") or 0)
+        total = bid_size + ask_size
+        if total <= 0:
+            return None
+        return (bid_size - ask_size) / total
+    except Exception:
+        return None
+
 # r67: tape_acceleration_factor deleted — was buggy (rate_last numerator and
 # denominator were identical, always returned 0.25). Dead-code masquerading
 # as a signal. No callers in production code; only the existence test.

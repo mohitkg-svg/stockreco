@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import deque
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,10 @@ _subscribers: Set[Callable[[Dict[str, Any]], Awaitable[None]]] = set()
 # r48 BACKLOG #concurrency-P1-10: lock guard for ensure/unsubscribe.
 _subscribed_symbols_lock = _lq_threading.Lock()
 _subscribed_symbols: Set[str] = set()
+
+# Zero-latency memory tape for ML microstructure feature extraction
+_trade_tape: Dict[str, deque] = {}
+_TAPE_MAX_LEN = 10000
 
 # Background worker task + lock
 _stream_task: Optional[asyncio.Task] = None
@@ -113,6 +118,22 @@ def get_live_price(ticker: str, *, max_age_sec: Optional[float] = None) -> Optio
     if bid and ask:
         return (bid + ask) / 2.0
     return None
+
+
+def get_recent_trades_df(ticker: str, max_age_sec: float) -> Optional["pd.DataFrame"]:
+    """Zero-latency read of the live in-memory tape for ML microstructure extraction."""
+    import pandas as pd
+    tape = _trade_tape.get(ticker.upper())
+    if not tape:
+        return None
+    now = time.time()
+    cutoff = now - max_age_sec
+    valid = [tk for tk in tape if tk["t"] >= cutoff]
+    if not valid:
+        return None
+    df = pd.DataFrame(valid)
+    df["t"] = pd.to_datetime(df["t"], unit="s", utc=True)
+    return df
 
 
 def quote_age_seconds(ticker: str) -> Optional[float]:
@@ -288,6 +309,10 @@ async def _handle_trade(trade) -> None:
     _stock_quotes[sym] = new_dict   # atomic dict-pointer swap (GIL-protected)
     event = {"type": "stock_trade", "symbol": sym, "last": px, "ts": new_ts}
     await _broadcast(event)
+    
+    # Append to rolling zero-latency memory tape for ML Features
+    tape = _trade_tape.setdefault(sym, deque(maxlen=_TAPE_MAX_LEN))
+    tape.append({"t": new_ts, "p": px, "s": float(getattr(trade, "size", 0) or 0)})
 
     # Live recompute gating
     if prev and abs(px - prev) / prev >= _RECOMPUTE_PRICE_DELTA:
@@ -329,6 +354,8 @@ async def _handle_quote(quote) -> None:
     sym = getattr(quote, "symbol", "").upper()
     bid = float(getattr(quote, "bid_price", 0) or 0)
     ask = float(getattr(quote, "ask_price", 0) or 0)
+    bid_size = float(getattr(quote, "bid_size", 0) or 0)
+    ask_size = float(getattr(quote, "ask_size", 0) or 0)
     if not sym:
         return
     # r48 BACKLOG #concurrency-P1-9: atomic dict swap (mirror of trade handler).
@@ -339,6 +366,10 @@ async def _handle_quote(quote) -> None:
         new_dict["bid"] = bid
     if ask > 0:
         new_dict["ask"] = ask
+    if bid_size > 0:
+        new_dict["bid_size"] = bid_size
+    if ask_size > 0:
+        new_dict["ask_size"] = ask_size
     new_dict["ts"] = new_ts
     _stock_quotes[sym] = new_dict
     # r48 BACKLOG: feed spread EMA into order_flow tracker.
@@ -658,6 +689,74 @@ async def _option_stream_worker():
             await asyncio.sleep(backoff)
             backoff = min(300, backoff * 2)
 
+async def _polygon_option_stream_worker():
+    """Subscribe to real-time OPRA option quotes via Polygon.io WebSocket."""
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        return
+        
+    import json
+    import websockets
+    
+    uri = "wss://socket.polygon.io/options"
+    backoff = 5
+    local_subscribed = set()
+    
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                # Auth
+                await ws.send(json.dumps({"action": "auth", "params": api_key}))
+                auth_resp = json.loads(await ws.recv())
+                if not auth_resp or auth_resp[0].get("status") != "auth_success":
+                    logger.warning(f"polygon-options-stream auth failed: {auth_resp}")
+                    await asyncio.sleep(backoff)
+                    continue
+                    
+                logger.info("polygon-options-stream: authenticated successfully (OPRA Real-Time)")
+                backoff = 5
+                
+                while True:
+                    # Sync subscriptions
+                    current_subs = set(_option_subscribed)
+                    to_sub = current_subs - local_subscribed
+                    to_unsub = local_subscribed - current_subs
+                    
+                    if to_sub:
+                        subs_str = ",".join(f"Q.O:{sym}" for sym in to_sub)
+                        await ws.send(json.dumps({"action": "subscribe", "params": subs_str}))
+                        local_subscribed.update(to_sub)
+                        logger.info(f"polygon-options-stream: subscribed to {len(to_sub)} new symbols")
+                        
+                    if to_unsub:
+                        unsubs_str = ",".join(f"Q.O:{sym}" for sym in to_unsub)
+                        await ws.send(json.dumps({"action": "unsubscribe", "params": unsubs_str}))
+                        local_subscribed.difference_update(to_unsub)
+                        logger.info(f"polygon-options-stream: unsubscribed from {len(to_unsub)} stale symbols")
+                        
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        events = json.loads(msg)
+                        for ev in events:
+                            if ev.get("ev") == "Q":
+                                sym = ev.get("sym", "").replace("O:", "")
+                                if not sym: continue
+                                data = {
+                                    "symbol": sym,
+                                    "bid": float(ev.get("bp") or 0) or None,
+                                    "ask": float(ev.get("ap") or 0) or None,
+                                    "ts": time.time()
+                                }
+                                _option_quotes[sym] = data
+                                await _broadcast({"type": "option_quote", **data})
+                    except asyncio.TimeoutError:
+                        pass
+        except Exception as e:
+            logger.warning(f"polygon-options-stream error, reconnecting in {backoff}s: {e}")
+            local_subscribed.clear() # Reset on disconnect
+            await asyncio.sleep(backoff)
+            backoff = min(300, backoff * 2)
+
 
 def ensure_option_symbols(occ_symbols: List[str]) -> None:
     """Dynamically add OCC option symbols to the option stream subscription.
@@ -721,7 +820,10 @@ async def start(initial_tickers: List[str]) -> None:
     if _news_stream_task is None and (os.getenv("ALPACA_NEWS_STREAM", "1") or "1").lower() in ("1", "true", "on"):
         _news_stream_task = asyncio.create_task(_news_worker(), name="alpaca_news_stream")
     if _option_stream_task is None:
-        _option_stream_task = asyncio.create_task(_option_stream_worker(), name="alpaca_option_stream")
+        if os.getenv("POLYGON_API_KEY"):
+            _option_stream_task = asyncio.create_task(_polygon_option_stream_worker(), name="polygon_option_stream")
+        else:
+            _option_stream_task = asyncio.create_task(_option_stream_worker(), name="alpaca_option_stream")
     logger.info(f"Live quotes started with {len(initial_tickers)} initial tickers")
 
 

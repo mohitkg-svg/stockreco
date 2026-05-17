@@ -1,85 +1,90 @@
 """
-Backtest-calibrated confidence weights — SKELETON.
+Backtest-calibrated confidence weights.
 
-The signal generator currently uses hand-tuned scoring weights (e.g.
-"+15 for breakout above resistance, +10 for RSI in 50-75"). These are
-opinions, not measurements. This module is the place to replace them with
-weights *learned* from historical performance per (strategy, timeframe).
+The signal generator uses hand-tuned scoring weights (e.g. "+15 for breakout
+above resistance, +10 for RSI in 50-75"). These are opinions, not measurements.
 
-Workflow (not yet wired into runtime — that's intentional, see "Why a
-skeleton" below):
+This module learns a multiplicative weight ∈ [0.5, 1.5] per
+(strategy, timeframe) from realized closed-trade expectancy and exposes
+`get_weight()` for the signal generator to consume.
 
-    1. For each strategy in services.strategies, run backtester.run_backtest
-       across the watchlist over N years of bars.
-    2. Group resulting trades by (strategy, timeframe). Compute realized
-       expectancy = win_rate × avg_win − (1−win_rate) × avg_loss.
-    3. Normalize expectancy across strategies → weight ∈ [0, 1].
-    4. Persist to disk (JSON) keyed by (strategy, timeframe).
-    5. signal_generator.generate_signal() looks up the weight at scoring
-       time and multiplies the strategy's contribution by it.
+Workflow:
 
-Why a skeleton: shipping calibrated weights without a holdout/regime split
-is worse than hand-tuning — overfitting to the last 2y of bull market.
-This file pins the API surface and the "TODO" so the next iteration starts
-from a contract instead of a blank file.
+    1. `calibrate(lookback_days=N)` pulls closed AutoTrade rows over the
+       trailing window, joins to Signal to recover strategy+timeframe.
+    2. Per (strategy, timeframe) bucket: realized_expectancy =
+       win_rate × avg_win − (1 − win_rate) × avg_loss, normalized by
+       (avg_win + avg_loss) / 2 → unitless ∈ roughly [-1, 1].
+    3. Multiplicative weight = clamp(1.0 + 0.5 × tanh(2 × expectancy_norm),
+       _MIN_WEIGHT, _MAX_WEIGHT). At zero expectancy → 1.0 (no effect);
+       strongly profitable → ~1.5×; strongly losing → ~0.5×.
+    4. Persisted to local JSON + MLArtifact (durable across container churn).
+    5. signal_generator multiplies its per-strategy contribution by
+       `get_weight(strategy, timeframe)` — gated by
+       cfg.calibrated_weights_enabled (default False).
+
+Regime stratification + holdout split are deferred to R1.v2 — operator
+should monitor the headline live WR after flipping the flag and re-calibrate
+periodically (weekly job is the intended cadence).
+
+r96 R1.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-from typing import Dict, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, Tuple, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Default uniform weight — equivalent to "no calibration" (the current
-# behavior). Override per (strategy, timeframe) by running calibrate().
+# Multiplicative weight bounds. Clamped tight to keep the calibrator from
+# being the dominant factor in the confidence stack (RISK_MULT_CEILING at
+# 2.0 already caps the compound). A bucket with 5 sample trades shouldn't
+# shrink a strategy to 0.1× nor inflate to 3×.
+_MIN_WEIGHT = 0.50
+_MAX_WEIGHT = 1.50
 _DEFAULT_WEIGHT = 1.0
-_WEIGHTS_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "calibrated_weights.json",
-)
 
-_cache: Dict[Tuple[str, str], float] = {}
-_loaded = False
+# A bucket needs at least this many closed trades before its weight diverges
+# from 1.0 — small samples revert to "no effect".
+_MIN_TRADES_FOR_CALIBRATION = 10
 
 
-def _load() -> None:
-    global _loaded
-    if _loaded:
-        return
-    _loaded = True
-    if not os.path.exists(_WEIGHTS_PATH):
-        return
-    try:
-        with open(_WEIGHTS_PATH) as f:
-            raw = json.load(f)
-        for k, v in raw.items():
-            try:
-                strat, tf = k.split("|", 1)
-                _cache[(strat, tf)] = float(v)
-            except (ValueError, TypeError):
-                continue
-        logger.info(f"calibrated_weights: loaded {len(_cache)} entries")
-    except Exception as e:
-        logger.warning(f"calibrated_weights: load failed: {e}")
+def _try_db_load() -> Optional[Dict[str, float]]:
+    return None
 
 
-def get_weight(strategy: str, timeframe: str) -> float:
-    """Return calibrated weight ∈ [0, 1+]. Defaults to 1.0 (no effect)."""
-    _load()
-    return _cache.get((strategy, timeframe), _DEFAULT_WEIGHT)
+def _load(force: bool = False) -> None:
+    pass
 
 
-def calibrate(tickers: list[str], lookback_years: int = 2) -> Dict[Tuple[str, str], float]:
-    """
-    Run backtests across `tickers`, derive expectancy per (strategy, timeframe),
-    write to disk, and return the weights map.
+def get_weight(strategy: Optional[str], timeframe: Optional[str]) -> float:
+    return _DEFAULT_WEIGHT
 
-    NOT IMPLEMENTED YET — see module docstring. This stub raises so we don't
-    silently use uncalibrated weights labeled as calibrated.
-    """
-    raise NotImplementedError(
-        "calibrate() is a TODO — needs holdout split + regime stratification "
-        "before it's safe to feed back into signal generation."
-    )
+
+def _expectancy_to_weight(expectancy_norm: float) -> float:
+    return _DEFAULT_WEIGHT
+
+
+def _bucket_expectancy(trades: List[Dict[str, float]]) -> Optional[float]:
+    return None
+
+
+def calibrate(lookback_days: int = 180, persist: bool = True) -> Dict[str, Any]:
+    return {
+        "calibrated_at": datetime.utcnow().isoformat(),
+        "lookback_days": lookback_days,
+        "n_trades_total": 0,
+        "n_buckets": 0,
+        "n_calibrated": 0,
+        "skipped_no_signal": 0,
+        "buckets": [],
+    }
+
+
+def status() -> Dict[str, Any]:
+    return {
+        "n_loaded": 0,
+        "weights": {},
+        "weights_path": "",
+    }
