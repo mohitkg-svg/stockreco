@@ -199,6 +199,7 @@ gcloud run deploy "$SERVICE" \
   --cpu 1 \
   --min-instances 1 \
   --max-instances 1 \
+  --no-cpu-throttling \
   --timeout 300s \
   --cpu-boost \
   --add-cloudsql-instances "$CSQL_INSTANCE" \
