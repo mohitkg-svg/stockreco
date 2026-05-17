@@ -187,109 +187,35 @@ def _dte(expiration_ts: int) -> int:
 
 
 def _score(
-    rr_t1: float, rr_t2: float, rr_t3: float, dte: int, vol: int, oi: int, iv: float,
-    delta_proxy: float,
-    premium: float = 0.0,
-    # Real Greeks from Alpaca OPRA/indicative feed (AT+ tier). When None,
-    # we fall back to the delta_proxy heuristic so Yahoo fallback still scores.
-    delta: Optional[float] = None, theta: Optional[float] = None,
-    gamma: Optional[float] = None, vega: Optional[float] = None,
+    prob_win: float, best_reward: float, managed_risk: float, 
+    premium: float, iv: float,
+    theta: Optional[float] = None, vega: Optional[float] = None,
 ) -> float:
-    """Composite score for an option contract. Max ~125 with Greeks, ~100 without.
-
-    Sections (each independent so operator can intuit why a contract ranks):
-      R:R core              → 40 pts
-      R:R T2 bonus          → 15 pts
-      DTE sweet-spot        → 15 pts
-      Liquidity (vol/OI)    → 20 pts
-      Delta fitness         → 10 pts  (real delta when available)
-      Theta efficiency      → 15 pts  (Greeks-only)
-      Vega-crush penalty    → −10 pts (Greeks-only)
-      Gamma leverage        → 10 pts  (Greeks-only)
     """
-    best_rr = max(rr_t1, rr_t2, rr_t3)
-    rr_score = min(best_rr / 5.0, 1.0) * 40
-    rr2_bonus = min(rr_t2 / 10.0, 1.0) * 15
-
-    if 30 <= dte <= 60:
-        dte_score = 15
-    elif 20 <= dte <= 75:
-        dte_score = 12
-    elif 8 <= dte <= 19:
-        dte_score = 8
-    elif dte <= WEEKLY_DTE:
-        dte_score = 10 if best_rr >= 6 else 5
-    else:
-        dte_score = 5
-
-    liq = min((vol / 100.0), 1.0) * 10 + min((oi / 500.0), 1.0) * 10
-
-    # r43 fix #1.24: asymmetric delta scoring. The previous symmetric formula
-    # `10 * (1 - |delta - 0.5| / 0.5)` scored delta=0.7 (ITM, tracks
-    # underlying tightly) and delta=0.1 (OTM lottery) the same — both got
-    # ~6 pts. For directional plays on 30-45 DTE, delta 0.4-0.7 is
-    # empirically much better. New scoring:
-    #   |delta| in [0.4, 0.7] → full 10 pts (the directional sweet spot)
-    #   |delta| in [0.25, 0.4] → 5 pts (linear ramp from 5→10)
-    #   |delta| > 0.7         → 7 pts (deep ITM, costs more)
-    #   |delta| < 0.25        → 0 pts (OTM lottery, harsh penalty)
-    d_eff = delta if delta is not None else delta_proxy
-    abs_d = abs(d_eff)
-    if 0.4 <= abs_d <= 0.7:
-        delta_score = 10.0
-    elif 0.25 <= abs_d < 0.4:
-        # Linear 5 → 10 across [0.25, 0.4].
-        delta_score = 5.0 + (abs_d - 0.25) * (5.0 / 0.15)
-    elif abs_d > 0.7:
-        delta_score = 7.0
-    else:
-        delta_score = 0.0
-
-    # ---- Greeks-aware adjustments ----
-    theta_efficiency = 0.0
-    vega_penalty = 0.0
-    gamma_reward = 0.0
-
-    if theta is not None and premium > 0:
-        # Critical-audit fix #3: don't DOUBLE-penalize weeklies. The dte_score
-        # above already penalizes <=7 DTE (5-10 pts vs 15). Applying both
-        # dte_score AND theta_efficiency on weeklies punishes good 2-3 day
-        # setups that happen to be on short calendar. Skip theta efficiency
-        # entirely for weeklies — dte_score handles calendar risk there.
-        if dte > WEEKLY_DTE:
-            theta_pct = abs(theta) / premium
-            if theta_pct <= 0.01:
-                theta_efficiency = 15
-            elif theta_pct <= 0.02:
-                theta_efficiency = 10
-            elif theta_pct <= 0.03:
-                theta_efficiency = 5
-            elif theta_pct <= 0.05:
-                theta_efficiency = 0
-            else:
-                theta_efficiency = -8
-
+    Pure quantitative Expected Value (EV) scoring.
+    Replaces the human heuristic point system.
+    EV = (P(Win) * Expected Net Reward) - (P(Loss) * Expected Net Risk)
+    """
+    p_loss = max(0.0, 1.0 - prob_win)
+    
+    # 1. Base Expected Value in dollars
+    ev = (prob_win * best_reward) - (p_loss * managed_risk)
+    
+    # 2. Subtract predictable time decay (Theta) over an estimated 5-day hold
+    theta_cost = abs(theta or (premium * 0.025)) * 5.0
+    ev -= theta_cost
+    
+    # 3. Penalize expensive Volatility (Vega crush risk)
     if vega is not None and iv and iv > 0 and premium > 0:
-        # Vol-crush exposure = vega × IV / premium — high when we're paying
-        # for inflated vol that may mean-revert against the thesis.
-        vc = abs(vega) * float(iv) / premium
-        if vc > 0.10:
-            vega_penalty = -10
-        elif vc > 0.05:
-            vega_penalty = -5
-
-    if gamma is not None and premium > 0:
-        # Gamma-per-dollar: how fast delta changes per underlying unit per
-        # dollar of premium. High = strong leverage on favorable moves.
-        gpd = gamma / premium
-        if gpd >= 0.05:
-            gamma_reward = 10
-        elif gpd >= 0.02:
-            gamma_reward = 5
-
-    total = (rr_score + rr2_bonus + dte_score + liq + delta_score
-             + theta_efficiency + vega_penalty + gamma_reward)
-    return round(total, 1)
+        vol_crush_risk = abs(vega) * float(iv) / premium
+        if vol_crush_risk > 0.05:
+            ev -= (vol_crush_risk * managed_risk)
+            
+    # Normalize to a score relative to premium (EV yield %) to fit 
+    # seamlessly into the existing downstream ranking expectations.
+    if premium > 0:
+        return round(50.0 + ((ev / premium) * 100.0), 1)
+    return 0.0
 
 
 def _delta_proxy(spot: float, strike: float, is_call: bool) -> float:
@@ -471,11 +397,13 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             real_theta = o.get("theta")
             real_gamma = o.get("gamma")
             real_vega  = o.get("vega")
+            
+            # P(win) from calibrated ML model, fallback to 0.50 if not scored
+            prob_win = float(signal.get("ml_prob", 0.50))
+            
             score = _score(
-                rr_t1, rr_t2, rr_t3, dte, vol, oi, iv, proxy,
-                premium=premium,
-                delta=real_delta, theta=real_theta,
-                gamma=real_gamma, vega=real_vega,
+                prob_win=prob_win, best_reward=best_theta_reward, managed_risk=managed_risk,
+                premium=premium, iv=iv, theta=real_theta, vega=real_vega,
             )
             # For downstream consumers: surface the real delta when we have it,
             # fall back to proxy. This is what gets shown as "Δ" in the UI.

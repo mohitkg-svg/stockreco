@@ -218,6 +218,7 @@ def _live_only_features(ticker: str) -> Dict[str, Optional[float]]:
     even when these aren't computable."""
     out: Dict[str, Optional[float]] = {
         "analyst_mean": None, "analyst_count": None, "analyst_target_prem": None,
+        "sentiment_bullish_pct": None, "sentiment_message_count": None,
     }
     try:
         from services.analyst_ratings import get_rating
@@ -235,7 +236,17 @@ def _live_only_features(ticker: str) -> Dict[str, Optional[float]]:
             except Exception:
                 pass
     except Exception as e:
-        logger.debug(f"live-only features: {e}")
+        logger.debug(f"live-only features analyst: {e}")
+        
+    try:
+        from services.social_sentiment import get_sentiment
+        s = get_sentiment(ticker)
+        if s:
+            out["sentiment_bullish_pct"] = _safe(s.get("bullish_pct_24h"))
+            out["sentiment_message_count"] = _safe(s.get("message_count_24h"))
+    except Exception as e:
+        logger.debug(f"live-only features sentiment: {e}")
+        
     return out
 
 
@@ -305,7 +316,8 @@ def extract_features(
         feat.update(_live_only_features(ticker))
     else:
         # keep schema consistent
-        feat.update({"analyst_mean": None, "analyst_count": None, "analyst_target_prem": None})
+        feat.update({"analyst_mean": None, "analyst_count": None, "analyst_target_prem": None,
+                     "sentiment_bullish_pct": None, "sentiment_message_count": None})
     return feat
 
 
@@ -331,4 +343,5 @@ def feature_columns() -> List[str]:
         "ms_ob_imbalance", "ms_l3_skew",
         # live-only
         "analyst_mean", "analyst_count", "analyst_target_prem",
+        "sentiment_bullish_pct", "sentiment_message_count",
     ]

@@ -759,14 +759,17 @@ async def lifespan(app: FastAPI):
             )
         except Exception as _e:
             logger.warning(f"health_watchdog not scheduled: {_e}")
-            try:
-                from services import algo_execution
-                scheduler.add_job(
-                    algo_execution.tick_twaps, "interval", seconds=15, id="tick_twaps",
-                    max_instances=1, coalesce=True, misfire_grace_time=10,
-                )
-            except Exception as e:
-                pass
+
+        # TWAP Execution Engine
+        try:
+            from services import algo_execution
+            scheduler.add_job(
+                algo_execution.tick_twaps, "interval", seconds=15, id="tick_twaps",
+                max_instances=1, coalesce=True, misfire_grace_time=10,
+            )
+        except Exception as e:
+            logger.warning(f"tick_twaps not scheduled: {e}")
+
         scheduler.start()
         _app_health["scheduler_started"] = True
         logger.info("Manager service started — manage every 20s, reconcile every 60min")

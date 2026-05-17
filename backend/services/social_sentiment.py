@@ -22,16 +22,6 @@ from database import SessionLocal, SocialSentiment, WatchlistStock, CandidatePoo
 
 logger = logging.getLogger(__name__)
 
-_MULT_NEUTRAL = 1.00
-_MULT_CONFIRM = 1.04     # retail agrees with our direction
-_MULT_CONTRA = 0.96      # retail disagrees
-
-# Thresholds — fraction of tagged messages that must lean one way for the
-# reading to count as a direction. We require meaningful volume (≥ 20 messages
-# in 24h) before trusting the split; below that the % is too noisy.
-_MIN_MESSAGES = 20
-_STRONG_LEAN_PCT = 0.60   # ≥60% bullish (of tagged) = strong bullish lean
-
 
 def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
     """Pull recent messages for `ticker` from Stocktwits.
@@ -198,64 +188,3 @@ def get_sentiment(ticker: str) -> Optional[Dict[str, Any]]:
         }
     finally:
         db.close()
-
-
-_MAX_MARKETCAP_FOR_SOCIAL_SIGNAL = 50_000_000_000  # $50B — above this the tape already priced it in
-
-
-def _is_retail_moveable(ticker: str) -> bool:
-    """Retail sentiment only informative on small/mid caps. Above $50B market
-    cap the tape already reflects retail flow; sentiment adds noise, not signal."""
-    try:
-        from services.fundamentals import get_fundamentals
-        f = get_fundamentals(ticker)
-        if not f:
-            # No fundamentals yet → default to trusting sentiment.
-            # Erring on the side of applying the signal when we don't know.
-            return True
-        mcap = f.get("market_cap")
-        if mcap is None:
-            return True
-        return float(mcap) < _MAX_MARKETCAP_FOR_SOCIAL_SIGNAL
-    except Exception:
-        return True
-
-
-def sentiment_multiplier(ticker: str, direction: str) -> float:
-    """±4% envelope. Requires min message volume to be trusted AND market cap
-    below $50B (retail sentiment has near-zero signal on mega-caps)."""
-    r = get_sentiment(ticker)
-    if r is None:
-        return _MULT_NEUTRAL
-    total = r.get("message_count_24h") or 0
-    if total < _MIN_MESSAGES:
-        return _MULT_NEUTRAL
-    if not _is_retail_moveable(ticker):
-        return _MULT_NEUTRAL
-    bull = r.get("bullish_pct_24h")
-    if bull is None:
-        return _MULT_NEUTRAL
-    direction = (direction or "").upper()
-    if direction == "BUY":
-        if bull >= _STRONG_LEAN_PCT: return _MULT_CONFIRM
-        if bull <= 1 - _STRONG_LEAN_PCT: return _MULT_CONTRA
-        return _MULT_NEUTRAL
-    if direction == "SELL":
-        if bull <= 1 - _STRONG_LEAN_PCT: return _MULT_CONFIRM
-        if bull >= _STRONG_LEAN_PCT: return _MULT_CONTRA
-        return _MULT_NEUTRAL
-    return _MULT_NEUTRAL
-
-
-def sentiment_reason_line(ticker: str, direction: str) -> Optional[str]:
-    r = get_sentiment(ticker)
-    if r is None or (r.get("message_count_24h") or 0) < _MIN_MESSAGES or r.get("bullish_pct_24h") is None:
-        return None
-    mult = sentiment_multiplier(ticker, direction)
-    if mult == _MULT_NEUTRAL:
-        return None  # skip the line if it's not moving the multiplier
-    bull = r["bullish_pct_24h"]
-    msgs = r["message_count_24h"]
-    mark = "💬✅" if mult > _MULT_NEUTRAL else "💬⚠️"
-    lean = "bullish" if bull >= 0.5 else "bearish"
-    return f"{mark} Stocktwits (24h): {msgs} msgs, {bull*100:.0f}% {lean} — {'confirms' if mult > _MULT_NEUTRAL else 'contradicts'} {direction}"

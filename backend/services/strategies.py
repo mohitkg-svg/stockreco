@@ -24,147 +24,6 @@ import numpy as np
 from typing import Dict, Callable, List
 
 
-def _trend_following(d: pd.DataFrame) -> Dict:
-    """Long when price is above SMA50 AND momentum (RSI) is in the
-    healthy 50–70 zone AND MACD histogram just flipped positive.
-    Mirror conditions for shorts. The MACD-histogram-cross gate ensures
-    we only enter on the FIRST bar of momentum confirmation, not every
-    bar a trend persists."""
-    long = (
-        (d["Close"] > d["SMA_50"])
-        & (d["RSI_14"] > 50) & (d["RSI_14"] < 70)
-        & (d["MACDh_12_26"] > 0) & (d["MACDh_12_26"].shift(1) <= 0)
-    )
-    short = (
-        (d["Close"] < d["SMA_50"])
-        & (d["RSI_14"] < 50) & (d["RSI_14"] > 30)
-        & (d["MACDh_12_26"] < 0) & (d["MACDh_12_26"].shift(1) >= 0)
-    )
-    return {
-        "name": "Trend Following",
-        "description": "Price above SMA50, RSI 50-70, MACD histogram flips positive",
-        "regime": "trend",
-        "entry_long": long.fillna(False),
-        "entry_short": short.fillna(False),
-    }
-
-
-def _golden_cross(d: pd.DataFrame) -> Dict:
-    """Major-trend-reversal signal: SMA50 crosses above SMA200 (golden
-    cross) → long; below (death cross) → short. Slow-moving — fires
-    a few times per year per ticker — but historically high R:R."""
-    long = (d["SMA_50"] > d["SMA_200"]) & (d["SMA_50"].shift(1) <= d["SMA_200"].shift(1))
-    short = (d["SMA_50"] < d["SMA_200"]) & (d["SMA_50"].shift(1) >= d["SMA_200"].shift(1))
-    return {
-        "name": "Golden/Death Cross",
-        "description": "SMA50 crosses SMA200 (major trend reversal)",
-        "regime": "trend",
-        "entry_long": long.fillna(False),
-        "entry_short": short.fillna(False),
-    }
-
-
-def _rsi_mean_reversion(d: pd.DataFrame) -> Dict:
-    """Oversold-bounce long: RSI crosses UP through 30 while price is
-    above the SMA200 (i.e., dip in an uptrend). Mirror for shorts: RSI
-    crosses DOWN through 70 in a downtrend. The SMA200 trend-direction
-    filter prevents catching falling-knife mean-reversion attempts."""
-    long = (d["RSI_14"] > 30) & (d["RSI_14"].shift(1) <= 30) & (d["Close"] > d["SMA_200"])
-    short = (d["RSI_14"] < 70) & (d["RSI_14"].shift(1) >= 70) & (d["Close"] < d["SMA_200"])
-    return {
-        "name": "RSI Mean Reversion",
-        "description": "Oversold bounce (RSI crosses up through 30) in uptrend; inverse for shorts",
-        "regime": "chop",
-        "entry_long": long.fillna(False),
-        "entry_short": short.fillna(False),
-    }
-
-
-def _macd_crossover(d: pd.DataFrame) -> Dict:
-    """MACD line crosses signal line — classic momentum-rotation
-    trigger. No trend-direction filter (works in both directions),
-    making it noisier than `_trend_following` but faster to react."""
-    long = (d["MACD_12_26"] > d["MACDs_12_26"]) & (d["MACD_12_26"].shift(1) <= d["MACDs_12_26"].shift(1))
-    short = (d["MACD_12_26"] < d["MACDs_12_26"]) & (d["MACD_12_26"].shift(1) >= d["MACDs_12_26"].shift(1))
-    return {
-        "name": "MACD Crossover",
-        "description": "MACD line crosses signal line",
-        "regime": "any",
-        "entry_long": long.fillna(False),
-        "entry_short": short.fillna(False),
-    }
-
-
-def _bollinger_breakout(d: pd.DataFrame) -> Dict:
-    """Volatility-expansion breakout: close pierces the Bollinger upper
-    (long) or lower (short) band on at least 1.2× the 20-bar average
-    volume. Volume filter rejects the no-conviction breakouts that
-    typically reverse within a few bars."""
-    vol_ok = d["Volume"] > 1.2 * d["VOL_SMA20"]
-    long = (d["Close"] > d["BBU_20"]) & (d["Close"].shift(1) <= d["BBU_20"].shift(1)) & vol_ok
-    short = (d["Close"] < d["BBL_20"]) & (d["Close"].shift(1) >= d["BBL_20"].shift(1)) & vol_ok
-    return {
-        "name": "Bollinger Breakout",
-        "description": "Close breaks outside Bollinger Band with volume confirmation",
-        "regime": "trend",
-        "entry_long": long.fillna(False),
-        "entry_short": short.fillna(False),
-    }
-
-
-def _donchian_breakout(d: pd.DataFrame) -> Dict:
-    """Donchian breakout with discipline filters (Faber-style update on
-    classic Turtle).
-
-    r47 fix #TP-flow Donchian discipline: vanilla 20-day breakouts fail
-    ~60% of the time. Gating on RVOL >= 1.5 AND ATR-expansion (current ATR
-    >= 60-day median ATR) raises win rate to ~48% with 2.5R skew. Without
-    these filters the strategy mostly catches false-starts on light volume.
-    """
-    high_20 = d["High"].rolling(20).max().shift(1)
-    low_20 = d["Low"].rolling(20).min().shift(1)
-    raw_long = (d["Close"] > high_20) & (d["Close"].shift(1) <= high_20.shift(1))
-    raw_short = (d["Close"] < low_20) & (d["Close"].shift(1) >= low_20.shift(1))
-    # RVOL filter (volume confirmation): today's volume >= 1.5× 20d average
-    vol_ok = pd.Series(True, index=d.index)
-    if "Volume" in d.columns and "VOL_SMA20" in d.columns:
-        vol_ok = (d["Volume"] >= 1.5 * d["VOL_SMA20"]).fillna(False)
-    # ATR-expansion filter: current ATR >= 60d median ATR (vol expansion)
-    atr_ok = pd.Series(True, index=d.index)
-    if "ATR_14" in d.columns:
-        med_atr = d["ATR_14"].rolling(60).median()
-        atr_ok = (d["ATR_14"] >= med_atr).fillna(True)
-    long_e = raw_long & vol_ok & atr_ok
-    short_e = raw_short & vol_ok & atr_ok
-    return {
-        "name": "Donchian Breakout",
-        "description": "First close beyond 20-bar high/low + RVOL>=1.5 + ATR-expansion (volatility-confirmed)",
-        "regime": "trend",
-        "entry_long": long_e.fillna(False),
-        "entry_short": short_e.fillna(False),
-    }
-
-
-def _ema_pullback(d: pd.DataFrame) -> Dict:
-    """Trend-continuation pullback: in an uptrend (SMA50 > SMA200),
-    buy bars whose Low touched the EMA21 but closed back above it.
-    The "touched and recovered" pattern is the classic
-    healthy-pullback-in-trend signature. Mirror logic for shorts."""
-    uptrend = d["SMA_50"] > d["SMA_200"]
-    downtrend = d["SMA_50"] < d["SMA_200"]
-    touched_ema_below = (d["Low"] <= d["EMA_21"]) & (d["Close"] > d["EMA_21"])
-    touched_ema_above = (d["High"] >= d["EMA_21"]) & (d["Close"] < d["EMA_21"])
-    long = (uptrend & touched_ema_below).fillna(False)
-    short = (downtrend & touched_ema_above).fillna(False)
-    return {
-        "name": "EMA Pullback",
-        "description": "In trend, buy pullback that bounces off EMA21",
-        "regime": "trend",
-        "entry_long": long,
-        "entry_short": short,
-    }
-
-
 def _opening_reversal(d: pd.DataFrame) -> Dict:
     """r46 Tier P: Opening Reversal after large gap.
 
@@ -229,106 +88,6 @@ def _last_30min_momentum(d: pd.DataFrame) -> Dict:
     }
 
 
-def _news_spike_fade(d: pd.DataFrame) -> Dict:
-    """r46 Tier P: After-news-spike fade.
-
-    Tetlock (2007 JF) + retail-attention literature: ~80% of headline-
-    driven intraday spikes >3% retrace 50% within 60 minutes when the
-    news lacks fundamental substance. We approximate "spike" via 1×ATR
-    move + RVOL>3 within a single bar; signal_generator can layer the
-    news-timestamp filter on top.
-
-    Regime: chop.
-    """
-    # r82: DISABLED. The docstring promised a news-timestamp filter would
-    # be layered in signal_generator; no such filter exists. The strategy
-    # therefore fades any 1.5×ATR + RVOL≥3 bar — many of which are
-    # catalyst-driven moves that continue. Knife-catching without news
-    # context has negative empirical edge. Re-enable only when the news
-    # filter is actually wired (and behind an explicit cfg flag).
-    empty = pd.Series(False, index=d.index)
-    return {
-        "name": "News Spike Fade",
-        "description": "DISABLED (r82): missing news-timestamp filter",
-        "regime": "chop",
-        "entry_long": empty,
-        "entry_short": empty,
-    }
-
-
-def _gap_fill(d: pd.DataFrame) -> Dict:
-    """
-    Gap-and-fill mean-reversion. After a session gap, price often retraces to fill it:
-      • Gap down (Open < prev Low) in an uptrend (Close > SMA_50) → long, target = prev Close (fill)
-      • Gap up   (Open > prev High) in a downtrend (Close < SMA_50) → short, target = prev Close (fill)
-    Entry triggers on the gap bar itself; backtester enters at next bar's Open.
-    """
-    prev_high = d["High"].shift(1)
-    prev_low = d["Low"].shift(1)
-    gap_down = d["Open"] < prev_low
-    gap_up = d["Open"] > prev_high
-    long = (gap_down & (d["Close"] > d["SMA_50"])).fillna(False)
-    short = (gap_up & (d["Close"] < d["SMA_50"])).fillna(False)
-    return {
-        "name": "Gap Fill",
-        "description": "Fade overnight gaps that print against the prevailing trend (gap-down in uptrend → long; gap-up in downtrend → short)",
-        "regime": "chop",
-        "entry_long": long,
-        "entry_short": short,
-    }
-
-
-def _fvg_pullback(d: pd.DataFrame) -> Dict:
-    """
-    Fair-Value-Gap pullback: enter on the first bar that taps an unfilled
-    bullish FVG (long) or bearish FVG (short). Approximated bar-wise by
-    detecting a 3-bar imbalance and triggering entry when the *current* bar's
-    range overlaps the imbalance zone.
-
-    Bullish FVG at i-2: Low[i-1] > High[i-3]  → zone = (High[i-3], Low[i-1])
-    Trigger: bar i Low <= zone_top (price pulled back into the zone)
-    """
-    H = d["High"]
-    L = d["Low"]
-    O = d["Open"]
-    C = d["Close"]
-    # FVG forms on bar i-2 (using bars i-3 and i-1)
-    bull_zone_top = L.shift(1)               # = Low[i-1]
-    bull_zone_bot = H.shift(3)               # = High[i-3]
-    has_bull_fvg = bull_zone_top > bull_zone_bot
-    # Rejection candle filter: when price taps the FVG, require the bar to
-    # close BULLISH (above its open) — proves buyers stepped in instead of
-    # passively drifting through the zone. Cuts ~30% of false entries.
-    bull_rejection = C > O
-    long = (
-        has_bull_fvg
-        & (L <= bull_zone_top)
-        & (C > bull_zone_bot)                 # didn't fully fill yet
-        & bull_rejection                      # closed green at the tap
-        & (C > d["SMA_50"])                   # only buy in trend
-    ).fillna(False)
-
-    bear_zone_top = L.shift(3)               # = Low[i-3]
-    bear_zone_bot = H.shift(1)               # = High[i-1]
-    has_bear_fvg = bear_zone_top > bear_zone_bot
-    bear_rejection = C < O
-    short = (
-        has_bear_fvg
-        & (H >= bear_zone_bot)
-        & (C < bear_zone_top)
-        & bear_rejection
-        & (C < d["SMA_50"])
-    ).fillna(False)
-
-    return {
-        "name": "FVG Pullback",
-        "description": "Enter on first retrace into an unfilled fair-value gap (3-bar imbalance) in the direction of the trend",
-        "regime": "trend",
-        "entry_long": long,
-        "entry_short": short,
-    }
-
-
 def _gap_and_go(d: pd.DataFrame) -> Dict:
     """
     Gap-and-Go (continuation, NOT fade). Opposite of _gap_fill: when price gaps
@@ -388,112 +147,6 @@ def _vwap_reclaim(d: pd.DataFrame) -> Dict:
         "regime": "any",
         "entry_long": long.fillna(False),
         "entry_short": short.fillna(False),
-    }
-
-
-def _opening_range_breakout(d: pd.DataFrame) -> Dict:
-    """
-    Opening-Range Breakout (ORB). On intraday data, define each session's
-    opening range as the first N bars; subsequent bars that close beyond the
-    OR high (long) or low (short) on volume trigger.
-
-    On daily+ bars there's no meaningful "opening range" — the strategy
-    no-ops cleanly (returns empty entry series).
-
-      Long  : Close > OR_high AND prior bar Close <= OR_high AND vol > 1.2× SMA20
-      Short : Close < OR_low  AND prior bar Close >= OR_low  AND vol > 1.2× SMA20
-
-    OR window = first 3 bars of each session.
-    """
-    empty = pd.Series(False, index=d.index)
-    # Bail on non-intraday bars (heuristic: median diff < 1 day)
-    try:
-        if len(d) < 4 or (d.index[1] - d.index[0]) >= pd.Timedelta(days=1):
-            return {"name": "Opening Range Breakout", "description": "—", "regime": "trend",
-                    "entry_long": empty, "entry_short": empty}
-    except Exception:
-        return {"name": "Opening Range Breakout", "description": "—", "regime": "trend",
-                "entry_long": empty, "entry_short": empty}
-
-    OR_BARS = 3
-    grp = pd.Index(d.index.date)
-    # bar position within each session (0-indexed)
-    bar_idx = pd.Series(range(len(d)), index=d.index).groupby(grp).cumcount()
-    # Audit fix C3: use transform("max")/transform("min") so the OR high/low
-    # is a single STABLE value broadcast to every bar of the session. The old
-    # cummax().ffill() approach produced an evolving value within the OR
-    # window itself (bar 1's or_high only saw bar 0, bar 2 only saw bars 0-1);
-    # after_or gated that out but it was fragile — a schema-compliant full-
-    # session max is the correct semantic for Opening Range.
-    or_high_src = d["High"].where(bar_idx < OR_BARS)
-    or_low_src = d["Low"].where(bar_idx < OR_BARS)
-    or_high = or_high_src.groupby(grp).transform("max")
-    or_low = or_low_src.groupby(grp).transform("min")
-    # Only fire OUTSIDE the OR window itself.
-    after_or = bar_idx >= OR_BARS
-    vol_ok = d["Volume"] > 1.2 * d["VOL_SMA20"]
-    long = after_or & (d["Close"] > or_high) & (d["Close"].shift(1) <= or_high.shift(1)) & vol_ok
-    short = after_or & (d["Close"] < or_low) & (d["Close"].shift(1) >= or_low.shift(1)) & vol_ok
-    return {
-        "name": "Opening Range Breakout",
-        "description": "First close beyond the session's opening-range high/low (3-bar OR) on volume>1.2× avg",
-        "regime": "trend",
-        "entry_long": long.fillna(False),
-        "entry_short": short.fillna(False),
-    }
-
-
-def _nr7_breakout(d: pd.DataFrame) -> Dict:
-    """r44 Wave 7 — NR7 (Narrow-Range-of-7) volatility breakout.
-
-    Crabel (1990); Connors empirical: a bar whose range is the smallest
-    of the last 7 precedes ≥1×ATR expansion 65-70% of the time. We enter
-    on the FIRST close beyond the NR7 bar's High/Low with volume
-    confirmation.
-
-    Regime: any (volatility-compression precursor — fires before the
-    regime classifier sees the breakout).
-    """
-    rng = d["High"] - d["Low"]
-    is_nr7 = rng == rng.rolling(7, min_periods=7).min()
-    is_nr7_prev = is_nr7.shift(1).fillna(False)
-    vol_ok = d["Volume"] > 1.2 * d["VOL_SMA20"]
-    long_e = is_nr7_prev & (d["Close"] > d["High"].shift(1)) & vol_ok
-    short_e = is_nr7_prev & (d["Close"] < d["Low"].shift(1)) & vol_ok
-    return {
-        "name": "NR7 Breakout",
-        "description": "First close beyond the NR7 (narrowest of 7) bar's H/L with volume>1.2× avg",
-        "regime": "any",
-        "entry_long": long_e.fillna(False),
-        "entry_short": short_e.fillna(False),
-    }
-
-
-def _inside_bar_breakout(d: pd.DataFrame) -> Dict:
-    """r44 Wave 7 — Inside-bar continuation breakout. Bar fully contained
-    inside prior bar's range signals consolidation; FIRST close beyond the
-    PARENT bar's H/L is a high-probability continuation trigger.
-
-    r47 fix #T0c-4: prior implementation built `inside` against
-    `prev_h.shift(1)` (= shift(2)) AND triggered the breakout against
-    `prev_h` (yesterday's high — i.e. the inside bar's OWN high), so the
-    strategy fired on every minor up-day-after-a-narrow-down, not real
-    inside-bar breakouts. Now: bar i-1 inside bar i-2; trigger on close
-    of bar i breaking parent (i-2) range.
-    """
-    parent_h = d["High"].shift(2)
-    parent_l = d["Low"].shift(2)
-    inner_h = d["High"].shift(1)
-    inner_l = d["Low"].shift(1)
-    inside = (inner_h < parent_h) & (inner_l > parent_l)
-    long_e = inside & (d["Close"] > parent_h)
-    short_e = inside & (d["Close"] < parent_l)
-    return {
-        "name": "Inside Bar Breakout",
-        "description": "Close beyond parent-bar range after one inside bar (continuation)",
-        "regime": "any",
-        "entry_long": long_e.fillna(False),
-        "entry_short": short_e.fillna(False),
     }
 
 
@@ -593,20 +246,26 @@ def _vix_spike_reversion(d: pd.DataFrame) -> Dict:
             "entry_long": empty, "entry_short": empty,
         }
     try:
-        from services.r47_overlays import vix_spike_signal
-        sig = vix_spike_signal()
-        if sig is None:
-            return {
-                "name": "VIX 5σ Spike Reversion",
-                "description": "Long SPY/QQQ next session after VIX +5σ spike (Bollerslev-Tauchen-Zhou)",
-                "regime": "any",
-                "entry_long": empty, "entry_short": empty,
-            }
-        # Fire on the most recent bar only (we don't paint historical
-        # entries; the trigger is real-time / event-driven).
-        if len(d) > 0:
-            last_idx = d.index[-1]
-            long_e.loc[last_idx] = True
+        from services.data_fetcher import fetch_ohlcv
+        vix_df = fetch_ohlcv("^VIX", "1d")
+        if vix_df is not None and not vix_df.empty:
+            # Compute historical 5-sigma spikes cleanly against the VIX dataframe
+            v_closes = vix_df["Close"]
+            changes = v_closes.diff()
+            mu = changes.rolling(60).mean()
+            sigma = changes.rolling(60).std()
+            
+            # z-score of the change
+            z = (changes - mu) / sigma
+            
+            # Find all dates where a spike occurred
+            spike_dates = vix_df.index[(z >= 5.0) & (v_closes >= 25.0)]
+            
+            for sd in spike_dates:
+                future_bars = d.index[d.index > sd]
+                if len(future_bars) > 0:
+                    # Enter on the open of the immediately following session
+                    long_e.loc[future_bars[0]] = True
     except Exception:
         pass
     return {
@@ -618,20 +277,39 @@ def _vix_spike_reversion(d: pd.DataFrame) -> Dict:
     }
 
 
+def _inside_bar_breakout(d: pd.DataFrame) -> Dict:
+    """r47 #T0c-4: Inside bar breakout.
+    
+    A bar is 'inside' if its high is lower than the previous bar's high and 
+    its low is higher than the previous bar's low. We enter when price breaks
+    the *parent* bar's high (long) or low (short).
+    """
+    parent_high = d["High"].shift(2)
+    parent_low = d["Low"].shift(2)
+    inside = (d["High"].shift(1) < parent_high) & (d["Low"].shift(1) > parent_low)
+    long_e = inside & (d["Close"] > parent_high)
+    short_e = inside & (d["Close"] < parent_low)
+    return {
+        "name": "Inside Bar Breakout",
+        "description": "Breakout past the parent bar of an inside bar",
+        "regime": "any",
+        "entry_long": long_e.fillna(False),
+        "entry_short": short_e.fillna(False),
+    }
+
+
 # QUANT REVISION: Orthogonal (uncorrelated) features. 
 # Discarding multicollinear technical indicators. Keeping ONE mean-reversion factor, 
 # and leaning into alternative data and structurally sound setups.
 STRATEGY_FUNCS: List[Callable[[pd.DataFrame], Dict]] = [
-    _rsi_mean_reversion,
     _gap_and_go,
     _vwap_reclaim,
     _vix_spike_reversion,
     _high52_proximity,
-    _trend_following,
-    _nr7_breakout,
     _lev_etf_decay_short,
     _opening_reversal,
     _last_30min_momentum,
+    _inside_bar_breakout,
 ]
 
 
