@@ -458,6 +458,7 @@ class AutoTraderConfig(Base):
     # VIX level. Any one tripping promotes regime to HIGH_VOL. Default
     # False keeps the prior ADX+VIX-level-only classifier.
     multidim_regime_enabled = Column(Boolean, default=False)
+    twap_enabled = Column(Boolean, default=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
