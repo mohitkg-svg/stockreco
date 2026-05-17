@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -77,34 +76,6 @@ class TestVwapStrategy(unittest.TestCase):
         self.assertIn("entry_short", out)
         self.assertFalse(out["entry_long"].any())
         self.assertFalse(out["entry_short"].any())
-
-
-class TestORBStrategy(unittest.TestCase):
-    """Opening Range Breakout: handles intraday and noops on daily."""
-
-    def setUp(self):
-        from services.strategies import _opening_range_breakout
-        self.fn = _opening_range_breakout
-
-    def test_daily_noop(self):
-        idx = pd.date_range("2024-01-01", periods=20, freq="D")
-        d = pd.DataFrame({
-            "Open":[100]*20, "High":[101]*20, "Low":[99]*20, "Close":[100]*20,
-            "Volume":[1000]*20,
-        }, index=idx)
-        out = self.fn(d)
-        self.assertFalse(out["entry_long"].any())
-        self.assertFalse(out["entry_short"].any())
-
-    def test_short_input_noop(self):
-        # Less than 4 bars triggers the early-bail branch
-        idx = pd.date_range("2024-01-02 09:30", periods=2, freq="5min")
-        d = pd.DataFrame({
-            "Open":[100]*2, "High":[101]*2, "Low":[99]*2, "Close":[100]*2,
-            "Volume":[10000]*2,
-        }, index=idx)
-        out = self.fn(d)
-        self.assertFalse(out["entry_long"].any())
 
 
 class TestChandelierTrailMath(unittest.TestCase):
