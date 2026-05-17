@@ -398,13 +398,6 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             real_gamma = o.get("gamma")
             real_vega  = o.get("vega")
             
-            # P(win) from calibrated ML model, fallback to 0.50 if not scored
-            prob_win = float(signal.get("ml_prob", 0.50))
-            
-            score = _score(
-                prob_win=prob_win, best_reward=best_theta_reward, managed_risk=managed_risk,
-                premium=premium, iv=iv, theta=real_theta, vega=real_vega,
-            )
             # For downstream consumers: surface the real delta when we have it,
             # fall back to proxy. This is what gets shown as "Δ" in the UI.
             delta = real_delta if real_delta is not None else proxy
@@ -482,6 +475,14 @@ def suggest_options_for_signal(ticker: str, signal: dict, limit: int = 50) -> Di
             rr_t1_managed = round(reward_t1 / managed_risk, 2) if reward_t1 > 0 else round(rr_t1, 2)
             rr_t2_managed = round(reward_t2 / managed_risk, 2) if reward_t2 > 0 else round(rr_t2, 2)
             rr_t3_managed = round(reward_t3 / managed_risk, 2) if reward_t3 > 0 else round(rr_t3, 2)
+
+            # P(win) from calibrated ML model, fallback to 0.50 if not scored
+            prob_win = float(signal.get("ml_prob", 0.50))
+            
+            score = _score(
+                prob_win=prob_win, best_reward=best_theta_reward, managed_risk=managed_risk,
+                premium=premium, iv=iv, theta=real_theta, vega=real_vega,
+            )
 
             contracts.append({
                 "type": "CALL" if is_call else "PUT",
