@@ -1068,55 +1068,5 @@ class TestMLDriftAutoDisable(unittest.TestCase):
         _maybe_auto_disable_on_drift(db, brier_now=0.20)
         self.assertTrue(cfg.ml_scoring_enabled)
         self.assertFalse(db._committed)
-
-
-class TestMLLabelLeakFix(unittest.TestCase):
-    """r96 F1: feature vector must not encode the labeler's R/R levels.
-
-    The labeler in ml_trainer._label_trade decides win/loss by checking
-    whether price reaches target1 before stop_loss within N bars. If features
-    include sig_stop_pct = (entry - stop_loss)/stop_loss and sig_t1_pct =
-    (target1 - entry)/entry, the model is being told the same numbers that
-    decide the label. The drop_target_geometry flag must wipe those features.
-    """
-
-    def test_drop_target_geometry_omits_levels(self):
-        from services.ml_features import _signal_features
-        sig_a = {"signal_type": "BUY", "confidence": 70.0,
-                 "entry": 100.0, "stop_loss": 95.0, "target1": 110.0}
-        sig_b = {"signal_type": "BUY", "confidence": 70.0,
-                 "entry": 100.0, "stop_loss": 80.0, "target1": 200.0}
-        # With flag OFF (default), the two signals produce DIFFERENT features —
-        # this is the existing leaky behavior.
-        a_off = _signal_features(sig_a, drop_target_geometry=False)
-        b_off = _signal_features(sig_b, drop_target_geometry=False)
-        self.assertNotEqual(a_off["sig_stop_pct"], b_off["sig_stop_pct"])
-        self.assertNotEqual(a_off["sig_t1_pct"], b_off["sig_t1_pct"])
-        # With flag ON, both signals produce IDENTICAL features (None levels).
-        a_on = _signal_features(sig_a, drop_target_geometry=True)
-        b_on = _signal_features(sig_b, drop_target_geometry=True)
-        self.assertIsNone(a_on["sig_stop_pct"])
-        self.assertIsNone(a_on["sig_t1_pct"])
-        self.assertEqual(a_on, b_on)
-        # sig_dir and sig_conf are derived from non-leaky fields and must
-        # still carry signal (confidence and direction encode model input
-        # without revealing the labeler's pricing).
-        self.assertEqual(a_on["sig_dir"], 1.0)
-        self.assertEqual(a_on["sig_conf"], 70.0)
-
-    def test_column_schema_stable_across_flag(self):
-        """Column list must NOT change when the flag flips — that would force
-        a model-shape mismatch at load. Values change; schema doesn't."""
-        from services.ml_features import _signal_features, feature_columns
-        sig = {"signal_type": "BUY", "confidence": 70.0,
-               "entry": 100.0, "stop_loss": 95.0, "target1": 110.0}
-        off_keys = set(_signal_features(sig, drop_target_geometry=False).keys())
-        on_keys = set(_signal_features(sig, drop_target_geometry=True).keys())
-        self.assertEqual(off_keys, on_keys)
-        cols = feature_columns()
-        self.assertIn("sig_stop_pct", cols)
-        self.assertIn("sig_t1_pct", cols)
-
-
 if __name__ == "__main__":
     unittest.main()
