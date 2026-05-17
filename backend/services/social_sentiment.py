@@ -46,13 +46,25 @@ def _fetch_one(ticker: str) -> Optional[Dict[str, Any]]:
     msgs = []
     try:
         import httpx
+        import os
+        import time
         url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker.upper()}.json"
         cutoff_24h_ts = (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp()
         max_id = None
-        with httpx.Client(timeout=10.0, headers={"User-Agent": "stockrecs-bot/1.0"}) as c:
+        
+        headers = {"User-Agent": "stockrecs-bot/1.0"}
+        api_key = os.getenv("STOCKTWITS_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            
+        with httpx.Client(timeout=10.0, headers=headers) as c:
             for _ in range(5):
                 params = {"max": max_id} if max_id else None
                 r = c.get(url, params=params)
+                if r.status_code == 429:
+                    logger.warning(f"stocktwits {ticker}: HTTP 429 Rate Limit. Backing off.")
+                    time.sleep(60.0)
+                    break
                 if r.status_code != 200:
                     logger.debug(f"stocktwits {ticker}: HTTP {r.status_code}")
                     break

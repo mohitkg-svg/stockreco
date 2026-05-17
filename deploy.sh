@@ -123,10 +123,6 @@ if [ -n "${APP_API_KEY:-}" ]; then
   SECRETS="${SECRETS},APP_API_KEY=app-api-key:latest"
   REMOVE_ENV_VARS="${REMOVE_ENV_VARS},APP_API_KEY"
 fi
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  SECRETS="${SECRETS},ANTHROPIC_API_KEY=anthropic-api-key:latest"
-  REMOVE_ENV_VARS="${REMOVE_ENV_VARS},ANTHROPIC_API_KEY"
-fi
 if [ -n "${FMP_API_KEY:-}" ]; then
   SECRETS="${SECRETS},FMP_API_KEY=fmp-api-key:latest"
   REMOVE_ENV_VARS="${REMOVE_ENV_VARS},FMP_API_KEY"
@@ -135,18 +131,15 @@ if [ -n "${POLYGON_API_KEY:-}" ]; then
   SECRETS="${SECRETS},POLYGON_API_KEY=polygon-api-key:latest"
   REMOVE_ENV_VARS="${REMOVE_ENV_VARS},POLYGON_API_KEY"
 fi
+if [ -n "${STOCKTWITS_API_KEY:-}" ]; then
+  SECRETS="${SECRETS},STOCKTWITS_API_KEY=stocktwits-api-key:latest"
+  REMOVE_ENV_VARS="${REMOVE_ENV_VARS},STOCKTWITS_API_KEY"
+fi
 
 # Build env-var string for non-sensitive configuration.
 # We use `--update-env-vars` below so existing Cloud Run env vars are preserved.
 ENV_VARS=""
 
-# AI judge call-site modes. Only forwarded when explicitly set, so the
-# default off-everywhere stays put unless you flip the env var.
-for _m in AI_ENTRY_VETO_MODE AI_NEWS_EXIT_MODE AI_CONFIDENCE_MULT_MODE; do
-  if [ -n "${!_m:-}" ]; then
-    ENV_VARS="${ENV_VARS}${ENV_VARS:+,}${_m}=${!_m}"
-  fi
-done
 # CORS: r82 — was unconditionally setting CORS_ALLOW_ORIGINS=* on every
 # deploy, which silently overwrote any tightened value previously set on
 # Cloud Run. LIVE_CHECKLIST requires this NOT be * in prod. We now require
@@ -205,7 +198,7 @@ gcloud run deploy "$SERVICE" \
   --memory 4Gi \
   --cpu 1 \
   --min-instances 1 \
-  --max-instances 2 \
+  --max-instances 1 \
   --timeout 300s \
   --cpu-boost \
   --add-cloudsql-instances "$CSQL_INSTANCE" \

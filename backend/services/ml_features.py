@@ -156,6 +156,7 @@ def _macro_features(as_of: datetime) -> Dict[str, Optional[float]]:
     out: Dict[str, Optional[float]] = {
         "macro_hrs_to_next_high": None, "macro_hrs_since_last_high": None,
         "macro_in_blackout": 0.0,
+        "macro_last_surprise_pct": None,
     }
     db = SessionLocal()
     try:
@@ -173,6 +174,8 @@ def _macro_features(as_of: datetime) -> Dict[str, Optional[float]]:
             out["macro_hrs_to_next_high"] = max(0.0, min(168.0, (nxt_high.release_time_utc - as_of).total_seconds() / 3600))
         if last_high:
             out["macro_hrs_since_last_high"] = max(0.0, min(168.0, (as_of - last_high.release_time_utc).total_seconds() / 3600))
+            if last_high.surprise_pct is not None:
+                out["macro_last_surprise_pct"] = float(last_high.surprise_pct)
         # crude blackout: within 30m before any high event or 60m after
         if nxt_high and (nxt_high.release_time_utc - as_of) <= timedelta(minutes=30):
             out["macro_in_blackout"] = 1.0
@@ -240,15 +243,27 @@ def _microstructure_features(ticker: str, as_of: datetime,
                               tape_day_df: Optional[pd.DataFrame] = None) -> Dict[str, Optional[float]]:
     """Wrapper around services.alpaca_tape.microstructure_features that
     gracefully no-ops if the tape module / Alpaca credentials are missing."""
+    out: Dict[str, Optional[float]] = {
+        "ms_trade_count": None, "ms_avg_size": None, "ms_dollar_volume": None,
+        "ms_block_trade_pct": None, "ms_buysell_imbalance": None, "ms_tape_accel": None,
+        "ms_ob_imbalance": None, "ms_l3_skew": None,
+    }
     try:
         from services.alpaca_tape import microstructure_features
-        return microstructure_features(ticker, as_of, lookback_minutes=30, day_df=tape_day_df)
+        ms = microstructure_features(ticker, as_of, lookback_minutes=30, day_df=tape_day_df)
+        out.update(ms)
     except Exception as e:
         logger.debug(f"microstructure features {ticker}: {e}")
-        return {
-            "ms_trade_count": None, "ms_avg_size": None, "ms_dollar_volume": None,
-            "ms_block_trade_pct": None, "ms_buysell_imbalance": None, "ms_tape_accel": None,
-        }
+        
+    try:
+        from services.polygon_historical import get_historical_obi
+        obi = get_historical_obi(ticker, as_of)
+        if obi is not None:
+            out["ms_ob_imbalance"] = obi
+    except Exception as e:
+        pass
+        
+    return out
 
 
 def extract_features(
@@ -307,6 +322,7 @@ def feature_columns() -> List[str]:
         "corr_TLT_ret_20d", "corr_QQQ_ret_20d", "corr_SPY_ret_20d",
         # macro
         "macro_hrs_to_next_high", "macro_hrs_since_last_high", "macro_in_blackout",
+        "macro_last_surprise_pct",
         # regime
         "regime_vix", "regime_vix_chg_5d",
         # microstructure (Alpaca consolidated tape, last 30 min)
