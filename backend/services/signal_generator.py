@@ -50,24 +50,9 @@ NOT in this module:
   * Position management / trailing stops (`services/position_manager`)
   * Backtester / portfolio backtester (`services/backtester*`)
 """
-import json
 from typing import Dict, Any, List, Optional
 from services.indicators import extract_latest
-from services.support_resistance import pivot_points, swing_levels, nearest_support_resistance, classify_levels_relative_to_price, multi_timeframe_levels
-from services.pattern_detector import detect_patterns
-from services.supply_demand import detect_zones, nearest_demand_below, nearest_supply_above, in_zone
-from services.fibonacci import compute_fib_levels, fib_supports_below, fib_resistances_above, near_key_fib
-from services.gap_detector import (
-    unfilled_gaps,
-    gap_targets_above,
-    gap_targets_below,
-    support_gaps_below,
-    resistance_gaps_above,
-    in_gap,
-    gap_patterns,
-)
 import pandas as pd
-import numpy as np
 
 
 # Tunables live in services/config.py — re-exported here under the

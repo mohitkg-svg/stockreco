@@ -12,8 +12,7 @@ the opposite. Per-ticker winner selection captures this.
 """
 from __future__ import annotations
 import logging
-from datetime import datetime
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 

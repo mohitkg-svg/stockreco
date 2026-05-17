@@ -8,7 +8,7 @@ POC = price bin with the most volume over the window.
 VAH/VAL = upper/lower edges of the 70% Value Area centered on POC.
 """
 from __future__ import annotations
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import pandas as pd
 
 

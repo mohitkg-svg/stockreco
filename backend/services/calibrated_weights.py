@@ -32,8 +32,8 @@ r96 R1.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, Tuple, List, Any, Optional
+from datetime import datetime
+from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 

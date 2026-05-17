@@ -21,13 +21,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from typing import List, Optional
-import json
-import numpy as np
 from database import get_db, WatchlistStock, Signal
 from models import AnalysisResponse, SignalResponse, ChartDataResponse, ChartCandle, IndicatorLine, SupportResistanceLevel, OverviewItem
 from services.data_fetcher import fetch_ohlcv, get_ticker_info, get_current_price, TIMEFRAME_CONFIG
 from services.indicators import compute_indicators, get_chart_indicator_series
-from services.support_resistance import pivot_points, swing_levels, classify_levels_relative_to_price
+from services.support_resistance import swing_levels, classify_levels_relative_to_price
 from services.supply_demand import detect_zones
 from services.fibonacci import compute_fib_levels
 from services.gap_detector import detect_all_gaps

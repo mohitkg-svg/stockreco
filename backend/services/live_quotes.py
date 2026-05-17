@@ -120,7 +120,7 @@ def get_live_price(ticker: str, *, max_age_sec: Optional[float] = None) -> Optio
     return None
 
 
-def get_recent_trades_df(ticker: str, max_age_sec: float) -> Optional["pd.DataFrame"]:
+def get_recent_trades_df(ticker: str, max_age_sec: float) -> Optional[Any]:
     """Zero-latency read of the live in-memory tape for ML microstructure extraction."""
     import pandas as pd
     tape = _trade_tape.get(ticker.upper())

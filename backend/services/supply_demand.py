@@ -18,9 +18,8 @@ Detection rules (pragmatic, no ML):
   5. Classify relative to current price: demand zones must sit at/below price,
      supply zones at/above.
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import pandas as pd
-import numpy as np
 
 
 MOVE_ATR_MULT = 1.5       # departure candle body ≥ 1.5× ATR

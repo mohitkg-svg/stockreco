@@ -14,7 +14,7 @@ The output plugs straight into `options_analyzer.suggest_options_for_signal`
 with direction='SELL' to find PUT contracts that meet the existing R:R filter.
 """
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import logging
 
 logger = logging.getLogger(__name__)

@@ -26,7 +26,7 @@ defensive: any fetch failure or insufficient history → returns 1.0
 """
 from __future__ import annotations
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
