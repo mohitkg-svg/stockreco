@@ -1,49 +1,73 @@
 """
-Level 3 Market-by-Order (MBO) Order Book Ingestor.
-Connects to Databento's raw PCAP ITCH feed to maintain a full depth-of-book 
-in memory. Calculates Order Book Skew, Cancel-to-Trade Ratios, etc.
+High-Frequency Order Book Skew Ingestor (Polygon.io Shim).
+
+Replaces the Databento L3 MBO ingestor. While Polygon does not provide true 
+Level 3 Market-by-Order data, we can subscribe to their high-frequency 
+equities quote stream (Q) to maintain a rolling top-of-book skew.
 """
 import os
+import json
+import asyncio
 import logging
 from typing import Dict
 
 logger = logging.getLogger(__name__)
 
-_l3_book: Dict[str, Dict[str, Dict[float, int]]] = {}
+# Holds the latest bid/ask sizes for our macro tickers
+_l1_quotes: Dict[str, Dict[str, float]] = {}
 
-async def databento_mbo_worker():
-    api_key = os.getenv("DATABENTO_API_KEY")
+async def polygon_quote_worker():
+    api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
         return
-    try:
-        import databento as db
-        client = db.Live(api_key=api_key)
-        client.subscribe(dataset="GLBX.MDP3", schema="mbo", symbols=["SPY", "QQQ"])
-        logger.info("Databento L3 MBO stream connected.")
-        async for record in client:
-            if not hasattr(record, "action"): continue
-            sym, price, size, side = record.symbol, record.price, record.size, "bids" if record.side == "B" else "asks"
-            if sym not in _l3_book:
-                _l3_book[sym] = {"bids": {}, "asks": {}}
-            if record.action == "A":
-                _l3_book[sym][side][price] = _l3_book[sym][side].get(price, 0) + size
-            elif record.action in ("C", "R"):
-                if price in _l3_book[sym][side]:
-                    _l3_book[sym][side][price] -= size
-                    if _l3_book[sym][side][price] <= 0:
-                        del _l3_book[sym][side][price]
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.debug(f"Databento L3 worker error: {e}")
+        
+    import websockets
+    
+    uri = "wss://socket.polygon.io/stocks"
+    backoff = 5
+    
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps({"action": "auth", "params": api_key}))
+                auth_resp = json.loads(await ws.recv())
+                if not auth_resp or auth_resp[0].get("status") != "auth_success":
+                    logger.warning(f"polygon-l3-shim auth failed: {auth_resp}")
+                    await asyncio.sleep(backoff)
+                    continue
+                    
+                logger.info("Polygon high-frequency quote stream connected (Shim for L3 Skew).")
+                await ws.send(json.dumps({"action": "subscribe", "params": "Q.SPY,Q.QQQ"}))
+                backoff = 5
+                
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        events = json.loads(msg)
+                        for ev in events:
+                            if ev.get("ev") == "Q":
+                                sym = ev.get("sym")
+                                if sym:
+                                    _l1_quotes[sym] = {
+                                        "bid_size": float(ev.get("bs", 0)),
+                                        "ask_size": float(ev.get("as", 0)),
+                                    }
+                    except asyncio.TimeoutError:
+                        pass
+        except Exception as e:
+            logger.debug(f"Polygon L3 shim worker error, reconnecting in {backoff}s: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(300, backoff * 2)
 
 def get_orderbook_skew(ticker: str, levels: int = 10) -> float:
-    book = _l3_book.get(ticker)
-    if not book:
+    """
+    Calculates skew. Since we use Polygon L1, `levels` is ignored, 
+    and we return the NBBO size imbalance.
+    """
+    q = _l1_quotes.get(ticker.upper())
+    if not q:
         return 0.0
-    bids = sorted(book["bids"].items(), key=lambda x: x[0], reverse=True)[:levels]
-    asks = sorted(book["asks"].items(), key=lambda x: x[0])[:levels]
-    bid_vol = sum(qty for p, qty in bids)
-    ask_vol = sum(qty for p, qty in asks)
+    bid_vol = q["bid_size"]
+    ask_vol = q["ask_size"]
     total = bid_vol + ask_vol
     return (bid_vol - ask_vol) / total if total > 0 else 0.0

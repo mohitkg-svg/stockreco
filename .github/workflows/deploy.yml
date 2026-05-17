@@ -37,6 +37,13 @@ jobs:
         pip install -r backend/requirements.txt
         pip install -r backend/requirements-dev.txt
 
+    - name: Install Frontend Dependencies
+      run: |
+        if [ -d "frontend" ] && [ -f "frontend/package.json" ]; then
+          cd frontend
+          npm install || npm install esbuild
+        fi
+
     - name: Check GCP Secrets
       run: |
         if [ -z "${{ secrets.WIF_PROVIDER }}" ]; then
@@ -59,12 +66,16 @@ jobs:
 
     - name: Inject Environment Variables
       run: |
+        CORS_ORIGINS="${{ secrets.CORS_ALLOW_ORIGINS }}"
+        if [ -z "$CORS_ORIGINS" ]; then
+          CORS_ORIGINS="*"
+        fi
         cat << EOF > backend/.env
         APCA_API_KEY_ID=${{ secrets.APCA_API_KEY_ID }}
         APCA_API_SECRET_KEY=${{ secrets.APCA_API_SECRET_KEY }}
         DATABASE_URL=${{ secrets.DATABASE_URL }}
         APP_API_KEY=${{ secrets.APP_API_KEY }}
-        CORS_ALLOW_ORIGINS=${{ secrets.CORS_ALLOW_ORIGINS }}
+        CORS_ALLOW_ORIGINS=$CORS_ORIGINS
         POLYGON_API_KEY=${{ secrets.POLYGON_API_KEY }}
         EOF
 
