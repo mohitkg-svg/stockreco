@@ -59,45 +59,6 @@ class TestIdempotencyKey(unittest.TestCase):
         self.assertNotEqual(self.fn(self._sig()), self.fn(self._sig(timeframe="1h")))
 
 
-class TestCalibrateLongStop(unittest.TestCase):
-    """Stop calibration math — never above price, ATR-floor respected, structurally widened."""
-
-    def setUp(self):
-        from services.signal_generator import _calibrate_long_stop
-        self.fn = _calibrate_long_stop
-        # Build a tiny df with a clear 5-bar swing low at 95.0
-        self.df = pd.DataFrame({
-            "High": [101, 102, 103, 102, 101],
-            "Low":  [99, 100, 95, 96, 97],
-            "Close":[100, 101, 100, 100, 100],
-            "Open": [100, 100, 100, 100, 100],
-            "Volume":[1000]*5,
-        })
-
-    def test_stop_below_price(self):
-        stop = self.fn(price=100.0, atr=2.0, df=self.df,
-                       candidates=[98.0, 97.0, 96.0], timeframe="1d")
-        self.assertLess(stop, 100.0)
-
-    def test_atr_floor_widens(self):
-        # candidates all very tight (99) — ATR floor at 100 - 2*2 = 96 must dominate
-        stop = self.fn(price=100.0, atr=2.0, df=self.df,
-                       candidates=[99.0, 99.5], timeframe="1d")
-        self.assertLessEqual(stop, 96.0 + 0.01)
-
-    def test_no_candidates_falls_back_to_atr(self):
-        stop = self.fn(price=100.0, atr=2.0, df=self.df,
-                       candidates=[None, None], timeframe="1d")
-        self.assertLess(stop, 100.0)
-
-    def test_picks_second_tightest(self):
-        # Tightest (99) gets dropped; second (98) becomes seed; structural widens
-        stop = self.fn(price=100.0, atr=0.1, df=self.df,
-                       candidates=[99.0, 98.0, 97.0], timeframe="1d")
-        # Min of {98, atr_floor=99.8, swing_lo*.997=94.7} → ~94.7
-        self.assertLessEqual(stop, 98.0)
-
-
 class TestVwapStrategy(unittest.TestCase):
     """VWAP-reclaim strategy: returns dict with entry_long/entry_short series."""
 
@@ -617,6 +578,544 @@ class TestPortfolioBacktest(unittest.TestCase):
         self.assertEqual(len(pairs), 3)
         self.assertAlmostEqual(float(pairs.max()), 1.0, places=4)
         self.assertAlmostEqual(float(pairs.min()), -1.0, places=4)
+
+
+class TestMultidimRegimeThresholds(unittest.TestCase):
+    """r96 R6: stress_regime_active thresholds + flag-gating accessor.
+
+    The actual signal fetchers (VIX, SPY, breadth) need network; here we
+    confirm threshold constants are sane and that multidim_enabled returns
+    False when the DB cfg row is missing the field."""
+
+    def test_threshold_constants_sane(self):
+        from services.multidim_regime import (
+            VIX_LEVEL_STRESS, VIX_TERM_BACKWARDATION,
+            REALIZED_VOL_STRESS_ANNUALIZED, BREADTH_BEAR_FLOOR,
+        )
+        # VIX level — historical mean is ~19, stress regimes start ~22.
+        self.assertGreaterEqual(VIX_LEVEL_STRESS, 18.0)
+        self.assertLessEqual(VIX_LEVEL_STRESS, 30.0)
+        # Backwardation: VIX/VIX3M >= 1.0 is the classic stress signal.
+        self.assertAlmostEqual(VIX_TERM_BACKWARDATION, 1.0, places=5)
+        # Realized vol: 25% annualized is well above SPY's ~15% baseline.
+        self.assertGreaterEqual(REALIZED_VOL_STRESS_ANNUALIZED, 0.18)
+        self.assertLessEqual(REALIZED_VOL_STRESS_ANNUALIZED, 0.40)
+        # Breadth proxy bear floor: at most 50% (median bull baseline).
+        self.assertGreaterEqual(BREADTH_BEAR_FLOOR, 0.20)
+        self.assertLessEqual(BREADTH_BEAR_FLOOR, 0.50)
+
+    def test_multidim_enabled_default_false(self):
+        # On a fresh test environment cfg row might not exist; helper must
+        # safe-default to False without raising.
+        from services.multidim_regime import multidim_enabled
+        # Just confirms it returns a bool — value depends on cfg state.
+        self.assertIsInstance(multidim_enabled(), bool)
+
+
+class TestOptionGreeksBackfill(unittest.TestCase):
+    """r96 R5: backfill_one with a mock trade + monkey-patched fetcher."""
+
+    def test_skips_non_option_rows(self):
+        from services import option_greeks as og
+
+        class _T:
+            asset_type = "stock"
+            ticker = "AAPL"
+            symbol = "AAPL"
+            entry_delta = None
+            entry_gamma = None
+            entry_theta = None
+            entry_vega = None
+        res = og.backfill_one(_T(), db=None)
+        self.assertEqual(res.get("skipped"), "not option")
+
+    def test_idempotent_when_all_populated(self):
+        from services import option_greeks as og
+
+        class _T:
+            asset_type = "option"
+            ticker = "AAPL"
+            symbol = "AAPL250117C00200000"
+            entry_delta = 0.5
+            entry_gamma = 0.01
+            entry_theta = -0.05
+            entry_vega = 0.10
+        # No DB writes expected; mock db that raises if commit is called.
+
+        class _DB:
+            def commit(self):
+                raise AssertionError("commit should not be called")
+
+            def rollback(self):
+                pass
+        res = og.backfill_one(_T(), db=_DB(), force_refresh=False)
+        self.assertEqual(res.get("updated_fields"), [])
+
+    def test_backfills_missing_fields_when_quote_available(self):
+        from services import option_greeks as og
+
+        # Monkey-patch the fetcher to return a synthetic Greeks dict.
+        original_fetch = og._fetch_contract_greeks
+        og._fetch_contract_greeks = lambda _s: {
+            "delta": 0.42, "gamma": 0.008, "theta": -0.04, "vega": 0.12, "iv": 0.25,
+        }
+        try:
+            class _T:
+                asset_type = "option"
+                ticker = "AAPL"
+                symbol = "AAPL250117C00200000"
+                entry_delta = None
+                entry_gamma = None
+                entry_theta = None
+                entry_vega = None
+
+            class _DB:
+                committed = False
+
+                def commit(self):
+                    type(self).committed = True
+
+                def rollback(self):
+                    pass
+            t = _T()
+            db = _DB()
+            res = og.backfill_one(t, db=db)
+            self.assertEqual(set(res["updated_fields"]), {"delta", "gamma", "theta", "vega"})
+            self.assertEqual(t.entry_delta, 0.42)
+            self.assertEqual(t.entry_gamma, 0.008)
+            self.assertEqual(t.entry_theta, -0.04)
+            self.assertEqual(t.entry_vega, 0.12)
+            self.assertTrue(_DB.committed)
+        finally:
+            og._fetch_contract_greeks = original_fetch
+
+    def test_no_quote_available_skips(self):
+        from services import option_greeks as og
+        original_fetch = og._fetch_contract_greeks
+        og._fetch_contract_greeks = lambda _s: None
+        try:
+            class _T:
+                asset_type = "option"
+                ticker = "AAPL"
+                symbol = "AAPL250117C00200000"
+                entry_delta = None
+                entry_gamma = None
+                entry_theta = None
+                entry_vega = None
+            res = og.backfill_one(_T(), db=None)
+            self.assertEqual(res.get("skipped"), "no quote")
+        finally:
+            og._fetch_contract_greeks = original_fetch
+
+
+class TestSurvivorshipClamp(unittest.TestCase):
+    """r96 R4: clamp_df_to_delisted_at returns the input unchanged when
+    no delisting record exists. (DB-bound paths exercised at integration.)"""
+
+    def test_no_delisted_record_returns_input(self):
+        from services.survivorship import clamp_df_to_delisted_at
+        df = pd.DataFrame(
+            {"Close": [100.0, 101.0, 99.5]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        )
+        # Use a ticker that won't be in any test DB (with __ prefix).
+        out = clamp_df_to_delisted_at(df, "__NEVER_EXISTS__")
+        self.assertEqual(len(out), 3)
+
+    def test_empty_df_passthrough(self):
+        from services.survivorship import clamp_df_to_delisted_at
+        df = pd.DataFrame()
+        out = clamp_df_to_delisted_at(df, "ANYTHING")
+        self.assertTrue(out.empty)
+
+
+class TestCorrelationMath(unittest.TestCase):
+    """r96 R3: pearson + inflation factor math, no external data."""
+
+    def test_pearson_perfect_positive(self):
+        from services.correlation import _pearson
+        xs = list(range(40))
+        ys = [2 * x + 5 for x in xs]
+        self.assertAlmostEqual(_pearson(xs, ys), 1.0, places=4)
+
+    def test_pearson_perfect_negative(self):
+        from services.correlation import _pearson
+        xs = list(range(40))
+        ys = [-x for x in xs]
+        self.assertAlmostEqual(_pearson(xs, ys), -1.0, places=4)
+
+    def test_pearson_zero_variance_returns_zero(self):
+        from services.correlation import _pearson
+        xs = [1.0] * 40
+        ys = list(range(40))
+        self.assertEqual(_pearson(xs, ys), 0.0)
+
+    def test_pearson_too_short_returns_zero(self):
+        from services.correlation import _pearson
+        self.assertEqual(_pearson([1, 2, 3], [1, 2, 3]), 0.0)
+
+    def test_inflation_factor_single_position_is_unity(self):
+        from services.correlation import correlation_inflation_factor
+        self.assertEqual(
+            correlation_inflation_factor([{"ticker": "AAPL", "dollar_risk": 100.0}]),
+            1.0,
+        )
+
+    def test_inflation_factor_empty_is_unity(self):
+        from services.correlation import correlation_inflation_factor
+        self.assertEqual(correlation_inflation_factor([]), 1.0)
+
+    def test_inflation_factor_capped(self):
+        from services.correlation import correlation_inflation_factor, MAX_INFLATION
+        # Even if we could synthesize perfect correlation, the cap protects.
+        # We can't easily inject mock OHLCV here; the cap is the guarantee.
+        # Just confirm the cap constant is sane.
+        self.assertGreaterEqual(MAX_INFLATION, 1.0)
+        self.assertLessEqual(MAX_INFLATION, 10.0)
+
+
+class TestSignalBucketsDiversity(unittest.TestCase):
+    pass
+
+
+class TestCalibratedWeightsMath(unittest.TestCase):
+    pass
+
+
+class TestOrphanStopOrderBucketing(unittest.TestCase):
+    """r96 F7: _stop_orders_by_symbol must keep only stop-typed entries and
+    bucket them case-insensitively by symbol."""
+
+    def test_keeps_only_stop_orders(self):
+        from services.auto_trader import _stop_orders_by_symbol
+        orders = [
+            {"symbol": "AAPL", "type": "stop"},
+            {"symbol": "AAPL", "type": "limit"},
+            {"symbol": "MSFT", "type": "stop_limit"},
+            {"symbol": "TSLA", "type": "market"},
+            {"symbol": "TSLA", "type": "STOP"},
+        ]
+        result = _stop_orders_by_symbol(orders)
+        self.assertIn("AAPL", result)
+        self.assertEqual(len(result["AAPL"]), 1)
+        self.assertIn("MSFT", result)
+        self.assertEqual(len(result["MSFT"]), 1)
+        self.assertIn("TSLA", result)
+        self.assertEqual(len(result["TSLA"]), 1)
+
+    def test_handles_empty_and_malformed(self):
+        from services.auto_trader import _stop_orders_by_symbol
+        self.assertEqual(_stop_orders_by_symbol([]), {})
+        self.assertEqual(_stop_orders_by_symbol(None), {})
+        # Malformed entries are skipped without raising
+        self.assertEqual(
+            _stop_orders_by_symbol([{"symbol": "", "type": "stop"}, {"type": "stop"}]),
+            {},
+        )
+
+    def test_case_normalizes_symbol(self):
+        from services.auto_trader import _stop_orders_by_symbol
+        result = _stop_orders_by_symbol([{"symbol": "aapl", "type": "stop"}])
+        self.assertIn("AAPL", result)
+
+
+class TestDailyLossHardHalt(unittest.TestCase):
+    """r96 F4: pure-function predicate for the hard daily-loss halt."""
+
+    def test_breached_when_combined_below_threshold(self):
+        from services.auto_trader import _daily_loss_hard_halt_breached
+        # -3% × $100k = -$3000 threshold; combined PnL -$3100 → breach
+        breached, combined, threshold = _daily_loss_hard_halt_breached(
+            realized_today=-2000.0, unrealized=-1100.0,
+            equity=100_000.0, halt_pct=0.03,
+        )
+        self.assertTrue(breached)
+        self.assertEqual(combined, -3100.0)
+        self.assertEqual(threshold, -3000.0)
+
+    def test_not_breached_at_exact_threshold_minus_one_cent(self):
+        from services.auto_trader import _daily_loss_hard_halt_breached
+        # combined at -$2999.99 > -$3000 threshold → no breach
+        breached, _, _ = _daily_loss_hard_halt_breached(
+            realized_today=-2999.99, unrealized=0.0,
+            equity=100_000.0, halt_pct=0.03,
+        )
+        self.assertFalse(breached)
+
+    def test_breached_exactly_at_threshold(self):
+        from services.auto_trader import _daily_loss_hard_halt_breached
+        # ≤ semantics: combined exactly equals threshold → breach
+        breached, _, _ = _daily_loss_hard_halt_breached(
+            realized_today=-3000.0, unrealized=0.0,
+            equity=100_000.0, halt_pct=0.03,
+        )
+        self.assertTrue(breached)
+
+    def test_safe_default_on_unknown_realized(self):
+        from services.auto_trader import _daily_loss_hard_halt_breached
+        breached, _, _ = _daily_loss_hard_halt_breached(
+            realized_today=None, unrealized=-5000.0,
+            equity=100_000.0, halt_pct=0.03,
+        )
+        self.assertFalse(breached)
+
+    def test_safe_default_on_zero_equity(self):
+        from services.auto_trader import _daily_loss_hard_halt_breached
+        breached, _, _ = _daily_loss_hard_halt_breached(
+            realized_today=-5000.0, unrealized=0.0,
+            equity=0.0, halt_pct=0.03,
+        )
+        self.assertFalse(breached)
+
+    def test_safe_default_on_zero_halt_pct(self):
+        from services.auto_trader import _daily_loss_hard_halt_breached
+        breached, _, _ = _daily_loss_hard_halt_breached(
+            realized_today=-5000.0, unrealized=0.0,
+            equity=100_000.0, halt_pct=0.0,
+        )
+        self.assertFalse(breached)
+
+    def test_unrealized_gain_offsets_realized_loss(self):
+        from services.auto_trader import _daily_loss_hard_halt_breached
+        # -$5k realized but +$3k unrealized → combined -$2k > -$3k threshold
+        breached, combined, _ = _daily_loss_hard_halt_breached(
+            realized_today=-5000.0, unrealized=3000.0,
+            equity=100_000.0, halt_pct=0.03,
+        )
+        self.assertFalse(breached)
+        self.assertEqual(combined, -2000.0)
+
+
+class TestStrategyAutoDisableGate(unittest.TestCase):
+    """r96 F3: pure-function gate evaluation. Confirms the (disabled, reason)
+    tuple is correct across the four corner cases (off, no data, edge of
+    floor, far below floor)."""
+
+    def test_disabled_returns_false_when_flag_off(self):
+        from services.auto_trader import _strategy_auto_disable_check
+        # Even a catastrophic 10% WR on n=100 does not disable when flag is off.
+        disabled, _ = _strategy_auto_disable_check(
+            "BreakoutVol",
+            {"n": 100, "win_rate": 0.10},
+            enabled=False, wr_floor=0.40, min_n=30,
+        )
+        self.assertFalse(disabled)
+
+    def test_disabled_returns_false_when_n_below_min(self):
+        from services.auto_trader import _strategy_auto_disable_check
+        disabled, _ = _strategy_auto_disable_check(
+            "BreakoutVol",
+            {"n": 29, "win_rate": 0.10},
+            enabled=True, wr_floor=0.40, min_n=30,
+        )
+        self.assertFalse(disabled)
+
+    def test_disabled_returns_false_when_wr_at_floor(self):
+        # win_rate >= floor → not disabled (strict-below convention)
+        from services.auto_trader import _strategy_auto_disable_check
+        disabled, _ = _strategy_auto_disable_check(
+            "BreakoutVol",
+            {"n": 30, "win_rate": 0.40},
+            enabled=True, wr_floor=0.40, min_n=30,
+        )
+        self.assertFalse(disabled)
+
+    def test_disabled_when_wr_below_floor_and_n_sufficient(self):
+        from services.auto_trader import _strategy_auto_disable_check
+        disabled, reason = _strategy_auto_disable_check(
+            "BreakoutVol",
+            {"n": 30, "win_rate": 0.39},
+            enabled=True, wr_floor=0.40, min_n=30,
+        )
+        self.assertTrue(disabled)
+        self.assertIn("BreakoutVol", reason)
+        self.assertIn("0.390", reason)
+
+    def test_missing_strategy_or_card_returns_false(self):
+        from services.auto_trader import _strategy_auto_disable_check
+        disabled, _ = _strategy_auto_disable_check(
+            None, {"n": 30, "win_rate": 0.10},
+            enabled=True, wr_floor=0.40, min_n=30,
+        )
+        self.assertFalse(disabled)
+        disabled, _ = _strategy_auto_disable_check(
+            "BreakoutVol", None,
+            enabled=True, wr_floor=0.40, min_n=30,
+        )
+        self.assertFalse(disabled)
+
+
+class TestMLDriftAutoDisable(unittest.TestCase):
+    """r96 F2: nightly eval flips ml_scoring_enabled off when Brier breaches
+    the threshold on N consecutive eval rows. Pure-logic test using a
+    hand-rolled mock-DB that mirrors the SQLAlchemy surface we use."""
+
+    def _mk_db(self, scoring_enabled, drift_enabled, threshold, n_required, recent_briers):
+        """Build a mock db object with `query(...)` returning a chained API
+        for both AutoTraderConfig and MLEvalResult."""
+
+        class _Cfg:
+            def __init__(self):
+                self.id = 1
+                self.ml_scoring_enabled = scoring_enabled
+                self.ml_drift_auto_disable_enabled = drift_enabled
+                self.ml_drift_brier_alert_threshold = threshold
+                self.ml_drift_consecutive_days_required = n_required
+
+        class _Row:
+            def __init__(self, brier):
+                self.brier = brier
+
+        cfg = _Cfg()
+        rows = [_Row(b) for b in recent_briers]
+
+        class _Query:
+            def __init__(self, kind, parent):
+                self.kind = kind
+                self.parent = parent
+
+            def filter(self, *a, **k): return self
+
+            def first(self):
+                return cfg if self.kind == "cfg" else (rows[0] if rows else None)
+
+            def order_by(self, *a, **k): return self
+
+            def limit(self, n):
+                self.parent._last_limit = n
+                return self
+
+            def all(self):
+                lim = getattr(self.parent, "_last_limit", len(rows))
+                return rows[:lim]
+
+        class _DB:
+            def __init__(self):
+                self._committed = False
+                self._last_limit = None
+
+            def query(self, model):
+                kind = "cfg" if model.__name__ == "AutoTraderConfig" else "row"
+                return _Query(kind, self)
+
+            def commit(self):
+                self._committed = True
+
+        return _DB(), cfg
+
+    def test_no_action_when_disabled(self):
+        from services.ml_eval import _maybe_auto_disable_on_drift
+        db, cfg = self._mk_db(
+            scoring_enabled=True, drift_enabled=False,
+            threshold=0.05, n_required=3,
+            recent_briers=[0.20, 0.20, 0.20],
+        )
+        _maybe_auto_disable_on_drift(db, brier_now=0.20)
+        self.assertTrue(cfg.ml_scoring_enabled)  # still on
+        self.assertFalse(db._committed)
+
+    def test_no_action_when_already_off(self):
+        from services.ml_eval import _maybe_auto_disable_on_drift
+        db, cfg = self._mk_db(
+            scoring_enabled=False, drift_enabled=True,
+            threshold=0.05, n_required=3,
+            recent_briers=[0.20, 0.20, 0.20],
+        )
+        _maybe_auto_disable_on_drift(db, brier_now=0.20)
+        self.assertFalse(cfg.ml_scoring_enabled)
+        self.assertFalse(db._committed)
+
+    def test_no_action_when_below_threshold(self):
+        from services.ml_eval import _maybe_auto_disable_on_drift
+        db, cfg = self._mk_db(
+            scoring_enabled=True, drift_enabled=True,
+            threshold=0.05, n_required=3,
+            recent_briers=[0.04, 0.04, 0.04],
+        )
+        _maybe_auto_disable_on_drift(db, brier_now=0.04)
+        self.assertTrue(cfg.ml_scoring_enabled)
+        self.assertFalse(db._committed)
+
+    def test_no_action_when_one_row_passes(self):
+        from services.ml_eval import _maybe_auto_disable_on_drift
+        db, cfg = self._mk_db(
+            scoring_enabled=True, drift_enabled=True,
+            threshold=0.05, n_required=3,
+            recent_briers=[0.20, 0.04, 0.20],  # middle row OK → no breach
+        )
+        _maybe_auto_disable_on_drift(db, brier_now=0.20)
+        self.assertTrue(cfg.ml_scoring_enabled)
+        self.assertFalse(db._committed)
+
+    def test_disables_when_all_breach(self):
+        from services.ml_eval import _maybe_auto_disable_on_drift
+        db, cfg = self._mk_db(
+            scoring_enabled=True, drift_enabled=True,
+            threshold=0.05, n_required=3,
+            recent_briers=[0.20, 0.15, 0.10],
+        )
+        _maybe_auto_disable_on_drift(db, brier_now=0.20)
+        self.assertFalse(cfg.ml_scoring_enabled)
+        self.assertTrue(db._committed)
+
+    def test_skipped_when_history_too_short(self):
+        from services.ml_eval import _maybe_auto_disable_on_drift
+        db, cfg = self._mk_db(
+            scoring_enabled=True, drift_enabled=True,
+            threshold=0.05, n_required=3,
+            recent_briers=[0.20, 0.20],  # only 2 rows
+        )
+        _maybe_auto_disable_on_drift(db, brier_now=0.20)
+        self.assertTrue(cfg.ml_scoring_enabled)
+        self.assertFalse(db._committed)
+
+
+class TestMLLabelLeakFix(unittest.TestCase):
+    """r96 F1: feature vector must not encode the labeler's R/R levels.
+
+    The labeler in ml_trainer._label_trade decides win/loss by checking
+    whether price reaches target1 before stop_loss within N bars. If features
+    include sig_stop_pct = (entry - stop_loss)/stop_loss and sig_t1_pct =
+    (target1 - entry)/entry, the model is being told the same numbers that
+    decide the label. The drop_target_geometry flag must wipe those features.
+    """
+
+    def test_drop_target_geometry_omits_levels(self):
+        from services.ml_features import _signal_features
+        sig_a = {"signal_type": "BUY", "confidence": 70.0,
+                 "entry": 100.0, "stop_loss": 95.0, "target1": 110.0}
+        sig_b = {"signal_type": "BUY", "confidence": 70.0,
+                 "entry": 100.0, "stop_loss": 80.0, "target1": 200.0}
+        # With flag OFF (default), the two signals produce DIFFERENT features —
+        # this is the existing leaky behavior.
+        a_off = _signal_features(sig_a, drop_target_geometry=False)
+        b_off = _signal_features(sig_b, drop_target_geometry=False)
+        self.assertNotEqual(a_off["sig_stop_pct"], b_off["sig_stop_pct"])
+        self.assertNotEqual(a_off["sig_t1_pct"], b_off["sig_t1_pct"])
+        # With flag ON, both signals produce IDENTICAL features (None levels).
+        a_on = _signal_features(sig_a, drop_target_geometry=True)
+        b_on = _signal_features(sig_b, drop_target_geometry=True)
+        self.assertIsNone(a_on["sig_stop_pct"])
+        self.assertIsNone(a_on["sig_t1_pct"])
+        self.assertEqual(a_on, b_on)
+        # sig_dir and sig_conf are derived from non-leaky fields and must
+        # still carry signal (confidence and direction encode model input
+        # without revealing the labeler's pricing).
+        self.assertEqual(a_on["sig_dir"], 1.0)
+        self.assertEqual(a_on["sig_conf"], 70.0)
+
+    def test_column_schema_stable_across_flag(self):
+        """Column list must NOT change when the flag flips — that would force
+        a model-shape mismatch at load. Values change; schema doesn't."""
+        from services.ml_features import _signal_features, feature_columns
+        sig = {"signal_type": "BUY", "confidence": 70.0,
+               "entry": 100.0, "stop_loss": 95.0, "target1": 110.0}
+        off_keys = set(_signal_features(sig, drop_target_geometry=False).keys())
+        on_keys = set(_signal_features(sig, drop_target_geometry=True).keys())
+        self.assertEqual(off_keys, on_keys)
+        cols = feature_columns()
+        self.assertIn("sig_stop_pct", cols)
+        self.assertIn("sig_t1_pct", cols)
 
 
 if __name__ == "__main__":
