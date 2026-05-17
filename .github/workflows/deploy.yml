@@ -44,7 +44,7 @@ jobs:
           npm install || npm install esbuild
         fi
 
-    - name: Check GCP Secrets
+    - name: Check All Secrets
       run: |
         if [ -z "${{ secrets.WIF_PROVIDER }}" ]; then
           echo "::error::WIF_PROVIDER secret is missing or empty! Please add it to Settings > Secrets and variables > Actions > Repository secrets."
@@ -52,6 +52,18 @@ jobs:
         fi
         if [ -z "${{ secrets.WIF_SERVICE_ACCOUNT }}" ]; then
           echo "::error::WIF_SERVICE_ACCOUNT secret is missing or empty! Please add it to Settings > Secrets and variables > Actions > Repository secrets."
+          exit 1
+        fi
+        if [ -z "${{ secrets.APCA_API_KEY_ID }}" ]; then
+          echo "::error::APCA_API_KEY_ID secret is missing or empty! Please add your Alpaca Key ID to Repository secrets."
+          exit 1
+        fi
+        if [ -z "${{ secrets.APCA_API_SECRET_KEY }}" ]; then
+          echo "::error::APCA_API_SECRET_KEY secret is missing or empty! Please add your Alpaca Secret Key to Repository secrets."
+          exit 1
+        fi
+        if [ -z "${{ secrets.DATABASE_URL }}" ]; then
+          echo "::error::DATABASE_URL secret is missing or empty! Please add your Postgres Database URL to Repository secrets."
           exit 1
         fi
 
