@@ -66,15 +66,22 @@ jobs:
           echo "::error::DATABASE_URL secret is missing or empty! Please add your Postgres Database URL to Repository secrets."
           exit 1
         fi
+        if [ -z "${{ secrets.GCP_PROJECT_ID }}" ]; then
+          echo "::error::GCP_PROJECT_ID secret is missing or empty! Please add your Google Cloud Project ID to Repository secrets."
+          exit 1
+        fi
 
     - name: Authenticate to Google Cloud (Workload Identity Federation)
       uses: google-github-actions/auth@v2
       with:
         workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
         service_account: '${{ secrets.WIF_SERVICE_ACCOUNT }}'
+        project_id: '${{ secrets.GCP_PROJECT_ID }}'
 
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: '${{ secrets.GCP_PROJECT_ID }}'
 
     - name: Inject Environment Variables
       run: |
