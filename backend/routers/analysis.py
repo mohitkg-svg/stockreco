@@ -26,9 +26,7 @@ from models import AnalysisResponse, SignalResponse, ChartDataResponse, ChartCan
 from services.data_fetcher import fetch_ohlcv, get_ticker_info, get_current_price, TIMEFRAME_CONFIG
 from services.indicators import compute_indicators, get_chart_indicator_series
 from services.support_resistance import swing_levels, classify_levels_relative_to_price
-from services.supply_demand import detect_zones
 from services.fibonacci import compute_fib_levels
-from services.gap_detector import detect_all_gaps
 from services.signal_generator import generate_signal, get_timeframe_alignment
 from services.backtester import run_multi_strategy
 from services import auto_trader
@@ -600,12 +598,10 @@ def _prewarm_other_tfs(ticker: str, current_tf: str) -> None:
                 classified = classify_levels_relative_to_price(swing_lvls, price)
                 sr_levels = [SupportResistanceLevel(price=l["price"], type=l["type"],
                                                     strength=l.get("strength",1)) for l in classified]
-                zones = detect_zones(df_ind, price)
                 fib = compute_fib_levels(df_ind)
-                gaps = detect_all_gaps(df_ind)
                 resp = ChartDataResponse(ticker=ticker, timeframe=tf, candles=candles,
                                          indicators=indicators, support_resistance=sr_levels,
-                                         supply_demand_zones=zones, fibonacci=fib, gaps=gaps)
+                                         supply_demand_zones={"demand": [], "supply": []}, fibonacci=fib, gaps={"price_gaps": [], "fvgs": []})
                 ck = (ticker, tf, len(df), int(df.index[-1].timestamp()))
                 _chart_cache[ck] = (resp, time.time() + _CHART_TTL_BY_TF.get(tf, 60))
             except Exception as e:
@@ -703,9 +699,7 @@ def get_chart_data(
         for lvl in classified
     ]
 
-    zones = detect_zones(df_ind, price)
     fib = compute_fib_levels(df_ind)
-    gaps = detect_all_gaps(df_ind)
 
     resp = ChartDataResponse(
         ticker=ticker,
@@ -713,9 +707,9 @@ def get_chart_data(
         candles=candles,
         indicators=indicators,
         support_resistance=sr_levels,
-        supply_demand_zones=zones,
+        supply_demand_zones={"demand": [], "supply": []},
         fibonacci=fib,
-        gaps=gaps,
+        gaps={"price_gaps": [], "fvgs": []},
     )
     _chart_cache[_ck] = (resp, time.time() + _CHART_TTL_BY_TF.get(timeframe, 60))
     # Bound memory: keep only the 128 most-recently-written entries.
