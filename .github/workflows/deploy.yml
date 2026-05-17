@@ -69,7 +69,8 @@ jobs:
         EOF
 
     - name: Run Deployment Scripts
-      run: ./deploy-all.sh us-central1
+      run: |
+        bash deploy-all.sh us-central1
 
     - name: Notify on Failure
       if: failure()
