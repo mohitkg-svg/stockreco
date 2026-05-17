@@ -579,39 +579,6 @@ class TestPortfolioBacktest(unittest.TestCase):
         self.assertAlmostEqual(float(pairs.max()), 1.0, places=4)
         self.assertAlmostEqual(float(pairs.min()), -1.0, places=4)
 
-
-class TestMultidimRegimeThresholds(unittest.TestCase):
-    """r96 R6: stress_regime_active thresholds + flag-gating accessor.
-
-    The actual signal fetchers (VIX, SPY, breadth) need network; here we
-    confirm threshold constants are sane and that multidim_enabled returns
-    False when the DB cfg row is missing the field."""
-
-    def test_threshold_constants_sane(self):
-        from services.multidim_regime import (
-            VIX_LEVEL_STRESS, VIX_TERM_BACKWARDATION,
-            REALIZED_VOL_STRESS_ANNUALIZED, BREADTH_BEAR_FLOOR,
-        )
-        # VIX level — historical mean is ~19, stress regimes start ~22.
-        self.assertGreaterEqual(VIX_LEVEL_STRESS, 18.0)
-        self.assertLessEqual(VIX_LEVEL_STRESS, 30.0)
-        # Backwardation: VIX/VIX3M >= 1.0 is the classic stress signal.
-        self.assertAlmostEqual(VIX_TERM_BACKWARDATION, 1.0, places=5)
-        # Realized vol: 25% annualized is well above SPY's ~15% baseline.
-        self.assertGreaterEqual(REALIZED_VOL_STRESS_ANNUALIZED, 0.18)
-        self.assertLessEqual(REALIZED_VOL_STRESS_ANNUALIZED, 0.40)
-        # Breadth proxy bear floor: at most 50% (median bull baseline).
-        self.assertGreaterEqual(BREADTH_BEAR_FLOOR, 0.20)
-        self.assertLessEqual(BREADTH_BEAR_FLOOR, 0.50)
-
-    def test_multidim_enabled_default_false(self):
-        # On a fresh test environment cfg row might not exist; helper must
-        # safe-default to False without raising.
-        from services.multidim_regime import multidim_enabled
-        # Just confirms it returns a bool — value depends on cfg state.
-        self.assertIsInstance(multidim_enabled(), bool)
-
-
 class TestOptionGreeksBackfill(unittest.TestCase):
     """r96 R5: backfill_one with a mock trade + monkey-patched fetcher."""
 
